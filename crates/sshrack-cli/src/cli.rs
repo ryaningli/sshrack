@@ -5,25 +5,25 @@
 //! inherited stdio, and waits. Argument parsing is fully delegated to clap.
 //!
 //! The top level has these groups:
-//! - `ssh` — explicit connect: `sshrack ssh <alias> [command...]`.
-//! - `scp` — file transfer with `alias:path` expansion.
+//! - `ssh` — explicit connect: `sshrack ssh <name> [command...]`.
+//! - `scp` — file transfer with `name:path` expansion.
 //! - `host` — resource group for `add`/`ls`/`show`/`edit`/`rm`/`cp`.
 //! - `cred` — resource group for managing reusable credentials.
 //! - `store` — password storage-mode management
 //!   (`use`/`status`/`rekey`/`lock`/`unlock`/`config`); see [`Command::Store`].
 //!
-//! The `<alias>` shorthand (`sshrack <alias> [command...]`) is an equivalent of
-//! `sshrack ssh <alias>`: clap's `external_subcommand` collects the alias plus
+//! The `<name>` shorthand (`sshrack <name> [command...]`) is an equivalent of
+//! `sshrack ssh <name>`: clap's `external_subcommand` collects the name plus
 //! the verbatim remote command in [`Command::Connect`], so flags after the
-//! alias reach ssh, not sshrack (the pass-through contract). A bare `sshrack`
+//! name reach ssh, not sshrack (the pass-through contract). A bare `sshrack`
 //! (no subcommand) prints help — there is no TUI in this phase.
 
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
-/// Per-connection `user`/`port`/`identity` for the `ssh`/`scp`/`<alias>`
-/// routes. Flattened into the top-level [`Cli`] (for the `sshrack <alias>`
+/// Per-connection `user`/`port`/`identity` for the `ssh`/`scp`/`<name>`
+/// routes. Flattened into the top-level [`Cli`] (for the `sshrack <name>`
 /// shorthand) and into the `ssh`/`scp` subcommands, so the flags surface only
 /// where a connection actually happens; each overlays the resolved config for
 /// that one connection. A value given after the subcommand token overlays one
@@ -44,12 +44,12 @@ pub struct ConnectOptions {
 
     /// Reuse a `[[credentials]]` entry for this connection only (overlays the
     /// resolved auth). For an ad-hoc target this is the identity source.
-    /// Resolved from alias to id by the CLI layer, not by clap.
+    /// Resolved from name to id by the CLI layer, not by clap.
     #[arg(short = 'c', long = "credential")]
     pub credential: Option<String>,
 
-    /// Treat the target as a literal address, not a config alias. The only way
-    /// to reach an IP/host that is not a configured alias.
+    /// Treat the target as a literal address, not a config name. The only way
+    /// to reach an IP/host that is not a configured name.
     #[arg(long = "ad-hoc")]
     pub ad_hoc: bool,
 }
@@ -85,8 +85,8 @@ pub enum OutputFormat {
 pub enum SortMode {
     /// Sort by frecency (frequency + recency of use).
     Frecency,
-    /// Sort alphabetically by alias.
-    Alias,
+    /// Sort alphabetically by name.
+    Name,
     /// Sort by most recently used.
     Recent,
 }
@@ -118,14 +118,14 @@ pub struct Cli {
     )]
     pub format: OutputFormat,
 
-    /// Per-connection `user`/`port`/`identity` for the `ssh`/`scp`/`<alias>`
-    /// routes. Flattened here so `sshrack --port <alias>` (and `--user`/
+    /// Per-connection `user`/`port`/`identity` for the `ssh`/`scp`/`<name>`
+    /// routes. Flattened here so `sshrack --port <name>` (and `--user`/
     /// `--identity`) work; consulted only on the connect arms.
     #[command(flatten)]
     pub connect_opts: ConnectOptions,
 
     /// Subcommand selects the action. An unknown first token (e.g. a host
-    /// alias) falls through to [`Command::Connect`] via `external_subcommand`.
+    /// name) falls through to [`Command::Connect`] via `external_subcommand`.
     /// Omitting it prints help.
     #[command(subcommand)]
     pub cmd: Option<Command>,
@@ -135,36 +135,36 @@ pub struct Cli {
 ///
 /// `Ssh`/`Scp` are operations; `Host`/`Cred`/`Store` are resource groups (each
 /// with its own sub-action). The catch-all [`Command::Connect`] handles
-/// `sshrack <alias> [remote command...]` — the shorthand for `ssh`.
+/// `sshrack <name> [remote command...]` — the shorthand for `ssh`.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Connect to a host: `sshrack ssh <alias> [command...]`. Everything after
-    /// the alias reaches `ssh` verbatim (flags after the alias are not sshrack
-    /// flags). Equivalent to the `sshrack <alias>` shorthand.
+    /// Connect to a host: `sshrack ssh <name> [command...]`. Everything after
+    /// the name reaches `ssh` verbatim (flags after the name are not sshrack
+    /// flags). Equivalent to the `sshrack <name>` shorthand.
     Ssh {
         /// Per-connection flags given after the `ssh` token (overlay the
-        /// top-level ones); must precede the alias.
+        /// top-level ones); must precede the name.
         #[command(flatten)]
         opts: ConnectOptions,
-        /// `<alias> [remote command...]` — the host alias followed by any
-        /// command handed to ssh verbatim. Flags after the alias are not
+        /// `<name> [remote command...]` — the host name followed by any
+        /// command handed to ssh verbatim. Flags after the name are not
         /// sshrack flags.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
 
-    /// File transfer with `alias:path` expansion. All scp flags pass through
-    /// verbatim; sshrack only rewrites `alias:` operands and injects the
+    /// File transfer with `name:path` expansion. All scp flags pass through
+    /// verbatim; sshrack only rewrites `name:` operands and injects the
     /// matched host's port/identity.
     Scp {
         /// Per-connection flags given after the `scp` token (overlay the
         /// top-level ones); must precede the first operand.
         #[command(flatten)]
         opts: ConnectOptions,
-        /// scp operands and flags. Remotes use `alias:path`; sshrack rewrites
-        /// known aliases and passes `user@host:path` through verbatim. An
+        /// scp operands and flags. Remotes use `name:path`; sshrack rewrites
+        /// known names and passes `user@host:path` through verbatim. An
         /// unknown `name:path` is rejected — use `--ad-hoc` or
-        /// `user@host:path` for a host that is not a registered alias.
+        /// `user@host:path` for a host that is not a registered name.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -187,12 +187,12 @@ pub enum Command {
         action: StoreAction,
     },
 
-    /// Catch-all: `sshrack <alias> [command...]` — the shorthand for `ssh`.
-    /// clap's `external_subcommand` collects the alias plus the verbatim
-    /// remote command, so flags after the alias reach ssh, not sshrack.
+    /// Catch-all: `sshrack <name> [command...]` — the shorthand for `ssh`.
+    /// clap's `external_subcommand` collects the name plus the verbatim
+    /// remote command, so flags after the name reach ssh, not sshrack.
     #[command(external_subcommand)]
     Connect(
-        /// `<alias> [remote command...]`.
+        /// `<name> [remote command...]`.
         Vec<String>,
     ),
 }
@@ -202,9 +202,9 @@ pub enum Command {
 pub enum HostAction {
     /// Add a host (interactive by default; --no-input for scripts).
     Add {
-        /// Host alias to add (or overwrite when --force is set). Omit for
-        /// interactive mode (you'll be prompted for a fresh alias).
-        alias: Option<String>,
+        /// Host name to add (or overwrite when --force is set). Omit for
+        /// interactive mode (you'll be prompted for a fresh name).
+        name: Option<String>,
         /// Remote hostname or IP.
         #[arg(long)]
         host: Option<String>,
@@ -217,27 +217,27 @@ pub enum HostAction {
         /// Path to a private key file.
         #[arg(long)]
         identity: Option<PathBuf>,
-        /// Reference a [[credentials]] entry by alias instead of inline user/key.
-        /// Resolved from alias to id by the CLI layer, not by clap.
+        /// Reference a [[credentials]] entry by name instead of inline user/key.
+        /// Resolved from name to id by the CLI layer, not by clap.
         #[arg(long)]
         credential: Option<String>,
         /// Non-interactive: all required fields must come from flags (a
         /// password host cannot be created in this mode).
         #[arg(long = "no-input")]
         no_input: bool,
-        /// Overwrite an existing alias.
+        /// Overwrite an existing name.
         #[arg(long)]
         force: bool,
     },
 
     /// List all configured hosts as an aligned table. `--fields` selects a
-    /// comma-separated column subset (e.g. `alias,host`); omit for all columns.
+    /// comma-separated column subset (e.g. `name,host`); omit for all columns.
     /// `--sort` selects the ordering (default: config order).
     Ls {
-        /// Comma-separated column subset (e.g. `alias,host`); omit for all.
+        /// Comma-separated column subset (e.g. `name,host`); omit for all.
         #[arg(long)]
         fields: Option<String>,
-        /// Sort order: `frecency` | `alias` | `recent`.
+        /// Sort order: `frecency` | `name` | `recent`.
         #[arg(long, value_enum)]
         sort: Option<SortMode>,
     },
@@ -245,8 +245,8 @@ pub enum HostAction {
     /// Print a single host's details. `--reveal` prints the stored password in
     /// plaintext (decrypts it in encrypted mode); default masks it.
     Show {
-        /// Host alias to show.
-        alias: String,
+        /// Host name to show.
+        name: String,
         /// Print the stored password in plaintext.
         #[arg(long)]
         reveal: bool,
@@ -255,8 +255,8 @@ pub enum HostAction {
     /// Edit an existing host's fields (patch via flags; interactive pre-fill
     /// when no flags are given).
     Edit {
-        /// Host alias to edit. Omit for interactive mode (pick from a menu).
-        alias: Option<String>,
+        /// Host name to edit. Omit for interactive mode (pick from a menu).
+        name: Option<String>,
         /// New remote hostname or IP.
         #[arg(long)]
         host: Option<String>,
@@ -269,7 +269,7 @@ pub enum HostAction {
         /// New identity file path.
         #[arg(long)]
         identity: Option<PathBuf>,
-        /// Rename the host to this new alias.
+        /// Rename the host to this new name.
         #[arg(long)]
         rename: Option<String>,
         /// Switch auth to a credential reference (sets `Auth::Ref`). Mutually
@@ -292,20 +292,20 @@ pub enum HostAction {
 
     /// Remove a host from the config (prompts unless --yes).
     Rm {
-        /// Host alias to remove. Omit for interactive mode (pick from a menu).
-        alias: Option<String>,
+        /// Host name to remove. Omit for interactive mode (pick from a menu).
+        name: Option<String>,
         /// Skip the confirmation prompt.
         #[arg(short = 'y', long)]
         yes: bool,
     },
 
-    /// Copy a host's config to a new alias. Two args = non-interactive copy;
-    /// no args = pick the source from a menu and type the new alias. The
+    /// Copy a host's config to a new name. Two args = non-interactive copy;
+    /// no args = pick the source from a menu and type the new name. The
     /// destination must be globally unique (no overwrite).
     Cp {
-        /// Source host alias (omit both for interactive mode).
+        /// Source host name (omit both for interactive mode).
         src: Option<String>,
-        /// Destination alias (omit both for interactive mode).
+        /// Destination name (omit both for interactive mode).
         dst: Option<String>,
     },
 }
@@ -315,9 +315,9 @@ pub enum HostAction {
 pub enum CredAction {
     /// Add a reusable credential (interactive by default; --no-input for scripts).
     Add {
-        /// Credential alias to add (or overwrite when --force is set). Omit
-        /// for interactive mode (you'll be prompted for a fresh alias).
-        alias: Option<String>,
+        /// Credential name to add (or overwrite when --force is set). Omit
+        /// for interactive mode (you'll be prompted for a fresh name).
+        name: Option<String>,
         /// Login user (required in --no-input mode).
         #[arg(long)]
         user: Option<String>,
@@ -328,14 +328,14 @@ pub enum CredAction {
         /// cannot be created in this mode).
         #[arg(long = "no-input")]
         no_input: bool,
-        /// Overwrite an existing credential alias.
+        /// Overwrite an existing credential name.
         #[arg(long)]
         force: bool,
     },
     /// Edit an existing credential (patch via flags; interactive when none given).
     Edit {
-        /// Credential alias to edit. Omit for interactive mode (pick from a menu).
-        alias: Option<String>,
+        /// Credential name to edit. Omit for interactive mode (pick from a menu).
+        name: Option<String>,
         /// New login user.
         #[arg(long)]
         user: Option<String>,
@@ -345,7 +345,7 @@ pub enum CredAction {
         /// Remove the identity file.
         #[arg(long, conflicts_with = "identity")]
         clear_identity: bool,
-        /// Rename the credential to this new alias.
+        /// Rename the credential to this new name.
         #[arg(long)]
         rename: Option<String>,
         /// Non-interactive: only apply flags; never prompt.
@@ -354,13 +354,13 @@ pub enum CredAction {
     },
     /// Remove a credential (prompts unless --yes).
     Rm {
-        /// Credential alias to remove. Omit for interactive mode (pick from a menu).
-        alias: Option<String>,
+        /// Credential name to remove. Omit for interactive mode (pick from a menu).
+        name: Option<String>,
         #[arg(short = 'y', long)]
         yes: bool,
     },
     /// List all credentials (password masked). `--fields` selects a
-    /// comma-separated column subset (e.g. `alias,user`); omit for all columns.
+    /// comma-separated column subset (e.g. `name,user`); omit for all columns.
     Ls {
         #[arg(long)]
         fields: Option<String>,
@@ -368,8 +368,8 @@ pub enum CredAction {
     /// Print one credential's details. `--reveal` prints the stored password
     /// in plaintext (decrypts it in encrypted mode); default masks it.
     Show {
-        /// Credential alias to show.
-        alias: String,
+        /// Credential name to show.
+        name: String,
         /// Print the stored password in plaintext.
         #[arg(long)]
         reveal: bool,

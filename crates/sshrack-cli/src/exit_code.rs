@@ -10,10 +10,10 @@ pub const USAGE: i32 = 2;
 /// A referenced host, credential, or resource was not found.
 pub const NOT_FOUND: i32 = 4;
 
-/// A name collision blocked a create/rename (e.g. alias already exists).
+/// A name collision blocked a create/rename (e.g. name already exists).
 pub const DUPLICATE: i32 = 5;
 
-/// Input failed validation (e.g. bad port, malformed alias).
+/// Input failed validation (e.g. bad port, malformed name).
 pub const VALIDATION: i32 = 6;
 
 /// A connection or remote operation failed.

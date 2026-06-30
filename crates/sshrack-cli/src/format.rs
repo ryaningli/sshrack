@@ -15,8 +15,8 @@
 //!
 //! Security rule: **no struct in this module ever carries a password, key, or
 //! any secret material — with one documented exception.** Rows expose only
-//! routing/identity metadata (alias, host, port, user, an auth-kind label, and
-//! the referenced credential alias). A password is represented only by its
+//! routing/identity metadata (name, host, port, user, an auth-kind label, and
+//! the referenced credential name). A password is represented only by its
 //! *kind* (`"password"`, `"key"`, `"keyring"`, `"default"`), never its value.
 //! The single exception is the **reveal row**: when the user explicitly runs
 //! `show --reveal` (host or credential), the revealed plaintext is attached as
@@ -38,19 +38,19 @@ use sshrack_core::config::schema::{
 /// A single `host ls` row. Field names are the stable `--format json` schema.
 ///
 /// `auth_kind` is one of `"credential"`, `"password"`, `"key"`, `"keyring"`,
-/// `"default"`. `credential_alias` is `Some` only when `auth_kind ==
-/// "credential"`; it is the referenced credential's alias (resolved from the
+/// `"default"`. `credential_name` is `Some` only when `auth_kind ==
+/// "credential"`; it is the referenced credential's name (resolved from the
 /// id by the caller), never the id itself. `user` is the inline body's user,
 /// or the referenced credential's user.
 #[derive(Debug, Clone, Serialize)]
 pub struct HostListRow<'a> {
-    pub alias: &'a str,
+    pub name: &'a str,
     pub host: &'a str,
     pub port: u16,
     pub user: &'a str,
     pub auth_kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub credential_alias: Option<&'a str>,
+    pub credential_name: Option<&'a str>,
 }
 
 /// A single `host show` row — the same fields as [`HostListRow`] plus the
@@ -63,14 +63,14 @@ pub struct HostListRow<'a> {
 /// `skip_serializing_if`) for every non-reveal path.
 #[derive(Debug, Clone, Serialize)]
 pub struct HostDetailRow<'a> {
-    pub alias: &'a str,
+    pub name: &'a str,
     pub id: &'a str,
     pub host: &'a str,
     pub port: u16,
     pub user: &'a str,
     pub auth_kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub credential_alias: Option<&'a str>,
+    pub credential_name: Option<&'a str>,
     /// Identity-file path for inline-key auth (`None` for credential refs and
     /// non-key inline bodies). Rendered via `to_string_lossy` so non-UTF-8 paths
     /// still serialize.
@@ -93,7 +93,7 @@ pub struct HostDetailRow<'a> {
 /// which never reveals).
 #[derive(Debug, Clone, Serialize)]
 pub struct CredentialListRow<'a> {
-    pub alias: &'a str,
+    pub name: &'a str,
     pub user: &'a str,
     pub secret_kind: &'static str,
     /// The revealed plaintext, present only under `show --reveal`. See the
@@ -146,21 +146,21 @@ pub fn secret_kind_label(kind: &SecretKind) -> &'static str {
     }
 }
 
-/// Build a [`HostListRow`] from a host plus the alias of its referenced
+/// Build a [`HostListRow`] from a host plus the name of its referenced
 /// credential (resolved by the caller from the id; `None` for inline auth or
 /// a dangling reference). Pure.
-pub fn host_list_row<'a>(host: &'a Host, credential_alias: Option<&'a str>) -> HostListRow<'a> {
+pub fn host_list_row<'a>(host: &'a Host, credential_name: Option<&'a str>) -> HostListRow<'a> {
     HostListRow {
-        alias: &host.alias,
+        name: &host.name,
         host: &host.host,
         port: host.port,
         user: user_of(host.auth.inline_body()),
         auth_kind: auth_kind_label(&host.auth),
-        credential_alias,
+        credential_name,
     }
 }
 
-/// Build a [`HostDetailRow`] from a host plus its referenced credential alias
+/// Build a [`HostDetailRow`] from a host plus its referenced credential name
 /// and the string form of its id. Pure. `identity` borrows the inline body's
 /// key path when present; for a credential reference it is `None`. `password`
 /// is the revealed plaintext under `--reveal` (`None` otherwise); passing it
@@ -169,17 +169,17 @@ pub fn host_list_row<'a>(host: &'a Host, credential_alias: Option<&'a str>) -> H
 pub fn host_detail_row<'a>(
     host: &'a Host,
     id_str: &'a str,
-    credential_alias: Option<&'a str>,
+    credential_name: Option<&'a str>,
     password: Option<Cow<'a, str>>,
 ) -> HostDetailRow<'a> {
     HostDetailRow {
-        alias: &host.alias,
+        name: &host.name,
         id: id_str,
         host: &host.host,
         port: host.port,
         user: user_of(host.auth.inline_body()),
         auth_kind: auth_kind_label(&host.auth),
-        credential_alias,
+        credential_name,
         identity: host
             .auth
             .inline_body()
@@ -198,7 +198,7 @@ pub fn credential_list_row<'a>(
     password: Option<Cow<'a, str>>,
 ) -> CredentialListRow<'a> {
     CredentialListRow {
-        alias: &cred.alias,
+        name: &cred.name,
         user: &cred.body.user,
         secret_kind: secret_kind_label(&cred.body.secret_kind()),
         password,
@@ -267,7 +267,7 @@ mod tests {
     fn inline_host() -> Host {
         Host {
             id: Ulid::new(),
-            alias: "web1".into(),
+            name: "web1".into(),
             host: "10.0.0.5".into(),
             port: 2222,
             auth: Auth::Inline(CredentialBody::new("deploy").with_password("hunter2")),
@@ -278,7 +278,7 @@ mod tests {
     fn ref_host(cred_id: Ulid) -> Host {
         Host {
             id: Ulid::new(),
-            alias: "db1".into(),
+            name: "db1".into(),
             host: "db.internal".into(),
             port: 22,
             auth: Auth::reference(cred_id),
@@ -331,7 +331,7 @@ mod tests {
     fn host_detail_row_json_includes_id_and_identity() {
         let host = Host {
             id: Ulid::new(),
-            alias: "box".into(),
+            name: "box".into(),
             host: "1.2.3.4".into(),
             port: 22,
             auth: Auth::Inline(CredentialBody::new("root").with_key("/home/u/.ssh/id_ed25519")),
@@ -352,7 +352,7 @@ mod tests {
     fn credential_list_row_json_has_stable_field_names() {
         let cred = sshrack_core::config::schema::Credential {
             id: Ulid::new(),
-            alias: "team-dev".into(),
+            name: "team-dev".into(),
             body: CredentialBody::new("deploy").with_password("s3cret"),
         };
         let row = credential_list_row(&cred, None);
@@ -440,7 +440,7 @@ mod tests {
     fn credential_list_row_reveal_round_trips_through_json() {
         let cred = sshrack_core::config::schema::Credential {
             id: Ulid::new(),
-            alias: "team-dev".into(),
+            name: "team-dev".into(),
             body: CredentialBody::new("deploy").with_password("ignored"),
         };
         // A nasty password mixing every escapable class.
@@ -457,7 +457,7 @@ mod tests {
     fn credential_list_row_non_reveal_has_no_password_field() {
         let cred = sshrack_core::config::schema::Credential {
             id: Ulid::new(),
-            alias: "team-dev".into(),
+            name: "team-dev".into(),
             body: CredentialBody::new("deploy").with_password("s3cret"),
         };
         let row = credential_list_row(&cred, None);

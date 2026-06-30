@@ -5,9 +5,9 @@
 //! [`config::store::save`]. Every handler honors `--no-input` (missing required
 //! fields error out; no field prompts) and `--format json|text`.
 //!
-//! Ref-by-id invariant: `--credential <alias>` is resolved to a [`Ulid`] here
-//! before any core call (fail-fast on an unknown alias). `ls`/`show` reverse-
-//! resolve the stored `Ulid` back to the credential alias for display — the
+//! Ref-by-id invariant: `--credential <name>` is resolved to a [`Ulid`] here
+//! before any core call (fail-fast on an unknown name). `ls`/`show` reverse-
+//! resolve the stored `Ulid` back to the credential name for display — the
 //! on-disk form is always the id.
 //!
 //! Nothing here prints a password in an error message. `show --reveal` is the
@@ -43,7 +43,7 @@ use crate::format as fmt;
 use super::shared::{
     confirm_destructive, ensure_storage_mode_decided, fail, load_config, print_json_array,
     print_text_table, prompt_fail, prompt_password, prompt_port, prompt_string,
-    prompt_string_with_default, resolve_credential_alias, save_config, selected_fields, sort_hosts,
+    prompt_string_with_default, resolve_credential_name, save_config, selected_fields, sort_hosts,
     unlock_vault_key,
 };
 
@@ -52,7 +52,7 @@ pub fn run(cli: &Cli, action: &HostAction) -> i32 {
     let no_input = cli.no_input || subcommand_no_input(action);
     match action {
         HostAction::Add {
-            alias,
+            name,
             host,
             user,
             port,
@@ -62,7 +62,7 @@ pub fn run(cli: &Cli, action: &HostAction) -> i32 {
             force,
         } => add(
             cli,
-            alias.as_deref(),
+            name.as_deref(),
             host.as_deref(),
             user.as_deref(),
             *port,
@@ -72,9 +72,9 @@ pub fn run(cli: &Cli, action: &HostAction) -> i32 {
             no_input,
         ),
         HostAction::Ls { fields, sort } => ls(cli, fields.as_deref(), *sort),
-        HostAction::Show { alias, reveal } => show(cli, alias, *reveal, no_input),
+        HostAction::Show { name, reveal } => show(cli, name, *reveal, no_input),
         HostAction::Edit {
-            alias,
+            name,
             host,
             user,
             port,
@@ -87,7 +87,7 @@ pub fn run(cli: &Cli, action: &HostAction) -> i32 {
             no_input: _,
         } => edit(
             cli,
-            alias.as_deref(),
+            name.as_deref(),
             host.as_deref(),
             user.as_deref(),
             *port,
@@ -99,7 +99,7 @@ pub fn run(cli: &Cli, action: &HostAction) -> i32 {
             *clear_credential,
             no_input,
         ),
-        HostAction::Rm { alias, yes } => rm(cli, alias.as_deref(), *yes, no_input),
+        HostAction::Rm { name, yes } => rm(cli, name.as_deref(), *yes, no_input),
         HostAction::Cp { src, dst } => cp(cli, src.as_deref(), dst.as_deref(), no_input),
     }
 }
@@ -121,7 +121,7 @@ fn subcommand_no_input(action: &HostAction) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn add(
     cli: &Cli,
-    alias: Option<&str>,
+    name: Option<&str>,
     host_addr: Option<&str>,
     user: Option<&str>,
     port: Option<u16>,
@@ -135,21 +135,21 @@ fn add(
         Err((msg, code)) => return fail(&msg, code),
     };
 
-    // Validate the alias up front (forbidden chars) and the duplicate check
+    // Validate the name up front (forbidden chars) and the duplicate check
     // before any prompt or field work — fail-fast on local errors.
-    let alias = match resolve_alias(&cfg, alias, force, no_input, "host") {
+    let name = match resolve_name(&cfg, name, force, no_input, "host") {
         Ok(a) => a,
         Err(ret) => return ret,
     };
-    if let Err(e) = host::validate_alias_chars(&alias) {
+    if let Err(e) = host::validate_name_chars(&name) {
         return fail(&format!("sshrack: {e}"), exit_code::VALIDATION);
     }
-    if let Err(e) = host::validate_no_duplicate(&cfg, &alias, force) {
+    if let Err(e) = host::validate_no_duplicate(&cfg, &name, force) {
         return fail(&format!("sshrack: {e}"), exit_code::DUPLICATE);
     }
 
-    // Resolve `--credential <alias>` → Ulid (fail-fast if unknown).
-    let cred_ulid = match resolve_credential_alias(&cfg, credential) {
+    // Resolve `--credential <name>` → Ulid (fail-fast if unknown).
+    let cred_ulid = match resolve_credential_name(&cfg, credential) {
         Ok(v) => v,
         Err((msg, code)) => return fail(&msg, code),
     };
@@ -180,7 +180,7 @@ fn add(
     };
 
     let host_id = new_id();
-    let mut new_host = match host::merge_fields(host_id, &alias, &opts) {
+    let mut new_host = match host::merge_fields(host_id, &name, &opts) {
         Ok(h) => h,
         Err(e) => return fail(&format!("sshrack: {e}"), exit_code::VALIDATION),
     };
@@ -197,16 +197,16 @@ fn add(
         }
     }
 
-    // add_host validates alias chars again (cheap) and appends; force replaces.
+    // add_host validates name chars again (cheap) and appends; force replaces.
     let next = if force {
-        // Replace in place on --force, preserving nothing (the alias is the
+        // Replace in place on --force, preserving nothing (the name is the
         // key). A fresh id is correct — but if the host being overwritten was
         // keyring-marked, its keyring entry (keyed by the OLD id) must be
         // cleaned up so no orphaned secret is left behind, exactly like `rm`.
         // Best-effort: a missing/unreachable entry is silently ignored.
-        host::forget_keyring_on_overwrite(&cfg, &alias, &OsKeyring);
+        host::forget_keyring_on_overwrite(&cfg, &name, &OsKeyring);
         let mut replaced = cfg.clone();
-        if let Some(slot) = replaced.hosts.iter_mut().find(|h| h.alias == alias) {
+        if let Some(slot) = replaced.hosts.iter_mut().find(|h| h.name == name) {
             *slot = new_host;
         } else {
             replaced.hosts.push(new_host);
@@ -216,7 +216,7 @@ fn add(
         match host::add_host(
             &cfg,
             host_id,
-            &alias,
+            &name,
             &new_host.host,
             new_host.port,
             new_host.auth.clone(),
@@ -229,7 +229,7 @@ fn add(
     if let Err((msg, code)) = save_config(&path, &next) {
         return fail(&msg, code);
     }
-    println!("added host '{alias}'");
+    println!("added host '{name}'");
     exit_code::SUCCESS
 }
 
@@ -244,7 +244,7 @@ fn ls(cli: &Cli, fields_spec: Option<&str>, sort: Option<crate::cli::SortMode>) 
     };
 
     if cfg.hosts.is_empty() {
-        println!("no hosts yet — add one with: sshrack host add <alias>");
+        println!("no hosts yet — add one with: sshrack host add <name>");
         return exit_code::SUCCESS;
     }
 
@@ -261,8 +261,8 @@ fn ls(cli: &Cli, fields_spec: Option<&str>, sort: Option<crate::cli::SortMode>) 
         OutputFormat::Json => {
             let mut rows = Vec::with_capacity(ordered.len());
             for h in &ordered {
-                let cred_alias = credential_alias_for_host(&cfg, h);
-                rows.push(fmt::host_list_row(h, cred_alias));
+                let cred_name = credential_name_for_host(&cfg, h);
+                rows.push(fmt::host_list_row(h, cred_name));
             }
             print_json_array(&rows);
         }
@@ -277,19 +277,19 @@ fn ls(cli: &Cli, fields_spec: Option<&str>, sort: Option<crate::cli::SortMode>) 
 // show
 // ===========================================================================
 
-fn show(cli: &Cli, alias: &str, reveal: bool, no_input: bool) -> i32 {
+fn show(cli: &Cli, name: &str, reveal: bool, no_input: bool) -> i32 {
     let (_path, cfg) = match load_config(cli.config.as_deref()) {
         Ok(v) => v,
         Err((msg, code)) => return fail(&msg, code),
     };
 
-    let Some(host) = cfg.find_host_by_alias(alias) else {
-        let err = host::host_not_found(&cfg, alias);
+    let Some(host) = cfg.find_host_by_name(name) else {
+        let err = host::host_not_found(&cfg, name);
         return fail(&format!("sshrack: {err}"), exit_code::NOT_FOUND);
     };
 
-    // Reverse-resolve the credential id → alias for display.
-    let cred_alias = credential_alias_for_host(&cfg, host);
+    // Reverse-resolve the credential id → name for display.
+    let cred_name = credential_name_for_host(&cfg, host);
 
     // --reveal: decrypt (vault mode ⇒ unlock first) and fetch (keyring mode).
     let revealed_pw = if reveal {
@@ -308,7 +308,7 @@ fn show(cli: &Cli, alias: &str, reveal: bool, no_input: bool) -> i32 {
             // hand-splice: a password with `"`, `\`, or control chars must
             // round-trip as valid JSON.
             let id_str = host.id.to_string();
-            let row = fmt::host_detail_row(host, &id_str, cred_alias, revealed_pw.json_password());
+            let row = fmt::host_detail_row(host, &id_str, cred_name, revealed_pw.json_password());
             let json = serde_json::to_string(&row).unwrap_or_else(|e| {
                 eprintln!("sshrack: json error: {e}");
                 String::from("{}")
@@ -316,7 +316,7 @@ fn show(cli: &Cli, alias: &str, reveal: bool, no_input: bool) -> i32 {
             println!("{json}");
         }
         OutputFormat::Text => {
-            print!("{}", format_detail(&cfg, host, cred_alias, &revealed_pw));
+            print!("{}", format_detail(&cfg, host, cred_name, &revealed_pw));
         }
     }
     exit_code::SUCCESS
@@ -329,7 +329,7 @@ fn show(cli: &Cli, alias: &str, reveal: bool, no_input: bool) -> i32 {
 #[allow(clippy::too_many_arguments)]
 fn edit(
     cli: &Cli,
-    alias: Option<&str>,
+    name: Option<&str>,
     host_addr: Option<&str>,
     user: Option<&str>,
     port: Option<u16>,
@@ -346,20 +346,20 @@ fn edit(
         Err((msg, code)) => return fail(&msg, code),
     };
 
-    // Pick the alias (interactive menu when omitted and not --no-input).
-    let alias = match pick_existing_host(&cfg, alias, no_input) {
+    // Pick the name (interactive menu when omitted and not --no-input).
+    let name = match pick_existing_host(&cfg, name, no_input) {
         Ok(a) => a,
         Err(ret) => return ret,
     };
 
-    let Some(orig) = cfg.find_host_by_alias(&alias).cloned() else {
-        let err = host::host_not_found(&cfg, &alias);
+    let Some(orig) = cfg.find_host_by_name(&name).cloned() else {
+        let err = host::host_not_found(&cfg, &name);
         return fail(&format!("sshrack: {err}"), exit_code::NOT_FOUND);
     };
 
     // Validate rename target before any field work.
     if let Some(new) = rename {
-        if let Err(e) = host::validate_rename(&cfg, &alias, new) {
+        if let Err(e) = host::validate_rename(&cfg, &name, new) {
             return fail(&format!("sshrack: {e}"), exit_code::DUPLICATE);
         }
     }
@@ -374,8 +374,8 @@ fn edit(
         || clear_password
         || clear_credential;
 
-    // Resolve `--credential <alias>` → Ulid (fail-fast).
-    let cred_ulid = match resolve_credential_alias(&cfg, credential) {
+    // Resolve `--credential <name>` → Ulid (fail-fast).
+    let cred_ulid = match resolve_credential_name(&cfg, credential) {
         Ok(v) => v,
         Err((msg, code)) => return fail(&msg, code),
     };
@@ -395,10 +395,10 @@ fn edit(
             Ok(a) => a,
             Err(ret) => return ret,
         };
-        // Stamp the original id (kept on the host) and the original alias; a
+        // Stamp the original id (kept on the host) and the original name; a
         // rename in the full-prompt path is a separate edit.
         let mut rebuilt =
-            host::finalize_body(orig.id, &orig.alias, &new_host_addr, new_port, new_auth);
+            host::finalize_body(orig.id, &orig.name, &new_host_addr, new_port, new_auth);
         match prompt_auth_and_seal(&mut cfg, &mut rebuilt.auth, OwnerKind::Host, &orig.id) {
             Ok(()) => {}
             Err(ret) => return ret,
@@ -427,7 +427,7 @@ fn edit(
         }
     };
 
-    // Replace in place by alias (orig may have been renamed).
+    // Replace in place by id (orig may have been renamed).
     let mut next = cfg.clone();
     if let Some(slot) = next.hosts.iter_mut().find(|h| h.id == orig.id) {
         *slot = updated;
@@ -435,16 +435,16 @@ fn edit(
     if let Err((msg, code)) = save_config(&path, &next) {
         return fail(&msg, code);
     }
-    let final_alias = next
+    let final_name = next
         .hosts
         .iter()
         .find(|h| h.id == orig.id)
-        .map(|h| h.alias.as_str())
-        .unwrap_or(&alias);
-    if rename.is_some() && final_alias != alias {
-        println!("renamed '{alias}' -> '{final_alias}'");
+        .map(|h| h.name.as_str())
+        .unwrap_or(&name);
+    if rename.is_some() && final_name != name {
+        println!("renamed '{name}' -> '{final_name}'");
     }
-    println!("edited host '{final_alias}'");
+    println!("edited host '{final_name}'");
     exit_code::SUCCESS
 }
 
@@ -452,20 +452,20 @@ fn edit(
 // rm
 // ===========================================================================
 
-fn rm(cli: &Cli, alias: Option<&str>, yes: bool, no_input: bool) -> i32 {
+fn rm(cli: &Cli, name: Option<&str>, yes: bool, no_input: bool) -> i32 {
     let (path, cfg) = match load_config(cli.config.as_deref()) {
         Ok(v) => v,
         Err((msg, code)) => return fail(&msg, code),
     };
 
-    let alias = match pick_existing_host(&cfg, alias, no_input) {
+    let name = match pick_existing_host(&cfg, name, no_input) {
         Ok(a) => a,
         Err(ret) => return ret,
     };
 
     // Confirm unless --yes. Under --no-input without --yes, fail-closed.
     if !yes {
-        let confirmed = match confirm_destructive(no_input, &format!("Remove host '{alias}'?")) {
+        let confirmed = match confirm_destructive(no_input, &format!("Remove host '{name}'?")) {
             Ok(c) => c,
             Err(ret) => return ret,
         };
@@ -476,7 +476,7 @@ fn rm(cli: &Cli, alias: Option<&str>, yes: bool, no_input: bool) -> i32 {
     }
 
     let backend = OsKeyring;
-    let next = match host::delete_host_with_secret(&cfg, &alias, &backend) {
+    let next = match host::delete_host_with_secret(&cfg, &name, &backend) {
         Ok(n) => n,
         Err(e) => {
             return fail(&format!("sshrack: {e}"), map_not_found_or_validation(&e));
@@ -485,7 +485,7 @@ fn rm(cli: &Cli, alias: Option<&str>, yes: bool, no_input: bool) -> i32 {
     if let Err((msg, code)) = save_config(&path, &next) {
         return fail(&msg, code);
     }
-    println!("removed host '{alias}'");
+    println!("removed host '{name}'");
     exit_code::SUCCESS
 }
 
@@ -499,11 +499,11 @@ fn cp(cli: &Cli, src: Option<&str>, dst: Option<&str>, no_input: bool) -> i32 {
         Err((msg, code)) => return fail(&msg, code),
     };
 
-    let (src_alias, dst_alias) = match (src, dst) {
+    let (src_name, dst_name) = match (src, dst) {
         (Some(s), Some(d)) => (s.to_owned(), d.to_owned()),
         (None, None) => {
             if cfg.hosts.is_empty() {
-                println!("no hosts to copy — add one with: sshrack host add <alias>");
+                println!("no hosts to copy — add one with: sshrack host add <name>");
                 return exit_code::SUCCESS;
             }
             if no_input {
@@ -516,7 +516,7 @@ fn cp(cli: &Cli, src: Option<&str>, dst: Option<&str>, no_input: bool) -> i32 {
                 Ok(a) => a,
                 Err(ret) => return ret,
             };
-            let d = match prompt_fresh_alias(&cfg, "New alias", true) {
+            let d = match prompt_fresh_name(&cfg, "New name", true) {
                 Ok(a) => a,
                 Err(ret) => return ret,
             };
@@ -532,23 +532,23 @@ fn cp(cli: &Cli, src: Option<&str>, dst: Option<&str>, no_input: bool) -> i32 {
     };
 
     // Validate dst + look up src before any write.
-    if let Err(e) = host::validate_dst(&cfg, &dst_alias) {
+    if let Err(e) = host::validate_dst(&cfg, &dst_name) {
         return fail(&format!("sshrack: {e}"), exit_code::DUPLICATE);
     }
-    let Some(src_host) = cfg.find_host_by_alias(&src_alias).cloned() else {
-        let err = host::host_not_found(&cfg, &src_alias);
+    let Some(src_host) = cfg.find_host_by_name(&src_name).cloned() else {
+        let err = host::host_not_found(&cfg, &src_name);
         return fail(&format!("sshrack: {err}"), exit_code::NOT_FOUND);
     };
 
     let dst_id = new_id();
-    let cloned = host::clone_host_as(&src_host, dst_id, &dst_alias);
+    let cloned = host::clone_host_as(&src_host, dst_id, &dst_name);
 
     // Best-effort copy the keyring entry so the copy connects immediately.
     let backend = OsKeyring;
     if let Err(e) = host::copy_keyring_entry(&src_host, &cloned, &backend) {
         eprintln!(
             "warning: could not stage keyring password for '{}': {e}",
-            dst_alias
+            dst_name
         );
     }
 
@@ -556,7 +556,7 @@ fn cp(cli: &Cli, src: Option<&str>, dst: Option<&str>, no_input: bool) -> i32 {
     if let Err((msg, code)) = save_config(&path, &cfg) {
         return fail(&msg, code);
     }
-    println!("copied host '{src_alias}' -> '{dst_alias}'");
+    println!("copied host '{src_name}' -> '{dst_name}'");
     exit_code::SUCCESS
 }
 
@@ -565,34 +565,34 @@ fn cp(cli: &Cli, src: Option<&str>, dst: Option<&str>, no_input: bool) -> i32 {
 // ===========================================================================
 
 /// Every column `host ls` can show, in default order. The `auth` column label
-/// is `cred:<alias>` for a reference (reverse-resolved), else the secret kind.
-const ALL_HOST_FIELDS: &[&str] = &["alias", "host", "user", "port", "auth"];
+/// is `cred:<name>` for a reference (reverse-resolved), else the secret kind.
+const ALL_HOST_FIELDS: &[&str] = &["name", "host", "user", "port", "auth"];
 
-/// Resolve a fresh alias (for `add`). Interactive when not `--no-input`:
+/// Resolve a fresh name (for `add`). Interactive when not `--no-input`:
 /// re-prompts until it passes the forbidden-char and duplicate checks.
-fn resolve_alias(
+fn resolve_name(
     cfg: &sshrack_core::config::schema::SshrackConfig,
-    alias: Option<&str>,
+    name: Option<&str>,
     force: bool,
     no_input: bool,
     kind: &str,
 ) -> Result<String, i32> {
-    if let Some(a) = alias {
+    if let Some(a) = name {
         return Ok(a.to_owned());
     }
     if no_input {
         return Err(fail(
             &format!(
-                "sshrack: missing required field: {kind} alias (required in --no-input mode; omit --no-input for interactive entry)"
+                "sshrack: missing required field: {kind} name (required in --no-input mode; omit --no-input for interactive entry)"
             ),
             exit_code::VALIDATION,
         ));
     }
-    prompt_fresh_alias(cfg, "New host alias", force)
+    prompt_fresh_name(cfg, "New host name", force)
 }
 
-/// Prompt for a fresh alias, re-prompting on a collision or forbidden char.
-fn prompt_fresh_alias(
+/// Prompt for a fresh name, re-prompting on a collision or forbidden char.
+fn prompt_fresh_name(
     cfg: &sshrack_core::config::schema::SshrackConfig,
     prompt: &str,
     force: bool,
@@ -602,7 +602,7 @@ fn prompt_fresh_alias(
             Ok(s) => s,
             ret @ Err(_) => return ret,
         };
-        match host::validate_alias_chars(&s) {
+        match host::validate_name_chars(&s) {
             Ok(()) => match host::validate_no_duplicate(cfg, &s, force) {
                 Ok(()) => return Ok(s),
                 Err(e) => eprintln!("sshrack: {e}"),
@@ -612,33 +612,33 @@ fn prompt_fresh_alias(
     }
 }
 
-/// Pick an existing host by alias. Interactive menu when `alias` is `None`
+/// Pick an existing host by name. Interactive menu when `name` is `None`
 /// and not `--no-input`; error when `None` and `--no-input`.
 fn pick_existing_host(
     cfg: &sshrack_core::config::schema::SshrackConfig,
-    alias: Option<&str>,
+    name: Option<&str>,
     no_input: bool,
 ) -> Result<String, i32> {
-    if let Some(a) = alias {
+    if let Some(a) = name {
         return Ok(a.to_owned());
     }
     if cfg.hosts.is_empty() {
-        println!("no hosts yet — add one with: sshrack host add <alias>");
+        println!("no hosts yet — add one with: sshrack host add <name>");
         return Err(exit_code::SUCCESS);
     }
     if no_input {
         return Err(fail(
-            "sshrack: host alias required in --no-input mode",
+            "sshrack: host name required in --no-input mode",
             exit_code::USAGE,
         ));
     }
     pick_host_menu(cfg)
 }
 
-/// Interactive host picker (FuzzySelect over aliases).
+/// Interactive host picker (FuzzySelect over names).
 fn pick_host_menu(cfg: &sshrack_core::config::schema::SshrackConfig) -> Result<String, i32> {
     let theme = ColorfulTheme::default();
-    let items: Vec<&str> = cfg.hosts.iter().map(|h| h.alias.as_str()).collect();
+    let items: Vec<&str> = cfg.hosts.iter().map(|h| h.name.as_str()).collect();
     let idx = FuzzySelect::with_theme(&theme)
         .with_prompt("Select host")
         .items(&items)
@@ -653,11 +653,11 @@ fn pick_host_menu(cfg: &sshrack_core::config::schema::SshrackConfig) -> Result<S
     Ok(items[idx].to_owned())
 }
 
-/// The AUTH column label for a host: `cred:<alias>` for a reference (reverse-
+/// The AUTH column label for a host: `cred:<name>` for a reference (reverse-
 /// resolved from the id), else the secret-kind label (`key`/`password`/...).
 fn cell(field: &str, h: &Host, cfg: &sshrack_core::config::schema::SshrackConfig) -> String {
     match field {
-        "alias" => h.alias.clone(),
+        "name" => h.name.clone(),
         "host" => h.host.clone(),
         "user" => derive_user(&h.auth, cfg),
         "port" => h.port.to_string(),
@@ -679,27 +679,27 @@ fn derive_user(auth: &Auth, cfg: &sshrack_core::config::schema::SshrackConfig) -
     }
 }
 
-/// The AUTH column label: `cred:<alias>` for a reference, else the secret kind.
+/// The AUTH column label: `cred:<name>` for a reference, else the secret kind.
 fn derive_auth_label(auth: &Auth, cfg: &sshrack_core::config::schema::SshrackConfig) -> String {
     match auth {
         Auth::Ref { credential } => match cfg.find_credential_by_id(credential) {
-            Some(c) => format!("cred:{}", c.alias),
+            Some(c) => format!("cred:{}", c.name),
             None => "cred:?".into(),
         },
         Auth::Inline(body) => fmt::secret_kind_label(&body.secret_kind()).into(),
     }
 }
 
-/// Reverse-resolve a host's credential reference id to its alias (for JSON
+/// Reverse-resolve a host's credential reference id to its name (for JSON
 /// output). `None` for inline auth or a dangling reference.
-fn credential_alias_for_host<'a>(
+fn credential_name_for_host<'a>(
     cfg: &'a sshrack_core::config::schema::SshrackConfig,
     host: &Host,
 ) -> Option<&'a str> {
     match &host.auth {
         Auth::Ref { credential } => cfg
             .find_credential_by_id(credential)
-            .map(|c| c.alias.as_str()),
+            .map(|c| c.name.as_str()),
         _ => None,
     }
 }
@@ -781,24 +781,24 @@ fn reveal_password(
 fn format_detail(
     cfg: &sshrack_core::config::schema::SshrackConfig,
     host: &Host,
-    cred_alias: Option<&str>,
+    cred_name: Option<&str>,
     reveal: &RevealedPassword,
 ) -> String {
     let mut out = String::new();
-    out.push_str(&format!("alias:    {}\n", host.alias));
+    out.push_str(&format!("name:     {}\n", host.name));
     out.push_str(&format!("id:       {}\n", host.id));
     out.push_str(&format!("host:     {}\n", host.host));
     out.push_str(&format!("port:     {}\n", host.port));
     match &host.auth {
         Auth::Ref { credential } => match cfg.find_credential_by_id(credential) {
             Some(c) => {
-                out.push_str(&format!("auth:     credential '{}'\n", c.alias));
+                out.push_str(&format!("auth:     credential '{}'\n", c.name));
                 render_body_lines(&c.body, reveal, &mut out);
             }
             None => {
                 out.push_str(&format!(
                     "auth:     credential '{}'\n",
-                    cred_alias_or_id(cred_alias, credential)
+                    cred_name_or_id(cred_name, credential)
                 ));
                 out.push_str("user:     (dangling reference)\n");
             }
@@ -831,8 +831,8 @@ fn render_body_lines(body: &CredentialBody, reveal: &RevealedPassword, out: &mut
     }
 }
 
-fn cred_alias_or_id<'a>(alias: Option<&'a str>, id: &Ulid) -> Cow<'a, str> {
-    match alias {
+fn cred_name_or_id<'a>(name: Option<&'a str>, id: &Ulid) -> Cow<'a, str> {
+    match name {
         Some(a) => Cow::Borrowed(a),
         None => Cow::Owned(id.to_string()),
     }
@@ -896,7 +896,7 @@ fn prompt_auth_menu(
     };
     let choice = match idx {
         0 => AuthChoice::Credential {
-            alias: String::new(),
+            name: String::new(),
         },
         1 => AuthChoice::InlinePassword,
         2 => AuthChoice::InlineKey,
@@ -906,7 +906,7 @@ fn prompt_auth_menu(
 }
 
 /// Turn an [`AuthChoice`] into an [`Auth`], prompting for sub-fields. For the
-/// credential choice the user picks a credential alias (resolved to id by the
+/// credential choice the user picks a credential name (resolved to id by the
 /// caller before persisting).
 fn auth_from_choice(
     cfg: &sshrack_core::config::schema::SshrackConfig,
@@ -920,7 +920,7 @@ fn auth_from_choice(
                 return Err(exit_code::USAGE);
             }
             let theme = ColorfulTheme::default();
-            let items: Vec<&str> = cfg.credentials.iter().map(|c| c.alias.as_str()).collect();
+            let items: Vec<&str> = cfg.credentials.iter().map(|c| c.name.as_str()).collect();
             let idx = match FuzzySelect::with_theme(&theme)
                 .with_prompt("Credential")
                 .items(&items)

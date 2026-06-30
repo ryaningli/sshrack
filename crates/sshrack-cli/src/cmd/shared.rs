@@ -1,7 +1,7 @@
 //! Shared helpers for the `host`/`cred` command handlers.
 //!
 //! These wrap the cross-cutting concerns every CRUD handler repeats: loading
-//! and saving the config, resolving a `--credential <alias>` to a stable
+//! and saving the config, resolving a `--credential <name>` to a stable
 //! [`Ulid`] before a pure core call, deciding the active password-storage mode
 //! (the first-use prompt lives here, not in core), and ranking hosts by
 //! frecency for `host ls --sort frecency`.
@@ -61,19 +61,19 @@ pub fn save_config(path: &Path, cfg: &SshrackConfig) -> Result<(), (String, i32)
     })
 }
 
-/// Resolve `--credential <alias>` to the credential's stable [`Ulid`], or
-/// `None` when no `--credential` was given. Failures (alias unknown) carry the
+/// Resolve `--credential <name>` to the credential's stable [`Ulid`], or
+/// `None` when no `--credential` was given. Failures (name unknown) carry the
 /// printed message + exit code so the caller returns them directly.
-pub fn resolve_credential_alias(
+pub fn resolve_credential_name(
     cfg: &SshrackConfig,
     credential: Option<&str>,
 ) -> Result<Option<Ulid>, (String, i32)> {
     match credential {
         None => Ok(None),
-        Some(alias) => match cfg.find_credential_by_alias(alias) {
+        Some(name) => match cfg.find_credential_by_name(name) {
             Some(c) => Ok(Some(c.id)),
             None => {
-                let err = credential::credential_not_found(cfg, alias);
+                let err = credential::credential_not_found(cfg, name);
                 Err((format!("sshrack: {err}"), exit_code::NOT_FOUND))
             }
         },
@@ -360,9 +360,9 @@ pub fn sort_hosts<'a>(hosts: &'a [&'a Host], sort: Option<SortMode>) -> Vec<&'a 
                 .map(|r| r.host)
                 .collect()
         }
-        SortMode::Alias => {
+        SortMode::Name => {
             let mut v = hosts.to_vec();
-            v.sort_by(|a, b| a.alias.cmp(&b.alias));
+            v.sort_by(|a, b| a.name.cmp(&b.name));
             v
         }
     }

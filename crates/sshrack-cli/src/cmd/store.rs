@@ -718,7 +718,7 @@ mod tests {
         let mut cfg = vault_cfg();
         cfg.credentials.push(Credential {
             id: ulid::Ulid::new(),
-            alias: "enc".into(),
+            name: "enc".into(),
             body: CredentialBody {
                 user: "u".into(),
                 password: Some(Secret::Encrypted(
@@ -733,7 +733,7 @@ mod tests {
         });
         cfg.hosts.push(Host {
             id: ulid::Ulid::new(),
-            alias: "plain-host".into(),
+            name: "plain-host".into(),
             host: "h".into(),
             port: 22,
             auth: sshrack_core::config::schema::Auth::Inline(CredentialBody {
@@ -745,7 +745,7 @@ mod tests {
         });
         cfg.hosts.push(Host {
             id: ulid::Ulid::new(),
-            alias: "kr-host".into(),
+            name: "kr-host".into(),
             host: "k".into(),
             port: 22,
             auth: sshrack_core::config::schema::Auth::Inline(CredentialBody {

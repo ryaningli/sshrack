@@ -1,11 +1,11 @@
-//! Connect-path command handler: resolves an alias and launches `ssh`.
+//! Connect-path command handler: resolves a name and launches `ssh`.
 //!
 //! This module implements the 8-step connect flow that backs both
-//! `sshrack ssh <alias>` and the `sshrack <alias>` shorthand. The steps,
+//! `sshrack ssh <name>` and the `sshrack <name>` shorthand. The steps,
 //! in the order the code actually runs them:
 //!
-//! 1. Resolve `--credential <alias>` → `Ulid` (fail-fast if unknown).
-//! 2. Resolve the alias → [`Host`] (fail-fast: `HostNotFound` + did-you-mean
+//! 1. Resolve `--credential <name>` → `Ulid` (fail-fast if unknown).
+//! 2. Resolve the name → [`Host`] (fail-fast: `HostNotFound` + did-you-mean
 //!    before any network I/O).
 //! 3. If vault mode active: unlock vault via env or prompt.
 //! 4. [`credential::resolve`] → [`ResolvedAuth`].
@@ -16,7 +16,7 @@
 //!
 //! ## Why credential before host (Steps 1 → 2)
 //!
-//! The credential alias must be resolved to a `Ulid` *before* [`Host`]
+//! The credential name must be resolved to a `Ulid` *before* [`Host`]
 //! resolution because `host::resolve_target` consumes that `Ulid` inside
 //! [`host::ResolveOverrides`]. Resolving the credential first also gives the
 //! earlier fail-fast: a dangling `--credential` errors out before any
@@ -67,7 +67,7 @@ pub fn run(cli: &Cli) -> i32 {
     };
 
     if tokens.is_empty() {
-        eprintln!("sshrack: no host alias given");
+        eprintln!("sshrack: no host name given");
         return exit_code::USAGE;
     }
 
@@ -84,23 +84,23 @@ pub fn run(cli: &Cli) -> i32 {
         }
     };
 
-    // ── Step 1: Resolve credential alias → Ulid BEFORE resolving host. This
+    // ── Step 1: Resolve credential name → Ulid BEFORE resolving host. This
     // order is required because host::resolve_target consumes the Ulid via
     // ResolveOverrides (Step 2); it also fails fast on a dangling
     // --credential before any network I/O. ────────────────────────────────────
     let cred_ulid = match opts.credential.as_deref() {
         None => None,
-        Some(alias) => match cfg.find_credential_by_alias(alias) {
+        Some(name) => match cfg.find_credential_by_name(name) {
             Some(c) => Some(c.id),
             None => {
-                let err = credential::credential_not_found(&cfg, alias);
+                let err = credential::credential_not_found(&cfg, name);
                 eprintln!("sshrack: {err}");
                 return exit_code::NOT_FOUND;
             }
         },
     };
 
-    // ── Step 2: Resolve alias → Host (fail-fast, no network I/O). ────────────
+    // ── Step 2: Resolve name → Host (fail-fast, no network I/O). ─────────────
     let resolve_overrides = host::ResolveOverrides {
         ad_hoc: opts.ad_hoc,
         credential: cred_ulid,
@@ -110,8 +110,8 @@ pub fn run(cli: &Cli) -> i32 {
     };
     let resolved_host = match host::resolve_target(&cfg, target, &resolve_overrides) {
         Ok(h) => h,
-        Err(SshrackError::HostNotFound { alias, hint }) => {
-            eprintln!("sshrack: host not found: {alias}{hint}");
+        Err(SshrackError::HostNotFound { name, hint }) => {
+            eprintln!("sshrack: host not found: {name}{hint}");
             return exit_code::NOT_FOUND;
         }
         Err(e) => {
@@ -142,17 +142,17 @@ pub fn run(cli: &Cli) -> i32 {
     // ── Step 4: Resolve auth (dangling credential errors here). ──────────────
     let resolved_auth = match credential::resolve(&resolved_host, &cfg, vault_key.as_ref()) {
         Ok(a) => a,
-        Err(SshrackError::CredentialNotFound { alias, hint }) => {
-            // The ref-by-id path surfaces a bare ULID as `alias` (the host
+        Err(SshrackError::CredentialNotFound { name, hint }) => {
+            // The ref-by-id path surfaces a bare ULID as `name` (the host
             // references the credential by id; the credential is missing so no
-            // alias exists to show). Reword to name the originating host so the
+            // name exists to show). Reword to name the originating host so the
             // message reads like a host problem, not a stray id. CLI-layer
             // concern only — core's `credential::resolve` is unchanged.
             eprintln!(
                 "sshrack: host '{}' references an unknown credential{hint}",
-                resolved_host.alias
+                resolved_host.name
             );
-            let _ = alias; // the bare ULID is intentionally not surfaced
+            let _ = name; // the bare ULID is intentionally not surfaced
             return exit_code::NOT_FOUND;
         }
         Err(SshrackError::VaultLocked) => {

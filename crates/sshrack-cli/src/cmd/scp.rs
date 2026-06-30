@@ -1,12 +1,12 @@
-//! scp transfer handler: resolves `alias:path` operands and launches `scp`.
+//! scp transfer handler: resolves `name:path` operands and launches `scp`.
 //!
 //! Mirrors the connect path ([`super::connect`]) but for file transfer. The
 //! steps, in the order the code actually runs them:
 //!
-//! 1. Resolve `--credential <alias>` → `Ulid` (fail-fast if unknown).
+//! 1. Resolve `--credential <name>` → `Ulid` (fail-fast if unknown).
 //! 2. Load config (a missing file is an empty config).
 //! 3. Vault unlock if needed (env-passphrase under `--no-input`, else TTY).
-//! 4. [`connect::scp::build`] — resolves every `alias:path` operand to
+//! 4. [`connect::scp::build`] — resolves every `name:path` operand to
 //!    `user@host:path`, assembles the argv, and resolves the first remote's
 //!    [`PasswordSource`] once (carried in [`ScpPlan`]) so the launch path does
 //!    not re-resolve after the host-key check.
@@ -15,7 +15,7 @@
 //!
 //! ## Validation order
 //!
-//! The credential alias resolves (Step 1) before [`connect::scp::build`]
+//! The credential name resolves (Step 1) before [`connect::scp::build`]
 //! consumes it via [`Overrides`] (Step 4). `build` itself fails fast on a
 //! typo'd `name:path` operand ([`HostNotFound`]) and a dangling credential
 //! reference ([`CredentialNotFound`]) before any network I/O runs in Step 5.
@@ -23,7 +23,7 @@
 //! ## Frecency
 //!
 //! scp does NOT record frecency: it is a file transfer, not a connect. Only the
-//! `ssh`/`<alias>` connect paths bump the frecency table (see [`super::connect`]).
+//! `ssh`/`<name>` connect paths bump the frecency table (see [`super::connect`]).
 //!
 //! [`ScpPlan`]: sshrack_core::connect::scp::ScpPlan
 //! [`Overrides`]: sshrack_core::connect::ssh::Overrides
@@ -62,7 +62,7 @@ pub fn run(cli: &Cli) -> i32 {
     };
 
     if args.is_empty() {
-        eprintln!("sshrack: scp: no operands given (expected `alias:path` or local paths)");
+        eprintln!("sshrack: scp: no operands given (expected `name:path` or local paths)");
         return exit_code::USAGE;
     }
 
@@ -77,15 +77,15 @@ pub fn run(cli: &Cli) -> i32 {
         }
     };
 
-    // ── Step 1: Resolve credential alias → Ulid BEFORE build (fail-fast). ─────
+    // ── Step 1: Resolve credential name → Ulid BEFORE build (fail-fast). ──────
     // A dangling --credential must error before any network I/O; resolving it
     // here also gives build the Ulid its Overrides expect.
     let cred_ulid = match opts.credential.as_deref() {
         None => None,
-        Some(alias) => match cfg.find_credential_by_alias(alias) {
+        Some(name) => match cfg.find_credential_by_name(name) {
             Some(c) => Some(c.id),
             None => {
-                let err = sshrack_core::credential::credential_not_found(&cfg, alias);
+                let err = sshrack_core::credential::credential_not_found(&cfg, name);
                 eprintln!("sshrack: {err}");
                 return exit_code::NOT_FOUND;
             }
@@ -121,16 +121,16 @@ pub fn run(cli: &Cli) -> i32 {
     };
     let plan = match connect::scp::build(args, &cfg, &overrides, vault_key.as_ref()) {
         Ok(p) => p,
-        Err(SshrackError::HostNotFound { alias, hint }) => {
-            eprintln!("sshrack: host not found: {alias}{hint}");
+        Err(SshrackError::HostNotFound { name, hint }) => {
+            eprintln!("sshrack: host not found: {name}{hint}");
             return exit_code::NOT_FOUND;
         }
-        Err(SshrackError::CredentialNotFound { alias, hint }) => {
-            // The ref-by-id path surfaces a bare ULID as `alias` (the host
+        Err(SshrackError::CredentialNotFound { name, hint }) => {
+            // The ref-by-id path surfaces a bare ULID as `name` (the host
             // references the credential by id; the credential is missing so no
-            // alias exists to show). Reword to point at the originating host so
+            // name exists to show). Reword to point at the originating host so
             // the message reads like a host problem, not a stray id.
-            let msg = credential_msg(&alias, &hint, plan_host_alias(&cfg, args));
+            let msg = credential_msg(&name, &hint, plan_host_name(&cfg, args));
             eprintln!("sshrack: {msg}");
             return exit_code::NOT_FOUND;
         }
@@ -186,7 +186,7 @@ pub fn run(cli: &Cli) -> i32 {
 }
 
 /// Build the human-facing message for a dangling-credential error surfaced by
-/// the scp build path. When the originating host alias is known (`Some`), the
+/// the scp build path. When the originating host name is known (`Some`), the
 /// message points at the host ("host 'web1' references an unknown credential");
 /// otherwise it falls back to the bare string core produced (a ULID).
 ///
@@ -195,23 +195,23 @@ pub fn run(cli: &Cli) -> i32 {
 ///
 /// CLI-layer concern only — core's `credential::resolve` is unchanged.
 fn credential_msg(
-    alias: &str,
+    name: &str,
     hint: &sshrack_core::error::DidYouMean,
-    host_alias: Option<&str>,
+    host_name: Option<&str>,
 ) -> String {
-    match host_alias {
+    match host_name {
         Some(h) => format!("host '{h}' references an unknown credential{hint}"),
-        None => format!("credential not found: {alias}{hint}"),
+        None => format!("credential not found: {name}{hint}"),
     }
 }
 
-/// Best-effort reverse-lookup of the host alias whose `alias:path` operand
+/// Best-effort reverse-lookup of the host name whose `name:path` operand
 /// triggered a dangling-credential error. Returns `None` for an ad-hoc operand
-/// (no registered alias) or when the operand was not in `alias:path` form.
+/// (no registered name) or when the operand was not in `name:path` form.
 ///
 /// Used only to improve the dangling-credential error message (Task-8
 /// follow-up); never affects control flow.
-fn plan_host_alias<'a>(
+fn plan_host_name<'a>(
     cfg: &'a sshrack_core::config::schema::SshrackConfig,
     args: &[String],
 ) -> Option<&'a str> {
@@ -219,12 +219,12 @@ fn plan_host_alias<'a>(
         let Some((left, _rest)) = arg.split_once(':') else {
             continue;
         };
-        // `user@host:path` and ad-hoc literals have no registered alias.
+        // `user@host:path` and ad-hoc literals have no registered name.
         if left.contains('@') {
             continue;
         }
-        if let Some(h) = cfg.find_host_by_alias(left) {
-            return Some(&h.alias);
+        if let Some(h) = cfg.find_host_by_name(left) {
+            return Some(&h.name);
         }
     }
     None
