@@ -2,17 +2,26 @@
 //!
 //! This module implements the 8-step connect flow that backs both
 //! `sshrack ssh <alias>` and the `sshrack <alias>` shorthand. The steps,
-//! in order:
+//! in the order the code actually runs them:
 //!
-//! 1. Resolve the alias → [`Host`] (fail-fast: `HostNotFound` + did-you-mean
+//! 1. Resolve `--credential <alias>` → `Ulid` (fail-fast if unknown).
+//! 2. Resolve the alias → [`Host`] (fail-fast: `HostNotFound` + did-you-mean
 //!    before any network I/O).
-//! 2. Resolve `--credential <alias>` → `Ulid` (fail-fast if unknown).
 //! 3. If vault mode active: unlock vault via env or prompt.
 //! 4. [`credential::resolve`] → [`ResolvedAuth`].
 //! 5. [`hostkey::run_host_key_flow`] — host-key pre-flight.
 //! 6. [`connect::ssh::build`] → argv.
 //! 7. [`frecency::record`] + [`frecency::store::save`] **before** launch.
 //! 8. [`connect::launch`].
+//!
+//! ## Why credential before host (Steps 1 → 2)
+//!
+//! The credential alias must be resolved to a `Ulid` *before* [`Host`]
+//! resolution because `host::resolve_target` consumes that `Ulid` inside
+//! [`host::ResolveOverrides`]. Resolving the credential first also gives the
+//! earlier fail-fast: a dangling `--credential` errors out before any
+//! network-touching host-key work runs (consistent with the project rule that
+//! local validation precedes network I/O).
 //!
 //! Under `--no-input` the passphrase must come from `SSHRACK_PASSPHRASE` env;
 //! the TTY prompt is never invoked. The host-key trust prompt is also refused
@@ -93,8 +102,10 @@ pub fn run(cli: &Cli) -> i32 {
         }
     };
 
-    // ── Step 1: Resolve credential alias to id BEFORE resolving host, so
-    // a dangling --credential fails before any network I/O. ──────────────────
+    // ── Step 1: Resolve credential alias → Ulid BEFORE resolving host. This
+    // order is required because host::resolve_target consumes the Ulid via
+    // ResolveOverrides (Step 2); it also fails fast on a dangling
+    // --credential before any network I/O. ────────────────────────────────────
     let cred_ulid = match opts.credential.as_deref() {
         None => None,
         Some(alias) => match cfg.find_credential_by_alias(alias) {
@@ -107,7 +118,7 @@ pub fn run(cli: &Cli) -> i32 {
         },
     };
 
-    // ── Step 1 (host): Resolve alias → Host (fail-fast, no network I/O). ────
+    // ── Step 2: Resolve alias → Host (fail-fast, no network I/O). ────────────
     let resolve_overrides = host::ResolveOverrides {
         ad_hoc: opts.ad_hoc,
         credential: cred_ulid,
@@ -134,13 +145,17 @@ pub fn run(cli: &Cli) -> i32 {
     } else {
         &DialoguerPassphrase
     };
-    let vault_key = match vault::ensure_unlocked_vault_key(&cfg, passphrase_provider) {
-        Ok(k) => k,
-        Err(e) => {
-            eprintln!("sshrack: vault unlock failed: {e}");
-            return exit_code::STORE;
-        }
-    };
+    // Read the env-passphrase here and inject it — keeps `unlock` testable
+    // without env mutation (CLAUDE.md forbids `std::env` writes in tests).
+    let env_pw = vault::passphrase_from_env();
+    let vault_key =
+        match vault::ensure_unlocked_vault_key(&cfg, env_pw.as_ref(), passphrase_provider) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("sshrack: vault unlock failed: {e}");
+                return exit_code::STORE;
+            }
+        };
 
     // ── Step 4: Resolve auth (dangling credential errors here). ──────────────
     let resolved_auth = match credential::resolve(&resolved_host, &cfg, vault_key.as_ref()) {

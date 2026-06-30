@@ -10,14 +10,19 @@
 //! # Unlock precedence
 //!
 //! 1. Valid cache hit (within TTL and verifier passes) → return cached key.
-//! 2. `SSHRACK_PASSPHRASE` env var → derive + verify + cache.
-//! 3. `PassphraseProvider::passphrase()` (TTY prompt) → derive + verify + cache.
+//! 2. The env-passphrase passed in by the caller (read from
+//!    `SSHRACK_PASSPHRASE` via [`passphrase_from_env`]) → derive + verify +
+//!    cache.
+//! 3. `PassphraseProvider::passphrase()` (TTY prompt) → derive + verify +
+//!    cache.
 //!
-//! The env-var path shadows the TTY prompt, so CI / `--no-input` callers can
-//! inject the passphrase without a terminal. The connect path passes
-//! `--no-input` through to the provider; under `--no-input` the CLI's
-//! [`PassphraseProvider`] impl errors instead of prompting, so if the env is
-//! not set the call fails fast.
+//! The env-passphrase is injected as a parameter (not read inside [`unlock`])
+//! so the precedence is testable without mutating `std::env` — which the
+//! project forbids in tests. The env value shadows the TTY prompt, so CI /
+//! `--no-input` callers can inject the passphrase without a terminal. The
+//! connect path passes `--no-input` through to the provider; under `--no-input`
+//! the CLI's [`PassphraseProvider`] impl errors instead of prompting, so if
+//! neither the cache nor the env value is available the call fails fast.
 //!
 //! # Design rules
 //!
@@ -56,7 +61,12 @@ pub(crate) const VERIFIER_PLAINTEXT: &[u8] = b"sshrack-vault-v1";
 /// Read the passphrase from the environment, wrapped in [`Zeroizing`] so it
 /// is wiped on drop rather than lingering as a bare `String` through the derive
 /// phase. Returns `None` when the variable is unset or empty.
-fn passphrase_from_env() -> Option<Zeroizing<String>> {
+///
+/// Used by the production caller (the connect path), which then passes the
+/// value into [`unlock`] / [`ensure_unlocked_vault_key`] as the
+/// `env_passphrase` parameter. Tests inject the value directly instead of
+/// calling this — they never mutate `std::env`.
+pub fn passphrase_from_env() -> Option<Zeroizing<String>> {
     std::env::var(PASSPHRASE_ENV).ok().map(Zeroizing::new)
 }
 
@@ -105,12 +115,18 @@ pub fn cached_key_is_valid(key: &VaultKey, meta: &VaultMeta) -> bool {
 /// Resolve the master key for the session, or `None` when the config is not in
 /// encrypted mode.
 ///
-/// Order: cache hit (valid) → `SSHRACK_PASSPHRASE` env → prompt via
-/// `provider`. Returns `None` when no vault is active; `Err` when unlock fails
-/// (wrong passphrase or the provider is refused / interrupted).
+/// Order: cache hit (valid) → `env_passphrase` (the value the caller read from
+/// `SSHRACK_PASSPHRASE`) → prompt via `provider`. Returns `None` when no vault
+/// is active; `Err` when unlock fails (wrong passphrase or the provider is
+/// refused / interrupted).
+///
+/// `env_passphrase` is injected rather than read inside this function so the
+/// precedence is testable without mutating `std::env` (forbidden in tests).
+/// Production callers read it with [`passphrase_from_env`].
 pub fn unlock(
     cfg: &SshrackConfig,
     cache_path: Option<&Path>,
+    env_passphrase: Option<&Zeroizing<String>>,
     provider: &dyn PassphraseProvider,
 ) -> Result<Option<VaultKey>, SshrackError> {
     let Some(meta) = cfg.vault_meta() else {
@@ -128,11 +144,15 @@ pub fn unlock(
         return Ok(Some(key));
     }
 
-    let passphrase = match passphrase_from_env() {
+    let env_pw_owned;
+    let passphrase: &Zeroizing<String> = match env_passphrase {
         Some(p) => p,
-        None => provider.passphrase()?,
+        None => {
+            env_pw_owned = provider.passphrase()?;
+            &env_pw_owned
+        }
     };
-    let key = unlock_with_passphrase(meta, &passphrase, cache_path)?;
+    let key = unlock_with_passphrase(meta, passphrase, cache_path)?;
     Ok(Some(key))
 }
 
@@ -140,23 +160,29 @@ pub fn unlock(
 ///
 /// - If the config is not in vault mode, returns `Ok(None)`.
 /// - Cache hit (valid) → returns the cached key immediately (no prompt).
-/// - Env var `SSHRACK_PASSPHRASE` → derive, verify, cache, return.
+/// - `env_passphrase` (the value the caller read from `SSHRACK_PASSPHRASE`)
+///   → derive, verify, cache, return.
 /// - Otherwise → `provider.passphrase()` → derive, verify, cache, return.
 ///
 /// Under `--no-input`, the CLI's provider errors on `passphrase()`, so the
-/// call fails here when neither the cache nor the env var is available —
+/// call fails here when neither the cache nor the env value is available —
 /// exactly the right behavior for unattended runs.
+///
+/// `env_passphrase` is injected (read by the caller via
+/// [`passphrase_from_env`]) so this function is testable without touching
+/// `std::env`.
 ///
 /// This is the key entry point for the connect path. Write-direction callers
 /// (`enable`, `seal_body`) are Task 20.
 pub fn ensure_unlocked_vault_key(
     cfg: &SshrackConfig,
+    env_passphrase: Option<&Zeroizing<String>>,
     provider: &dyn PassphraseProvider,
 ) -> Result<Option<VaultKey>, SshrackError> {
     if !cfg.is_vault() {
         return Ok(None);
     }
-    match unlock(cfg, None, provider)? {
+    match unlock(cfg, None, env_passphrase, provider)? {
         Some(k) => Ok(Some(k)),
         None => Err(SshrackError::VaultLocked),
     }
@@ -251,7 +277,7 @@ mod tests {
     #[test]
     fn unlock_returns_none_in_plaintext_mode() {
         let cfg = SshrackConfig::default(); // no vault
-        assert!(matches!(unlock(&cfg, None, &deny()), Ok(None)));
+        assert!(matches!(unlock(&cfg, None, None, &deny()), Ok(None)));
     }
 
     #[test]
@@ -268,10 +294,10 @@ mod tests {
         let stale = crypto::derive_key("wrong", &meta).unwrap();
         cache::write_cache(tmp.path(), &stale, std::time::Duration::from_secs(1800)).unwrap();
 
-        // No env var (the env may already hold a different passphrase outside this
-        // test), and deny() provider refuses to prompt — so we test the stale-
-        // cache rejection path without relying on env state.
-        let res = unlock(&cfg, Some(tmp.path()), &deny());
+        // No env-passphrase injected, and deny() provider refuses to prompt —
+        // so we exercise the stale-cache rejection path without relying on
+        // env state (the test never touches `std::env`).
+        let res = unlock(&cfg, Some(tmp.path()), None, &deny());
         assert!(
             !matches!(res, Ok(Some(_))),
             "stale cache key must not be returned: {res:?}"
@@ -283,65 +309,44 @@ mod tests {
     #[test]
     fn ensure_unlocked_vault_key_returns_none_for_non_vault_config() {
         let cfg = SshrackConfig::default();
-        let result = ensure_unlocked_vault_key(&cfg, &deny()).unwrap();
+        let result = ensure_unlocked_vault_key(&cfg, None, &deny()).unwrap();
         assert!(result.is_none());
     }
 
     #[test]
-    fn ensure_unlocked_vault_key_succeeds_via_env_var() {
-        // Build a vault config and seed the passphrase via env (hermetic: no TTY).
-        // Uses std::env::set_var which is unsafe in multi-threaded tests per
-        // Rust edition 2024 lints; wrap in catch_unwind to ensure cleanup. The
-        // test is intentionally single-threaded (no par execution via cargo test
-        // default; no `cargo nextest` parallel hazard here because each nextest
-        // test runs in its own process). We document the known hazard but accept
-        // it for this one env-var precedence test.
+    fn ensure_unlocked_vault_key_prefers_env_passphrase_over_provider() {
+        // Hermetic: the env-passphrase is injected as a parameter, so the real
+        // `SSHRACK_PASSPHRASE` (set or unset in the shell) is irrelevant. The
+        // deny() provider would refuse a prompt — proving the env value won
+        // over the provider.
         let meta = meta_with_verifier("env-passphrase");
         let cfg = SshrackConfig {
             store: Some(SecretStore::Vault { meta }),
             ..SshrackConfig::default()
         };
-        // Safety note: env mutation is process-wide; this test must not run in
-        // parallel with tests that also mutate PASSPHRASE_ENV. cargo test
-        // serializes tests within a single binary by default, so this is safe in
-        // practice, but `cargo nextest` may run binaries concurrently — each
-        // binary is still a separate process so there is no cross-binary hazard.
-        let prev = std::env::var(PASSPHRASE_ENV).ok();
-        // SAFETY: single-threaded test; restored below.
-        unsafe { std::env::set_var(PASSPHRASE_ENV, "env-passphrase") };
-        let result = ensure_unlocked_vault_key(&cfg, &deny());
-        // Restore before any assertion so a panic does not leave the env dirty.
-        match prev {
-            Some(v) => unsafe { std::env::set_var(PASSPHRASE_ENV, v) },
-            None => unsafe { std::env::remove_var(PASSPHRASE_ENV) },
-        }
+        let env_pw = Zeroizing::new("env-passphrase".to_string());
+        let result = ensure_unlocked_vault_key(&cfg, Some(&env_pw), &deny());
         assert!(
             matches!(result, Ok(Some(_))),
-            "env-var passphrase must unlock: {result:?}"
+            "env-passphrase must unlock even when the provider refuses: {result:?}"
         );
     }
 
     #[test]
     fn ensure_unlocked_vault_key_fails_when_provider_refuses_and_no_env() {
-        // No cache, no env, provider refuses → must fail (not panic).
-        // We cannot safely remove PASSPHRASE_ENV here (env mutation hazard), so
-        // skip when it is already set to a value that might accidentally match.
-        // In CI the env is clean; in dev it is also clean for vault tests.
-        if std::env::var(PASSPHRASE_ENV).is_ok() {
-            // A passphrase is already set: this test would pass for the wrong
-            // reason (the env path succeeds). Skip rather than assert the wrong
-            // thing.
-            return;
-        }
+        // No cache, no injected env-passphrase (None), provider refuses → must
+        // fail (not panic). Hermetic: passes `None` explicitly, so the real
+        // `SSHRACK_PASSPHRASE` in the shell never reaches this test. This test
+        // never early-returns — it always runs.
         let meta = meta_with_verifier("secret");
         let cfg = SshrackConfig {
             store: Some(SecretStore::Vault { meta }),
             ..SshrackConfig::default()
         };
-        let result = ensure_unlocked_vault_key(&cfg, &deny());
+        let result = ensure_unlocked_vault_key(&cfg, None, &deny());
         assert!(
             result.is_err(),
-            "provider refusal with no env must fail: {result:?}"
+            "provider refusal with no env-passphrase must fail: {result:?}"
         );
     }
 }
