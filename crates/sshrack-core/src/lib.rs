@@ -12,6 +12,7 @@ pub mod connect;
 pub mod credential;
 pub mod error;
 pub mod fsutil;
+pub mod host;
 pub mod hostkey;
 pub mod id;
 pub mod secret;

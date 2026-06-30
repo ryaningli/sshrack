@@ -5,110 +5,11 @@
 
 use std::path::PathBuf;
 
-use ulid::Ulid;
-
 use super::ssh::Overrides;
-use crate::config::schema::{Auth, CredentialBody, Host, SshrackConfig};
+use crate::config::schema::{Host, SshrackConfig};
 use crate::credential::{self, PasswordSource};
-use crate::error::{DidYouMean, SshrackError};
-
-/// ssh default port, used for ad-hoc targets that have no config entry.
-const DEFAULT_PORT: u16 = 22;
-
-/// Build a [`SshrackError::HostNotFound`] with a "did you mean" hint computed
-/// from the config's host aliases.
-///
-/// Local copy of `host::host_not_found` because the `host` module is not ported
-/// until Task 13. When `crate::host` lands, route through it and remove this.
-fn host_not_found(cfg: &SshrackConfig, alias: &str) -> SshrackError {
-    let candidates: Vec<&str> = cfg.hosts.iter().map(|h| h.alias.as_str()).collect();
-    SshrackError::HostNotFound {
-        alias: alias.into(),
-        hint: DidYouMean::from_option(crate::suggest::closest(&candidates, alias)),
-    }
-}
-
-/// Connection-time overrides that influence how a connect target is resolved.
-/// Borrows from the CLI layer so this core module stays free of CLI coupling.
-///
-/// Local copy of `host::ResolveOverrides` because the `host` module is not
-/// ported until Task 13. When `crate::host` lands, route through it and remove
-/// this. The `credential` is a [`Ulid`] (the CLI resolves `--credential <alias>`
-/// to an id before constructing this), matching [`Overrides::credential`].
-#[derive(Debug, Clone, Copy)]
-struct ResolveOverrides<'a> {
-    /// `--ad-hoc`: treat an unknown target as a literal address, not an alias.
-    ad_hoc: bool,
-    /// `--credential <id>`: reuse a `[[credentials]]` entry's identity.
-    credential: Option<Ulid>,
-    /// `--port <n>`: override the resolved port.
-    port: Option<u16>,
-    /// `--user <name>`: override the resolved login user.
-    user: Option<&'a str>,
-    /// `--identity <path>`: override the resolved key file.
-    identity: Option<&'a std::path::Path>,
-}
-
-/// Resolve a connect `target` into a concrete [`Host`], whether it names a
-/// configured alias or an ad-hoc address.
-///
-/// Local copy of `host::resolve_target` because the `host` module is not ported
-/// until Task 13. When `crate::host` lands, route through it and remove this.
-fn resolve_target(
-    cfg: &SshrackConfig,
-    target: &str,
-    overrides: &ResolveOverrides<'_>,
-) -> Result<Host, SshrackError> {
-    if let Some(found) = cfg.find_host_by_alias(target) {
-        let mut host = found.clone();
-        if let Some(cred) = overrides.credential {
-            host.auth = Auth::reference(cred);
-        }
-        return Ok(host);
-    }
-
-    if !overrides.ad_hoc {
-        return Err(host_not_found(cfg, target));
-    }
-
-    let auth = ad_hoc_auth(overrides)?;
-    Ok(ad_hoc_host(
-        target,
-        overrides.port.unwrap_or(DEFAULT_PORT),
-        auth,
-    ))
-}
-
-/// Build the auth for an ad-hoc target from the overrides.
-fn ad_hoc_auth(overrides: &ResolveOverrides<'_>) -> Result<Auth, SshrackError> {
-    if let Some(cred) = overrides.credential {
-        return Ok(Auth::reference(cred));
-    }
-    let Some(user) = overrides.user else {
-        return Err(SshrackError::MissingRequiredField {
-            field: "--credential or --user (required for --ad-hoc)",
-        });
-    };
-    let mut body = CredentialBody::new(user);
-    if let Some(key) = overrides.identity {
-        body = body.with_key(key);
-    }
-    Ok(Auth::inline(body))
-}
-
-/// Build an ephemeral [`Host`] for an ad-hoc address + auth. Never persisted:
-/// `alias` mirrors the address (cosmetic — ad-hoc hosts are never looked up by
-/// alias after construction). The `id` is fresh so a keyring password (if any)
-/// keys off a stable identity.
-fn ad_hoc_host(address: &str, port: u16, auth: Auth) -> Host {
-    Host {
-        id: crate::id::new_id(),
-        alias: address.to_string(),
-        host: address.to_string(),
-        port,
-        auth,
-    }
-}
+use crate::error::SshrackError;
+use crate::host::{ResolveOverrides, host_not_found, resolve_target};
 
 /// The assembled scp invocation plus the resolved remote host (if any), so the
 /// caller can resolve a password without re-parsing.
@@ -236,6 +137,7 @@ pub fn build(
 mod tests {
     use super::*;
     use crate::config::schema::{Auth, Credential, CredentialBody, Host, SshrackConfig};
+    use ulid::Ulid;
 
     fn cfg_with_key_host(alias: &str) -> SshrackConfig {
         SshrackConfig {

@@ -18,30 +18,9 @@ use zeroize::Zeroizing;
 
 use crate::config::schema::{Auth, Credential, CredentialBody, Host, SshrackConfig};
 use crate::error::{DidYouMean, SshrackError};
+use crate::host::validate_alias_chars;
 use crate::id::{OwnerKind, keyring_key};
 use crate::suggest;
-
-/// Characters forbidden in a host or credential alias: they break sshrack's own
-/// syntax (`:` is the scp `alias:path` separator; `@` is reserved for the
-/// future `user@alias` form) or argv/token splitting (whitespace). Hosts and
-/// credentials share the same rule.
-///
-/// This is a local copy of the host module's rule until the host module lands
-/// in core; once `crate::host` exists, callers should route through
-/// `host::validate_alias_chars` and this helper is removed.
-const FORBIDDEN_ALIAS_CHARS: &[char] = &[':', '@', ' ', '\t', '\n', '\r'];
-
-/// Reject `alias` if it contains a [`FORBIDDEN_ALIAS_CHARS`] character. Local
-/// copy shared with the (forthcoming) `host` module — see that module's note.
-fn validate_alias_chars(alias: &str) -> Result<(), SshrackError> {
-    if let Some(ch) = alias.chars().find(|c| FORBIDDEN_ALIAS_CHARS.contains(c)) {
-        return Err(SshrackError::InvalidAliasChar {
-            alias: alias.to_string(),
-            ch,
-        });
-    }
-    Ok(())
-}
 
 /// Where a resolved password lives, if any.
 ///
