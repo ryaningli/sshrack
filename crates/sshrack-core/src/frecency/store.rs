@@ -13,7 +13,7 @@
 //! default entry round-trips cleanly.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -75,7 +75,12 @@ pub fn save(dir: &Path, frec: &Frecency) -> Result<(), SshrackError> {
         path: dir.to_path_buf(),
         source: e,
     })?;
-    atomic_write_private(&path, serialized)
+    crate::fsutil::atomic_write_private(&path, serialized.as_bytes()).map_err(|source| {
+        SshrackError::ConfigWrite {
+            path: path.clone(),
+            source,
+        }
+    })
 }
 
 /// Convert the in-memory [`Frecency`] to its TOML-friendly mirror.
@@ -128,47 +133,6 @@ fn secs_to_system_time(secs: i64) -> Option<SystemTime> {
         return None;
     }
     UNIX_EPOCH.checked_add(std::time::Duration::from_secs(secs as u64))
-}
-
-/// Write `contents` to a sibling temp file at 0600 (via [`crate::fsutil`]),
-/// then atomically rename it over `path`. Removes the temp file on rename
-/// failure so no `.tmp` leftovers remain after a failed save.
-fn atomic_write_private(path: &Path, contents: String) -> Result<(), SshrackError> {
-    let tmp = atomic_temp_path(path);
-    crate::fsutil::write_private(&tmp, contents.as_bytes()).map_err(|source| {
-        SshrackError::ConfigWrite {
-            path: tmp.to_path_buf(),
-            source,
-        }
-    })?;
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(SshrackError::ConfigWrite {
-            path: path.to_path_buf(),
-            source: e,
-        });
-    }
-    Ok(())
-}
-
-/// A unique sibling temp path: `.<file>.tmp.<pid>.<nanos>`. Falls back to
-/// `frecency.toml` when `path` has no file name component. Mirrors
-/// [`crate::config::store::atomic_temp_path`] but is duplicated here to keep the
-/// frecency persistence self-contained (the config helper is private).
-fn atomic_temp_path(path: &Path) -> PathBuf {
-    let pid = std::process::id();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let base = path
-        .file_name()
-        .map(|n| n.to_os_string())
-        .unwrap_or_else(|| "frecency.toml".into());
-    let mut name = std::ffi::OsString::from(".");
-    name.push(base);
-    name.push(format!(".tmp.{pid}.{nanos}"));
-    path.with_file_name(name)
 }
 
 #[cfg(test)]

@@ -37,47 +37,12 @@ pub fn save(path: &Path, cfg: &SshrackConfig) -> Result<(), SshrackError> {
             source: e,
         })?;
     }
-    atomic_write_private(path, serialized)
-}
-
-/// Write `contents` to a sibling temp file at 0600 (via [`crate::fsutil`]),
-/// then atomically rename it over `path`. Removes the temp file on rename
-/// failure so no `.tmp` leftovers remain after a failed save. The temp path
-/// embeds pid + nanos, so collisions are effectively impossible.
-fn atomic_write_private(path: &Path, contents: String) -> Result<(), SshrackError> {
-    let tmp = atomic_temp_path(path);
-    crate::fsutil::write_private(&tmp, contents.as_bytes()).map_err(|source| {
+    crate::fsutil::atomic_write_private(path, serialized.as_bytes()).map_err(|source| {
         SshrackError::ConfigWrite {
-            path: tmp.to_path_buf(),
+            path: path.to_path_buf(),
             source,
         }
-    })?;
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(SshrackError::ConfigWrite {
-            path: path.to_path_buf(),
-            source: e,
-        });
-    }
-    Ok(())
-}
-
-/// A unique sibling temp path: `.<file>.tmp.<pid>.<nanos>`. Falls back to
-/// `config.toml` when `path` has no file name component.
-fn atomic_temp_path(path: &Path) -> std::path::PathBuf {
-    let pid = std::process::id();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let base = path
-        .file_name()
-        .map(|n| n.to_os_string())
-        .unwrap_or_else(|| "config.toml".into());
-    let mut name = std::ffi::OsString::from(".");
-    name.push(base);
-    name.push(format!(".tmp.{pid}.{nanos}"));
-    path.with_file_name(name)
+    })
 }
 
 #[cfg(test)]
