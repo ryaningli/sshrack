@@ -1517,6 +1517,7 @@ dependencies = [
  "getrandom 0.4.3",
  "keyring",
  "serde",
+ "strsim",
  "tempfile",
  "thiserror",
  "toml",
