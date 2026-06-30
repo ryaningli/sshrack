@@ -96,15 +96,27 @@ fn upgrade_terminal(handle: &TerminalHandle) -> Result<Rc<RefCell<Tui>>, Sshrack
 /// every keystroke so masking tracks input live.
 #[allow(dead_code)]
 pub fn prompt_password(terminal: &mut Tui, title: &str) -> Result<Zeroizing<String>, SshrackError> {
-    let mut buffer = String::new();
+    // Zeroizing wrapper so the typed passphrase bytes are wiped on drop on
+    // EVERY path — including cancel (Esc/Ctrl-C), where the buffer would
+    // otherwise sit on the heap until the allocator reuses the slot. On Submit
+    // we move the inner String into a fresh Zeroizing so the wipe still runs
+    // when the caller drops the returned value.
+    let mut buffer = Zeroizing::new(String::new());
     loop {
-        render_password_popup(terminal, title, &buffer, None);
+        render_password_popup(terminal, title, buffer.as_str(), None);
         match read_decision_key()? {
             KeyDecision::Char(ch) => buffer.push(ch),
             KeyDecision::Backspace => {
                 buffer.pop();
             }
-            KeyDecision::Submit => return Ok(Zeroizing::new(buffer)),
+            KeyDecision::Submit => {
+                // Move the inner String out so this Zeroizing does not double-
+                // hold it; the returned Zeroizing owns the wipe from here.
+                // `&mut *buffer` goes through DerefMut to the inner String
+                // (not AsMut<str>), so mem::take yields the owned String.
+                let inner = std::mem::take(&mut *buffer);
+                return Ok(Zeroizing::new(inner));
+            }
             KeyDecision::Cancel => return Err(SshrackError::Interrupted),
             KeyDecision::Other => {}
         }
@@ -121,9 +133,12 @@ pub fn prompt_password_confirm(
 ) -> Result<Zeroizing<String>, SshrackError> {
     loop {
         let first = prompt_password(terminal, title)?;
-        let mut second = String::new();
+        // Zeroizing so the second-entry bytes are wiped on cancel / mismatch
+        // restart, not left on the heap. On match we move the inner String
+        // into the returned Zeroizing (same pattern as prompt_password).
+        let mut second = Zeroizing::new(String::new());
         loop {
-            render_password_popup(terminal, "Confirm passphrase", &second, None);
+            render_password_popup(terminal, "Confirm passphrase", second.as_str(), None);
             match read_decision_key()? {
                 KeyDecision::Char(ch) => second.push(ch),
                 KeyDecision::Backspace => {
@@ -131,9 +146,12 @@ pub fn prompt_password_confirm(
                 }
                 KeyDecision::Submit => {
                     if second.as_str() == first.as_str() {
-                        return Ok(Zeroizing::new(second));
+                        let inner = std::mem::take(&mut *second);
+                        return Ok(Zeroizing::new(inner));
                     }
-                    // Mismatch: flash a hint and restart the whole flow.
+                    // Mismatch: flash a hint and restart the whole flow. The
+                    // second buffer drops here (Zeroizing wipes it) before the
+                    // next iteration builds a fresh one.
                     render_password_popup(terminal, "Mismatch — try again", "", Some(true));
                     break;
                 }
@@ -296,26 +314,52 @@ impl PassphraseProvider for TuiPassphrase {
     }
 }
 
-/// Build a host-key confirm closure for [`sshrack_core::hostkey::run_host_key_flow`].
-/// The closure renders the fingerprint text in a confirm popup and returns the
-/// user's yes/no decision. `Ctrl-C` and `Esc` both map to "decline" (false),
-/// which `run_host_key_flow` turns into [`SshrackError::HostKeyNotConfirmed`].
+/// Build a host-key confirm closure for [`sshrack_core::hostkey::run_host_key_flow`],
+/// paired with a shared interruption flag. The closure renders the fingerprint
+/// text in a confirm popup and returns the user's yes/no decision. On
+/// `Ctrl-C`/`Esc` (`confirm_popup` returns [`SshrackError::Interrupted`]) or when
+/// the guard is already gone, the closure returns `false` (decline —
+/// `run_host_key_flow` then surfaces [`SshrackError::HostKeyNotConfirmed`]) AND
+/// flips the shared [`Cell`] so the caller ([`super::connect::connect_host`])
+/// can re-surface the cancel as `Interrupted` afterwards. This keeps the
+/// connect-cancel UX consistent with the vault-unlock popup: a cancel inside
+/// the host-key popup shows "connect cancelled", NOT "connect failed".
 ///
 /// `terminal` is a weak handle captured by move; the closure is `FnOnce`
 /// because `run_host_key_flow` consumes it. If the guard is gone by the time
 /// the closure runs, the popup cannot render and the closure returns `false`
-/// (decline) via [`upgrade_terminal`]'s `Interrupted` mapping — never a panic.
+/// (decline) via [`upgrade_terminal`]'s `Interrupted` mapping AND marks the
+/// flow interrupted — never a panic.
+///
+/// Returns `(closure, interrupted_flag)`: pass the closure to
+/// `run_host_key_flow`, then inspect the flag; when it is `true`, return
+/// `Err(SshrackError::Interrupted)` from the caller so the cancel surfaces as
+/// "cancelled", not as a host-key rejection.
 #[allow(dead_code)]
-pub fn host_key_confirm(terminal: TerminalHandle) -> impl FnOnce(&str) -> bool + use<> {
-    move |text: &str| {
-        // An interrupted confirm (Ctrl-C, or guard already dropped) is treated
-        // as a decline: the host key is NOT appended to known_hosts, and
-        // run_host_key_flow returns HostKeyNotConfirmed. No panic, no
-        // swallowed decision.
-        upgrade_terminal(&terminal)
-            .and_then(|rc| confirm_popup(&mut rc.borrow_mut(), text))
-            .unwrap_or(false)
-    }
+pub fn host_key_confirm(
+    terminal: TerminalHandle,
+) -> (
+    impl FnOnce(&str) -> bool + use<>,
+    std::rc::Rc<std::cell::Cell<bool>>,
+) {
+    let flag = std::rc::Rc::new(std::cell::Cell::new(false));
+    let flag_for_closure = std::rc::Rc::clone(&flag);
+    let closure = move |text: &str| {
+        // An interrupted confirm (Ctrl-C, or guard already dropped) flips the
+        // shared flag so the caller re-surfaces it as Interrupted (cancel),
+        // and declines the popup so run_host_key_flow does NOT append the key.
+        match upgrade_terminal(&terminal).and_then(|rc| confirm_popup(&mut rc.borrow_mut(), text)) {
+            Ok(decision) => decision,
+            Err(SshrackError::Interrupted) => {
+                flag_for_closure.set(true);
+                false
+            }
+            // Any other error (e.g. an I/O failure mid-popup) also declines;
+            // surfacing those is the caller's job, but they are not a cancel.
+            Err(_) => false,
+        }
+    };
+    (closure, flag)
 }
 
 #[cfg(test)]

@@ -107,10 +107,17 @@ pub fn connect_host(
     // ── Step 4: Host-key pre-flight via the TUI confirm closure. ─────────────
     // The closure renders the fingerprint in a y/n popup. A new key the user
     // accepts is appended to known_hosts; a changed key is rejected by ssh at
-    // connect time (core never classifies "changed", only "present").
+    // connect time (core never classifies "changed", only "present"). A cancel
+    // inside the popup (Ctrl-C/Esc) flips the shared flag; we re-surface that
+    // as Interrupted so run_loop shows "connect cancelled", NOT the
+    // HostKeyNotConfirmed "connect failed" message (Finding #4: the popup
+    // cancel used to be flattened to a host-key rejection).
     let host_str = resolved_host.host.as_str();
-    let confirm = host_key_confirm(handle);
+    let (confirm, interrupted) = host_key_confirm(handle);
     hostkey::run_host_key_flow(host_str, port, confirm)?;
+    if interrupted.get() {
+        return Err(SshrackError::Interrupted);
+    }
 
     // ── Step 5: Build argv (interactive shell: no overrides, no command). ────
     let argv = connect::ssh::build(
