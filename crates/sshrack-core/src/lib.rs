@@ -10,3 +10,4 @@ pub mod config;
 pub mod error;
 pub mod fsutil;
 pub mod id;
+pub mod secret;
