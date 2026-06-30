@@ -21,11 +21,13 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{Frame, Terminal, backend::CrosstermBackend};
-use sshrack_core::config::schema::Host;
+use sshrack_core::config::schema::SshrackConfig;
+use sshrack_core::error::SshrackError;
 use sshrack_core::frecency::Frecency;
 
 use super::ConnectRequest;
 use super::CredentialNames;
+use super::connect::connect_host;
 use super::launcher::Launcher;
 
 /// ratatui backend bound to stdout via crossterm.
@@ -112,27 +114,33 @@ pub enum Outcome {
     Quit,
     /// Nothing of interest happened; keep rendering and reading events.
     Continue,
-    /// User picked a host to connect to. The loop returns `Some(req)`; `main`
-    /// execs ssh after the terminal is restored.
-    ///
-    /// Constructed by the launcher in Task 15; Task 11 only matches on it.
-    #[allow(dead_code)]
-    Connect(ConnectRequest),
+    /// Pure intent: the user pressed Enter on a host. `on_key` sets the
+    /// launcher's `pending_connect` field to the host's id and returns this.
+    /// The event loop reads the id, runs the I/O-heavy connect orchestration
+    /// ([`crate::tui::connect_host`]), and either returns the resulting
+    /// [`ConnectRequest`] to `main` or — on user cancel — returns to the
+    /// launcher. This variant carries no data because the id lives on the
+    /// launcher (single source of truth, clearable on cancel).
+    ConnectRequested,
 }
 
 /// TUI application state. The launcher is the primary mode; later tasks grow
 /// this with wizard/store/help modes via a `mode` enum.
 ///
-/// `App` owns the data (hosts, frecency, credential-name lookup) loaded once
-/// at startup from core. The [`Launcher`] inside it owns the query/selection
-/// view state and is the only mode wired up here.
+/// `App` owns the data (config, hosts, frecency, credential-name lookup)
+/// loaded once at startup from core. The [`Launcher`] inside it owns the
+/// query/selection view state and is the only mode wired up here. The config
+/// is kept here (not just its derived slices) because connect orchestration
+/// needs the credential table and vault meta, which live on the full
+/// [`SshrackConfig`].
 pub struct App {
     /// Set by [`App::on_key`] when the user presses a quit binding. The loop
     /// checks this as a secondary exit (the primary exit is [`Outcome::Quit`]).
     pub should_quit: bool,
-    /// The full host list, loaded from core config. The launcher borrows into
-    /// this by index; no data path lives in the view.
-    hosts: Vec<Host>,
+    /// The full config, loaded from core. Owned here so connect orchestration
+    /// can resolve auth, unlock the vault, and look up hosts by id. The host
+    /// list and credential table are borrowed out of this via `&self.config`.
+    config: SshrackConfig,
     /// Machine-local frecency table, loaded from core's data dir.
     frecency: Frecency,
     /// Reverse lookup from a credential ULID to its display name, so the
@@ -145,15 +153,31 @@ pub struct App {
 impl App {
     /// Construct a fresh app from loaded core data. Builds the launcher with
     /// its initial frecency-ordered ranking.
-    pub fn new(hosts: Vec<Host>, frecency: Frecency, credential_names: CredentialNames) -> Self {
-        let launcher = Launcher::new(&hosts, &frecency);
+    pub fn new(
+        config: SshrackConfig,
+        frecency: Frecency,
+        credential_names: CredentialNames,
+    ) -> Self {
+        let launcher = Launcher::new(&config.hosts, &frecency);
         Self {
             should_quit: false,
-            hosts,
+            config,
             frecency,
             credential_names,
             launcher,
         }
+    }
+
+    /// Borrow the loaded config. Used by connect orchestration to resolve auth
+    /// and unlock the vault.
+    pub fn config(&self) -> &SshrackConfig {
+        &self.config
+    }
+
+    /// Borrow the frecency table mutably. Connect orchestration records + saves
+    /// it before returning a [`ConnectRequest`].
+    pub fn frecency_mut(&mut self) -> &mut Frecency {
+        &mut self.frecency
     }
 
     /// Pure: decide what should happen next for a given key. Performs **no**
@@ -164,7 +188,9 @@ impl App {
     /// (`Esc` with empty query, or `Ctrl-C`); this method sets `should_quit`
     /// for the loop's secondary exit check.
     pub fn on_key(&mut self, key: KeyEvent) -> Outcome {
-        let outcome = self.launcher.on_key(key, &self.hosts, &self.frecency);
+        let outcome = self
+            .launcher
+            .on_key(key, &self.config.hosts, &self.frecency);
         if matches!(outcome, Outcome::Quit) {
             self.should_quit = true;
         }
@@ -178,7 +204,7 @@ impl App {
         self.launcher.draw(
             frame,
             area,
-            &self.hosts,
+            &self.config.hosts,
             &self.frecency,
             &self.credential_names,
         );
@@ -187,14 +213,29 @@ impl App {
 
 /// Blocking event loop. Renders `app`, polls crossterm for key events, and
 /// dispatches each key through [`App::on_key`]. Returns `Some(req)` when the
-/// app signals a connect (the loop exits and `main` execs ssh after terminal
-/// restore), or `None` when the user quits.
+/// user connects (the loop exits and `main` execs ssh after terminal restore),
+/// or `None` when the user quits.
+///
+/// When `on_key` returns [`Outcome::ConnectRequested`], the launcher has set
+/// `pending_connect` to a host id (pure intent, no I/O). The loop then runs
+/// [`connect_host`] — vault unlock popup, host-key confirm popup, argv build,
+/// frecency record+save — which is the connect orchestration mirroring
+/// `cli::cmd::connect::run`. A user cancel inside a popup (Esc/Ctrl-C)
+/// surfaces as [`SshrackError::Interrupted`] and returns the user to the
+/// launcher rather than exiting: `pending_connect` is cleared and the loop
+/// keeps running. Any other orchestration error is shown in the status line
+/// and also returns to the launcher.
 ///
 /// Event-read errors are tolerated (treated as "no event this tick") rather
 /// than aborting the TUI: a transient read failure should not strand the user
 /// in an unrecoverable state. The terminal is still restored on return because
 /// the caller owns the [`TerminalGuard`].
-pub fn run_loop(terminal: &mut Tui, app: &mut App) -> Option<ConnectRequest> {
+pub fn run_loop(
+    terminal: &mut Tui,
+    app: &mut App,
+    handle: TerminalHandle,
+    data_dir: Option<&std::path::Path>,
+) -> Option<ConnectRequest> {
     loop {
         if terminal.draw(|f| app.draw(f)).is_err() {
             // A draw failure (e.g. suspended tty) is not fatal; try again next
@@ -218,7 +259,29 @@ pub fn run_loop(terminal: &mut Tui, app: &mut App) -> Option<ConnectRequest> {
             // emits Release/Repeat on some platforms).
             match app.on_key(key) {
                 Outcome::Quit => return None,
-                Outcome::Connect(req) => return Some(req),
+                Outcome::ConnectRequested => {
+                    // Read the pure intent the launcher set on Enter. Clear it
+                    // so a subsequent keystroke does not re-fire a stale id.
+                    let Some(host_id) = app.launcher.pending_connect.take() else {
+                        // No id: defensive — treat as if Enter hit no host.
+                        continue;
+                    };
+                    match connect_host(host_id, app, handle.clone(), data_dir) {
+                        Ok(req) => return Some(req),
+                        Err(SshrackError::Interrupted) => {
+                            // User cancelled a popup (Esc/Ctrl-C). Return to the
+                            // launcher, NOT an exit.
+                            app.launcher.status = Some("connect cancelled".into());
+                        }
+                        Err(e) => {
+                            // A real error (vault unlock fail, host-key reject,
+                            // dangling credential, frecency save fail). Surface
+                            // it in the status line and return to the launcher
+                            // so the user can read it.
+                            app.launcher.status = Some(format!("connect failed: {e}"));
+                        }
+                    }
+                }
                 Outcome::Continue => {}
             }
         }
@@ -237,7 +300,7 @@ mod tests {
 
     use super::*;
     use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
-    use sshrack_core::config::schema::{Auth, CredentialBody};
+    use sshrack_core::config::schema::{Auth, CredentialBody, Host, SshrackConfig};
     use std::collections::HashMap;
     use ulid::Ulid;
 
@@ -251,7 +314,11 @@ mod tests {
             port: 22,
             auth: Auth::inline(CredentialBody::new("u")),
         };
-        App::new(vec![host], Frecency::default(), HashMap::new())
+        let cfg = SshrackConfig {
+            hosts: vec![host],
+            ..SshrackConfig::default()
+        };
+        App::new(cfg, Frecency::default(), HashMap::new())
     }
 
     fn press(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
@@ -341,19 +408,16 @@ mod tests {
     }
 
     #[test]
-    fn enter_sets_connect_pending_status_without_quitting() {
-        // Task 14: Enter is a Continue placeholder (Task 15 wires connect).
+    fn enter_signals_connect_intent_without_quitting() {
+        // Task 15: Enter is now the pure ConnectRequested intent. on_key does
+        // NO I/O; it sets pending_connect and returns ConnectRequested. The
+        // loop runs connect orchestration. This pins the pure half.
         let mut app = app_with_host("web");
+        let expected_id = app.config.hosts[0].id;
         let outcome = app.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(matches!(outcome, Outcome::Continue));
-        assert!(!app.should_quit);
-        assert!(
-            app.launcher
-                .status
-                .as_deref()
-                .unwrap_or("")
-                .contains("pending")
-        );
+        assert!(matches!(outcome, Outcome::ConnectRequested));
+        assert!(!app.should_quit, "Enter must not set should_quit");
+        assert_eq!(app.launcher.pending_connect, Some(expected_id));
     }
 
     #[test]
@@ -373,7 +437,11 @@ mod tests {
             port: 22,
             auth: Auth::inline(CredentialBody::new("u")),
         };
-        let mut app = App::new(vec![h1, h2], Frecency::default(), HashMap::new());
+        let cfg = SshrackConfig {
+            hosts: vec![h1, h2],
+            ..SshrackConfig::default()
+        };
+        let mut app = App::new(cfg, Frecency::default(), HashMap::new());
         assert_eq!(app.launcher.selected, 0);
         app.on_key(press(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(

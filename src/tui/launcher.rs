@@ -33,6 +33,7 @@ use ratatui::{
 };
 use sshrack_core::config::schema::Host;
 use sshrack_core::frecency::{self, Frecency};
+use ulid::Ulid;
 
 use super::CredentialNames;
 use super::app::Outcome;
@@ -143,12 +144,18 @@ fn frecency_tier(score: f64) -> &'static str {
 }
 
 /// Interactive launcher state: the live query, the cursor into the ranked
-/// list, the (recomputed on each keystroke) ranked list, and a transient
-/// status message (e.g. "connect — pending Task 15" or "not yet implemented").
+/// list, the (recomputed on each keystroke) ranked list, a transient status
+/// message, and the pending-connect intent set by Enter.
 ///
 /// The launcher holds **no host data of its own** — it carries only indices
 /// into the `&[Host]` slice owned by [`super::app::App`]. This keeps the view
 /// a thin layer over core and avoids copying hosts on every keystroke.
+///
+/// `pending_connect` is the pure-intent channel from `on_key` (which does no
+/// I/O) to the event loop: Enter sets it, the loop reads and clears it, then
+/// runs the I/O-heavy connect orchestration. Keeping the intent here (rather
+/// than in the [`Outcome`]) lets the loop also clear `should_quit`-style
+/// booleans and lets a future wizard reuse the same pattern.
 #[derive(Debug, Clone)]
 pub struct Launcher {
     /// The fuzzy query string the user is typing.
@@ -161,6 +168,10 @@ pub struct Launcher {
     /// A transient one-line message (e.g. a deferred-action notice). Cleared
     /// on the next query/edit keystroke. `None` shows the default status line.
     pub status: Option<String>,
+    /// Set by `on_key` when the user presses Enter on a host. The event loop
+    /// reads this (clearing it on cancel), then runs connect orchestration.
+    /// `on_key` performs NO I/O, so this is the pure bridge to the loop.
+    pub pending_connect: Option<Ulid>,
 }
 
 impl Launcher {
@@ -174,6 +185,7 @@ impl Launcher {
             selected: 0,
             ranked,
             status: None,
+            pending_connect: None,
         }
     }
 
@@ -226,8 +238,10 @@ impl Launcher {
     /// - `Esc` → clear query if non-empty, else [`Outcome::Quit`]
     /// - `Ctrl-C` (exact) → [`Outcome::Quit`]
     /// - `Down` / `Ctrl-N` → selection down; `Up` / `Ctrl-P` → selection up
-    /// - `Enter` → [`Outcome::Continue`] for now (Task 15 wires the real
-    ///   connect); sets a status notice
+    /// - `Enter` → set [`Launcher::pending_connect`] and return
+    ///   [`Outcome::ConnectRequested`] (pure intent; the loop runs the
+    ///   I/O-heavy connect orchestration). When no host is under the cursor,
+    ///   sets a "no host selected" status and returns [`Outcome::Continue`].
     /// - `^a` / `^e` / `^d` / `F1` → set a "not yet implemented" status
     ///   (Tasks 16/19/20); does **not** build the wizards
     pub fn on_key(&mut self, key: KeyEvent, hosts: &[Host], frecency: &Frecency) -> Outcome {
@@ -258,12 +272,21 @@ impl Launcher {
                 }
             }
             KeyCode::Enter => {
-                if self.selected_host(hosts).is_some() {
-                    self.status = Some("connect — pending Task 15".into());
-                } else {
-                    self.status = Some("no host selected".into());
+                // Pure intent: signal that the user wants to connect to the host
+                // under the cursor. We set `pending_connect` and return
+                // `ConnectRequested`; the event loop (run_loop) reads the id and
+                // runs the I/O-heavy connect orchestration (vault unlock popup,
+                // host-key popup, frecency save). on_key itself does NO I/O.
+                match self.selected_host(hosts) {
+                    Some(h) => {
+                        self.pending_connect = Some(h.id);
+                        Outcome::ConnectRequested
+                    }
+                    None => {
+                        self.status = Some("no host selected".into());
+                        Outcome::Continue
+                    }
                 }
-                Outcome::Continue
             }
             KeyCode::Backspace => {
                 self.query.pop();
@@ -839,14 +862,30 @@ mod tests {
     }
 
     #[test]
-    fn on_key_enter_is_continue_placeholder() {
+    fn on_key_enter_signals_connect_intent_with_host_id() {
+        // Enter on a host sets pending_connect to that host's id and returns
+        // the pure ConnectRequested intent (no I/O happens here). The event
+        // loop reads pending_connect to run connect orchestration.
         let hosts = vec![host(1, "web")];
+        let expected_id = hosts[0].id;
+        let fr = Frecency::default();
+        let mut launcher = Launcher::new(&hosts, &fr);
+        let outcome = launcher.on_key(key(KeyCode::Enter, KeyModifiers::NONE), &hosts, &fr);
+        assert!(matches!(outcome, Outcome::ConnectRequested));
+        assert_eq!(launcher.pending_connect, Some(expected_id));
+    }
+
+    #[test]
+    fn on_key_enter_with_no_host_sets_status_and_continues() {
+        // Enter with an empty host list cannot select anything: stay Continue,
+        // set a status, and do NOT set a pending_connect.
+        let hosts: Vec<Host> = vec![];
         let fr = Frecency::default();
         let mut launcher = Launcher::new(&hosts, &fr);
         let outcome = launcher.on_key(key(KeyCode::Enter, KeyModifiers::NONE), &hosts, &fr);
         assert!(matches!(outcome, Outcome::Continue));
-        // Enter must NOT produce a Connect yet (Task 15 wires it).
-        assert!(launcher.status.as_deref().unwrap_or("").contains("pending"));
+        assert!(launcher.pending_connect.is_none());
+        assert_eq!(launcher.status.as_deref(), Some("no host selected"));
     }
 
     #[test]

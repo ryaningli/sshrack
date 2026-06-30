@@ -23,6 +23,7 @@ use sshrack_core::frecency;
 use ulid::Ulid;
 
 pub mod app;
+pub mod connect;
 pub mod help;
 pub mod launcher;
 pub mod popup;
@@ -77,7 +78,8 @@ pub fn run(cli: &Cli) -> Result<Option<ConnectRequest>, SshrackError> {
 
     // Best-effort frecency load: a missing/corrupt file is an empty table,
     // never a reason to strand the user.
-    let frecency = config_path::default_data_dir()
+    let data_dir = config_path::default_data_dir();
+    let frecency = data_dir
         .as_ref()
         .map(|d| frecency::store::load(d).unwrap_or_default())
         .unwrap_or_default();
@@ -88,15 +90,20 @@ pub fn run(cli: &Cli) -> Result<Option<ConnectRequest>, SshrackError> {
         .map(|c| (c.id, c.name.clone()))
         .collect();
 
-    let app = App::new(cfg.hosts, frecency, credential_names);
+    let app = App::new(cfg, frecency, credential_names);
 
     let guard = TerminalGuard::enter()?;
     let mut app = app;
+    // A weak handle the prompt layer (vault popup, host-key popup) upgrades to
+    // borrow the terminal for rendering. Cloned from the guard so it goes dead
+    // the moment the guard drops (RAII restore), never keeping the Tui alive.
+    let handle = guard.handle();
     // run_loop borrows the terminal through the guard; the guard itself stays
     // alive here, so the screen stays in alternate/raw mode for the duration.
     // `with_terminal` hands `run_loop` a `&mut Tui` without surrendering guard
     // ownership, so RAII restore still runs at function return.
-    let request = guard.with_terminal(|terminal| run_loop(terminal, &mut app));
+    let request =
+        guard.with_terminal(|terminal| run_loop(terminal, &mut app, handle, data_dir.as_deref()));
     // `guard` drops at function return: disable_raw_mode +
     // LeaveAlternateScreen. The terminal is restored on every path — plain
     // quit, connect, or early return from run_loop — because Drop always runs.
