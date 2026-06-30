@@ -5,8 +5,6 @@
 //! 19–20); they are declared up front so the mapping is stable from the first
 //! shipped CLI.
 
-#![allow(dead_code)]
-
 /// Successful execution.
 pub const SUCCESS: i32 = 0;
 

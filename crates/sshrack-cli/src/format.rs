@@ -1,26 +1,24 @@
 //! Output shaping for `host ls/show`, `cred ls`, and `store status`.
 //!
-//! These row structs and helpers form the `--format json` contract; they are
-//! wired into the command handlers in Tasks 19–20. Until then they are unused
-//! at the call site (only the unit tests reference them), so the module
-//! carries `#![allow(dead_code)]` — the same convention `exit_code` uses for
-//! ahead-of-time declarations.
+//! The host/cred row structs and helpers form the `--format json` contract and
+//! are wired into the `cmd::host`/`cmd::cred` handlers. The `store status` row
+//! ([`StoreStatusRow`] / [`store_status_row`]) is declared up front but is not
+//! consumed until the `store` command lands (Part C); it carries
+//! `#[allow(dead_code)]` so the contract is stable from the first shipped CLI.
 //!
 //! Two output paths exist: human-readable aligned text (the default, rendered
-//! by the command handlers in later tasks) and machine-readable JSON selected
-//! by the global `--format json`. The JSON path is the automation contract: it
-//! is produced exclusively by the `#[derive(Serialize)]` structs in this
-//! module, whose field names are the stable public schema. The unit tests lock
-//! the field names and their presence so a refactor cannot silently change
-//! what `jq` sees.
+//! by the command handlers) and machine-readable JSON selected by the global
+//! `--format json`. The JSON path is the automation contract: it is produced
+//! exclusively by the `#[derive(Serialize)]` structs in this module, whose
+//! field names are the stable public schema. The unit tests lock the field
+//! names and their presence so a refactor cannot silently change what `jq`
+//! sees.
 //!
 //! Security rule: **no struct in this module ever carries a password, key, or
 //! any secret material.** Rows expose only routing/identity metadata (alias,
 //! host, port, user, an auth-kind label, and the referenced credential alias).
 //! A password is represented only by its *kind* (`"password"`, `"key"`,
 //! `"keyring"`, `"default"`), never its value.
-
-#![allow(dead_code)]
 
 use std::borrow::Cow;
 
@@ -83,6 +81,7 @@ pub struct CredentialListRow<'a> {
 /// (`kdf`, `memory_kib`, `time_cost`, `lanes`, `cache_ttl_secs`); a present
 /// `verifier` is reported only as a boolean (the ciphertext itself is never
 /// surfaced).
+#[allow(dead_code)] // consumed by the `store status` command (Part C)
 #[derive(Debug, Clone, Serialize)]
 pub struct StoreStatusRow {
     pub mode: &'static str,
@@ -168,6 +167,7 @@ pub fn credential_list_row(cred: &Credential) -> CredentialListRow<'_> {
 }
 
 /// Build a [`StoreStatusRow`] from a config's active [`SecretStore`]. Pure.
+#[allow(dead_code)] // consumed by the `store status` command (Part C)
 pub fn store_status_row(cfg: &SshrackConfig) -> StoreStatusRow {
     match &cfg.store {
         None => StoreStatusRow {

@@ -35,8 +35,9 @@ fn main() {
 
 /// Parse the CLI and dispatch on the parsed subcommand.
 ///
-/// The `Ssh` and `Connect` arms run the connect path (Task 19). Other arms
-/// print a stub message until Task 20 wires them up.
+/// `Ssh`/`Connect` run the connect path; `Host`/`Cred` run the resource-group
+/// handlers; `Scp`/`Store` are stubbed (Part C). Handlers return their own
+/// exit codes; domain-error → exit-code mapping lives inside each handler.
 fn run_cli() -> i32 {
     let cli = match cli::Cli::try_parse() {
         Ok(c) => c,
@@ -55,10 +56,15 @@ fn run_cli() -> i32 {
             exit_code::SUCCESS
         }
         Some(cli::Command::Ssh { .. }) | Some(cli::Command::Connect(_)) => cmd::connect::run(&cli),
-        Some(_) => {
-            // TODO(Task 20): dispatch on cli.cmd to the cmd:: handlers.
-            eprintln!("sshrack CLI dispatch not yet implemented for this subcommand");
-            exit_code::SUCCESS
+        Some(cli::Command::Host { action }) => cmd::host::run(&cli, action),
+        Some(cli::Command::Cred { action }) => cmd::cred::run(&cli, action),
+        Some(cli::Command::Scp { .. }) => {
+            eprintln!("sshrack: scp not yet implemented");
+            exit_code::USAGE
+        }
+        Some(cli::Command::Store { .. }) => {
+            eprintln!("sshrack: store not yet implemented");
+            exit_code::USAGE
         }
     }
 }

@@ -30,8 +30,6 @@
 //!
 //! [`SecretStore`]: sshrack_core::config::schema::SecretStore
 
-#![allow(dead_code)]
-
 use dialoguer::Password;
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::{Confirm, FuzzySelect};
