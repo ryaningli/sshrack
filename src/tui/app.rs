@@ -262,7 +262,10 @@ impl App {
     }
 
     /// Open the host wizard in edit mode, prefilled from the host with the
-    /// given id. No-op (returns false) when the id is not in the config.
+    /// given id. No-op (returns false) when the id is not in the config. When
+    /// the host's auth is a credential reference, the referenced credential's
+    /// current name is resolved from the config so the chooser can prefill the
+    /// correct index (the wizard works in names; it cannot map id→name alone).
     pub fn open_host_wizard_edit(&mut self, host_id: Ulid) -> bool {
         let Some(host) = self.config.find_host_by_id(&host_id).cloned() else {
             return false;
@@ -273,7 +276,19 @@ impl App {
             .iter()
             .map(|c| c.name.clone())
             .collect();
-        self.wizard = Some(HostForm::new_edit(&host, names));
+        // Resolve the referenced credential id → its current name (if any) so
+        // new_edit can prefill the chooser at the right index. None covers both
+        // non-Ref auth and a dangling ref (credential deleted between sessions).
+        let referenced_credential_name = host.auth.credential_id().and_then(|id| {
+            self.config
+                .find_credential_by_id(&id)
+                .map(|c| c.name.clone())
+        });
+        self.wizard = Some(HostForm::new_edit(
+            &host,
+            names,
+            referenced_credential_name.as_deref(),
+        ));
         self.mode = Mode::HostWizard;
         true
     }

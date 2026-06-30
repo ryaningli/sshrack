@@ -99,7 +99,10 @@ impl Field {
     ];
 
     fn idx(self) -> usize {
-        Self::ORDER.iter().position(|f| *f == self).unwrap_or(0)
+        Self::ORDER
+            .iter()
+            .position(|f| *f == self)
+            .expect("invariant: every Field variant is in ORDER")
     }
 
     fn next(self) -> Field {
@@ -244,28 +247,28 @@ impl HostForm {
     }
 
     /// Build an edit-mode form prefilled from `host`. The Credential chooser is
-    /// seeded with `credential_names`; if `host.auth` is a reference whose id
-    /// names one of them, the chooser starts on that index.
-    pub fn new_edit(host: &Host, credential_names: Vec<String>) -> Self {
+    /// seeded with `credential_names`; when `host.auth` is a reference, the
+    /// caller resolves the referenced credential id → its current name (via the
+    /// config) and passes it in as `referenced_credential_name`. The chooser
+    /// then starts on that name's index. If the referenced credential was
+    /// deleted between sessions (name no longer in the list), the chooser falls
+    /// back to index 0 — a defensible last resort; the user must pick a valid
+    /// credential (or change the auth kind) before save, and the loop re-validates
+    /// the name→id resolution at persist time.
+    pub fn new_edit(
+        host: &Host,
+        credential_names: Vec<String>,
+        referenced_credential_name: Option<&str>,
+    ) -> Self {
         let (auth_choice, user, key_path) = match &host.auth {
-            Auth::Ref { credential } => {
-                // Try to find the referenced credential's name in the chooser
-                // list; if missing (dangling ref or empty list), fall back to
-                // Default so the user sees something editable rather than an
-                // index into an empty list.
-                let idx = credential_names
-                    .iter()
-                    .position(|n| {
-                        // Match by name is not possible here (we only have the
-                        // id); the loop resolves name→id at save, so at prefill
-                        // time we can only index when the list carries the name
-                        // for this id. The caller passes names in config order;
-                        // we leave idx 0 and rely on the user to pick. This is
-                        // acceptable: prefill is best-effort, save validates.
-                        n.is_empty()
-                    })
+            Auth::Ref { .. } => {
+                // Match the referenced credential's current name in the chooser
+                // list. unwrap_or(0) only fires when the referenced credential
+                // was deleted between sessions (name no longer present); that is
+                // a genuine fallback, not the common path.
+                let idx = referenced_credential_name
+                    .and_then(|name| credential_names.iter().position(|n| n == name))
                     .unwrap_or(0);
-                let _ = credential;
                 (AuthChoice::Credential { idx }, String::new(), String::new())
             }
             Auth::Inline(body) => {
@@ -300,7 +303,10 @@ impl HostForm {
     fn cycle_auth(&mut self, delta: i32) {
         let cur_kind = self.auth_choice.kind();
         let order = AuthChoice::ORDER;
-        let cur_pos = order.iter().position(|k| *k == cur_kind).unwrap_or(0);
+        let cur_pos = order
+            .iter()
+            .position(|k| *k == cur_kind)
+            .expect("invariant: every AuthChoice variant is in AUTH_ORDER");
         let next_pos = (cur_pos as i32 + delta).rem_euclid(order.len() as i32) as usize;
         let next_kind = order[next_pos];
         self.auth_choice = match next_kind {
@@ -1067,7 +1073,7 @@ mod tests {
             port: 2222,
             auth: Auth::inline(CredentialBody::new("ops")),
         };
-        let f = HostForm::new_edit(&host, vec![]);
+        let f = HostForm::new_edit(&host, vec![], None);
         assert!(f.editing);
         assert_eq!(f.orig_id, Some(host.id));
         assert_eq!(f.name, "web");
@@ -1086,13 +1092,16 @@ mod tests {
             port: 22,
             auth: Auth::inline(CredentialBody::new("ops").with_key("/k/id")),
         };
-        let f = HostForm::new_edit(&host, vec![]);
+        let f = HostForm::new_edit(&host, vec![], None);
         assert_eq!(f.auth_choice, AuthChoice::InlineKey);
         assert_eq!(f.inline_key, "/k/id");
     }
 
     #[test]
     fn new_edit_prefills_from_credential_ref_host() {
+        // The referenced credential sits at a NON-zero index; the chooser must
+        // prefill that exact index, not 0. (This pins the fix: the old code
+        // always prefilled idx 0 because it matched on empty names.)
         let host = Host {
             id: Ulid::new(),
             name: "web".into(),
@@ -1100,7 +1109,34 @@ mod tests {
             port: 22,
             auth: Auth::reference(Ulid::new()),
         };
-        let f = HostForm::new_edit(&host, vec!["ops".into()]);
-        assert!(matches!(f.auth_choice, AuthChoice::Credential { .. }));
+        let names = vec!["alpha".to_string(), "ops".to_string(), "team".to_string()];
+        let f = HostForm::new_edit(&host, names, Some("ops"));
+        assert_eq!(
+            f.auth_choice,
+            AuthChoice::Credential { idx: 1 },
+            "must prefill the referenced credential's index, not 0"
+        );
+        assert_eq!(f.selected_credential_name(), Some("ops"));
+    }
+
+    #[test]
+    fn new_edit_credential_ref_falls_back_to_idx0_when_name_missing() {
+        // The referenced credential was deleted between sessions: its name is
+        // no longer in the chooser list. Graceful fallback → idx 0 (the user
+        // must pick a valid credential before save; the loop re-validates).
+        let host = Host {
+            id: Ulid::new(),
+            name: "web".into(),
+            host: "10.0.0.5".into(),
+            port: 22,
+            auth: Auth::reference(Ulid::new()),
+        };
+        let names = vec!["alpha".to_string(), "team".to_string()];
+        let f = HostForm::new_edit(&host, names, Some("ghost"));
+        assert_eq!(
+            f.auth_choice,
+            AuthChoice::Credential { idx: 0 },
+            "dangling ref falls back to idx 0"
+        );
     }
 }
