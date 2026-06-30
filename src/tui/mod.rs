@@ -51,11 +51,13 @@ pub struct ConnectRequest {
 /// function (raw mode off, alternate screen left), so by the time the
 /// `Option<ConnectRequest>` reaches `main` the terminal is fully restored.
 pub fn run(_cli: &Cli) -> Result<Option<ConnectRequest>, SshrackError> {
-    let mut guard = TerminalGuard::enter()?;
+    let guard = TerminalGuard::enter()?;
     let mut app = App::new();
     // run_loop borrows the terminal through the guard; the guard itself stays
     // alive here, so the screen stays in alternate/raw mode for the duration.
-    let request = run_loop(&mut guard, &mut app);
+    // `with_terminal` hands `run_loop` a `&mut Tui` without surrendering guard
+    // ownership, so RAII restore still runs at function return.
+    let request = guard.with_terminal(|terminal| run_loop(terminal, &mut app));
     // `guard` drops at function return: disable_raw_mode +
     // LeaveAlternateScreen. The terminal is restored on every path — plain
     // quit, connect, or early return from run_loop — because Drop always runs.

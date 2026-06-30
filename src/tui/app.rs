@@ -10,8 +10,9 @@
 //! runs, the terminal is restored even when the loop returns early (e.g. on a
 //! connect request that later errors in `main`).
 
+use std::cell::RefCell;
 use std::io::{self, Stdout};
-use std::ops::{Deref, DerefMut};
+use std::rc::Rc;
 use std::time::Duration;
 
 use crossterm::{
@@ -33,16 +34,25 @@ use super::ConnectRequest;
 /// ratatui backend bound to stdout via crossterm.
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;
 
+/// Shared, interior-mutable handle to the terminal. The [`TerminalGuard`] owns
+/// the only strong reference while the TUI is running; it hands out a **weak**
+/// clone ([`TerminalHandle`]) to the prompt layer so a `&self`
+/// [`sshrack_core::secret::PassphraseProvider`] impl can borrow the terminal
+/// `&mut` to render a popup. The weak handle goes dead when the guard drops, so
+/// a stray reference can never outlive the terminal restore.
+pub type TerminalHandle = Rc<RefCell<Tui>>;
+
 /// RAII terminal guard. On construction it enables raw mode and enters the
 /// alternate screen; on drop it leaves the alternate screen and disables raw
-/// mode. The guard owns the [`Tui`] (accessible via [`Deref`]/[`DerefMut`]) so
-/// the terminal lives exactly as long as raw mode is on.
+/// mode. The guard owns the [`Tui`] behind an [`Rc<RefCell<…>>`] so both the
+/// event loop and the prompt layer (which receives a [`TerminalHandle`]) can
+/// borrow it. The terminal lives exactly as long as raw mode is on.
 ///
 /// Drop swallows restore errors: there is no meaningful recovery at drop time,
 /// and a partially-restored terminal is strictly worse than a best-effort one.
 /// The user can `reset` if ever needed.
 pub struct TerminalGuard {
-    terminal: Tui,
+    terminal: TerminalHandle,
 }
 
 impl TerminalGuard {
@@ -59,21 +69,24 @@ impl TerminalGuard {
         }
         let backend = CrosstermBackend::new(io::stdout());
         let terminal = Terminal::new(backend)?;
-        Ok(Self { terminal })
+        Ok(Self {
+            terminal: Rc::new(RefCell::new(terminal)),
+        })
     }
-}
 
-impl Deref for TerminalGuard {
-    type Target = Tui;
-
-    fn deref(&self) -> &Self::Target {
-        &self.terminal
+    /// Borrow the terminal `&mut` for the duration of this call. Panics only
+    /// if the terminal is already borrowed — which cannot happen on the event
+    /// loop's single-threaded, non-reentrant path.
+    pub fn with_terminal<R>(&self, f: impl FnOnce(&mut Tui) -> R) -> R {
+        f(&mut self.terminal.borrow_mut())
     }
-}
 
-impl DerefMut for TerminalGuard {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.terminal
+    /// A weak handle the prompt layer can store inside a `&self`
+    /// [`sshrack_core::secret::PassphraseProvider`] impl. Upgrades to
+    /// `Some(handle)` only while this guard is alive.
+    #[allow(dead_code)]
+    pub fn handle(&self) -> TerminalHandle {
+        Rc::clone(&self.terminal)
     }
 }
 
