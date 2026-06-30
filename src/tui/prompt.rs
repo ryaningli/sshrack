@@ -8,12 +8,17 @@
 //! [`sshrack_core::secret::PassphraseProvider`] methods are `&self`, but
 //! rendering a ratatui popup needs `&mut Tui`. We solve this without changing
 //! the core trait and without `unsafe` by sharing the terminal behind an
-//! [`Rc<RefCell<Tui>>`] (see [`crate::tui::app::TerminalHandle`]).
-//! [`TuiPassphrase`] stores a [`TerminalHandle`] cloned from the
-//! [`crate::tui::app::TerminalGuard`]; its `&self` methods `borrow_mut()` the
-//! terminal to call the popup-driving free functions. The guard owns the only
-//! strong reference, so the handle goes dead on guard drop — RAII restore is
-//! unaffected.
+//! `Rc<RefCell<Tui>>` whose only strong ref lives in
+//! [`crate::tui::app::TerminalGuard`]. The prompt layer holds a *weak* handle
+//! ([`crate::tui::app::TerminalHandle`] = `Weak<RefCell<Tui>>`) cloned from the
+//! guard; [`TuiPassphrase`] stores it and its `&self` methods [`upgrade`] it at
+//! call time, then `borrow_mut()` the terminal to drive a popup. Because the
+//! handle is weak, a `TuiPassphrase` (or host-key closure) that outlives the
+//! guard cannot keep the `Tui` alive past the RAII restore — [`upgrade`]
+//! returns `None` and the call surfaces as a silent
+//! [`SshrackError::Interrupted`] cancel.
+//!
+//! [`upgrade`]: std::rc::Weak::upgrade
 //!
 //! # Purity boundary
 //!
@@ -21,6 +26,9 @@
 //! *decision* — which key yields which yes/no answer — is extracted into the
 //! pure [`confirm_from_key`] helper, which IS unit-tested (TDD: RED then
 //! GREEN). The popup wires raw keys to that helper.
+
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
@@ -71,6 +79,16 @@ pub fn confirm_from_key(key: KeyCode) -> ConfirmAnswer {
 /// the field non-empty looking without leaking length precisely.
 #[allow(dead_code)]
 const MASK: &str = "•";
+
+/// Upgrade a weak terminal handle to the owning `Rc<RefCell<Tui>>` so the
+/// caller can `borrow_mut()` it for the duration of one popup call. Returns
+/// [`SshrackError::Interrupted`] (the same silent cancel a `Ctrl-C` produces)
+/// when the guard is already gone — a popup that runs after `tui::run`
+/// returned cannot render and is treated as user-initiated cancellation, never
+/// as a noisy panic or `io error`.
+fn upgrade_terminal(handle: &TerminalHandle) -> Result<Rc<RefCell<Tui>>, SshrackError> {
+    handle.upgrade().ok_or(SshrackError::Interrupted)
+}
 
 /// Read a vault passphrase via a masked-input popup. Returns the typed string
 /// wrapped in [`Zeroizing`] so it is wiped on drop. `Enter` submits; `Esc` or
@@ -143,12 +161,14 @@ pub fn confirm_popup(terminal: &mut Tui, text: &str) -> Result<bool, SshrackErro
         let body = Paragraph::new(lines).alignment(Alignment::Left);
         terminal
             .draw(|f| popup::render_popup(f, "Confirm", body))
-            .map_err(SshrackError::from)?;
+            .map_err(SshrackError::from_prompt_io)?;
 
-        if !event::poll(std::time::Duration::from_millis(250))? {
+        if !event::poll(std::time::Duration::from_millis(250))
+            .map_err(SshrackError::from_prompt_io)?
+        {
             continue;
         }
-        let Event::Key(key) = event::read()? else {
+        let Event::Key(key) = event::read().map_err(SshrackError::from_prompt_io)? else {
             continue;
         };
         if key.kind != KeyEventKind::Press {
@@ -182,13 +202,15 @@ enum KeyDecision {
 
 /// Block until one key press, then decode it into a [`KeyDecision`]. Returns
 /// [`SshrackError::Interrupted`] on a read failure that looks like a user
-/// cancel; other I/O errors propagate as [`SshrackError::Io`].
+/// cancel (EINTR); other I/O errors propagate as [`SshrackError::Io`].
 fn read_decision_key() -> Result<KeyDecision, SshrackError> {
     loop {
-        if !event::poll(std::time::Duration::from_millis(250))? {
+        if !event::poll(std::time::Duration::from_millis(250))
+            .map_err(SshrackError::from_prompt_io)?
+        {
             continue;
         }
-        let Event::Key(key) = event::read()? else {
+        let Event::Key(key) = event::read().map_err(SshrackError::from_prompt_io)? else {
             continue;
         };
         if key.kind != KeyEventKind::Press {
@@ -232,9 +254,13 @@ fn render_password_popup(terminal: &mut Tui, title: &str, buffer: &str, mismatch
     let _ = terminal.draw(|f| popup::render_popup(f, title, body));
 }
 
-/// [`PassphraseProvider`] for the TUI. Holds a shared handle to the terminal
+/// [`PassphraseProvider`] for the TUI. Holds a weak handle to the terminal
 /// (cloned from [`crate::tui::app::TerminalGuard::handle`]); its `&self`
-/// methods `borrow_mut()` the terminal to drive a popup.
+/// methods [`upgrade`](std::rc::Weak::upgrade) the handle and `borrow_mut()`
+/// the terminal to drive a popup. If the guard has already dropped, the
+/// `upgrade` returns `None` and the call surfaces as
+/// [`SshrackError::Interrupted`] — a popup cannot run after the terminal
+/// restore, so it is treated as a silent cancel.
 ///
 /// Construct via [`TuiPassphrase::new`] *while the guard is alive* and pass it
 /// to [`sshrack_core::secret::vault::ensure_unlocked_vault_key`] (or any other
@@ -245,8 +271,8 @@ pub struct TuiPassphrase {
 }
 
 impl TuiPassphrase {
-    /// Build a provider that drives popups on `terminal` (a handle cloned from
-    /// the live [`crate::tui::app::TerminalGuard`]).
+    /// Build a provider that drives popups on `terminal` (a weak handle cloned
+    /// from the live [`crate::tui::app::TerminalGuard`]).
     #[allow(dead_code)]
     pub fn new(terminal: TerminalHandle) -> Self {
         Self { terminal }
@@ -255,15 +281,18 @@ impl TuiPassphrase {
 
 impl PassphraseProvider for TuiPassphrase {
     fn passphrase(&self) -> Result<Zeroizing<String>, SshrackError> {
-        prompt_password(&mut self.terminal.borrow_mut(), "Passphrase")
+        let rc = upgrade_terminal(&self.terminal)?;
+        prompt_password(&mut rc.borrow_mut(), "Passphrase")
     }
 
     fn passphrase_confirm(&self) -> Result<Zeroizing<String>, SshrackError> {
-        prompt_password_confirm(&mut self.terminal.borrow_mut(), "New passphrase")
+        let rc = upgrade_terminal(&self.terminal)?;
+        prompt_password_confirm(&mut rc.borrow_mut(), "New passphrase")
     }
 
     fn confirm(&self, text: &str) -> Result<bool, SshrackError> {
-        confirm_popup(&mut self.terminal.borrow_mut(), text)
+        let rc = upgrade_terminal(&self.terminal)?;
+        confirm_popup(&mut rc.borrow_mut(), text)
     }
 }
 
@@ -272,15 +301,20 @@ impl PassphraseProvider for TuiPassphrase {
 /// user's yes/no decision. `Ctrl-C` and `Esc` both map to "decline" (false),
 /// which `run_host_key_flow` turns into [`SshrackError::HostKeyNotConfirmed`].
 ///
-/// `terminal` is captured by move; the closure is `FnOnce` because
-/// `run_host_key_flow` consumes it.
+/// `terminal` is a weak handle captured by move; the closure is `FnOnce`
+/// because `run_host_key_flow` consumes it. If the guard is gone by the time
+/// the closure runs, the popup cannot render and the closure returns `false`
+/// (decline) via [`upgrade_terminal`]'s `Interrupted` mapping — never a panic.
 #[allow(dead_code)]
 pub fn host_key_confirm(terminal: TerminalHandle) -> impl FnOnce(&str) -> bool + use<> {
     move |text: &str| {
-        // An interrupted confirm (Ctrl-C) is treated as a decline: the host
-        // key is NOT appended to known_hosts, and run_host_key_flow returns
-        // HostKeyNotConfirmed. No panic, no swallowed decision.
-        confirm_popup(&mut terminal.borrow_mut(), text).unwrap_or(false)
+        // An interrupted confirm (Ctrl-C, or guard already dropped) is treated
+        // as a decline: the host key is NOT appended to known_hosts, and
+        // run_host_key_flow returns HostKeyNotConfirmed. No panic, no
+        // swallowed decision.
+        upgrade_terminal(&terminal)
+            .and_then(|rc| confirm_popup(&mut rc.borrow_mut(), text))
+            .unwrap_or(false)
     }
 }
 

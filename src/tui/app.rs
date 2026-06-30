@@ -12,7 +12,7 @@
 
 use std::cell::RefCell;
 use std::io::{self, Stdout};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::time::Duration;
 
 use crossterm::{
@@ -34,25 +34,31 @@ use super::ConnectRequest;
 /// ratatui backend bound to stdout via crossterm.
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;
 
-/// Shared, interior-mutable handle to the terminal. The [`TerminalGuard`] owns
-/// the only strong reference while the TUI is running; it hands out a **weak**
-/// clone ([`TerminalHandle`]) to the prompt layer so a `&self`
+/// Weak, interior-mutable handle to the terminal. The [`TerminalGuard`] owns
+/// the only strong reference (`Rc<RefCell<Tui>>`) while the TUI is running; it
+/// hands out a weak clone ([`TerminalHandle`]) to the prompt layer so a `&self`
 /// [`sshrack_core::secret::PassphraseProvider`] impl can borrow the terminal
 /// `&mut` to render a popup. The weak handle goes dead when the guard drops, so
-/// a stray reference can never outlive the terminal restore.
-pub type TerminalHandle = Rc<RefCell<Tui>>;
+/// a stray reference (e.g. a `TuiPassphrase` or host-key closure that outlives
+/// `tui::run`) can never keep the `Tui` alive past the terminal restore.
+/// Callers [`Weak::upgrade`] at use time; `None` means the guard is gone and the
+/// operation is treated as a silent cancellation.
+pub type TerminalHandle = Weak<RefCell<Tui>>;
 
 /// RAII terminal guard. On construction it enables raw mode and enters the
 /// alternate screen; on drop it leaves the alternate screen and disables raw
 /// mode. The guard owns the [`Tui`] behind an [`Rc<RefCell<…>>`] so both the
-/// event loop and the prompt layer (which receives a [`TerminalHandle`]) can
-/// borrow it. The terminal lives exactly as long as raw mode is on.
+/// event loop (via [`with_terminal`]) and the prompt layer (which receives a
+/// [`TerminalHandle`] via [`handle`](Self::handle)) can borrow it. The terminal
+/// lives exactly as long as raw mode is on.
 ///
 /// Drop swallows restore errors: there is no meaningful recovery at drop time,
 /// and a partially-restored terminal is strictly worse than a best-effort one.
 /// The user can `reset` if ever needed.
+///
+/// [`with_terminal`]: TerminalGuard::with_terminal
 pub struct TerminalGuard {
-    terminal: TerminalHandle,
+    terminal: Rc<RefCell<Tui>>,
 }
 
 impl TerminalGuard {
@@ -82,11 +88,13 @@ impl TerminalGuard {
     }
 
     /// A weak handle the prompt layer can store inside a `&self`
-    /// [`sshrack_core::secret::PassphraseProvider`] impl. Upgrades to
-    /// `Some(handle)` only while this guard is alive.
+    /// [`sshrack_core::secret::PassphraseProvider`] impl. [`Weak::upgrade`]
+    /// returns `Some` only while this guard is alive; once the guard drops, the
+    /// handle goes dead and consumers treat the `None` as a silent
+    /// cancellation ([`SshrackError::Interrupted`]).
     #[allow(dead_code)]
     pub fn handle(&self) -> TerminalHandle {
-        Rc::clone(&self.terminal)
+        Rc::downgrade(&self.terminal)
     }
 }
 
