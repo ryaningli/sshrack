@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use crate::cli::Cli;
 use crate::cli::args::{Command, CredAction, HostAction};
 use sshrack_core::config::path as config_path;
-use sshrack_core::config::store;
+use sshrack_core::config::store as config_store;
 use sshrack_core::error::SshrackError;
 use sshrack_core::frecency;
 use ulid::Ulid;
@@ -29,6 +29,7 @@ pub mod help;
 pub mod launcher;
 pub mod popup;
 pub mod prompt;
+pub mod store;
 pub mod wizard;
 
 pub use app::{App, TerminalGuard, run_loop};
@@ -73,7 +74,7 @@ pub fn run(cli: &Cli) -> Result<Option<ConnectRequest>, SshrackError> {
     let config_path = config_path::resolve(cli.config.as_deref());
     let cfg = config_path
         .as_ref()
-        .map(|p| store::load(p))
+        .map(|p| config_store::load(p))
         .transpose()?
         .unwrap_or_default();
 

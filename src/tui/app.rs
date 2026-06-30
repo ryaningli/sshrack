@@ -32,6 +32,7 @@ use super::CredentialNames;
 use super::connect::connect_host;
 use super::launcher::Launcher;
 use super::prompt::TuiPassphrase;
+use super::store::StoreView;
 use super::wizard::{CredForm, HostForm};
 
 /// ratatui backend bound to stdout via crossterm.
@@ -147,6 +148,35 @@ pub enum Outcome {
     /// Pure intent: the user pressed Esc / Ctrl-C inside the wizard. The loop
     /// discards the wizard and returns to the launcher.
     Cancel,
+    /// Pure intent: the store view's cursor is on keyring. The loop probes
+    /// [`sshrack_core::secret::OsKeyring`] availability, then migrates every
+    /// stored password into keyring mode via [`vault::transform::migrate`] (the
+    /// same core path the CLI's `store use keyring` takes) and persists the
+    /// config. A failure (keyring daemon down, migrate error, write error)
+    /// surfaces in the store view's status line and stays in the view.
+    ///
+    /// [`vault::transform::migrate`]: sshrack_core::secret::vault::transform::migrate
+    SwitchToKeyring,
+    /// Pure intent: the store view's cursor is on vault. The loop drives a
+    /// masked double-entry passphrase popup via [`TuiPassphrase`], then calls
+    /// [`vault::enable`] (the same core fn the CLI's `store use vault` uses) to
+    /// derive a fresh key, write the verifier, and migrate every existing
+    /// password into vault mode, and persists the config. A cancel inside the
+    /// passphrase popup surfaces as [`SshrackError::Interrupted`] → "cancelled"
+    /// status; other errors surface in the view's status line.
+    ///
+    /// [`vault::enable`]: sshrack_core::secret::vault::enable
+    SwitchToVault,
+    /// Pure intent: the store view's cursor is on plaintext. The loop drives a
+    /// confirm popup (downgrade warning) via [`TuiPassphrase::confirm`]; on Yes
+    /// it migrates every stored password into plaintext mode via
+    /// [`vault::transform::migrate`] (the same core path the CLI's `store use
+    /// plaintext` takes) and persists the config. On No it cancels (no
+    /// migration). Leaving vault mode needs the source vault key, unlocked via
+    /// [`TuiPassphrase`] first.
+    ///
+    /// [`vault::transform::migrate`]: sshrack_core::secret::vault::transform::migrate
+    SwitchToPlaintext,
 }
 
 /// Which view the TUI is showing. The launcher is the default; the host wizard
@@ -163,6 +193,8 @@ pub enum Mode {
     HostWizard,
     /// The credential add/edit wizard.
     CredWizard,
+    /// The store-mode switch view (keyring / vault / plaintext).
+    Store,
 }
 
 /// TUI application state. The launcher is the primary mode; the host wizard is
@@ -201,6 +233,8 @@ pub struct App {
     wizard: Option<HostForm>,
     /// The credential wizard, present only when [`Mode::CredWizard`] is active.
     cred_wizard: Option<CredForm>,
+    /// The store-mode switch view, present only when [`Mode::Store`] is active.
+    store_view: Option<StoreView>,
 }
 
 impl App {
@@ -225,6 +259,7 @@ impl App {
             mode: Mode::Launcher,
             wizard: None,
             cred_wizard: None,
+            store_view: None,
         }
     }
 
@@ -361,6 +396,35 @@ impl App {
         self.open_host_wizard_edit(host.id)
     }
 
+    /// The human-readable label for the currently active storage mode, or
+    /// `"undecided"` when `cfg.store` is `None`. Used by the store view to mark
+    /// the `(active)` row.
+    fn current_store_mode_label(&self) -> &'static str {
+        use sshrack_core::config::schema::SecretStore;
+        match &self.config.store {
+            Some(SecretStore::Keyring) => "keyring",
+            Some(SecretStore::Vault { .. }) => "vault",
+            Some(SecretStore::Plaintext) => "plaintext",
+            None => "undecided",
+        }
+    }
+
+    /// Open the store-mode switch view, snapshotting the active mode for the
+    /// `(active)` marker. Bound to `F2` in the launcher.
+    pub fn open_store_view(&mut self) {
+        self.store_view = Some(StoreView::new(Some(self.current_store_mode_label())));
+        self.mode = Mode::Store;
+    }
+
+    /// Leave the store view and return to the launcher. The host ranking is
+    /// unaffected by a mode switch, but re-running `recompute` is cheap and
+    /// keeps the launcher in sync.
+    pub fn close_store_view(&mut self) {
+        self.store_view = None;
+        self.mode = Mode::Launcher;
+        self.launcher.recompute(&self.config.hosts, &self.frecency);
+    }
+
     /// Apply the entry-routing decision (derived from `cli.cmd` in
     /// [`super::entry_mode_from_cmd`]) before the first frame. Called once from
     /// [`super::run`] after the config is loaded and before the alternate
@@ -469,6 +533,12 @@ impl App {
                         }
                         return Outcome::Continue;
                     }
+                    // F2 opens the store-mode switch view (keyring / vault /
+                    // plaintext). Pure: only flips the mode + builds the view.
+                    if key.modifiers.is_empty() && key.code == crossterm::event::KeyCode::F(2) {
+                        self.open_store_view();
+                        return Outcome::Continue;
+                    }
                 }
                 let outcome = self
                     .launcher
@@ -488,6 +558,10 @@ impl App {
             }
             Mode::CredWizard => match self.cred_wizard.as_mut() {
                 Some(w) => w.on_key(key),
+                None => Outcome::Continue,
+            },
+            Mode::Store => match self.store_view.as_mut() {
+                Some(v) => v.on_key(key),
                 None => Outcome::Continue,
             },
         }
@@ -513,6 +587,11 @@ impl App {
             Mode::CredWizard => {
                 if let Some(w) = &self.cred_wizard {
                     w.draw(frame, area);
+                }
+            }
+            Mode::Store => {
+                if let Some(v) = &self.store_view {
+                    v.draw(frame, area);
                 }
             }
         }
@@ -640,13 +719,79 @@ pub fn run_loop(
                     }
                 }
                 Outcome::Cancel => {
-                    // Wizard Esc / Ctrl-C: discard the active wizard and return
-                    // to the launcher. Which wizard to close depends on mode.
+                    // A view's Esc / Ctrl-C: discard the active view and return
+                    // to the launcher. Which view to close depends on mode.
                     app.launcher.status = Some("cancelled".into());
                     match app.mode {
                         Mode::HostWizard => app.close_host_wizard(),
                         Mode::CredWizard => app.close_cred_wizard(),
+                        Mode::Store => app.close_store_view(),
                         _ => {}
+                    }
+                }
+                Outcome::SwitchToKeyring => {
+                    match persist_store_switch(app, StoreSwitchTarget::Keyring, &handle) {
+                        Ok(true) => {
+                            app.close_store_view();
+                            app.launcher.status = Some("switched to keyring mode".into());
+                        }
+                        Ok(false) => {
+                            // Keyring unavailable or a transient error surfaced in
+                            // the store view's status line; stay in the view.
+                        }
+                        Err(SshrackError::Interrupted) => {
+                            // User cancelled a vault-unlock popup (vault→keyring
+                            // needs the source key). Stay in the store view.
+                            if let Some(v) = app.store_view.as_mut() {
+                                v.status = Some("cancelled".into());
+                            }
+                        }
+                        Err(e) => {
+                            if let Some(v) = app.store_view.as_mut() {
+                                v.status = Some(format!("switch failed: {e}"));
+                            }
+                        }
+                    }
+                }
+                Outcome::SwitchToVault => {
+                    match persist_store_switch(app, StoreSwitchTarget::Vault, &handle) {
+                        Ok(true) => {
+                            app.close_store_view();
+                            app.launcher.status = Some("switched to vault mode".into());
+                        }
+                        Ok(false) => {}
+                        Err(SshrackError::Interrupted) => {
+                            // User cancelled the passphrase popup. Stay in the view.
+                            if let Some(v) = app.store_view.as_mut() {
+                                v.status = Some("cancelled".into());
+                            }
+                        }
+                        Err(e) => {
+                            if let Some(v) = app.store_view.as_mut() {
+                                v.status = Some(format!("switch failed: {e}"));
+                            }
+                        }
+                    }
+                }
+                Outcome::SwitchToPlaintext => {
+                    match persist_store_switch(app, StoreSwitchTarget::Plaintext, &handle) {
+                        Ok(true) => {
+                            app.close_store_view();
+                            app.launcher.status = Some("switched to plaintext mode".into());
+                        }
+                        Ok(false) => {}
+                        Err(SshrackError::Interrupted) => {
+                            // User cancelled the confirm popup (or a vault-unlock
+                            // popup, when leaving vault). Stay in the store view.
+                            if let Some(v) = app.store_view.as_mut() {
+                                v.status = Some("cancelled".into());
+                            }
+                        }
+                        Err(e) => {
+                            if let Some(v) = app.store_view.as_mut() {
+                                v.status = Some(format!("switch failed: {e}"));
+                            }
+                        }
                     }
                 }
                 Outcome::Continue => {}
@@ -864,6 +1009,165 @@ fn persist_cred_save(app: &mut App, handle: &TerminalHandle) -> Result<(), Sshra
         app.set_config(new_cfg);
     }
     Ok(())
+}
+
+/// Which target mode a [`Outcome::SwitchToKeyring`]/[`Outcome::SwitchToVault`]/
+/// [`Outcome::SwitchToPlaintext`] intent wants. Carried so the shared
+/// [`persist_store_switch`] helper can dispatch on one enum rather than three
+/// near-identical loop arms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoreSwitchTarget {
+    Keyring,
+    Vault,
+    Plaintext,
+}
+
+/// Fulfill a store-mode switch intent. Mirrors `cli::cmd::store`'s three switch
+/// arms but swaps the UI surface: vault's master passphrase comes from
+/// [`TuiPassphrase::passphrase_confirm`] (masked double-entry popup) instead of
+/// `SSHRACK_PASSPHRASE`; plaintext's `--yes` becomes a confirm popup; keyring's
+/// availability probe surfaces in the store view's status line.
+///
+/// Returns `Ok(true)` when the switch succeeded + persisted (the loop closes
+/// the view and surfaces a launcher status). Returns `Ok(false)` when the switch
+/// was *refused* by the user or the environment (keyring daemon down, plaintext
+/// declined) and the reason is already in the store view's status line — the
+/// loop leaves the view open so the user can read it. Returns `Err` on a real
+/// core/IO failure (vault unlock cancel surfaces as [`SshrackError::Interrupted`];
+/// migrate/write errors propagate so the loop can show them).
+fn persist_store_switch(
+    app: &mut App,
+    target: StoreSwitchTarget,
+    handle: &TerminalHandle,
+) -> Result<bool, SshrackError> {
+    use sshrack_core::config::schema::SecretStore;
+    use sshrack_core::secret::PassphraseProvider;
+    use sshrack_core::secret::SecretBackend;
+    use sshrack_core::secret::{OsKeyring, vault};
+
+    // No-op when already in the target mode — surface and stay.
+    let already = match target {
+        StoreSwitchTarget::Keyring => app.config.is_keyring(),
+        StoreSwitchTarget::Vault => app.config.is_vault(),
+        StoreSwitchTarget::Plaintext => app.config.is_plaintext(),
+    };
+    if already {
+        set_store_status(app, format!("already in {} mode", target_label(target)));
+        return Ok(false);
+    }
+
+    // Leaving keyring mode needs the keyring entries readable to migrate them.
+    if app.config.is_keyring() && !OsKeyring.available() {
+        set_store_status(
+            app,
+            "keyring unavailable; cannot read keyring entries to migrate".into(),
+        );
+        return Ok(false);
+    }
+
+    let provider = TuiPassphrase::new(handle.clone());
+    let backend = OsKeyring;
+
+    match target {
+        StoreSwitchTarget::Keyring => {
+            // Probe availability first — a migrate into a dead keyring would
+            // drop plaintext on the floor.
+            if !backend.available() {
+                set_store_status(app, "OS keyring unavailable; cannot migrate".into());
+                return Ok(false);
+            }
+            // Source vault key needed only when leaving vault mode.
+            let source_key = if app.config.is_vault() {
+                let env_pw = vault::passphrase_from_env();
+                vault::ensure_unlocked_vault_key(&app.config, env_pw.as_ref(), &provider)?
+            } else {
+                None
+            };
+            vault::cache::clear_default_cache();
+            let n = vault::transform::migrate(
+                &mut app.config,
+                &SecretStore::Keyring,
+                source_key.as_ref(),
+                None,
+                &backend,
+            )?;
+            app.config.store = Some(SecretStore::Keyring);
+            persist_and_reload(app)?;
+            let _ = n;
+            Ok(true)
+        }
+        StoreSwitchTarget::Vault => {
+            // Masked double-entry popup for the new master passphrase. A cancel
+            // surfaces as Interrupted (handled by the loop as "stay in view").
+            let passphrase = provider.passphrase_confirm()?;
+            vault::cache::clear_default_cache();
+            // enable derives a fresh key, writes the verifier, migrates every
+            // existing password into vault mode, and flips cfg.store.
+            vault::enable(&mut app.config, &passphrase, None, &backend)?;
+            persist_and_reload(app)?;
+            Ok(true)
+        }
+        StoreSwitchTarget::Plaintext => {
+            // Downgrade confirmation via a popup (mirrors the CLI's --yes).
+            let text = "Switching to plaintext mode stores every password in the\n\
+                clear in config.toml. Anyone who reads the file gets every\n\
+                password. Continue?";
+            if !provider.confirm(text)? {
+                set_store_status(app, "plaintext switch declined".into());
+                return Ok(false);
+            }
+            // Source vault key needed when leaving vault mode.
+            let source_key = if app.config.is_vault() {
+                let env_pw = vault::passphrase_from_env();
+                vault::ensure_unlocked_vault_key(&app.config, env_pw.as_ref(), &provider)?
+            } else {
+                None
+            };
+            vault::cache::clear_default_cache();
+            let _n = vault::transform::migrate(
+                &mut app.config,
+                &SecretStore::Plaintext,
+                source_key.as_ref(),
+                None,
+                &backend,
+            )?;
+            app.config.store = Some(SecretStore::Plaintext);
+            persist_and_reload(app)?;
+            Ok(true)
+        }
+    }
+}
+
+/// Persist `app.config` to its on-disk path and reload it back through core's
+/// store::load (so the in-memory config round-trips through TOML and the
+/// credential-name lookup rebuilds). When no path is resolved (fresh install),
+/// keep the new config in memory only.
+fn persist_and_reload(app: &mut App) -> Result<(), SshrackError> {
+    if let Some(path) = app.config_path() {
+        sshrack_core::config::store::save(path, &app.config)?;
+        let reloaded = sshrack_core::config::store::load(path)?;
+        app.set_config(reloaded);
+    }
+    Ok(())
+}
+
+/// Set the store view's status line (best-effort: the view may be gone on a
+/// late error path). After a successful switch the loop closes the view, so a
+/// status set here only matters on a refusal / transient error that keeps the
+/// view open.
+fn set_store_status(app: &mut App, msg: String) {
+    if let Some(v) = app.store_view.as_mut() {
+        v.status = Some(msg);
+    }
+}
+
+/// The user-facing label for a [`StoreSwitchTarget`]. Used in status messages.
+fn target_label(target: StoreSwitchTarget) -> &'static str {
+    match target {
+        StoreSwitchTarget::Keyring => "keyring",
+        StoreSwitchTarget::Vault => "vault",
+        StoreSwitchTarget::Plaintext => "plaintext",
+    }
 }
 
 #[cfg(test)]
@@ -1782,5 +2086,135 @@ mod tests {
         assert_eq!(*app.mode(), Mode::Launcher);
         assert_eq!(app.config().credentials.len(), 1);
         assert_eq!(app.config().credentials[0].name, "ops");
+    }
+
+    // ===============================================================
+    // Store mode view: F2 entry, Esc cancel, persist_store_switch.
+    // ===============================================================
+
+    #[test]
+    fn f2_opens_store_view() {
+        // F2 in the launcher opens the store view (pure mode flip, no I/O).
+        let mut app = app_with_host("web");
+        let outcome = app.on_key(press(KeyCode::F(2), KeyModifiers::NONE));
+        assert!(matches!(outcome, Outcome::Continue));
+        assert_eq!(*app.mode(), Mode::Store);
+        assert!(app.store_view.is_some(), "F2 should open the store view");
+        // The active marker snapshots the current mode (undecided here).
+        assert_eq!(app.store_view.as_ref().unwrap().active_label, "undecided");
+    }
+
+    #[test]
+    fn f2_snapshots_active_mode_label_for_marker() {
+        // A config already in plaintext mode shows "plaintext (active)".
+        let cfg = SshrackConfig {
+            store: Some(SecretStore::Plaintext),
+            ..SshrackConfig::default()
+        };
+        let mut app = App::new(cfg, None, Frecency::default(), HashMap::new());
+        app.on_key(press(KeyCode::F(2), KeyModifiers::NONE));
+        assert_eq!(app.store_view.as_ref().unwrap().active_label, "plaintext");
+    }
+
+    #[test]
+    fn store_view_esc_signals_cancel() {
+        // Esc in the store view returns Cancel (pure); the loop closes the view.
+        let mut app = app_with_host("web");
+        app.on_key(press(KeyCode::F(2), KeyModifiers::NONE));
+        let outcome = app.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(outcome, Outcome::Cancel));
+        // Loop action: close the store view.
+        app.close_store_view();
+        assert_eq!(*app.mode(), Mode::Launcher);
+        assert!(app.store_view.is_none());
+    }
+
+    #[test]
+    fn store_view_down_then_enter_signals_switch_to_plaintext() {
+        // Down x2 from keyring→vault→plaintext, then Enter signals the switch.
+        let mut app = app_with_host("web");
+        app.on_key(press(KeyCode::F(2), KeyModifiers::NONE));
+        app.on_key(press(KeyCode::Down, KeyModifiers::NONE));
+        app.on_key(press(KeyCode::Down, KeyModifiers::NONE));
+        let outcome = app.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(outcome, Outcome::SwitchToPlaintext));
+    }
+
+    #[test]
+    fn store_view_enter_on_keyring_signals_switch_to_keyring() {
+        let mut app = app_with_host("web");
+        app.on_key(press(KeyCode::F(2), KeyModifiers::NONE));
+        // cursor at index 0 = keyring
+        let outcome = app.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(outcome, Outcome::SwitchToKeyring));
+    }
+
+    #[test]
+    fn store_view_enter_on_vault_signals_switch_to_vault() {
+        let mut app = app_with_host("web");
+        app.on_key(press(KeyCode::F(2), KeyModifiers::NONE));
+        app.on_key(press(KeyCode::Down, KeyModifiers::NONE)); // -> vault
+        let outcome = app.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(outcome, Outcome::SwitchToVault));
+    }
+
+    #[test]
+    fn persist_store_switch_already_in_target_is_noop_status() {
+        // Switching to plaintext when already plaintext sets a status and
+        // returns Ok(false) — no migrate, no write.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = SshrackConfig {
+            store: Some(SecretStore::Plaintext),
+            ..SshrackConfig::default()
+        };
+        sshrack_core::config::store::save(&path, &cfg).unwrap();
+        let mut app = App::new(cfg, Some(path.clone()), Frecency::default(), HashMap::new());
+        // Open the store view so set_store_status has somewhere to write.
+        app.open_store_view();
+        let result = persist_store_switch(&mut app, StoreSwitchTarget::Plaintext, &dead_handle());
+        assert!(matches!(result, Ok(false)), "already-there is Ok(false)");
+        assert!(
+            app.store_view
+                .as_ref()
+                .and_then(|v| v.status.as_deref())
+                .unwrap_or("")
+                .contains("already in plaintext mode")
+        );
+    }
+
+    #[test]
+    fn persist_store_switch_keyring_unavailable_when_no_daemon_returns_ok_false() {
+        // In a sandboxed test env the Secret Service daemon is almost always
+        // down, so OsKeyring::available() is false. The switch must refuse
+        // gracefully (Ok(false) with a status), NOT error or migrate.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = SshrackConfig {
+            store: Some(SecretStore::Plaintext),
+            ..SshrackConfig::default()
+        };
+        sshrack_core::config::store::save(&path, &cfg).unwrap();
+        let mut app = App::new(cfg, Some(path), Frecency::default(), HashMap::new());
+        app.open_store_view();
+        let result = persist_store_switch(&mut app, StoreSwitchTarget::Keyring, &dead_handle());
+        match result {
+            Ok(false) => {
+                // Daemon down → refused with a status (the expected path here).
+                let status = app
+                    .store_view
+                    .as_ref()
+                    .and_then(|v| v.status.as_deref())
+                    .unwrap_or("");
+                assert!(
+                    status.contains("unavailable"),
+                    "expected an unavailable status, got: {status}"
+                );
+            }
+            // If the daemon happens to be up in this env, the migrate runs and
+            // the switch succeeds — also a valid outcome, so accept Ok(true).
+            Ok(true) => {}
+            Err(e) => panic!("keyring switch should not error in a no-daemon env: {e}"),
+        }
     }
 }
