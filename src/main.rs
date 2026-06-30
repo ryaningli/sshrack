@@ -45,8 +45,31 @@ fn run_main() -> i32 {
     };
 
     if route_is_tui(&cli) {
+        // The TUI returns None (user quit, no connect) or a ConnectRequest for
+        // main to exec. The TerminalGuard is dropped inside tui::run before
+        // this match sees the value, so ssh inherits a restored terminal.
         return match tui::run(&cli) {
-            Ok(code) => code,
+            Ok(None) => exit_code::SUCCESS,
+            Ok(Some(req)) => {
+                // Unreachable in Task 11 (the App never produces a Connect),
+                // but compiles and is correct for Task 15. Resolve our own exe
+                // without `?` (run_main returns i32, not Result); a resolution
+                // failure is a connect-time error.
+                let exe = match sshrack_core::connect::current_exe() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        return exit_code::CONNECT;
+                    }
+                };
+                match sshrack_core::connect::launch(req.argv, req.source, &exe) {
+                    Ok(code) => code,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        exit_code::CONNECT
+                    }
+                }
+            }
             Err(e) => {
                 eprintln!("{e}");
                 exit_code::CONNECT
