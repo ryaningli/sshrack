@@ -2,5 +2,6 @@
 /docs/tmp
 /docs/superpowers/*
 !/docs/superpowers/specs
+!/docs/superpowers/plans
 /.claude
 /.superpowers
