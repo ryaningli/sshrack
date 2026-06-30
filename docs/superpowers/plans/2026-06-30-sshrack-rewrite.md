@@ -1,5 +1,7 @@
 # sshrack Rewrite Implementation Plan
 
+> **Status: Superseded for architecture.** This plan delivered the core capability layer and the original 3-crate skeleton. The **endgame plan** (`docs/superpowers/plans/2026-06-30-sshrack-endgame.md`) then collapsed the workspace to a single root binary (`src/{cli,tui,shared}` + the sole `sshrack-core` member), renamed `alias`→`name`, made the CLI fully non-interactive (no `--no-input`), and delivered the TUI MVP. Treat the architecture framing below (3 crates, `--no-input`, deferred TUI) as historical; the current architecture lives in `CLAUDE.md` and spec §2/§9.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Rebuild sshrack as a Cargo workspace with a UI-free capability core (`sshrack-core`), a non-interactive-capable CLI (`sshrack-cli`), and a deferred TUI crate — porting the verified backend from `sshrack-old` while fixing its identity model and adding first-class ULIDs, ref-by-id, frecency, and a `--no-input`/`--format json` CLI contract.

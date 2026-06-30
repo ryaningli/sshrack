@@ -136,7 +136,7 @@ pub fn connect_host(
 }
 
 /// Empty did-you-mean hint, used for the (unreachable) bare-ULID HostNotFound
-/// path so the error message stays clean. Re-declared here as a private alias
+/// path so the error message stays clean. Re-declared here as a private re-bind
 /// to keep the call site readable; the real type is in `sshrack_core::error`.
 use sshrack_core::error::DidYouMean;
 

@@ -8,14 +8,16 @@ sshrack is a terminal-native remote server management tool written in Rust. Bina
 
 It wraps the system `ssh` / `scp` (it does **not** reimplement the SSH protocol) and adds a config + credential layer, plus `SSH_ASKPASS`-based password injection for password-only hosts. Keys are preferred; passwords are the fallback.
 
-The tool has a **backend / frontend split**, like a web app:
+The tool has a **backend / frontend split**, like a web app, delivered as a single root binary `sshrack`:
 
-- **Backend** (`sshrack-core`) — a pure capability layer: host/credential management, secret storage, connection, transfer, frecency. It has **zero UI dependencies** (no `dialoguer`, no `ratatui`, no `console`). This is a compiler-enforced invariant, not a convention.
-- **Frontends** — thin views over the backend that hold no data path of their own:
-  - `sshrack-cli` — a general-purpose, non-interactive-capable command surface. Usable by humans and by scripts/automation alike. Given all flags, it completes with **zero interaction, no TTY, no prompts**. Nothing in its help or user-facing text frames it as "for AI" — it is a normal CLI tool; `--no-input` and `--format json` are neutral capability descriptions.
-  - `sshrack-tui` — a human-friendly interactive shell (**deferred**; currently an empty stub).
+- **Backend** (`sshrack-core`, the sole workspace member crate) — a pure capability layer: host/credential management, secret storage, connection, transfer, frecency. It has **zero UI dependencies** (no `ratatui`, no `crossterm`, no `nucleo-matcher`, no `console`). This is a compiler-enforced invariant, not a convention.
+- **Frontends** — both live inside the root binary (`src/`), as thin views over the backend that hold no data path of their own:
+  - `src/cli/` — a **non-interactive** command surface. The CLI **never** prompts: given all flags it completes with zero interaction, no TTY. Missing required flags error out. Usable by humans and by scripts/CI alike.
+  - `src/tui/` — a human-friendly interactive shell (ratatui 0.30 + crossterm + nucleo-matcher): launcher with frecency + fuzzy filter, host/credential add-edit wizards, store-mode switch view, connect orchestration, help overlay, consolidated status bar.
 
 Both front-ends converge on the same pure functions in core. Side effects (OS keyring I/O, master-passphrase source, host-key confirmation) are **injected via traits** defined in core, so the capability layer stays testable without a TTY or a keyring daemon.
+
+**Single-binary routing.** `src/main.rs` dispatches on the parsed subcommand: a bare `sshrack`, or `host`/`cred` `add`/`edit` carrying **no content flags**, routes to the TUI; everything else — connect shorthand, `ssh`/`scp`, `host`/`cred` `ls`/`show`/`rm`/`cp`, `store`, and any `add`/`edit` that carries a flag (a flagged field is always a CLI patch, never a wizard) — runs the non-interactive CLI. `--help`/`--version` and usage errors stay owned by clap.
 
 Passwords at rest use one of **three global storage modes** (the user picks one on first use, stored as `[store] mode = ...` in `config.toml`): **keyring** (recommended — OS keyring; the entry is keyed by the owning host/credential's stable ULID id, not the name, so renaming never orphans it), **vault** (Argon2id + XChaCha20-Poly1305 encrypted inline, unlocked by a master passphrase), or **plaintext** (stored in the clear). In keyring mode the main sshrack process never holds a password's plaintext: at connect time the `SSH_ASKPASS` helper (a fork of sshrack) fetches it directly from the keyring via `SSHRACK_KEYRING_KEY`. In plaintext/vault mode the parent stages the password in a `0600` temp file the helper reads.
 
@@ -23,51 +25,90 @@ Passwords at rest use one of **three global storage modes** (the user picks one 
 
 ## Architecture
 
-Cargo workspace, three crates:
+Cargo workspace: one member crate (the pure backend) plus the root package that is the `sshrack` binary.
 
 ```
 sshrack/
-├── Cargo.toml                  # [workspace] members + shared metadata
+├── Cargo.toml                  # [workspace] members = ["crates/sshrack-core"]; [package] = the sshrack bin
+├── src/                        # FRONTEND: the `sshrack` binary (single executable)
+│   ├── main.rs                 #   SSH_ASKPASS role dispatch + cli/tui routing (route_is_tui)
+│   ├── cli/                    #   NON-INTERACTIVE command surface (never prompts)
+│   │   ├── args.rs             #     clap derive (Cli/Command/HostAction/CredAction/StoreAction)
+│   │   ├── table.rs            #     text table rendering for ls/show
+│   │   └── mod.rs              #     cmd handlers (connect/scp/host/cred/store) + run()
+│   ├── tui/                    #   INTERACTIVE ratatui shell
+│   │   ├── launcher.rs         #     frecency-tiered host list + nucleo fuzzy filter + key bindings
+│   │   ├── wizard.rs           #     host add/edit + credential add/edit wizards
+│   │   ├── store.rs            #     store-mode switch view (keyring/vault/plaintext)
+│   │   ├── connect.rs          #     ConnectRequest orchestration + delayed exec handoff
+│   │   ├── prompt.rs           #     TUI PassphraseProvider impl (crossterm-based)
+│   │   ├── popup.rs            #     delete/confirm popups
+│   │   ├── help.rs             #     F1 help overlay
+│   │   ├── app.rs              #     top-level App loop + consolidated status bar
+│   │   └── mod.rs              #     TerminalGuard + run() entry
+│   └── shared/
+│       ├── format.rs           #     --format json|text output shapes (locked contract)
+│       ├── exit_code.rs        #     stable exit codes
+│       └── mod.rs
 └── crates/
-    ├── sshrack-core/           # BACKEND: pure capability, ZERO UI deps
-    │   └── src/
-    │       ├── config/         #   TOML schema + atomic load/save + path
-    │       ├── connect/        #   ssh/scp argv assembly + zero-copy launcher + SSH_ASKPASS env wiring
-    │       ├── secret/         #   SecretBackend/PassphraseProvider traits + keyring + vault/{crypto,cache,transform}
-    │       ├── credential.rs   #   auth resolution (ref-by-id), credential CRUD pure logic
-    │       ├── host.rs         #   name validation, host CRUD pure logic
-    │       ├── hostkey.rs      #   proactive host-key pre-flight (ssh-keyscan + injected confirm)
-    │       ├── frecency/       #   zoxide-style scoring + machine-local persistence
-    │       ├── askpass.rs      #   askpass protocol (temp-file / keyring branches)
-    │       ├── id.rs           #   ULID identity helpers + keyring-key derivation
-    │       ├── fsutil.rs       #   0600 atomic write helper (shared)
-    │       ├── suggest.rs      #   did-you-mean fuzzy hint
-    │       └── error.rs        #   SshrackError (thiserror)
-    ├── sshrack-cli/            # FRONTEND 1: the `sshrack` binary
-    │   └── src/
-    │       ├── main.rs         #   SSH_ASKPASS role dispatch + CLI entry
-    │       ├── cli.rs          #   clap derive (Cli/Command/HostAction/CredAction/StoreAction)
-    │       ├── cmd/            #   connect/scp/host/cred/store handlers + shared
-    │       ├── prompt.rs       #   DialoguerPassphrase + password_mode menu + --no-input confirm
-    │       ├── format.rs       #   --format json|text output shapes (locked contract)
-    │       └── exit_code.rs    #   stable exit codes
-    └── sshrack-tui/            # FRONTEND 2: ratatui shell (DEFERRED — empty stub)
+    └── sshrack-core/           # BACKEND: pure capability, ZERO UI deps (the only workspace member)
+        └── src/
+            ├── config/         #   TOML schema + atomic load/save + path
+            ├── connect/        #   ssh/scp argv assembly + zero-copy launcher + SSH_ASKPASS env wiring
+            ├── secret/         #   SecretBackend/PassphraseProvider traits + keyring + vault/{crypto,cache,transform}
+            ├── credential.rs   #   auth resolution (ref-by-id), credential CRUD pure logic
+            ├── host.rs         #   name validation, host CRUD pure logic
+            ├── hostkey.rs      #   proactive host-key pre-flight (ssh-keyscan + injected confirm)
+            ├── frecency/       #   zoxide-style scoring + machine-local persistence
+            ├── askpass.rs      #   askpass protocol (temp-file / keyring branches)
+            ├── id.rs           #   ULID identity helpers + keyring-key derivation
+            ├── fsutil.rs       #   0600 atomic write helper (shared)
+            ├── suggest.rs      #   did-you-mean fuzzy hint
+            └── error.rs        #   SshrackError (thiserror)
 ```
+
+### Routing rule (the contract)
+
+| Invocation | Routes to |
+|---|---|
+| `sshrack` (bare) | TUI launcher |
+| `sshrack host add` (no flags, no name) | TUI host-add wizard |
+| `sshrack host edit <name>` (no edit flags) | TUI host-edit wizard |
+| `sshrack cred add` (no flags, no name) | TUI cred-add wizard |
+| `sshrack cred edit <name>` (no edit flags) | TUI cred-edit wizard |
+| anything else | CLI (non-interactive) |
+
+A flagged field is **always** a CLI patch, never a wizard — `host edit x --port 22` is the CLI; `host edit x` is the wizard. A name positional alone on `host add x` is the CLI (which then errors: missing `--host`); only a truly flag-less `host add` opens the wizard.
+
+### TUI keys
+
+| Key | Action |
+|---|---|
+| `↑`/`↓` or `^n`/`^p` | move selection |
+| type | fuzzy-filter query (`⌫` delete, `^a`/`^e` home/end) |
+| `Enter` | connect to selected host |
+| `c` | add credential (`^c` cancels a popup/wizard) |
+| `Shift-C` | store-mode switch view |
+| `^a` (launcher) / `^e` (launcher) | add host / edit host |
+| `^d` | delete selected host (confirm popup) |
+| `F1` or `?` | help overlay |
+| `F2` | store-mode switch view |
+| `Esc` | cancel popup / close overlay / quit (twice from launcher) |
 
 ### Invariants
 
-- `sshrack-core/Cargo.toml` **never** lists `dialoguer`, `ratatui`, or `console`. Adding any of them is a build failure by intent.
-- Side effects are injected via traits: core defines `secret::SecretBackend` (keyring set/get/delete/available), `secret::PassphraseProvider` (passphrase/passphrase_confirm/confirm), and `hostkey::run_host_key_flow` takes a `confirm: impl FnOnce(&str) -> bool` callback. The CLI injects dialoguer-based impls (or `NoInputPassphrase` under `--no-input`); tests inject fakes.
-- The shipped `sshrack` binary is a **single executable** that doubles as its own `SSH_ASKPASS` helper: `main.rs` dispatches on `SSHRACK_ASKPASS_FILE` / `SSHRACK_KEYRING_KEY` to the askpass role, otherwise parses the CLI.
+- `sshrack-core/Cargo.toml` **never** lists `ratatui`, `crossterm`, `nucleo-matcher`, or `console`. UI crates are dependencies of the root package only. Adding any of them to core is a build failure by intent.
+- Side effects are injected via traits: core defines `secret::SecretBackend` (keyring set/get/delete/available), `secret::PassphraseProvider` (passphrase/passphrase_confirm/confirm), and `hostkey::run_host_key_flow` takes a `confirm: impl FnOnce(&str) -> bool` callback. The TUI injects crossterm-based impls; the CLI reads the vault passphrase from `SSHRACK_PASSPHRASE` (no prompt); tests inject fakes.
+- The shipped `sshrack` binary is a **single executable** that doubles as its own `SSH_ASKPASS` helper: `main.rs` dispatches on `SSHRACK_ASKPASS_FILE` / `SSHRACK_KEYRING_KEY` to the askpass role, otherwise parses the CLI and routes cli vs tui.
 - The connect path **never sits in the ssh data stream**: `ssh`/`scp` are spawned with inherited stdio. There is no PTY pump.
 - `frecency` is persisted **before** spawning ssh, so a hung ssh never loses the usage record.
 
 ## Build Commands
 
 ```bash
-cargo build --workspace             # Build all crates
+cargo build --workspace             # Build core + the sshrack binary
 cargo build --release               # Production build
-cargo run -p sshrack-cli -- --help  # Run the binary
+cargo run -- --help                 # Run the binary (CLI help); bare `cargo run -q --` opens the TUI
 cargo fmt                           # Format code
 cargo clippy --workspace --all-targets -- -D warnings   # Lint (warnings as errors, incl. tests)
 cargo test --workspace              # Run all tests
@@ -128,19 +169,23 @@ Both `Host` and `Credential` carry a **first-class, immutable `id: Ulid`** (gene
 
 ## CLI Contract
 
-The CLI is a general-purpose tool. Its non-interactive contract (first period):
+The CLI (`src/cli/`) is **always non-interactive** — it never prompts. Anything that needs input the CLI cannot supply (a password, a master passphrase, a destructive confirmation, an interactive host/cred edit) is either rejected with an error or sourced from the environment, never from a TTY. Interactive flows live in the TUI.
 
 | Capability | Behavior |
 |---|---|
-| `--no-input` | Missing fields do **not** prompt; the command errors and exits. Full flags ⇒ zero-interaction completion. Safe for scripts/CI. |
+| Non-interactive by construction | No `--no-input` flag exists. Missing required flags ⇒ error + exit `2`/`6`. Safe for scripts/CI by default. |
+| `--accept-new` | Accept a host key seen for the first time (like ssh's `accept-new`). Available globally and per-subcommand. |
+| `--yes` (destructive) | Required for `host rm`, `cred rm`, and `store use plaintext` (the plaintext downgrade wipes/seals secrets). Without it the command errors. Interactive confirm lives in the TUI. |
 | `--format json` (global) | Query/management commands emit structured JSON (locked field names). Default is human-readable text. |
+| `SSHRACK_PASSPHRASE` (env) | Supplies the vault master passphrase on the CLI path (e.g. `store use vault`, `store rekey`). There is no CLI passphrase prompt — set the env var or use the TUI. |
 | Stable exit codes | `0` success; `2` usage; `4` not-found; `5` duplicate; `6` validation; `7` connect; `8` store. |
 
 **Hard rules carried from prior pain:**
 
 1. **clap derive parses everything** — no hand-written parse/dispatch.
-2. **Patch commands touch only the named fields** — supplying a flag must not pop an interactive menu for an unspecified field.
-3. **Fail-fast validation precedes interaction and network IO** — duplicate / not-found / reserved-word checks, and connection-path local checks (credential existence via `credential::resolve`), run *before* any prompt and *before* any network IO.
+2. **Patch commands touch only the named fields** — supplying a flag must not pop an interactive menu for an unspecified field (the patch-vs-wizard line is enforced by `route_is_tui`).
+3. **Fail-fast validation precedes network IO** — duplicate / not-found / reserved-word checks, and connection-path local checks (credential existence via `credential::resolve`), run *before* any network IO. (There is no interaction to precede — the CLI does not prompt.)
+4. **Passwords never enter argv** — a password credential cannot be created from the CLI; use the TUI for that.
 
 ## Storage & Security
 
@@ -182,13 +227,26 @@ sshrack is an orchestration layer over the system OpenSSH. Do **not** introduce 
 - Keep plaintext passwords in memory for the shortest possible lifetime; do not park them in long-lived structs.
 - Code that handles passwords must respect which storage path it is on (keyring vs vault/plaintext temp-file).
 
-## Deferred (out of first period)
+## TUI (delivered)
 
-- **TUI** (`sshrack-tui`): HostPicker launcher (frecency + fuzzy), host/cred/store CRUD views, which-key help, deferred-connect tear-down/restore handoff.
+The interactive shell (`src/tui/`) is delivered: launcher (frecency-tiered host list + nucleo fuzzy filter), host add/edit wizard, credential add/edit wizard, store-mode switch view (keyring/vault/plaintext), delete-confirm popups, connect orchestration with delayed exec (the terminal is restored before `ssh` inherits it), F1 help overlay, and a consolidated status bar. It is reached by a bare `sshrack`, or by `host`/`cred` `add`/`edit` with no content flags.
+
+## Later phase (still deferred)
+
 - **`sshrack sftp`** + dual-pane SFTP transfer (ControlMaster + `sftp -b -`, tiered progress).
 - Port forwarding, `~/.ssh/config` read-only import, 2FA, `print-command` + clipboard.
 
 The CLI scriptable-transfer moat (`sshrack scp`) and non-interactive command execution (`sshrack <name> <cmd>`) remain first-class.
+
+## Breaking Changes (vs. the predecessor `sshrack-old`)
+
+Recorded for migration; this project is pre-1.0 and carries no compat shim (per the dev-stage rule).
+
+- **Identifier rename `alias` → `name`.** JSON output keys `alias`→`name` and `credential_alias`→`credential_name`; TOML key `alias`→`name` in hosts and credentials. `--credential` accepts a name.
+- **`--no-input` removed.** The CLI is non-interactive by construction; there is no flag to toggle. Missing required flags now error directly.
+- **`host rm` / `cred rm` require `--yes`.** Plain-text store downgrade (`store use plaintext`) also requires `--yes`.
+- **`store use vault` / `store rekey` are env-only on the CLI path.** The vault passphrase must come from `SSHRACK_PASSPHRASE`; there is no CLI passphrase prompt. Use the TUI for an interactive prompt.
+- **Workspace collapsed to one member crate.** `sshrack-cli` and `sshrack-tui` no longer exist as separate crates — their sources moved into the root `src/{cli,tui,shared}` of the single `sshrack` binary. Only `sshrack-core` remains as a workspace member.
 
 ## Git Commit Convention
 
@@ -271,7 +329,7 @@ Use `cargo add -p <crate>` instead of editing `Cargo.toml` directly.
 
 ```bash
 cargo add serde -p sshrack-core --features derive
-cargo add serde_json -p sshrack-cli
+cargo add serde_json -p sshrack               # the root binary package
 cargo add -D proptest                         # Dev dependency
 ```
 

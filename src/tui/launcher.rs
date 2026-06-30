@@ -451,7 +451,7 @@ impl Launcher {
 }
 
 /// Build the display line for one host: the name with fuzzy-matched chars
-/// highlighted, the address/port dimmed, the credential alias (or inline user)
+/// highlighted, the address/port dimmed, the credential name (or inline user)
 /// dimmed, and the frecency tier on the right.
 fn host_line(
     host: &Host,

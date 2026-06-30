@@ -16,7 +16,7 @@ do, in two front-ends over one capability core:
   scripts/agents alike. The distinguishing trait is that, given all flags, it completes with
   **zero interaction, no TTY, no prompts**. It is a normal CLI tool; nothing in its help or
   user-facing text frames it as "for AI".
-- **TUI** — a human-friendly interactive shell (deferred; see §9). Modern, direct, ergonomic.
+- **TUI** — a human-friendly interactive shell (delivered; see §9). Modern, direct, ergonomic.
 
 The guiding mental model is **backend / frontend separation**: the backend is a pure capability
 layer (host/cred/connect/transfer/store/secret); the front-ends are *views* over it and hold no
@@ -32,37 +32,39 @@ library — that is a hard, machine-checked invariant, not a convention.
 
 ```
 sshrack/                       # workspace root
-├── Cargo.toml                 # [workspace] members
+├── Cargo.toml                 # [workspace] members = ["crates/sshrack-core"]; [package] = the sshrack bin
+├── src/                        # FRONTEND: the single sshrack binary
+│   ├── main.rs                 #   SSH_ASKPASS role dispatch + cli/tui routing (route_is_tui)
+│   ├── cli/                    #   FRONTEND 1: NON-INTERACTIVE (never prompts); clap derive, --format json
+│   ├── tui/                    #   FRONTEND 2: ratatui + crossterm + nucleo-matcher (delivered)
+│   └── shared/                 #   format.rs (json|text shapes) + exit_code.rs
 ├── crates/
-│   ├── sshrack-core/          # BACKEND: pure capability layer, ZERO UI deps
-│   │   ├── config/            #   TOML schema + atomic load/save
-│   │   ├── id/                #   Ulid identity helpers (host + cred)
-│   │   ├── credential/        #   auth resolution, cred CRUD logic (pure)
-│   │   ├── host/              #   name resolution, host CRUD logic (pure)
-│   │   ├── secret/            #   store mode + trait SecretBackend / PassphraseProvider
-│   │   │   ├── keyring.rs      #     OS keyring I/O (behind the trait)
-│   │   │   └── vault/         #     argon2id + xchacha20poly1305 (ported), TTL cache + verifier
-│   │   ├── connect/           #   ssh argv assembly + zero-copy launcher + SSH_ASKPASS wiring
-│   │   ├── transfer/          #   scp argv assembly (scriptable transfer)
-│   │   ├── hostkey/           #   proactive host-key pre-flight (ssh-keyscan + confirm callback)
-│   │   ├── frecency/          #   zoxide-style scoring + machine-local persistence
-│   │   └── askpass/           #   askpass protocol logic
-│   ├── sshrack-cli/           # FRONTEND 1: clap derive, --no-input, --format json
-│   │   └── main.rs            #   also hosts the SSH_ASKPASS role dispatch (single binary)
-│   └── sshrack-tui/           # FRONTEND 2: ratatui (DEFERRED — empty shell first期 if built at all)
+│   └── sshrack-core/          # BACKEND: pure capability layer, ZERO UI deps (sole workspace member)
+│       ├── config/            #   TOML schema + atomic load/save
+│       ├── id.rs              #   Ulid identity helpers (host + cred)
+│       ├── credential.rs      #   auth resolution, cred CRUD logic (pure)
+│       ├── host.rs            #   name resolution, host CRUD logic (pure)
+│       ├── secret/            #   store mode + trait SecretBackend / PassphraseProvider
+│       │   ├── keyring.rs      #     OS keyring I/O (behind the trait)
+│       │   └── vault/         #     argon2id + xchacha20poly1305 (ported), TTL cache + verifier
+│       ├── connect/           #   ssh/scp argv assembly + zero-copy launcher + SSH_ASKPASS wiring
+│       ├── hostkey.rs         #   proactive host-key pre-flight (ssh-keyscan + confirm callback)
+│       ├── frecency/          #   zoxide-style scoring + machine-local persistence
+│       └── askpass.rs         #   askpass protocol logic
 └── docs/
 ```
 
 ### 2.1 Invariants
 
-- `sshrack-core/Cargo.toml` **never** lists `dialoguer`, `ratatui`, or `console`. The compiler
-  guarantees backend purity.
+- `sshrack-core/Cargo.toml` **never** lists `ratatui`, `crossterm`, `nucleo-matcher`, or
+  `console`. UI crates are dependencies of the root package only. The compiler guarantees
+  backend purity.
 - Side effects are **injected via traits**. Core defines `SecretBackend`, `PassphraseProvider`,
-  and a host-key confirmation callback. The CLI injects non-interactive / env / error
-  implementations; the TUI will later inject dialog-based implementations.
+  and a host-key confirmation callback. The CLI injects non-interactive / env (`SSHRACK_PASSPHRASE`) / error
+  implementations; the TUI injects crossterm-based dialog implementations.
 - The shipped binary is a **single executable**: `sshrack` doubles as its own `SSH_ASKPASS`
-  helper (ssh forks `SSH_ASKPASS`, which points back at sshrack). Role dispatch lives in the CLI
-  crate's `main.rs`; the askpass *protocol* logic lives in core.
+  helper (ssh forks `SSH_ASKPASS`, which points back at sshrack). Role dispatch lives in the root
+  `src/main.rs`; the askpass *protocol* logic lives in core.
 
 ## 3. CLI Command Surface (first期)
 
@@ -216,15 +218,23 @@ host inventory is a few KB, CRUD rewrite is cheap). frecency is split out becaus
 high-frequency writer and must never follow a cross-machine sync. macOS path follows
 `directories` conventions.
 
-## 9. Scope: Deferred to the TUI Phase
+## 9. Scope: TUI Delivered; Later Phase
 
-- **TUI** (ratatui): HostPicker launcher (frecency + nucleo fuzzy), host/cred/store CRUD views,
-  which-key help, deferred-connect tear-down/restore handoff.
+The TUI MVP is **delivered** (endgame plan `2026-06-30-sshrack-endgame.md`). The single root
+binary `sshrack` now carries both front-ends: a non-interactive CLI (`src/cli/`) and an
+interactive ratatui shell (`src/tui/`), routed by `src/main.rs`. Delivered TUI surface:
+- **Launcher** — frecency-tiered host list + nucleo fuzzy filter, key-bound navigation.
+- **Wizards** — host add/edit and credential add/edit, with store-mode-aware sealing.
+- **Store view** — switch among keyring / vault / plaintext; vault unlocked via a prompt.
+- **Connect** — ConnectRequest built in the loop, terminal restored, then `ssh` exec'd.
+- **Popups + help + status bar** — delete-confirm, F1 help overlay, consolidated status line.
+
+**Still deferred to a later phase:**
 - **`sshrack sftp`** + dual-pane SFTP transfer (ControlMaster + `sftp -b -`, tiered progress).
 - Port forwarding, `~/.ssh/config` read-only import, 2FA, `print-command` + clipboard.
 
-These are explicitly out of first期 scope. The CLI scriptable-transfer moat (`sshrack scp`) and
-non-interactive command execution (`sshrack <name> <cmd>`) remain first-class and untouched.
+The CLI scriptable-transfer moat (`sshrack scp`) and non-interactive command execution
+(`sshrack <name> <cmd>`) remain first-class and untouched.
 
 ## 10. Testing Strategy
 
@@ -264,4 +274,4 @@ Each slice obeys the hard rules (pure-logic TDD, clippy `-D warnings`, fmt, Engl
 6. **frecency** — `rank()` + machine-local persistence; `host ls --sort frecency`.
 7. **Test pass + polish** — integration coverage, clippy, fmt, docs.
 
-Then a separate TUI phase (see §9), starting from the trait seams already in place.
+Then the TUI phase (see §9), delivered by the endgame plan, reusing the trait seams already in place.

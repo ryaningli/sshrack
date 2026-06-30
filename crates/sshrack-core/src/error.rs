@@ -235,14 +235,14 @@ pub enum SshrackError {
 }
 
 impl SshrackError {
-    /// Convert an io error raised by a `dialoguer`/`console` prompt.
+    /// Convert an io error raised by a TUI prompt (crossterm-based).
     ///
-    /// A Ctrl+C surfaces from `console` as [`std::io::ErrorKind::Interrupted`]
-    /// (it translates the raw `\x03` into `raise(SIGINT)`); map that to the
-    /// silent [`SshrackError::Interrupted`] cancel rather than a noisy io
-    /// failure. Anything else is a genuine io error. Accepts any
-    /// `Into<io::Error>` so both `dialoguer::Error` and `io::Error` map in one
-    /// step, letting call sites drop their per-module `io_err` helpers.
+    /// A Ctrl+C surfaces from the terminal layer as
+    /// [`std::io::ErrorKind::Interrupted`]; map that to the silent
+    /// [`SshrackError::Interrupted`] cancel rather than a noisy io failure.
+    /// Anything else is a genuine io error. Accepts any `Into<io::Error>` so
+    /// both prompt-layer errors and raw `io::Error` map in one step, letting
+    /// call sites drop their per-module `io_err` helpers.
     pub fn from_prompt_io(error: impl Into<std::io::Error>) -> Self {
         let error = error.into();
         if error.kind() == std::io::ErrorKind::Interrupted {
