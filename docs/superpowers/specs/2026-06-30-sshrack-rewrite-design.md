@@ -38,7 +38,7 @@ sshrack/                       # workspace root
 │   │   ├── config/            #   TOML schema + atomic load/save
 │   │   ├── id/                #   Ulid identity helpers (host + cred)
 │   │   ├── credential/        #   auth resolution, cred CRUD logic (pure)
-│   │   ├── host/              #   alias resolution, host CRUD logic (pure)
+│   │   ├── host/              #   name resolution, host CRUD logic (pure)
 │   │   ├── secret/            #   store mode + trait SecretBackend / PassphraseProvider
 │   │   │   ├── keyring.rs      #     OS keyring I/O (behind the trait)
 │   │   │   └── vault/         #     argon2id + xchacha20poly1305 (ported), TTL cache + verifier
@@ -69,9 +69,9 @@ sshrack/                       # workspace root
 Verb-noun grouping, all parsed with **clap derive** (no hand-written parse/dispatch — see §6).
 
 ```
-sshrack <alias> [cmd...]          # connect / run remote command (bare alias)
-sshrack ssh <alias> [cmd...]      # explicit connect
-sshrack scp <src> <dst>           # scriptable transfer (alias:path expansion)
+sshrack <name> [cmd...]          # connect / run remote command (bare name)
+sshrack ssh <name> [cmd...]      # explicit connect
+sshrack scp <src> <dst>           # scriptable transfer (name:path expansion)
 
 sshrack host  add|ls|show|edit|rm|cp     # host CRUD
 sshrack cred  add|ls|show|edit|rm        # credential CRUD
@@ -90,7 +90,7 @@ Deferred to the TUI phase: `sshrack sftp` (interactive/batch SFTP browsing).
 
 ### 3.2 `host ls` sorting (frecency透出)
 
-`host ls --sort frecency|alias|recent` surfaces the backend frecency capability even without a
+`host ls --sort frecency|name|recent` surfaces the backend frecency capability even without a
 TUI. Default sort order is configurable.
 
 ### 3.3 Hard rules carried over from prior pain (memory)
@@ -108,12 +108,12 @@ TUI. Default sort order is configurable.
 
 Both host and credential carry a **first-class, immutable `id: Ulid`**, generated at creation.
 This corrects sshrack-old, where the id existed only to key the keyring. The id now feeds three
-things: keyring keying, frecency keying, and cross-object references. The `alias` is a
+things: keyring keying, frecency keying, and cross-object references. The `name` is a
 human-readable, mutable, unique handle (renamable).
 
 `host.auth` references a credential **by id** (immutable; rename never breaks the link). For
-human readability, `ls`/`show` resolve and display the alias; on `add`/`edit` the user specifies
-a credential by alias and the CLI resolves it to an id before persisting (an interaction-layer
+human readability, `ls`/`show` resolve and display the name; on `add`/`edit` the user specifies
+a credential by name and the CLI resolves it to an id before persisting (an interaction-layer
 nicety that does not affect the on-disk form).
 
 ```toml
@@ -122,13 +122,13 @@ mode = "keyring"                # or "vault" (+ KDF fields) or "plaintext"
 
 [[credentials]]
 id = "01J8X...ULID"             # first-class immutable identity
-alias = "team-deploy"           # mutable unique handle
+name = "team-deploy"            # mutable unique handle
 user = "deploy"
 key = "~/.ssh/team_ed25519"
 
 [[hosts]]
 id = "01J8Y...ULID"             # first-class immutable identity (keyring + frecency + refs)
-alias = "web-prod"
+name = "web-prod"
 host = "10.0.1.5"
 port = 22
 auth = { credential = "01J8X...ULID" }   # reference by cred id — never dangles on rename
@@ -224,7 +224,7 @@ high-frequency writer and must never follow a cross-machine sync. macOS path fol
 - Port forwarding, `~/.ssh/config` read-only import, 2FA, `print-command` + clipboard.
 
 These are explicitly out of first期 scope. The CLI scriptable-transfer moat (`sshrack scp`) and
-non-interactive command execution (`sshrack <alias> <cmd>`) remain first-class and untouched.
+non-interactive command execution (`sshrack <name> <cmd>`) remain first-class and untouched.
 
 ## 10. Testing Strategy
 
@@ -259,7 +259,7 @@ Each slice obeys the hard rules (pure-logic TDD, clippy `-D warnings`, fmt, Engl
    traits; keyring impl behind the trait.
 4. **askpass + connect** — port askpass protocol (core) + role dispatch (cli main); zero-copy
    launcher; ssh/scp argv assembly; host-key pre-flight with injected confirm.
-5. **CLI command surface** — clap derive for `<alias>`/`ssh`/`scp`/`host`/`cred`/`store`;
+5. **CLI command surface** — clap derive for `<name>`/`ssh`/`scp`/`host`/`cred`/`store`;
    `--no-input`, `--format json`, stable exit codes; dialoguer interaction in cli only.
 6. **frecency** — `rank()` + machine-local persistence; `host ls --sort frecency`.
 7. **Test pass + polish** — integration coverage, clippy, fmt, docs.

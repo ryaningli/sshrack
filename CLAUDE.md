@@ -17,7 +17,7 @@ The tool has a **backend / frontend split**, like a web app:
 
 Both front-ends converge on the same pure functions in core. Side effects (OS keyring I/O, master-passphrase source, host-key confirmation) are **injected via traits** defined in core, so the capability layer stays testable without a TTY or a keyring daemon.
 
-Passwords at rest use one of **three global storage modes** (the user picks one on first use, stored as `[store] mode = ...` in `config.toml`): **keyring** (recommended — OS keyring; the entry is keyed by the owning host/credential's stable ULID id, not the alias, so renaming never orphans it), **vault** (Argon2id + XChaCha20-Poly1305 encrypted inline, unlocked by a master passphrase), or **plaintext** (stored in the clear). In keyring mode the main sshrack process never holds a password's plaintext: at connect time the `SSH_ASKPASS` helper (a fork of sshrack) fetches it directly from the keyring via `SSHRACK_KEYRING_KEY`. In plaintext/vault mode the parent stages the password in a `0600` temp file the helper reads.
+Passwords at rest use one of **three global storage modes** (the user picks one on first use, stored as `[store] mode = ...` in `config.toml`): **keyring** (recommended — OS keyring; the entry is keyed by the owning host/credential's stable ULID id, not the name, so renaming never orphans it), **vault** (Argon2id + XChaCha20-Poly1305 encrypted inline, unlocked by a master passphrase), or **plaintext** (stored in the clear). In keyring mode the main sshrack process never holds a password's plaintext: at connect time the `SSH_ASKPASS` helper (a fork of sshrack) fetches it directly from the keyring via `SSHRACK_KEYRING_KEY`. In plaintext/vault mode the parent stages the password in a `0600` temp file the helper reads.
 
 **Keyring lifecycle.** Removing a keyring-password host/credential deletes its keyring entry, so no orphaned secret is left behind. `host cp` copies the source's keyring entry to the copy's fresh id. `host add --force` overwriting a keyring-marked host also cleans up the old entry.
 
@@ -35,7 +35,7 @@ sshrack/
     │       ├── connect/        #   ssh/scp argv assembly + zero-copy launcher + SSH_ASKPASS env wiring
     │       ├── secret/         #   SecretBackend/PassphraseProvider traits + keyring + vault/{crypto,cache,transform}
     │       ├── credential.rs   #   auth resolution (ref-by-id), credential CRUD pure logic
-    │       ├── host.rs         #   alias validation, host CRUD pure logic
+    │       ├── host.rs         #   name validation, host CRUD pure logic
     │       ├── hostkey.rs      #   proactive host-key pre-flight (ssh-keyscan + injected confirm)
     │       ├── frecency/       #   zoxide-style scoring + machine-local persistence
     │       ├── askpass.rs      #   askpass protocol (temp-file / keyring branches)
@@ -95,7 +95,7 @@ Do not block on clippy or formatting while the actual issue is still unresolved.
 - **English only** — all source code, comments, doc comments, error messages, help text, and log output must be in English. Commit messages follow the same rule (see Git Commit Convention).
 - **Zero `unsafe`** — no unsafe blocks allowed, ever, including in tests. (Rust 2024 made `std::env::set_var` unsafe; tests must inject values via parameters/seams rather than mutate the real env.)
 - **Zero `unwrap()` / `expect()`** in production code. Only permitted in `#[cfg(test)]` modules and genuinely unreachable states with `expect("invariant: ...")`.
-- **TDD for pure logic** — write tests before implementation (RED → GREEN → REFACTOR) for pure-logic modules (config parsing, command assembly, credential encode/decode, alias resolution, frecency scoring). Process/PTY-dependent behavior is covered by integration tests instead.
+- **TDD for pure logic** — write tests before implementation (RED → GREEN → REFACTOR) for pure-logic modules (config parsing, command assembly, credential encode/decode, name resolution, frecency scoring). Process/PTY-dependent behavior is covered by integration tests instead.
 - **Write enough tests** — unit tests for pure logic; integration tests where feasible (spawning a local mock process, exercising the connect path). There is no hard coverage gate — use judgment to cover meaningful branches and edge cases, including failure paths.
 - **Clippy strict** — `cargo clippy --workspace --all-targets -- -D warnings` must pass before every commit.
 - **Format** — `cargo fmt` must pass before every commit.
@@ -120,9 +120,9 @@ Do not block on clippy or formatting while the actual issue is still unresolved.
 
 ## Identity & Config Model
 
-Both `Host` and `Credential` carry a **first-class, immutable `id: Ulid`** (generated at construction via `id::new_id()`). The id feeds three things: keyring keying, frecency keying, and cross-object references. The `alias` is a human-readable, mutable, unique handle (renamable).
+Both `Host` and `Credential` carry a **first-class, immutable `id: Ulid`** (generated at construction via `id::new_id()`). The id feeds three things: keyring keying, frecency keying, and cross-object references. The `name` is a human-readable, mutable, unique handle (renamable).
 
-- **Reference by id.** `host.auth` references a credential by its ULID (`Auth::Ref { credential: Ulid }`), not by alias. **Renaming a credential never dangles a host reference.** For human readability, `host ls`/`show` reverse-resolve id→alias; on `add`/`edit` the user specifies a credential by alias and the CLI resolves it to an id before persisting.
+- **Reference by id.** `host.auth` references a credential by its ULID (`Auth::Ref { credential: Ulid }`), not by name. **Renaming a credential never dangles a host reference.** For human readability, `host ls`/`show` reverse-resolve id→name; on `add`/`edit` the user specifies a credential by name and the CLI resolves it to an id before persisting.
 - A `format_version` field (currently `1`) is included for future migrations.
 - `CredentialBody` (user + optional secret) carries no id — the id lives on the owner.
 
@@ -188,7 +188,7 @@ sshrack is an orchestration layer over the system OpenSSH. Do **not** introduce 
 - **`sshrack sftp`** + dual-pane SFTP transfer (ControlMaster + `sftp -b -`, tiered progress).
 - Port forwarding, `~/.ssh/config` read-only import, 2FA, `print-command` + clipboard.
 
-The CLI scriptable-transfer moat (`sshrack scp`) and non-interactive command execution (`sshrack <alias> <cmd>`) remain first-class.
+The CLI scriptable-transfer moat (`sshrack scp`) and non-interactive command execution (`sshrack <name> <cmd>`) remain first-class.
 
 ## Git Commit Convention
 

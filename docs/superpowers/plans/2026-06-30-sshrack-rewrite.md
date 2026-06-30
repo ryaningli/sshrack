@@ -21,7 +21,7 @@ Copied verbatim from `docs/superpowers/specs/2026-06-30-sshrack-rewrite-design.m
 - **Passwords are `Zeroizing<String>`** end-to-end; never logged, printed, or embedded in errors; keyring mode main process never materializes plaintext.
 - **Tests are hermetic**: `cargo test` is green in a real shell with `SSHRACK_PASSPHRASE` set; no `env -u` fallback.
 - **CLI is a general-purpose tool**: help/errors/commit messages must NOT say "for AI" or "for agents". `--no-input` and `--format json` are neutral capability descriptions.
-- **No compatibility/transition code** (dev stage, unreleased): no parsing of legacy alias-refs, no dual-form shims. `format_version` starts at `1`.
+- **No compatibility/transition code** (dev stage, unreleased): no parsing of legacy name-refs, no dual-form shims. `format_version` starts at `1`.
 - **Hard rules carried from prior pain**: clap derive parses everything (no hand-written dispatch); patch commands touch only named fields; fail-fast validation precedes interaction and network IO.
 - MSRV 1.86. Predecessor source is at `/home/ryan/workspace/open-source/sshrack-old`.
 
@@ -56,7 +56,7 @@ sshrack/
 │   │       │       ├── cache.rs       # ported TTL cache + verifier
 │   │       │       └── transform.rs   # ported migrate
 │   │       ├── credential.rs          # ported + ref-by-id resolve
-│   │       ├── host.rs                # ported alias validation/CRUD pure logic
+│   │       ├── host.rs                # ported name validation/CRUD pure logic
 │   │       ├── suggest.rs             # ported fuzzy did-you-mean
 │   │       ├── connect/
 │   │       │   ├── mod.rs             # ported zero-copy launcher
@@ -77,7 +77,7 @@ sshrack/
 │   │       ├── exit_code.rs           # NEW: stable exit codes
 │   │       └── cmd/
 │   │           ├── mod.rs
-│   │           ├── connect.rs         # <alias>/ssh route: resolve+hostkey+launch
+│   │           ├── connect.rs         # <name>/ssh route: resolve+hostkey+launch
 │   │           ├── scp.rs             # scp route
 │   │           ├── host.rs            # host add/ls/show/edit/rm/cp
 │   │           ├── cred.rs            # cred add/ls/show/edit/rm
@@ -91,7 +91,7 @@ sshrack/
 **Key redesign vs sshrack-old** (the highest-value work in this plan; everything else is port + verify):
 
 1. **First-class top-level id.** `Host` and `Credential` each carry `id: Ulid` as a first-class immutable field generated at construction. The `id` no longer lives on `CredentialBody` (it was there only for keyring keying). keyring and frecency both key off the owning object's top-level id — one identity layer, not two.
-2. **Reference by id.** `Auth::Ref { credential: Ulid }` (not alias). `host ls`/`show` reverse-resolve id→alias for display; `host add/edit --credential <alias>` resolves alias→id before persisting. Renaming a credential never dangles references.
+2. **Reference by id.** `Auth::Ref { credential: Ulid }` (not name). `host ls`/`show` reverse-resolve id→name for display; `host add/edit --credential <name>` resolves name→id before persisting. Renaming a credential never dangles references.
 3. **frecency is a first-period backend capability**, surfaced via `host ls --sort frecency`, keyed by host ULID, persisted under the data dir (separate from config).
 4. **CLI dual-mode contract**: global `--no-input`, global `--format json`, stable exit codes.
 5. **No TUI in this plan** (`sshrack-tui` is an empty stub); `sftp` command is also deferred.
@@ -359,7 +359,7 @@ This centralizes the keyring-key derivation that sshrack-old kept inside `keyrin
 //!
 //! Every host and credential carries a first-class, immutable `Ulid`. The
 //! keyring account key is derived from the owner kind plus that id (never the
-//! alias), so renaming an owner never moves its keyring entry.
+//! name), so renaming an owner never moves its keyring entry.
 
 use ulid::Ulid;
 
@@ -375,7 +375,7 @@ pub enum OwnerKind {
     Credential,
 }
 
-/// Pure: the keyring account key for an owner kind + id. Alias-free on purpose
+/// Pure: the keyring account key for an owner kind + id. Name-free on purpose
 /// so renames are safe.
 pub fn keyring_key(kind: OwnerKind, id: &Ulid) -> String {
     match kind {
@@ -444,12 +444,12 @@ git commit -m "feat(core): add first-class identity helpers (id + keyring key)"
 **Interfaces:**
 - Produces (the redesigned types later tasks rely on):
   - `SshrackConfig { format_version, hosts: Vec<Host>, credentials: Vec<Credential>, store: Option<SecretStore> }`
-  - `Host { id: Ulid, alias: String, host: String, port: u16, auth: Auth }` (id is first-class, top-level)
-  - `Credential { id: Ulid, alias: String, body: CredentialBody }` (id is first-class, top-level)
-  - `Auth { Ref { credential: Ulid }, Inline(CredentialBody) }` (**ref-by-id**, not alias)
+  - `Host { id: Ulid, name: String, host: String, port: u16, auth: Auth }` (id is first-class, top-level)
+  - `Credential { id: Ulid, name: String, body: CredentialBody }` (id is first-class, top-level)
+  - `Auth { Ref { credential: Ulid }, Inline(CredentialBody) }` (**ref-by-id**, not name)
   - `CredentialBody { user, password: Option<Secret>, key: Option<PathBuf>, keyring: bool }` (**no id field** — id moved to the owner)
   - `Secret`, `EncryptedSecret`, `VaultMeta`, `SecretStore`, `SecretKind`, `AuthChoice`
-  - `SshrackConfig::find_host_by_alias`, `find_host_by_id`, `find_credential_by_alias`, `find_credential_by_id`, `is_vault`, `is_keyring`, `is_plaintext`, `mode_chosen`, `vault_meta`
+  - `SshrackConfig::find_host_by_name`, `find_host_by_id`, `find_credential_by_name`, `find_credential_by_id`, `is_vault`, `is_keyring`, `is_plaintext`, `mode_chosen`, `vault_meta`
 
 **Approach:** Port `sshrack-old/src/config/schema.rs`, then apply four targeted changes. The ported unit tests come along and are updated to the new shapes.
 
@@ -465,7 +465,7 @@ Copy `/home/ryan/workspace/open-source/sshrack-old/src/config/schema.rs` to `cra
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Host {
     pub id: Ulid,
-    pub alias: String,
+    pub name: String,
     pub host: String,
     #[serde(default = "default_port")]
     pub port: u16,
@@ -475,7 +475,7 @@ pub struct Host {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Credential {
     pub id: Ulid,
-    pub alias: String,
+    pub name: String,
     #[serde(flatten)]
     pub body: CredentialBody,
 }
@@ -526,26 +526,26 @@ impl Auth {
 **1d. Add id-based lookups.** On `SshrackConfig` add:
 
 ```rust
-pub fn find_host_by_alias(&self, alias: &str) -> Option<&Host> {
-    self.hosts.iter().find(|h| h.alias == alias)
+pub fn find_host_by_name(&self, name: &str) -> Option<&Host> {
+    self.hosts.iter().find(|h| h.name == name)
 }
 pub fn find_host_by_id(&self, id: &Ulid) -> Option<&Host> {
     self.hosts.iter().find(|h| &h.id == id)
 }
-pub fn find_credential_by_alias(&self, alias: &str) -> Option<&Credential> {
-    self.credentials.iter().find(|c| c.alias == alias)
+pub fn find_credential_by_name(&self, name: &str) -> Option<&Credential> {
+    self.credentials.iter().find(|c| c.name == name)
 }
 pub fn find_credential_by_id(&self, id: &Ulid) -> Option<&Credential> {
     self.credentials.iter().find(|c| &c.id == id)
 }
 ```
 
-Remove the old `find_alias`/`find_credential` alias-only methods (callers migrate over the next tasks). Keep `is_vault`/`is_keyring`/`is_plaintext`/`mode_chosen`/`vault_meta` as-is.
+Remove the old `find_name`/`find_credential` name-only methods (callers migrate over the next tasks). Keep `is_vault`/`is_keyring`/`is_plaintext`/`mode_chosen`/`vault_meta` as-is.
 
 - [ ] **Step 2: Update the ported tests to the new shapes**
 
 In the `#[cfg(test)] mod tests` at the bottom of `schema.rs`, update every constructor:
-- `HostConfig { alias, host, port, auth }` → `Host { id: crate::id::new_id(), alias, host, port, auth }`.
+- `HostConfig { name, host, port, auth }` → `Host { id: crate::id::new_id(), name, host, port, auth }`.
 - `Auth::reference("team-dev")` → `Auth::reference(<the credential's id>)`.
 - The reference-auth parse test now feeds `auth = { credential = "01J..." }` (a ULID string) and asserts `credential_id()` returns it; flip the construct-then-serialize test to confirm the on-disk form is `credential = "<ulid>"`.
 - Drop any test referencing `body.id` / `ensure_ids` / `retain_id`.
@@ -558,7 +558,7 @@ fn reference_auth_serializes_to_credential_id() {
     let cid = ulid::Ulid::from_string("01HXYZ0000000000000000001").unwrap();
     let h = Host {
         id: crate::id::new_id(),
-        alias: "web1".into(),
+        name: "web1".into(),
         host: "10.0.0.5".into(),
         port: 22,
         auth: Auth::reference(cid),
@@ -631,7 +631,7 @@ Add a test that `default_data_dir()` ends with `sshrack` (mirroring the existing
 
 - [ ] **Step 2: Port `store.rs`**
 
-Copy `/home/ryan/workspace/open-source/sshrack-old/src/config/store.rs` verbatim (it uses `crate::fsutil::write_private`, `crate::config::schema::SshrackConfig`, `crate::error::SshrackError` — all present). Update the ported tests' `HostConfig` constructions to the new `Host { id, alias, host, port, auth }` shape.
+Copy `/home/ryan/workspace/open-source/sshrack-old/src/config/store.rs` verbatim (it uses `crate::fsutil::write_private`, `crate::config::schema::SshrackConfig`, `crate::error::SshrackError` — all present). Update the ported tests' `HostConfig` constructions to the new `Host { id, name, host, port, auth }` shape.
 
 - [ ] **Step 3: Run tests, clippy, fmt**
 
@@ -868,7 +868,7 @@ git commit -m "feat(secret): extract SecretBackend/PassphraseProvider traits and
 - Produces:
   - `credential::PasswordSource { None, Inline(Zeroizing<String>), Keyring { key } }` (Debug redacts Inline)
   - `credential::ResolvedAuth { user, key_path, password }` + `from_plain`
-  - `credential::resolve(host: &Host, cfg: &SshrackConfig, vault: Option<&VaultKey>) -> Result<ResolvedAuth, SshrackError>` — follows `Auth::Ref { credential: Ulid }` via `find_credential_by_id` (NOT alias)
+  - `credential::resolve(host: &Host, cfg: &SshrackConfig, vault: Option<&VaultKey>) -> Result<ResolvedAuth, SshrackError>` — follows `Auth::Ref { credential: Ulid }` via `find_credential_by_id` (NOT name)
   - `credential::find_referrers(cfg, cred_id) -> Vec<Ulid>` (hosts whose auth refs this credential id — for delete warnings)
   - `suggest::closest(candidates, query) -> Option<String>`
 
@@ -880,13 +880,13 @@ Copy sshrack-old's `suggest.rs` verbatim (pure Levenshtein-ish did-you-mean via 
 
 Copy sshrack-old's `credential.rs`. Apply:
 - `resolve`'s `Auth::Ref { credential }` arm: `credential` is now a `Ulid`. Look up via `cfg.find_credential_by_id(&credential).ok_or_else(|| SshrackError::CredentialNotFound { ... })?`. The keyring owner becomes `OwnerKind::Credential` with `cred.id`; the inline arm uses `OwnerKind::Host` with `host.id`.
-- `credential_not_found` / `find_referrers` now operate on ids. `find_referrers(cfg, cred_id: &Ulid)` returns the host **ids** (or aliases — pick ids for stability; display layer maps to alias) whose `auth.credential_id() == Some(cred_id)`.
-- Update `merge_credential`/`validate_*` to take `id`/`alias` explicitly (construct `Credential { id, alias, body }`).
+- `credential_not_found` / `find_referrers` now operate on ids. `find_referrers(cfg, cred_id: &Ulid)` returns the host **ids** (or names — pick ids for stability; display layer maps to name) whose `auth.credential_id() == Some(cred_id)`.
+- Update `merge_credential`/`validate_*` to take `id`/`name` explicitly (construct `Credential { id, name, body }`).
 - Keep `decrypt_secret` and the `PasswordSource` Debug-redaction tests; update them to the new `Host`/`Credential` shapes.
 
 - [ ] **Step 3: Update tests**
 
-Port the credential tests, updating every `Auth::Ref` to use a real ULID and every host/cred construction to the new shapes. Add a regression test: a credential referenced by id can be **renamed** (alias changed) without breaking `resolve`.
+Port the credential tests, updating every `Auth::Ref` to use a real ULID and every host/cred construction to the new shapes. Add a regression test: a credential referenced by id can be **renamed** (name changed) without breaking `resolve`.
 
 - [ ] **Step 4: Run tests, clippy, fmt**
 
@@ -915,14 +915,14 @@ git commit -m "feat(core): port credential resolution with ref-by-id"
 - Produces:
   - `connect::ssh::Overrides { user, port, identity, credential: Option<Ulid>, ad_hoc }` (credential is now a ULID, resolved by the CLI before calling)
   - `connect::ssh::build(resolved, host: &Host, overrides, remote_command) -> Vec<String>`
-  - `connect::scp::build(...)` (alias:path expansion to `user@host:path`)
+  - `connect::scp::build(...)` (name:path expansion to `user@host:path`)
 
 - [ ] **Step 1: Port `cmd/ssh.rs` and `cmd/scp.rs`**
 
 Copy them to `connect/ssh.rs` and `connect/scp.rs`. Adjust:
 - `use crate::config::schema::HostConfig` → `use crate::config::schema::Host`.
-- `Overrides.credential: Option<String>` → `Option<Ulid>`. (The CLI resolves `--credential <alias>` to an id before constructing `Overrides`; the argv builder does not need the alias.)
-- The `host()` test helper constructs the new `Host { id, alias, host, port, auth }`.
+- `Overrides.credential: Option<String>` → `Option<Ulid>`. (The CLI resolves `--credential <name>` to an id before constructing `Overrides`; the argv builder does not need the name.)
+- The `host()` test helper constructs the new `Host { id, name, host, port, auth }`.
 
 `crates/sshrack-core/src/connect/mod.rs`:
 
@@ -1046,16 +1046,16 @@ git commit -m "feat(core): port host-key pre-flight with injected confirm callba
 
 **Interfaces:**
 - Produces (pure validation + CRUD-helpers, no I/O):
-  - `host::validate_alias_chars(alias) -> Result<(), SshrackError>`
-  - `host::validate_no_duplicate_host(cfg, alias, force) -> Result<(), SshrackError>`
+  - `host::validate_name_chars(name) -> Result<(), SshrackError>`
+  - `host::validate_no_duplicate_host(cfg, name, force) -> Result<(), SshrackError>`
   - `host::validate_rename_host(cfg, current, new) -> Result<(), SshrackError>`
-  - `host::add_host(cfg, id, alias, host, port, auth) -> Result<SshrackConfig, SshrackError>` (returns a new immutable config)
-  - `host::remove_host(cfg, alias) -> Option<SshrackConfig>`
-  - `host::resolve_target(...)` — alias → `&Host` with did-you-mean, used by the connect path
+  - `host::add_host(cfg, id, name, host, port, auth) -> Result<SshrackConfig, SshrackError>` (returns a new immutable config)
+  - `host::remove_host(cfg, name) -> Option<SshrackConfig>`
+  - `host::resolve_target(...)` — name → `&Host` with did-you-mean, used by the connect path
 
 - [ ] **Step 1: Port and adapt `host.rs`**
 
-Copy sshrack-old's `host.rs`. Update alias/cred lookups to the new id-based finders where relevant. `add_host` now takes an explicit `id: Ulid` (the caller generates it via `id::new_id()`). Keep `validate_alias_chars` and the forbidden-char set verbatim.
+Copy sshrack-old's `host.rs`. Update name/cred lookups to the new id-based finders where relevant. `add_host` now takes an explicit `id: Ulid` (the caller generates it via `id::new_id()`). Keep `validate_name_chars` and the forbidden-char set verbatim.
 
 - [ ] **Step 2: Port/adapt the host add/edit/cp/rm pure helpers from `cmd/host/*`**
 
@@ -1106,7 +1106,7 @@ git commit -m "feat(core): port credential CRUD pure logic and seal path"
 **Interfaces:**
 - Produces:
   - `frecency::Score` / `frecency::Frecency` (a `HashMap<Ulid, { score: f64, last_used: SystemTime }>`)
-  - `frecency::rank(hosts: &[&Host], query: &str, frec: &Frecency) -> Vec<RankedHost>` — pure; sort by (fuzzy-match presence → frecency score → alias). Uses `strsim` for a first-period matcher (nucleo arrives with the TUI phase).
+  - `frecency::rank(hosts: &[&Host], query: &str, frec: &Frecency) -> Vec<RankedHost>` — pure; sort by (fuzzy-match presence → frecency score → name). Uses `strsim` for a first-period matcher (nucleo arrives with the TUI phase).
   - `frecency::record(&mut Frecency, id: &Ulid)` — bump score (zoxide 4-tier: `<1h ×4, <1d ×2, <1w ÷2, else ÷4`)
   - `frecency::store::load(dir) -> Frecency` / `save(dir, &Frecency)` — atomic TOML under `~/.local/share/sshrack/frecency.toml`
 
@@ -1114,8 +1114,8 @@ git commit -m "feat(core): port credential CRUD pure logic and seal path"
 
 In `frecency/mod.rs` `#[cfg(test)]`, test:
 - `record` on a fresh entry sets a high score; recording again after no time keeps it high.
-- `rank` with empty query orders by score desc, ties broken by alias.
-- `rank` with a query puts hosts whose alias contains the query ahead of non-matches.
+- `rank` with empty query orders by score desc, ties broken by name.
+- `rank` with a query puts hosts whose name contains the query ahead of non-matches.
 
 (Note: tests must not depend on real wall-clock; inject `last_used` directly via a constructor `Frecency::with_now` that takes a `SystemTime`, or build the map by hand in tests.)
 
@@ -1189,8 +1189,8 @@ pub struct RankedHost<'a> {
     pub score: f64,
 }
 
-/// Rank hosts by fuzzy-match presence, then frecency score, then alias.
-/// Pure; `query` is matched case-insensitively as a substring in the alias.
+/// Rank hosts by fuzzy-match presence, then frecency score, then name.
+/// Pure; `query` is matched case-insensitively as a substring in the name.
 pub fn rank<'a>(hosts: &'a [&Host], query: &str, frec: &Frecency) -> Vec<RankedHost<'a>> {
     let q = query.to_lowercase();
     let mut out: Vec<RankedHost<'a>> = hosts
@@ -1199,11 +1199,11 @@ pub fn rank<'a>(hosts: &'a [&Host], query: &str, frec: &Frecency) -> Vec<RankedH
         .collect();
     out.sort_by(|a, b| {
         // matches first
-        let am = a.host.alias.to_lowercase().contains(&q) as u8;
-        let bm = b.host.alias.to_lowercase().contains(&q) as u8;
+        let am = a.host.name.to_lowercase().contains(&q) as u8;
+        let bm = b.host.name.to_lowercase().contains(&q) as u8;
         bm.cmp(&am)
             .then_with(|| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal))
-            .then_with(|| a.host.alias.cmp(&b.host.alias))
+            .then_with(|| a.host.name.cmp(&b.host.name))
     });
     out
 }
@@ -1262,7 +1262,7 @@ git commit -m "test(core): green core gate before CLI layer" || echo "nothing to
 - Produces:
   - `cli::Cli` (top-level) with global `--config`, `--no-input`, `--format json|text`, and `ConnectOptions` flattened.
   - `cli::Command { Ssh, Scp, Host, Cred, Store, Connect(external_subcommand) }` — **no `Tui` and no `Sftp` variant** (deferred). A bare `sshrack` (no subcommand) prints help (the old "open TUI" behavior is dropped for this period).
-  - `cli::HostAction`/`CredAction`/`StoreAction` enums. `HostAction::Ls` gains `#[arg(long)] sort: Option<SortMode>` (`frecency|alias|recent`).
+  - `cli::HostAction`/`CredAction`/`StoreAction` enums. `HostAction::Ls` gains `#[arg(long)] sort: Option<SortMode>` (`frecency|name|recent`).
   - `exit_code::ExitCode` constants: `SUCCESS=0`, `USAGE=2`, `NOT_FOUND=4`, `DUPLICATE=5`, `VALIDATION=6`, `CONNECT=7`, `STORE=8`.
   - `main.rs` role dispatch: if `SSHRACK_ASKPASS_FILE` or `SSHRACK_KEYRING_KEY` is set, run `sshrack_core::askpass::run()`; otherwise parse CLI.
 
@@ -1287,7 +1287,7 @@ Port sshrack-old's `cli.rs` clap structs. Changes:
 - Drop the `Tui` variant and the bare-`sshrack`-opens-TUI behavior (print `--help` instead, or a one-line pointer to `--help`).
 - Drop any `Sftp` plumbing (none existed, but do not add it).
 - Add global `#[arg(long, global = true)] pub no_input: bool` and `#[arg(long = "format", global = true, default_value = "text")] pub format: OutputFormat` where `OutputFormat` is `clap::ValueEnum { Text, Json }`.
-- `HostAction::Add`'s `--credential <alias>` stays a `String` (the CLI resolves alias→id in Task 19's connect/cmd code, not in clap).
+- `HostAction::Add`'s `--credential <name>` stays a `String` (the CLI resolves name→id in Task 19's connect/cmd code, not in clap).
 - `HostAction::Ls` gets `sort: Option<SortMode>`.
 
 - [ ] **Step 3: Write role dispatch in `main.rs`**
@@ -1384,7 +1384,7 @@ git commit -m "feat(cli): dialoguer prompt impl and --format json shapes"
 
 ---
 
-## Task 19: CLI connect path (`<alias>` / `ssh`)
+## Task 19: CLI connect path (`<name>` / `ssh`)
 
 **Files:**
 - Create: `crates/sshrack-cli/src/cmd/mod.rs`
@@ -1392,8 +1392,8 @@ git commit -m "feat(cli): dialoguer prompt impl and --format json shapes"
 
 **Interfaces:**
 - Produces: `cmd::connect::run(cli, no_input) -> i32` that:
-  1. resolves the alias → `&Host` (fail-fast: not-found + did-you-mean **before** any network IO),
-  2. resolves the credential override `--credential <alias>` → `Ulid` (fail-fast if unknown),
+  1. resolves the name → `&Host` (fail-fast: not-found + did-you-mean **before** any network IO),
+  2. resolves the credential override `--credential <name>` → `Ulid` (fail-fast if unknown),
   3. loads/injects vault key (prompt via `DialoguerPassphrase` if vault mode; `--no-input` ⇒ require `SSHRACK_PASSPHRASE` env or fail),
   4. `credential::resolve` → `ResolvedAuth`,
   5. `hostkey::run_host_key_flow(host, port, confirm)` — confirm via dialoguer (fail-closed under `--no-input`),
@@ -1405,7 +1405,7 @@ git commit -m "feat(cli): dialoguer prompt impl and --format json shapes"
 
 - [ ] **Step 2: Manual smoke test against a throwaway local ssh target** (or a mock). At minimum:
 
-Run: `cargo run -p sshrack-cli -- --help` (sanity), then against a host alias configured via `host add`:
+Run: `cargo run -p sshrack-cli -- --help` (sanity), then against a host name configured via `host add`:
 
 ```bash
 cargo run -p sshrack-cli -- host add web1 --host 127.0.0.1 --user "$USER" --identity "$HOME/.ssh/id_ed25519" --no-input
@@ -1437,11 +1437,11 @@ git commit -m "feat(cli): connect path with fail-fast validation and frecency re
 **Interfaces:**
 - Produces: per-resource command handlers that call core pure functions, then `config::store::save`. Each honors `--no-input` (no field prompts) and `--format` (ls/show/status emit JSON or text). `host ls --sort frecency` reads `frecency::store::load` and uses `frecency::rank`.
 
-- [ ] **Step 1: `cmd/scp.rs`** — port sshrack-old's scp dispatch (alias:path expansion), using `connect::scp::build` and the same vault/hostkey resolution as connect.
+- [ ] **Step 1: `cmd/scp.rs`** — port sshrack-old's scp dispatch (name:path expansion), using `connect::scp::build` and the same vault/hostkey resolution as connect.
 
-- [ ] **Step 2: `cmd/host.rs`** — add/ls/show/edit/rm/cp. Patch commands (`edit`) touch only fields whose flags are present (the §3.3 rule). `ls` supports `--fields` and `--sort`. add/edit with `--credential <alias>` resolve to id before persisting; show/ls reverse-resolve id→alias for display.
+- [ ] **Step 2: `cmd/host.rs`** — add/ls/show/edit/rm/cp. Patch commands (`edit`) touch only fields whose flags are present (the §3.3 rule). `ls` supports `--fields` and `--sort`. add/edit with `--credential <name>` resolve to id before persisting; show/ls reverse-resolve id→name for display.
 
-- [ ] **Step 3: `cmd/cred.rs`** — add/ls/show/edit/rm. rm warns when `credential::find_referrers` is non-empty (references survive because they are by id — they become dangling only if the credential is actually removed; surface the referrer aliases so the user knows).
+- [ ] **Step 3: `cmd/cred.rs`** — add/ls/show/edit/rm. rm warns when `credential::find_referrers` is non-empty (references survive because they are by id — they become dangling only if the credential is actually removed; surface the referrer names so the user knows).
 
 - [ ] **Step 4: `cmd/store.rs`** — status/use/rekey/lock/unlock/config. `use keyring` fails fast via `SecretBackend::available()` before migrating; `use vault` prompts for a passphrase via `DialoguerPassphrase`. All migrations route through the core seal/transform path.
 
@@ -1478,7 +1478,7 @@ git commit -m "feat(cli): scp/host/cred/store commands with json output and exit
 
 **Interfaces:** consumes core + CLI public APIs.
 
-- [ ] **Step 1: `resolve_ref_by_id_test.rs`** — build a config with a host referencing a credential by id; rename the credential's alias; assert `resolve` still succeeds (ref-by-id does not dangle).
+- [ ] **Step 1: `resolve_ref_by_id_test.rs`** — build a config with a host referencing a credential by id; rename the credential's name; assert `resolve` still succeeds (ref-by-id does not dangle).
 
 - [ ] **Step 2: `frecency_persist_test.rs`** — `record` a host, `save` to a temp data dir, `load` back, assert the score round-trips.
 
@@ -1505,7 +1505,7 @@ git commit -m "test: ref-by-id, frecency persist, connect flow, json output"
 **Files:**
 - Modify: `CLAUDE.md` (full rewrite of the project-instructions file)
 
-- [ ] **Step 1: Rewrite CLAUDE.md** to reflect the new architecture. The existing file is copied from sshrack-old (single-crate, id-on-body, TUI-phase-0, alias-ref). Replace/extend the relevant sections:
+- [ ] **Step 1: Rewrite CLAUDE.md** to reflect the new architecture. The existing file is copied from sshrack-old (single-crate, id-on-body, TUI-phase-0, name-ref). Replace/extend the relevant sections:
 
   - **Project Overview**: keep the wrapping-ssh / three-storage-mode / keyring-lifecycle text, but reframe storage modes around the new core/cli/tui split. State the **backend/frontend** mental model explicitly.
   - **Architecture (NEW section):** the workspace layout (`sshrack-core` zero-UI-dep invariant, `sshrack-cli`, `sshrack-tui` deferred). The trait-injection seams (`SecretBackend`, `PassphraseProvider`, host-key confirm). The askpass role-dispatch in the CLI binary.
