@@ -107,15 +107,16 @@ pub fn run(cli: &Cli) -> Result<Option<ConnectRequest>, SshrackError> {
     // borrow the terminal for rendering. Cloned from the guard so it goes dead
     // the moment the guard drops (RAII restore), never keeping the Tui alive.
     let handle = guard.handle();
-    // run_loop borrows the terminal through the guard; the guard itself stays
-    // alive here, so the screen stays in alternate/raw mode for the duration.
-    // `with_terminal` hands `run_loop` a `&mut Tui` without surrendering guard
-    // ownership, so RAII restore still runs at function return.
-    let request =
-        guard.with_terminal(|terminal| run_loop(terminal, &mut app, handle, data_dir.as_deref()));
-    // `guard` drops at function return: disable_raw_mode +
-    // LeaveAlternateScreen. The terminal is restored on every path — plain
-    // quit, connect, or early return from run_loop — because Drop always runs.
+    // run_loop draws frames by borrowing the shared Rc<RefCell<Tui>> for ONE
+    // draw at a time (the RefMut is dropped before any key read or side
+    // effect). That narrow borrow is load-bearing: the popup paths re-borrow
+    // the terminal by upgrading `handle`, and a long-lived outer RefMut would
+    // panic on "already borrowed" (Critical #1). The guard still owns the
+    // strong Rc, so RAII restore (LeaveAlternateScreen + disable_raw_mode)
+    // still runs when `guard` drops at function return — on every path: plain
+    // quit, connect return, or early return from run_loop.
+    let terminal = guard.terminal();
+    let request = run_loop(&terminal, &mut app, handle, data_dir.as_deref());
     Ok(request)
 }
 
