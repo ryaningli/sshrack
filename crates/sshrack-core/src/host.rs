@@ -458,7 +458,7 @@ pub fn delete_host_with_secret(
     // Snapshot the keyring-relevant fields before the (cloned) remove, so the
     // forget decision reflects the host as it stood at call time.
     let (host_id, keyring) = (host.id, host.auth.inline_body().is_some_and(|b| b.keyring));
-    let next = remove_host(cfg, alias).expect("present (checked above)");
+    let next = remove_host(cfg, alias).expect("invariant: host present (checked above)");
     secret::forget_keyring_secret(backend, OwnerKind::Host, &host_id, keyring);
     Ok(next)
 }

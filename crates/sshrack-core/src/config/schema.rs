@@ -9,13 +9,25 @@ use ulid::Ulid;
 /// mode's TOML natural: plaintext mode writes `password = "x"` (a bare
 /// string, [`Secret::Plain`]); encrypted mode writes
 /// `password = { nonce = "...", cipher = "..." }` ([`Secret::Encrypted`]).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 pub enum Secret {
     /// Plaintext password (plaintext storage mode).
     Plain(String),
     /// Authenticated ciphertext: base64 nonce + base64 (ciphertext||tag).
     Encrypted(EncryptedSecret),
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact the plaintext so `format!("{:?}", secret)` can never leak a
+        // password to logs/error messages. Mirrors the redacting Debug on the
+        // consumer-side `credential::PasswordSource`.
+        match self {
+            Secret::Plain(_) => f.write_str("Plain(<redacted>)"),
+            Secret::Encrypted(e) => f.debug_tuple("Encrypted").field(e).finish(),
+        }
+    }
 }
 
 impl Secret {
@@ -913,6 +925,34 @@ keyring = true
             keyring: true,
         };
         assert_eq!(body.secret_kind(), SecretKind::KeyringPassword);
+    }
+
+    #[test]
+    fn secret_debug_redacts_plain_password() {
+        // Plain must never leak its plaintext through Debug — passwords must
+        // not appear in logs or error messages.
+        let plain = Secret::Plain("hunter2".into());
+        let dbg = format!("{plain:?}");
+        assert!(!dbg.contains("hunter2"), "Debug leaked plaintext: {dbg}");
+        assert!(dbg.contains("redacted"), "missing redaction marker: {dbg}");
+    }
+
+    #[test]
+    fn secret_debug_keeps_encrypted_fields() {
+        // Encrypted payloads (base64 nonce/cipher) are not sensitive — Debug
+        // surfaces them for diagnostics.
+        let enc = Secret::Encrypted(EncryptedSecret {
+            nonce: "bm9uY2U=".into(),
+            cipher: "Y2lwaGVy".into(),
+        });
+        let dbg = format!("{enc:?}");
+        assert!(dbg.contains("Encrypted"), "missing variant tag: {dbg}");
+        assert!(dbg.contains("bm9uY2U="), "missing nonce field: {dbg}");
+        assert!(dbg.contains("Y2lwaGVy"), "missing cipher field: {dbg}");
+        assert!(
+            !dbg.contains("redacted"),
+            "encrypted should not be redacted: {dbg}"
+        );
     }
 
     #[test]

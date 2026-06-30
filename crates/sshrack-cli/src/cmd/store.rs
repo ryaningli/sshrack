@@ -47,7 +47,9 @@ use crate::exit_code;
 use crate::format as fmt;
 use crate::prompt::DialoguerPassphrase;
 
-use super::shared::{NoInputPassphrase, confirm_destructive, fail, load_config, save_config};
+use super::shared::{
+    NoInputPassphrase, confirm_destructive, fail, load_config, save_config, unlock_vault_key,
+};
 
 /// The single tunable vault runtime field exposed by `store config`: the
 /// master-key cache TTL in seconds (`0` disables caching). KDF cost params
@@ -195,27 +197,6 @@ fn classify(cfg: &SshrackConfig, mode: StoreMode) -> Switch {
     Switch::Migrate { needs_source_key }
 }
 
-/// Resolve the source vault key when a switch needs it (vault → X). Under
-/// `--no-input` the passphrase must come from `SSHRACK_PASSPHRASE` env; the TTY
-/// provider is used otherwise. Returns `(message, exit_code)` on failure.
-fn source_key_for_switch(
-    cfg: &SshrackConfig,
-    no_input: bool,
-) -> Result<Option<vault::VaultKey>, (String, i32)> {
-    let provider: &dyn sshrack_core::secret::PassphraseProvider = if no_input {
-        &NoInputPassphrase
-    } else {
-        &DialoguerPassphrase
-    };
-    let env_pw = vault::passphrase_from_env();
-    vault::ensure_unlocked_vault_key(cfg, env_pw.as_ref(), provider).map_err(|e| {
-        (
-            format!("sshrack: vault unlock failed: {e}"),
-            exit_code::STORE,
-        )
-    })
-}
-
 /// Switch to keyring mode. Fail-fast on [`OsKeyring::available`]; migrate via
 /// [`vault::transform::migrate`] with the source key (if leaving vault).
 fn switch_to_keyring(
@@ -241,7 +222,7 @@ fn switch_to_keyring(
             needs_source_key: true
         }
     ) {
-        source_key_for_switch(cfg, no_input)?
+        unlock_vault_key(cfg, no_input)?
     } else {
         None
     };
@@ -344,7 +325,7 @@ fn switch_to_plaintext(
             needs_source_key: true
         }
     ) {
-        source_key_for_switch(cfg, no_input)?
+        unlock_vault_key(cfg, no_input)?
     } else {
         None
     };

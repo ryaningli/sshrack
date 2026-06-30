@@ -105,6 +105,7 @@ fn from_stored(stored: StoredFrecency) -> Frecency {
     let mut map = HashMap::with_capacity(stored.entries.len());
     for (id_str, entry) in stored.entries {
         let Ok(id) = ulid::Ulid::from_string(&id_str) else {
+            tracing::warn!(key = %id_str, "skipping malformed frecency entry");
             continue;
         };
         let last_used = entry.last_used_secs.and_then(secs_to_system_time);
