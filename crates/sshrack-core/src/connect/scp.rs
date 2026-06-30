@@ -1,4 +1,4 @@
-//! Assemble the `scp` argv from raw scp arguments, resolving any `alias:path`
+//! Assemble the `scp` argv from raw scp arguments, resolving any `name:path`
 //! token against the config (following credential references for user/key).
 //! Mirrors the system `scp` calling convention; the caller hands the result to
 //! `connect::launch`.
@@ -34,14 +34,14 @@ pub struct ScpPlan {
 
 /// Build the scp argv from raw arguments. A `left:rest` operand is rewritten
 /// to `user@host:rest` (user/key resolved through the host's auth, following
-/// credential references) when `left` is a known alias — or, with `--ad-hoc`,
+/// credential references) when `left` is a known name — or, with `--ad-hoc`,
 /// a literal address. The first rewritten operand also contributes `-P <port>`
 /// and `-i <identity>` (from override or the resolved key).
 ///
 /// Operands with no `:`, or in scp's `user@host:path` form (`left` has `@`),
 /// pass through verbatim — the escape hatch for reaching a host with no
-/// registered alias. A `name:path` whose `name` is neither a known alias nor
-/// (under `--ad-hoc`) an address is a typo'd alias: it errors with
+/// registered name. A `name:path` whose `name` is neither a known name nor
+/// (under `--ad-hoc`) an address is a typo'd name: it errors with
 /// [`SshrackError::HostNotFound`] instead of being forwarded to scp as a
 /// hostname.
 ///
@@ -79,17 +79,17 @@ pub fn build(
             continue;
         };
         // `user@host:path` (left contains @) is an explicit host in scp's
-        // native syntax, not an alias — pass it through so scp can still reach
-        // any host without a registered alias.
+        // native syntax, not a name — pass it through so scp can still reach
+        // any host without a registered name.
         if left.contains('@') {
             out_args.push(arg.clone());
             continue;
         }
-        // `name:path` (no @): a known alias, or (with --ad-hoc) a literal
-        // address. Anything else is a typo'd alias — refuse with HostNotFound
+        // `name:path` (no @): a known name, or (with --ad-hoc) a literal
+        // address. Anything else is a typo'd name — refuse with HostNotFound
         // + did-you-mean rather than letting scp treat it as a hostname and
         // surface a misleading DNS error.
-        let host_cfg = match cfg.find_host_by_alias(left) {
+        let host_cfg = match cfg.find_host_by_name(left) {
             Some(h) => h.clone(),
             None if overrides.ad_hoc => resolve_target(cfg, left, &resolve_overrides)?,
             None => return Err(host_not_found(cfg, left)),
@@ -139,11 +139,11 @@ mod tests {
     use crate::config::schema::{Auth, Credential, CredentialBody, Host, SshrackConfig};
     use ulid::Ulid;
 
-    fn cfg_with_key_host(alias: &str) -> SshrackConfig {
+    fn cfg_with_key_host(name: &str) -> SshrackConfig {
         SshrackConfig {
             hosts: vec![Host {
                 id: crate::id::new_id(),
-                alias: alias.into(),
+                name: name.into(),
                 host: "10.0.0.5".into(),
                 port: 2222,
                 auth: Auth::inline(
@@ -156,7 +156,7 @@ mod tests {
     }
 
     #[test]
-    fn resolves_alias_colon_path_with_port_and_identity() {
+    fn resolves_name_colon_path_with_port_and_identity() {
         let plan = build(
             &["local.txt".into(), "web1:/srv/app".into()],
             &cfg_with_key_host("web1"),
@@ -169,7 +169,7 @@ mod tests {
         assert!(plan.argv.contains(&"2222".to_string()));
         assert!(plan.argv.contains(&"-i".to_string()));
         assert!(plan.argv.iter().any(|a| a == "deploy@10.0.0.5:/srv/app"));
-        assert_eq!(plan.host.unwrap().alias, "web1");
+        assert_eq!(plan.host.unwrap().name, "web1");
     }
 
     #[test]
@@ -207,8 +207,8 @@ mod tests {
     }
 
     #[test]
-    fn unknown_alias_token_errors() {
-        // `name:path` (no @) that is not a known alias is a typo, not a host:
+    fn unknown_name_token_errors() {
+        // `name:path` (no @) that is not a known name is a typo, not a host:
         // refuse with HostNotFound rather than letting scp treat it as a
         // hostname and surface a misleading DNS resolution error.
         let err = build(
@@ -220,7 +220,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             err,
-            SshrackError::HostNotFound { alias, .. } if alias == "weird"
+            SshrackError::HostNotFound { name, .. } if name == "weird"
         ));
     }
 
@@ -229,7 +229,7 @@ mod tests {
         let cfg = SshrackConfig {
             hosts: vec![Host {
                 id: crate::id::new_id(),
-                alias: "web1".into(),
+                name: "web1".into(),
                 host: "10.0.0.5".into(),
                 port: 22,
                 auth: Auth::reference(crate::id::new_id()),
@@ -249,7 +249,7 @@ mod tests {
             hosts: vec![],
             credentials: vec![Credential {
                 id: cid,
-                alias: "team-dev".into(),
+                name: "team-dev".into(),
                 body: CredentialBody::new("deploy").with_key("/team_ed25519"),
             }],
             ..Default::default()
@@ -263,7 +263,7 @@ mod tests {
             hosts: vec![],
             credentials: vec![Credential {
                 id: cid,
-                alias: "team-dev".into(),
+                name: "team-dev".into(),
                 body: CredentialBody::new("deploy").with_password("s3cret"),
             }],
             ..Default::default()
@@ -311,8 +311,8 @@ mod tests {
     #[test]
     fn bare_address_without_ad_hoc_errors() {
         // A `host:path` operand with no @ and no --ad-hoc is treated as a
-        // typo'd alias and refused. Use --ad-hoc (or `user@host:path`) to
-        // reach a host that is not a registered alias.
+        // typo'd name and refused. Use --ad-hoc (or `user@host:path`) to
+        // reach a host that is not a registered name.
         let (cfg, cid) = cfg_with_key_credential();
         let o = Overrides {
             ad_hoc: false,
@@ -325,9 +325,9 @@ mod tests {
 
     #[test]
     fn user_at_host_token_passes_through() {
-        // `user@host:path` is scp's native explicit-host syntax, not an alias,
+        // `user@host:path` is scp's native explicit-host syntax, not a name,
         // so it passes through verbatim — the escape hatch for reaching a host
-        // that has no registered alias.
+        // that has no registered name.
         let (cfg, _cid) = cfg_with_key_credential();
         let plan = build(
             &["root@1.2.3.4:/x".into()],

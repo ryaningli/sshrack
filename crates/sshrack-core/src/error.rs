@@ -35,7 +35,7 @@ impl fmt::Display for DidYouMean {
 /// Errors returned by sshrack library modules.
 #[derive(Debug, Error)]
 pub enum SshrackError {
-    #[error("missing host alias — usage: sshrack ssh <alias> [command...]")]
+    #[error("missing host name — usage: sshrack ssh <name> [command...]")]
     NoCommand,
 
     /// The user cancelled an interactive prompt (Ctrl+C). Handled silently at
@@ -47,23 +47,23 @@ pub enum SshrackError {
     #[error("missing required field: {field}")]
     MissingRequiredField { field: &'static str },
 
-    #[error("host alias not found: {alias}{hint}")]
-    HostNotFound { alias: String, hint: DidYouMean },
+    #[error("host name not found: {name}{hint}")]
+    HostNotFound { name: String, hint: DidYouMean },
 
-    #[error("alias '{alias}' must not contain {ch:?}")]
-    InvalidAliasChar { alias: String, ch: char },
+    #[error("name '{name}' must not contain {ch:?}")]
+    InvalidNameChar { name: String, ch: char },
 
-    #[error("host alias already exists: {alias} (use --force to overwrite)")]
-    HostAlreadyExists { alias: String },
+    #[error("host name already exists: {name} (use --force to overwrite)")]
+    HostAlreadyExists { name: String },
 
-    #[error("alias '{alias}' is already used")]
-    AliasTaken { alias: String },
+    #[error("name '{name}' is already used")]
+    NameTaken { name: String },
 
-    #[error("credential alias not found: {alias}{hint}")]
-    CredentialNotFound { alias: String, hint: DidYouMean },
+    #[error("credential name not found: {name}{hint}")]
+    CredentialNotFound { name: String, hint: DidYouMean },
 
-    #[error("credential alias already exists: {alias} (use --force to overwrite)")]
-    CredentialAlreadyExists { alias: String },
+    #[error("credential name already exists: {name} (use --force to overwrite)")]
+    CredentialAlreadyExists { name: String },
 
     #[error("credential body for user '{user}' must set at most one of password/key")]
     InvalidCredentialBody { user: String },
@@ -143,21 +143,21 @@ pub enum SshrackError {
     VaultLocked,
 
     /// The passphrase did not match the vault's verifier, or the vault
-    /// metadata (salt, KDF params, base64) was corrupt. No alias attached —
+    /// metadata (salt, KDF params, base64) was corrupt. No name attached —
     /// unlock failure is vault-wide, not per-credential.
     #[error("failed to unlock vault (wrong passphrase or corrupted vault metadata)")]
     VaultUnlockFailed,
 
     /// XChaCha20-Poly1305 encryption or nonce generation failed for a single
-    /// password. Never carries a per-credential alias; the transform layer
-    /// surfaces this where the alias is known.
+    /// password. Never carries a per-credential name; the transform layer
+    /// surfaces this where the name is known.
     #[error("failed to encrypt a password")]
     EncryptionFailed,
 
     /// Decryption (or base64/nonce decode) failed for one credential. The
-    /// `alias` names *which* credential failed — never the secret itself.
-    #[error("failed to decrypt password for credential '{alias}'")]
-    DecryptionFailed { alias: String },
+    /// `name` names *which* credential failed — never the secret itself.
+    #[error("failed to decrypt password for credential '{name}'")]
+    DecryptionFailed { name: String },
 
     /// A vault operation was attempted (e.g. lock, rekey) but no vault is
     /// configured. Tell the user to run `sshrack store use vault` first.
@@ -286,22 +286,22 @@ mod tests {
     #[test]
     fn host_not_found_displays_with_hint() {
         let e = SshrackError::HostNotFound {
-            alias: "ets-pcc".into(),
+            name: "ets-pcc".into(),
             hint: DidYouMean::from_option(Some("ets-pc")),
         };
         assert_eq!(
             e.to_string(),
-            "host alias not found: ets-pcc (did you mean 'ets-pc'?)"
+            "host name not found: ets-pcc (did you mean 'ets-pc'?)"
         );
     }
 
     #[test]
     fn credential_not_found_displays_without_hint() {
         let e = SshrackError::CredentialNotFound {
-            alias: "ghost".into(),
+            name: "ghost".into(),
             hint: DidYouMean::none(),
         };
-        assert_eq!(e.to_string(), "credential alias not found: ghost");
+        assert_eq!(e.to_string(), "credential name not found: ghost");
     }
 
     #[test]
@@ -311,7 +311,7 @@ mod tests {
             SshrackError::VaultUnlockFailed.to_string(),
             SshrackError::EncryptionFailed.to_string(),
             SshrackError::DecryptionFailed {
-                alias: "team".into(),
+                name: "team".into(),
             }
             .to_string(),
             SshrackError::VaultNotEnabled.to_string(),
@@ -369,9 +369,9 @@ mod tests {
     }
 
     #[test]
-    fn decryption_failed_names_alias() {
+    fn decryption_failed_names_credential() {
         let e = SshrackError::DecryptionFailed {
-            alias: "team".into(),
+            name: "team".into(),
         };
         assert!(e.to_string().contains("team"));
     }
@@ -380,11 +380,11 @@ mod tests {
     fn unknown_field_displays_available() {
         let e = SshrackError::UnknownField {
             field: "xyz".into(),
-            available: "alias, host, port".into(),
+            available: "name, host, port".into(),
         };
         assert_eq!(
             e.to_string(),
-            "unknown field 'xyz' — valid fields: alias, host, port"
+            "unknown field 'xyz' — valid fields: name, host, port"
         );
     }
 }

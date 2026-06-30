@@ -2,7 +2,7 @@
 //!
 //! Passwords live in the OS credential store (macOS Keychain / Linux Secret
 //! Service), keyed by a stable account derived from the owning body's ULID id
-//! (not the alias), so renaming a host or credential never moves its entry.
+//! (not the name), so renaming a host or credential never moves its entry.
 //! `config.toml` holds only a `keyring = true` marker — the plaintext never
 //! touches disk. The askpass helper reads entries directly via [`get`], so the
 //! main sshrack process never materializes a keyring password.

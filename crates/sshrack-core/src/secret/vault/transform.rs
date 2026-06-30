@@ -75,22 +75,22 @@ pub fn count_secrets(cfg: &SshrackConfig) -> (usize, usize, usize) {
 }
 
 /// A copy of `body` with an encrypted password (if any) decrypted under `key`,
-/// tagged with `alias_label` on failure. Plaintext/key/default bodies pass
+/// tagged with `name_label` on failure. Plaintext/key/default bodies pass
 /// through. The body's `user`/`key`/`keyring` are preserved verbatim.
 ///
-/// `alias_label` is the owner's display label (host or credential alias) used
+/// `name_label` is the owner's display label (host or credential name) used
 /// only in the [`SshrackError::DecryptionFailed`] message — never the secret.
 pub(crate) fn decrypt_body(
     body: &CredentialBody,
     key: &VaultKey,
-    alias_label: &str,
+    name_label: &str,
 ) -> Result<CredentialBody, SshrackError> {
     let password = match &body.password {
         Some(Secret::Encrypted(enc)) => {
             // crypto::decrypt fails with a fieldless DecryptError; attach the
-            // alias here, intentionally discarding crypto detail (no oracle).
+            // name here, intentionally discarding crypto detail (no oracle).
             let plain = crypto::decrypt(enc, key).map_err(|_| SshrackError::DecryptionFailed {
-                alias: alias_label.to_string(),
+                name: name_label.to_string(),
             })?;
             // `plain.to_string()` moves the decrypted text into a plain
             // `Secret::Plain(String)` that is not zeroized (the String-typed
@@ -114,8 +114,8 @@ pub fn decrypt_all(cfg: &mut SshrackConfig, key: &VaultKey) -> Result<usize, Ssh
     let mut n = 0usize;
     for c in &mut cfg.credentials {
         if matches!(c.body.password, Some(Secret::Encrypted(_))) {
-            let alias = c.alias.clone();
-            c.body = decrypt_body(&c.body, key, &alias)?;
+            let name = c.name.clone();
+            c.body = decrypt_body(&c.body, key, &name)?;
             n += 1;
         }
     }
@@ -123,8 +123,8 @@ pub fn decrypt_all(cfg: &mut SshrackConfig, key: &VaultKey) -> Result<usize, Ssh
         if let Some(body) = h.auth.inline_body_mut()
             && matches!(body.password, Some(Secret::Encrypted(_)))
         {
-            let alias = h.alias.clone();
-            let next = decrypt_body(body, key, &alias)?;
+            let name = h.name.clone();
+            let next = decrypt_body(body, key, &name)?;
             *body = next;
             n += 1;
         }
@@ -134,31 +134,31 @@ pub fn decrypt_all(cfg: &mut SshrackConfig, key: &VaultKey) -> Result<usize, Ssh
 
 /// The routing identity for a stored secret during a transform: which owner
 /// kind (host vs credential), the stable id that keys the keyring entry, and
-/// the alias label attached to a decryption failure (never the secret). Packs
+/// the name label attached to a decryption failure (never the secret). Packs
 /// the three values the old crate carried in its `SecretOwner` enum into one
 /// borrowable handle so the transform helpers stay under clippy's arg limit.
 struct SecretOwner<'a> {
     kind: OwnerKind,
     id: ulid::Ulid,
-    alias_label: &'a str,
+    name_label: &'a str,
 }
 
 impl<'a> SecretOwner<'a> {
     /// A credential owner: the keyring account is `cred:<id>`.
-    fn credential(id: ulid::Ulid, alias_label: &'a str) -> Self {
+    fn credential(id: ulid::Ulid, name_label: &'a str) -> Self {
         Self {
             kind: OwnerKind::Credential,
             id,
-            alias_label,
+            name_label,
         }
     }
 
     /// A host owner: the keyring account is `host:<id>`.
-    fn host(id: ulid::Ulid, alias_label: &'a str) -> Self {
+    fn host(id: ulid::Ulid, name_label: &'a str) -> Self {
         Self {
             kind: OwnerKind::Host,
             id,
-            alias_label,
+            name_label,
         }
     }
 }
@@ -180,7 +180,7 @@ impl<'a> SecretOwner<'a> {
 ///
 /// The id used to key each keyring entry is the owner's stable [`ulid::Ulid`]
 /// (`cred.id` for credentials, `host.id` for inline host auth) — never the
-/// alias — so renames never move a keyring entry.
+/// name — so renames never move a keyring entry.
 pub fn migrate(
     cfg: &mut SshrackConfig,
     target: &SecretStore,
@@ -191,9 +191,9 @@ pub fn migrate(
     let mut n = 0usize;
     for c in &mut cfg.credentials {
         // Snapshot the owner identity so it does not borrow `*c` while we also
-        // pass `&mut c.body`. The id is the keyring account key; the alias is
+        // pass `&mut c.body`. The id is the keyring account key; the name is
         // only the decryption-failure label.
-        let owner = SecretOwner::credential(c.id, &c.alias);
+        let owner = SecretOwner::credential(c.id, &c.name);
         if migrate_body(
             &mut c.body,
             &owner,
@@ -207,7 +207,7 @@ pub fn migrate(
     }
     for h in &mut cfg.hosts {
         if let Some(body) = h.auth.inline_body_mut() {
-            let owner = SecretOwner::host(h.id, &h.alias);
+            let owner = SecretOwner::host(h.id, &h.name);
             if migrate_body(
                 body,
                 &owner,
@@ -226,7 +226,7 @@ pub fn migrate(
 /// Migrate one body's password into `target`. Returns `true` if the body had a
 /// password (counted), `false` if it was skipped. See [`migrate`].
 ///
-/// `owner` selects the keyring account (kind + id) and carries the alias label
+/// `owner` selects the keyring account (kind + id) and carries the name label
 /// attached to a decryption failure (never the secret).
 fn migrate_body(
     body: &mut CredentialBody,
@@ -276,7 +276,7 @@ fn migrate_body(
 /// holds it. `None` when the body has no password.
 ///
 /// `owner` derives the keyring account key for a marker body and carries the
-/// alias label attached to a decryption failure (never the secret).
+/// name label attached to a decryption failure (never the secret).
 fn extract_plain(
     body: &CredentialBody,
     owner: &SecretOwner<'_>,
@@ -295,11 +295,11 @@ fn extract_plain(
         Some(Secret::Plain(p)) => Ok(Some(Zeroizing::new(p.clone()))),
         Some(Secret::Encrypted(enc)) => {
             // crypto::decrypt fails with a fieldless DecryptError; attach the
-            // alias and discard crypto detail (no decryption oracle).
+            // name and discard crypto detail (no decryption oracle).
             let key = source_vault_key.ok_or(SshrackError::VaultLocked)?;
             Ok(Some(crypto::decrypt(enc, key).map_err(|_| {
                 SshrackError::DecryptionFailed {
-                    alias: owner.alias_label.to_string(),
+                    name: owner.name_label.to_string(),
                 }
             })?))
         }
@@ -335,7 +335,7 @@ mod tests {
     }
 
     #[test]
-    fn decrypt_body_round_trips_and_tags_alias() {
+    fn decrypt_body_round_trips_and_tags_name() {
         let enc = crypto::encrypt(b"hunter2", &KEY).unwrap();
         let body = CredentialBody {
             user: "u".into(),
@@ -345,9 +345,9 @@ mod tests {
         };
         let back = decrypt_body(&body, &KEY.into(), "team").unwrap();
         assert_eq!(back.password_plain(), Some("hunter2"));
-        // Wrong key surfaces an alias-tagged DecryptionFailed.
+        // Wrong key surfaces a name-tagged DecryptionFailed.
         let err = decrypt_body(&body, &[0u8; 32].into(), "team").unwrap_err();
-        assert!(matches!(err, SshrackError::DecryptionFailed { alias } if alias == "team"));
+        assert!(matches!(err, SshrackError::DecryptionFailed { name } if name == "team"));
     }
 
     #[test]
@@ -391,12 +391,12 @@ mod tests {
             credentials: vec![
                 Credential {
                     id: ulid::Ulid::new(),
-                    alias: "a".into(),
+                    name: "a".into(),
                     body: plain_body("u", "p1"),
                 },
                 Credential {
                     id: ulid::Ulid::new(),
-                    alias: "b".into(),
+                    name: "b".into(),
                     body: CredentialBody {
                         user: "u".into(),
                         password: Some(Secret::Encrypted(EncryptedSecret {
@@ -409,7 +409,7 @@ mod tests {
                 },
                 Credential {
                     id: ulid::Ulid::new(),
-                    alias: "c".into(),
+                    name: "c".into(),
                     body: CredentialBody {
                         user: "u".into(),
                         password: None,
@@ -429,12 +429,12 @@ mod tests {
         let mut cfg = SshrackConfig {
             credentials: vec![Credential {
                 id: ulid::Ulid::new(),
-                alias: "a".into(),
+                name: "a".into(),
                 body: plain_body("u", "p1"),
             }],
             hosts: vec![Host {
                 id: ulid::Ulid::new(),
-                alias: "h".into(),
+                name: "h".into(),
                 host: "x".into(),
                 port: 22,
                 auth: Auth::inline(plain_body("u", "p2")),
@@ -452,11 +452,11 @@ mod tests {
 
     // ---- migrate: the unified mode-switch ----
 
-    fn keyring_cfg_one_plain(cred_alias: &str) -> SshrackConfig {
+    fn keyring_cfg_one_plain(cred_name: &str) -> SshrackConfig {
         SshrackConfig {
             credentials: vec![Credential {
                 id: ulid::Ulid::new(),
-                alias: cred_alias.into(),
+                name: cred_name.into(),
                 body: plain_body("deploy", "hunter2"),
             }],
             hosts: vec![],
@@ -494,12 +494,12 @@ mod tests {
             credentials: vec![
                 Credential {
                     id: ulid::Ulid::new(),
-                    alias: "key-only".into(),
+                    name: "key-only".into(),
                     body: CredentialBody::new("u").with_key("/k"),
                 },
                 Credential {
                     id: ulid::Ulid::new(),
-                    alias: "default".into(),
+                    name: "default".into(),
                     body: CredentialBody::new("u"),
                 },
             ],
@@ -531,8 +531,8 @@ mod tests {
         // keyring because encrypt_all skipped keyring-marker bodies. The
         // FakeBackend stands in for the OS keyring, so this runs everywhere —
         // no Secret Service daemon required.
-        let cred_alias = "sshrack-test-mig-kr2v";
-        let mut cfg = keyring_cfg_one_plain(cred_alias);
+        let cred_name = "sshrack-test-mig-kr2v";
+        let mut cfg = keyring_cfg_one_plain(cred_name);
         let id = cfg.credentials[0].id;
         let backend = crate::secret::test_doubles::FakeBackend::new();
         // Start in keyring mode: move the plaintext into the backend. `migrate`
@@ -583,9 +583,9 @@ mod tests {
     }
 
     #[test]
-    fn migrate_keyring_uses_owner_id_not_alias_for_account_key() {
+    fn migrate_keyring_uses_owner_id_not_name_for_account_key() {
         // Renaming a credential must not change its keyring account key — the
-        // key is owner_kind + id, not the alias. Verify by migrating a renamed
+        // key is owner_kind + id, not the name. Verify by migrating a renamed
         // credential's keyring body: the entry keyed by the original id is the
         // one fetched.
         let mut cfg = keyring_cfg_one_plain("kr-rename");
@@ -595,8 +595,8 @@ mod tests {
         let _ = migrate(&mut cfg, &SecretStore::Keyring, None, None, &backend).unwrap();
         // Rename the credential in place (id unchanged) — the keyring entry is
         // still keyed by the id, so this rename is invisible to the backend.
-        cfg.credentials[0].alias = "kr-renamed".into();
-        // Leaving keyring must read the entry by id (not alias) and delete it.
+        cfg.credentials[0].name = "kr-renamed".into();
+        // Leaving keyring must read the entry by id (not name) and delete it.
         let n = migrate(&mut cfg, &vault_target(), None, Some(&KEY.into()), &backend).unwrap();
         assert_eq!(n, 1);
         assert!(

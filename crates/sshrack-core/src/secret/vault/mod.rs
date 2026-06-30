@@ -502,7 +502,7 @@ mod tests {
         let mut cfg = SshrackConfig {
             credentials: vec![Credential {
                 id: ulid::Ulid::new(),
-                alias: "a".into(),
+                name: "a".into(),
                 body: CredentialBody::new("u").with_password("p"),
             }],
             ..SshrackConfig::default()

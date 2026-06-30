@@ -54,8 +54,8 @@ pub fn encrypt(plain: &[u8], key: &[u8; 32]) -> Result<EncryptedSecret, SshrackE
 /// Decryption failure: wrong key, tampering, corruption, or malformed
 /// base64/nonce. Fieldless on purpose — a crypto primitive must not reveal
 /// which check failed (that would be a decryption oracle) and carries no
-/// credential alias. Business-layer callers attach
-/// [`SshrackError::DecryptionFailed`] with the alias they know.
+/// credential name. Business-layer callers attach
+/// [`SshrackError::DecryptionFailed`] with the name they know.
 #[derive(Debug, thiserror::Error)]
 #[error("decryption failed")]
 pub struct DecryptError;
@@ -63,7 +63,7 @@ pub struct DecryptError;
 /// Decrypt an [`EncryptedSecret`] under `key`. Any failure (wrong key,
 /// tampering, corruption, malformed base64/nonce) collapses to the fieldless
 /// [`DecryptError`] — it never reveals which check failed (no decryption
-/// oracle) and never carries a credential alias. Callers that know the alias
+/// oracle) and never carries a credential name. Callers that know the name
 /// map it to [`SshrackError::DecryptionFailed`] at the business layer.
 pub fn decrypt(
     secret: &EncryptedSecret,

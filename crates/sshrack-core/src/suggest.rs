@@ -1,8 +1,8 @@
-//! "Did you mean" suggestions for misspelled aliases.
+//! "Did you mean" suggestions for misspelled names.
 //!
 //! Pure fuzzy matching: [`closest`] scores each candidate against the input
 //! with [`strsim::jaro_winkler`] (the did-you-mean gold standard — sensitive to
-//! shared prefixes, which dominates alias similarity) and returns the single
+//! shared prefixes, which dominates name similarity) and returns the single
 //! best match above [`SUGGESTION_THRESHOLD`]. Borrow-only: returns a reference
 //! into the candidate slice so callers pay for a `String` only when they keep
 //! the result.

@@ -7,7 +7,7 @@
 //! [`crate::connect`] (the connect layer lands in a later task).
 //!
 //! Ref-by-id is the core guarantee of the redesigned schema: a host holds a
-//! `[[credentials]]` entry's stable [`Ulid`], never its alias, so renaming a
+//! `[[credentials]]` entry's stable [`Ulid`], never its name, so renaming a
 //! credential never dangles a host's reference. [`find_referrers`] is keyed on
 //! the same id so delete warnings stay accurate across renames too.
 
@@ -18,7 +18,7 @@ use zeroize::Zeroizing;
 
 use crate::config::schema::{Auth, Credential, CredentialBody, Host, SshrackConfig};
 use crate::error::{DidYouMean, SshrackError};
-use crate::host::validate_alias_chars;
+use crate::host::validate_name_chars;
 use crate::id::{OwnerKind, keyring_key};
 use crate::secret::{self, SecretBackend};
 use crate::suggest;
@@ -101,90 +101,88 @@ impl ResolvedAuth {
 }
 
 /// Build a [`SshrackError::CredentialNotFound`] with a "did you mean" hint
-/// computed from the config's credential aliases. Shared by credential lookup
+/// computed from the config's credential names. Shared by credential lookup
 /// failures in resolve, cred show, cred rm, and cred edit. (scp reaches this
 /// through `credential::resolve`, so it gains the hint for free.)
 ///
-/// `looked_for` is the alias (or alias-like string) the user typed; the hint is
-/// purely cosmetic since [`resolve`] looks credentials up by id, not alias.
+/// `looked_for` is the name (or name-like string) the user typed; the hint is
+/// purely cosmetic since [`resolve`] looks credentials up by id, not name.
 pub fn credential_not_found(cfg: &SshrackConfig, looked_for: &str) -> SshrackError {
-    let candidates: Vec<&str> = cfg.credentials.iter().map(|c| c.alias.as_str()).collect();
+    let candidates: Vec<&str> = cfg.credentials.iter().map(|c| c.name.as_str()).collect();
     SshrackError::CredentialNotFound {
-        alias: looked_for.into(),
+        name: looked_for.into(),
         hint: DidYouMean::from_option(suggest::closest(&candidates, looked_for)),
     }
 }
 
-/// Build a credential, validating the alias and body. The caller supplies the
+/// Build a credential, validating the name and body. The caller supplies the
 /// stable `id` (the owner owns the id; the body does not).
 pub fn merge_credential(
     id: Ulid,
-    alias: &str,
+    name: &str,
     body: CredentialBody,
 ) -> Result<Credential, SshrackError> {
-    validate_alias_chars(alias)?;
+    validate_name_chars(name)?;
     body.validate()?;
     Ok(Credential {
         id,
-        alias: alias.into(),
+        name: name.into(),
         body,
     })
 }
 
-/// Reject a duplicate credential alias unless `force` is set.
+/// Reject a duplicate credential name unless `force` is set.
 pub fn validate_no_duplicate_credential(
     cfg: &SshrackConfig,
-    alias: &str,
+    name: &str,
     force: bool,
 ) -> Result<(), SshrackError> {
-    if cfg.find_credential_by_alias(alias).is_some() && !force {
-        return Err(SshrackError::CredentialAlreadyExists {
-            alias: alias.into(),
-        });
+    if cfg.find_credential_by_name(name).is_some() && !force {
+        return Err(SshrackError::CredentialAlreadyExists { name: name.into() });
     }
     Ok(())
 }
 
-/// Validate renaming to `new_alias`, excluding the current alias.
+/// Validate renaming to `new_name`, excluding the current name.
 pub fn validate_rename_credential(
     cfg: &SshrackConfig,
-    current_alias: &str,
-    new_alias: &str,
+    current_name: &str,
+    new_name: &str,
 ) -> Result<(), SshrackError> {
-    validate_alias_chars(new_alias)?;
+    validate_name_chars(new_name)?;
     let taken_by_other = cfg
         .credentials
         .iter()
-        .any(|c| c.alias == new_alias && c.alias != current_alias);
+        .any(|c| c.name == new_name && c.name != current_name);
     if taken_by_other {
-        return Err(SshrackError::AliasTaken {
-            alias: new_alias.to_string(),
+        return Err(SshrackError::NameTaken {
+            name: new_name.to_string(),
         });
     }
     Ok(())
 }
 
-/// Return a new config with `alias` removed from credentials (hosts preserved),
+/// Return a new config with `name` removed from credentials (hosts preserved),
 /// or `None` if it was absent.
 ///
 /// Hosts referencing the removed credential by id are NOT rewritten here — the
 /// caller surfaces [`find_referrers`] as a delete warning and decides. Leaving
-/// a dangling id is intentional: the display layer maps ids to aliases, and
+/// a dangling id is intentional: the display layer maps ids to names, and
 /// rewriting auth refs is a separate concern.
-pub fn remove_credential(cfg: &SshrackConfig, alias: &str) -> Option<SshrackConfig> {
-    if !cfg.credentials.iter().any(|c| c.alias == alias) {
+pub fn remove_credential(cfg: &SshrackConfig, name: &str) -> Option<SshrackConfig> {
+    if !cfg.credentials.iter().any(|c| c.name == name) {
         return None;
     }
     let mut next = cfg.clone();
-    next.credentials.retain(|c| c.alias != alias);
+    next.credentials.retain(|c| c.name != name);
     Some(next)
 }
 
 /// Host ids whose auth references this credential (for delete warnings).
 ///
-/// Keyed by the credential's stable [`Ulid`], not its alias, so a rename never
+/// Keyed by the credential's stable [`Ulid`], not its name, so a rename never
 /// silently drops a referrer from the warning. The display layer maps each id
-/// back to a host alias when rendering.
+/// back to a host name when rendering.
 pub fn find_referrers(cfg: &SshrackConfig, cred_id: &Ulid) -> Vec<Ulid> {
     cfg.hosts
         .iter()
@@ -212,7 +210,7 @@ pub struct AddOptions {
     pub identity: Option<PathBuf>,
     /// Non-interactive: all required fields must come from flags.
     pub no_input: bool,
-    /// Overwrite an existing alias.
+    /// Overwrite an existing name.
     pub force: bool,
 }
 
@@ -224,7 +222,7 @@ pub struct EditOptions {
     pub identity: Option<PathBuf>,
     /// Drop an existing identity key (mutually exclusive with `identity`).
     pub clear_identity: bool,
-    /// Rename to a new alias. The caller validates the new name against the
+    /// Rename to a new name. The caller validates the new name against the
     /// config via [`validate_rename_credential`] before applying.
     pub rename: Option<String>,
     /// Non-interactive mode (does not change patch behaviour itself; the CLI
@@ -255,40 +253,40 @@ pub fn edit_has_any_flag(opts: &EditOptions) -> bool {
 }
 
 /// Return a new config with a credential appended, or `Err` on a forbidden
-/// alias character. Pure: does not mutate `cfg`, does not touch the filesystem.
+/// name character. Pure: does not mutate `cfg`, does not touch the filesystem.
 /// The caller supplies the stable `id` (generated via [`crate::id::new_id`]);
 /// the body's password is sealed by the CLI's interactive path before this is
 /// called.
 ///
-/// Does NOT check for duplicate aliases — the caller runs
+/// Does NOT check for duplicate names — the caller runs
 /// [`validate_no_duplicate_credential`] first (the `--force` flag belongs there,
 /// not on the pure append).
 pub fn add_credential(
     cfg: &SshrackConfig,
     id: Ulid,
-    alias: &str,
+    name: &str,
     body: CredentialBody,
 ) -> Result<SshrackConfig, SshrackError> {
-    validate_alias_chars(alias)?;
+    validate_name_chars(name)?;
     body.validate()?;
     let mut next = cfg.clone();
     next.credentials.push(Credential {
         id,
-        alias: alias.into(),
+        name: name.into(),
         body,
     });
     Ok(next)
 }
 
-/// Insert or replace the credential keyed by alias, preserving insertion order
-/// on replace (an existing alias is overwritten in place; a new alias is
+/// Insert or replace the credential keyed by name, preserving insertion order
+/// on replace (an existing name is overwritten in place; a new name is
 /// appended). Pure: returns a new config. Shared by `add --force` and `edit`.
 pub fn upsert_credential(cfg: &SshrackConfig, cred: Credential) -> SshrackConfig {
     let mut next = cfg.clone();
     if let Some(existing) = next
         .credentials
         .iter_mut()
-        .find(|c| c.alias == cred.alias.as_str())
+        .find(|c| c.name == cred.name.as_str())
     {
         *existing = cred;
     } else {
@@ -312,8 +310,8 @@ pub fn apply_credential_patch(
     orig: &Credential,
     opts: &EditOptions,
 ) -> Result<Credential, SshrackError> {
-    let alias = opts.rename.clone().unwrap_or_else(|| orig.alias.clone());
-    validate_alias_chars(&alias)?;
+    let name = opts.rename.clone().unwrap_or_else(|| orig.name.clone());
+    validate_name_chars(&name)?;
     let user = opts.user.clone().unwrap_or_else(|| orig.body.user.clone());
     let key = if opts.clear_identity {
         None
@@ -340,12 +338,12 @@ pub fn apply_credential_patch(
         // Preserve the original stable id: the keyring entry and every host
         // Auth::Ref are keyed by it; a patch must never mint a new identity.
         id: orig.id,
-        alias,
+        name,
         body,
     })
 }
 
-/// Remove the credential named `alias` from `cfg` and best-effort forget its
+/// Remove the credential named `name` from `cfg` and best-effort forget its
 /// keyring entry when the credential's body was keyring-marked. Returns the new
 /// config (keyring already cleaned), or `Err(CredentialNotFound)` if absent.
 ///
@@ -355,18 +353,18 @@ pub fn apply_credential_patch(
 /// persists the returned config.
 pub fn delete_credential_with_secret(
     cfg: &SshrackConfig,
-    alias: &str,
+    name: &str,
     backend: &dyn SecretBackend,
 ) -> Result<SshrackConfig, SshrackError> {
-    let Some(cred) = cfg.find_credential_by_alias(alias) else {
-        return Err(credential_not_found(cfg, alias));
+    let Some(cred) = cfg.find_credential_by_name(name) else {
+        return Err(credential_not_found(cfg, name));
     };
     // Snapshot the keyring-relevant fields before the (cloned) remove, so the
     // forget decision reflects the credential as it stood at call time.
     let (cred_id, keyring) = (cred.id, cred.body.keyring);
-    let next = remove_credential(cfg, alias)
-        // remove_credential returns None only when the alias is absent, which
-        // the find_credential_by_alias above already ruled out.
+    let next = remove_credential(cfg, name)
+        // remove_credential returns None only when the name is absent, which
+        // the find_credential_by_name above already ruled out.
         .expect("invariant: credential present (checked above)");
     secret::forget_keyring_secret(backend, OwnerKind::Credential, &cred_id, keyring);
     Ok(next)
@@ -397,12 +395,12 @@ pub fn copy_keyring_entry(
 /// Decrypt a stored password secret into plaintext, given an optional master
 /// key. `None`/`Plain` need no key; `Encrypted` without a key is `VaultLocked`.
 ///
-/// `alias_label` is the owner's display label (host or credential alias) used
+/// `name_label` is the owner's display label (host or credential name) used
 /// only in the [`SshrackError::DecryptionFailed`] message — never the secret.
 pub(crate) fn decrypt_secret(
     secret: Option<&crate::config::schema::Secret>,
     vault: Option<&crate::secret::vault::VaultKey>,
-    alias_label: &str,
+    name_label: &str,
 ) -> Result<Option<Zeroizing<String>>, SshrackError> {
     use crate::config::schema::Secret;
     use crate::secret::vault::crypto;
@@ -418,10 +416,10 @@ pub(crate) fn decrypt_secret(
             // `&Zeroizing<[u8; 32]>`, which auto-derefs to the `&[u8; 32]`
             // that `crypto::decrypt` expects.
             // crypto::decrypt fails with a fieldless DecryptError; attach the
-            // alias label and discard crypto detail (no decryption oracle).
+            // name label and discard crypto detail (no decryption oracle).
             Some(key) => Ok(Some(crypto::decrypt(enc, key).map_err(|_| {
                 SshrackError::DecryptionFailed {
-                    alias: alias_label.to_string(),
+                    name: name_label.to_string(),
                 }
             })?)),
             None => Err(SshrackError::VaultLocked),
@@ -432,11 +430,11 @@ pub(crate) fn decrypt_secret(
 /// Resolve `host`'s auth into a concrete identity, decrypting any encrypted
 /// password with `vault`. Pure (no I/O); the master key is an input. Returns
 /// `CredentialNotFound` for a dangling reference (with a did-you-mean hint
-/// computed from credential aliases), `VaultLocked` when an encrypted password
+/// computed from credential names), `VaultLocked` when an encrypted password
 /// is seen without a key.
 ///
 /// The reference arm follows [`Auth::Ref`] by the credential's stable [`Ulid`]
-/// (via [`SshrackConfig::find_credential_by_id`]) — never its alias — so
+/// (via [`SshrackConfig::find_credential_by_id`]) — never its name — so
 /// renaming the credential leaves this resolution intact.
 ///
 /// The resulting [`ResolvedAuth::password`] is a [`PasswordSource`]:
@@ -449,17 +447,17 @@ pub fn resolve(
     cfg: &SshrackConfig,
     vault: Option<&crate::secret::vault::VaultKey>,
 ) -> Result<ResolvedAuth, SshrackError> {
-    // owner_kind + owner_id select the keyring account; alias_label is the
+    // owner_kind + owner_id select the keyring account; name_label is the
     // display name attached to a decryption failure (never the secret).
-    let (user, key_path, password_secret, keyring, owner_kind, owner_id, alias_label) =
+    let (user, key_path, password_secret, keyring, owner_kind, owner_id, name_label) =
         match &host.auth {
             Auth::Ref { credential } => {
                 let cred = cfg.find_credential_by_id(credential).ok_or_else(|| {
-                    // The user typed a host alias, not a credential alias; surface a
-                    // did-you-mean over credential aliases anyway — it is the only
+                    // The user typed a host name, not a credential name; surface a
+                    // did-you-mean over credential names anyway — it is the only
                     // hint we can compute without a stable "looked-for" string, and
                     // a dangling id almost always means a deleted credential the
-                    // user might re-add by alias.
+                    // user might re-add by name.
                     credential_not_found(cfg, &credential.to_string())
                 })?;
                 (
@@ -469,7 +467,7 @@ pub fn resolve(
                     cred.body.keyring,
                     OwnerKind::Credential,
                     cred.id,
-                    cred.alias.as_str(),
+                    cred.name.as_str(),
                 )
             }
             Auth::Inline(body) => {
@@ -482,19 +480,19 @@ pub fn resolve(
                     body.keyring,
                     OwnerKind::Host,
                     host.id,
-                    host.alias.as_str(),
+                    host.name.as_str(),
                 )
             }
         };
     let password = if keyring {
         // Keyring body: plaintext lives in the OS keyring under the owner's
-        // stable id. The alias is NOT in the key, so renames are safe.
+        // stable id. The name is NOT in the key, so renames are safe.
         PasswordSource::Keyring {
             key: keyring_key(owner_kind, &owner_id),
         }
     } else {
         // Plaintext or vault body: decrypt to inline plaintext (None if absent).
-        match decrypt_secret(password_secret.as_ref(), vault, alias_label)? {
+        match decrypt_secret(password_secret.as_ref(), vault, name_label)? {
             Some(p) => PasswordSource::Inline(p),
             None => PasswordSource::None,
         }
@@ -550,11 +548,11 @@ mod tests {
         CredentialBody::new(user)
     }
 
-    fn cfg_with_cred(alias: &str) -> SshrackConfig {
+    fn cfg_with_cred(name: &str) -> SshrackConfig {
         SshrackConfig {
             credentials: vec![Credential {
                 id: Ulid::new(),
-                alias: alias.into(),
+                name: name.into(),
                 body: body("u"),
             }],
             ..Default::default()
@@ -564,7 +562,7 @@ mod tests {
     fn inline_host(b: CredentialBody) -> Host {
         Host {
             id: Ulid::new(),
-            alias: "h".into(),
+            name: "h".into(),
             host: "x".into(),
             port: 22,
             auth: Auth::inline(b),
@@ -574,7 +572,7 @@ mod tests {
     fn ref_host(cred_id: Ulid) -> Host {
         Host {
             id: Ulid::new(),
-            alias: "h".into(),
+            name: "h".into(),
             host: "x".into(),
             port: 22,
             auth: Auth::reference(cred_id),
@@ -618,7 +616,7 @@ mod tests {
         let cfg = SshrackConfig {
             credentials: vec![Credential {
                 id: cid,
-                alias: "team-dev".into(),
+                name: "team-dev".into(),
                 body: CredentialBody::new("deploy").with_key("/team"),
             }],
             ..Default::default()
@@ -659,7 +657,7 @@ mod tests {
         let cfg = SshrackConfig {
             credentials: vec![Credential {
                 id: Ulid::new(),
-                alias: "team-dev".into(),
+                name: "team-dev".into(),
                 body: crate::config::schema::CredentialBody::new("deploy"),
             }],
             ..Default::default()
@@ -672,16 +670,16 @@ mod tests {
     }
 
     #[test]
-    fn merge_credential_accepts_reserved_word_alias() {
-        // Reserved words are legal aliases now (reachable via `sshrack ssh <name>`).
+    fn merge_credential_accepts_reserved_word_name() {
+        // Reserved words are legal names now (reachable via `sshrack ssh <name>`).
         let c = merge_credential(Ulid::new(), "cred", body("u")).unwrap();
-        assert_eq!(c.alias, "cred");
+        assert_eq!(c.name, "cred");
     }
 
     #[test]
     fn merge_credential_rejects_forbidden_char() {
         let err = merge_credential(Ulid::new(), "a:b", body("u")).unwrap_err();
-        assert!(matches!(err, SshrackError::InvalidAliasChar { .. }));
+        assert!(matches!(err, SshrackError::InvalidNameChar { .. }));
     }
 
     #[test]
@@ -713,12 +711,12 @@ mod tests {
             credentials: vec![
                 Credential {
                     id: Ulid::new(),
-                    alias: "a".into(),
+                    name: "a".into(),
                     body: body("u"),
                 },
                 Credential {
                     id: Ulid::new(),
-                    alias: "b".into(),
+                    name: "b".into(),
                     body: body("u"),
                 },
             ],
@@ -726,7 +724,7 @@ mod tests {
         };
         assert!(matches!(
             validate_rename_credential(&cfg, "a", "b"),
-            Err(SshrackError::AliasTaken { alias }) if alias == "b"
+            Err(SshrackError::NameTaken { name }) if name == "b"
         ));
     }
 
@@ -742,14 +740,14 @@ mod tests {
         let cfg = SshrackConfig {
             hosts: vec![Host {
                 id: Ulid::new(),
-                alias: "web1".into(),
+                name: "web1".into(),
                 host: "h".into(),
                 port: 22,
                 auth: Auth::reference(cid),
             }],
             credentials: vec![Credential {
                 id: cid,
-                alias: "team-dev".into(),
+                name: "team-dev".into(),
                 body: body("u"),
             }],
             ..Default::default()
@@ -774,21 +772,21 @@ mod tests {
             hosts: vec![
                 Host {
                     id: web1_id,
-                    alias: "web1".into(),
+                    name: "web1".into(),
                     host: "h".into(),
                     port: 22,
                     auth: Auth::reference(cid),
                 },
                 Host {
                     id: web2_id,
-                    alias: "web2".into(),
+                    name: "web2".into(),
                     host: "h".into(),
                     port: 22,
                     auth: Auth::reference(cid),
                 },
                 Host {
                     id: Ulid::new(),
-                    alias: "db".into(),
+                    name: "db".into(),
                     host: "h".into(),
                     port: 22,
                     auth: Auth::inline(body("pg")),
@@ -796,7 +794,7 @@ mod tests {
             ],
             credentials: vec![Credential {
                 id: cid,
-                alias: "team-dev".into(),
+                name: "team-dev".into(),
                 body: body("u"),
             }],
             ..Default::default()
@@ -810,7 +808,7 @@ mod tests {
         let cfg = SshrackConfig {
             hosts: vec![Host {
                 id: Ulid::new(),
-                alias: "web1".into(),
+                name: "web1".into(),
                 host: "h".into(),
                 port: 22,
                 auth: Auth::inline(body("u")),
@@ -824,11 +822,11 @@ mod tests {
     #[test]
     fn resolve_keyring_inline_body_emits_keyring_source() {
         // A keyring-marker inline body resolves to PasswordSource::Keyring whose
-        // key is host:<host-id> (the alias is NOT in the key).
+        // key is host:<host-id> (the name is NOT in the key).
         let host_id = Ulid::new();
         let h = Host {
             id: host_id,
-            alias: "h".into(),
+            name: "h".into(),
             host: "x".into(),
             port: 22,
             auth: Auth::inline(CredentialBody {
@@ -842,7 +840,7 @@ mod tests {
         match r.password {
             PasswordSource::Keyring { key } => {
                 assert_eq!(key, format!("host:{host_id}"));
-                assert_ne!(key, "host:h", "alias must not appear in the key");
+                assert_ne!(key, "host:h", "name must not appear in the key");
             }
             other => panic!("expected Keyring, got {other:?}"),
         }
@@ -855,7 +853,7 @@ mod tests {
         let cfg = SshrackConfig {
             credentials: vec![Credential {
                 id: cid,
-                alias: "team-dev".into(),
+                name: "team-dev".into(),
                 body: CredentialBody {
                     user: "deploy".into(),
                     password: None,
@@ -943,13 +941,13 @@ mod tests {
     }
 
     #[test]
-    fn resolve_decrypt_failure_names_alias() {
+    fn resolve_decrypt_failure_names_credential() {
         use crate::config::schema::{Auth, CredentialBody, Host, Secret};
         use crate::secret::vault::crypto;
         let enc = crypto::encrypt(b"secret", &[1u8; 32]).unwrap();
         let h = Host {
             id: Ulid::new(),
-            alias: "web1".into(),
+            name: "web1".into(),
             host: "x".into(),
             port: 22,
             auth: Auth::inline(CredentialBody {
@@ -971,32 +969,32 @@ mod tests {
             ),
         )
         .unwrap_err();
-        assert!(matches!(err, SshrackError::DecryptionFailed { alias } if alias == "web1"));
+        assert!(matches!(err, SshrackError::DecryptionFailed { name } if name == "web1"));
     }
 
     /// Regression for the core ref-by-id guarantee: a host references a
-    /// credential by id; renaming that credential's ALIAS (the user-facing
+    /// credential by id; renaming that credential's NAME (the user-facing
     /// name) must not break `resolve`, because the host holds the id, not the
-    /// alias. Pre-ref-by-id (alias-keyed) this would have dangled.
+    /// name. Pre-ref-by-id (name-keyed) this would have dangled.
     #[test]
-    fn renaming_credential_alias_keeps_reference_resolvable() {
+    fn renaming_credential_name_keeps_reference_resolvable() {
         let cid = Ulid::new();
         let host_id = Ulid::new();
         // Host references the credential by its stable id and lives in the
         // config so find_referrers can see it.
         let h = Host {
             id: host_id,
-            alias: "web1".into(),
+            name: "web1".into(),
             host: "x".into(),
             port: 22,
             auth: Auth::reference(cid),
         };
-        // Credential exists under alias "team-dev".
+        // Credential exists under name "team-dev".
         let mut cfg = SshrackConfig {
             hosts: vec![h.clone()],
             credentials: vec![Credential {
                 id: cid,
-                alias: "team-dev".into(),
+                name: "team-dev".into(),
                 body: CredentialBody::new("deploy").with_password("p"),
             }],
             ..Default::default()
@@ -1007,10 +1005,10 @@ mod tests {
         // find_referrers lists the host before the rename.
         assert_eq!(find_referrers(&cfg, &cid), vec![host_id]);
 
-        // Rename the credential alias in place (id unchanged). A rename through
+        // Rename the credential name in place (id unchanged). A rename through
         // the CLI would re-run merge_credential with the same id; here we edit
-        // the alias directly to exercise the resolution invariant alone.
-        cfg.credentials[0].alias = "prod-team".into();
+        // the name directly to exercise the resolution invariant alone.
+        cfg.credentials[0].name = "prod-team".into();
         assert!(
             validate_rename_credential(&cfg, "prod-team", "prod-team").is_ok(),
             "rename to self should validate"
@@ -1026,7 +1024,7 @@ mod tests {
         }
 
         // find_referrers is keyed by id, so it still lists the host after the
-        // alias rename — delete warnings stay accurate across renames.
+        // name rename — delete warnings stay accurate across renames.
         assert_eq!(find_referrers(&cfg, &cid), vec![host_id]);
     }
 
@@ -1086,17 +1084,17 @@ mod tests {
         let next = add_credential(&cfg, id, "team", body("deploy")).unwrap();
         assert_eq!(next.credentials.len(), 1);
         assert_eq!(next.credentials[0].id, id);
-        assert_eq!(next.credentials[0].alias, "team");
+        assert_eq!(next.credentials[0].name, "team");
         // Original config is untouched (immutable).
         assert!(cfg.credentials.is_empty());
     }
 
     #[test]
-    fn add_credential_rejects_forbidden_alias_char() {
+    fn add_credential_rejects_forbidden_name_char() {
         let cfg = SshrackConfig::default();
         assert!(matches!(
             add_credential(&cfg, new_id(), "a:b", body("u")),
-            Err(SshrackError::InvalidAliasChar { .. })
+            Err(SshrackError::InvalidNameChar { .. })
         ));
     }
 
@@ -1116,31 +1114,27 @@ mod tests {
     }
 
     #[test]
-    fn upsert_replaces_in_place_on_alias_match() {
+    fn upsert_replaces_in_place_on_name_match() {
         let cfg = cfg_with_cred("team");
         let original_id = cfg.credentials[0].id;
         // Clone-then-build so we can hand ownership into upsert.
         let next = cfg.clone();
         let replacement = Credential {
             id: original_id,
-            alias: "team".into(),
+            name: "team".into(),
             body: body("new-user"),
         };
         let out = upsert_credential(&next, replacement);
-        assert_eq!(
-            out.credentials.len(),
-            1,
-            "must not duplicate on alias match"
-        );
+        assert_eq!(out.credentials.len(), 1, "must not duplicate on name match");
         assert_eq!(out.credentials[0].body.user, "new-user");
     }
 
     #[test]
-    fn upsert_appends_when_alias_is_new() {
+    fn upsert_appends_when_name_is_new() {
         let cfg = cfg_with_cred("a");
         let added = Credential {
             id: new_id(),
-            alias: "b".into(),
+            name: "b".into(),
             body: body("u"),
         };
         let out = upsert_credential(&cfg, added);
@@ -1151,7 +1145,7 @@ mod tests {
     fn apply_patch_overwrites_user_and_key() {
         let orig = Credential {
             id: new_id(),
-            alias: "c".into(),
+            name: "c".into(),
             body: CredentialBody::new("u").with_key("/k"),
         };
         let opts = EditOptions {
@@ -1168,7 +1162,7 @@ mod tests {
     fn apply_patch_clear_identity_drops_key() {
         let orig = Credential {
             id: new_id(),
-            alias: "c".into(),
+            name: "c".into(),
             body: CredentialBody::new("u").with_key("/k"),
         };
         let opts = EditOptions {
@@ -1187,7 +1181,7 @@ mod tests {
         // silently clear the key.
         let orig = Credential {
             id: new_id(),
-            alias: "c".into(),
+            name: "c".into(),
             body: CredentialBody::new("u").with_password("topsecret"),
         };
         let opts = EditOptions {
@@ -1208,7 +1202,7 @@ mod tests {
         // Password-only credential edited for user/rename keeps its password.
         let orig = Credential {
             id: new_id(),
-            alias: "c".into(),
+            name: "c".into(),
             body: CredentialBody::new("u").with_password("topsecret"),
         };
         let opts = EditOptions {
@@ -1222,24 +1216,24 @@ mod tests {
     }
 
     #[test]
-    fn apply_patch_rename_updates_alias() {
+    fn apply_patch_rename_updates_name() {
         let orig = Credential {
             id: new_id(),
-            alias: "c".into(),
+            name: "c".into(),
             body: body("u"),
         };
         let opts = EditOptions {
             rename: Some("d".into()),
             ..Default::default()
         };
-        assert_eq!(apply_credential_patch(&orig, &opts).unwrap().alias, "d");
+        assert_eq!(apply_credential_patch(&orig, &opts).unwrap().name, "d");
     }
 
     #[test]
     fn apply_patch_rename_rejects_forbidden_char() {
         let orig = Credential {
             id: new_id(),
-            alias: "c".into(),
+            name: "c".into(),
             body: body("u"),
         };
         let opts = EditOptions {
@@ -1248,7 +1242,7 @@ mod tests {
         };
         assert!(matches!(
             apply_credential_patch(&orig, &opts),
-            Err(SshrackError::InvalidAliasChar { .. })
+            Err(SshrackError::InvalidNameChar { .. })
         ));
     }
 
@@ -1259,7 +1253,7 @@ mod tests {
         let id = new_id();
         let orig = Credential {
             id,
-            alias: "c".into(),
+            name: "c".into(),
             body: body("u"),
         };
         let opts = EditOptions {
@@ -1277,7 +1271,7 @@ mod tests {
         // misreport the auth kind (and resolve to a stale Keyring source).
         let orig = Credential {
             id: new_id(),
-            alias: "c".into(),
+            name: "c".into(),
             body: CredentialBody {
                 user: "u".into(),
                 password: None,
@@ -1310,7 +1304,7 @@ mod tests {
         let cfg = SshrackConfig {
             credentials: vec![Credential {
                 id,
-                alias: "kr-cred-rm".into(),
+                name: "kr-cred-rm".into(),
                 body: CredentialBody {
                     user: "root".into(),
                     password: None,
@@ -1343,7 +1337,7 @@ mod tests {
         let cfg = SshrackConfig {
             credentials: vec![Credential {
                 id,
-                alias: "plain-cred".into(),
+                name: "plain-cred".into(),
                 body: CredentialBody::new("u").with_password("p"),
             }],
             ..Default::default()
@@ -1375,7 +1369,7 @@ mod tests {
         let backend = FakeBackend::new();
         let src = Credential {
             id: new_id(),
-            alias: "s".into(),
+            name: "s".into(),
             body: CredentialBody {
                 user: "u".into(),
                 password: None,
@@ -1385,7 +1379,7 @@ mod tests {
         };
         let dst = Credential {
             id: new_id(),
-            alias: "d".into(),
+            name: "d".into(),
             body: CredentialBody {
                 user: "u".into(),
                 password: None,
@@ -1423,12 +1417,12 @@ mod tests {
         let backend = FakeBackend::new();
         let src = Credential {
             id: new_id(),
-            alias: "s".into(),
+            name: "s".into(),
             body: CredentialBody::new("u").with_key("/k"),
         };
         let dst = Credential {
             id: new_id(),
-            alias: "d".into(),
+            name: "d".into(),
             body: CredentialBody::new("u"),
         };
         copy_keyring_entry(&src, &dst, &backend).unwrap();

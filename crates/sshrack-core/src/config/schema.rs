@@ -175,10 +175,10 @@ pub enum SecretKind {
 /// A selectable auth method for the interactive `add`/`edit`/`cred` menus.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthChoice {
-    /// Reuse a named `[[credentials]]` entry by alias.
+    /// Reuse a named `[[credentials]]` entry by name.
     Credential {
-        /// The credential alias to reference.
-        alias: String,
+        /// The credential name to reference.
+        name: String,
     },
     /// Inline username + password collected at the prompt.
     InlinePassword,
@@ -253,15 +253,15 @@ impl CredentialBody {
     }
 }
 
-/// A named credential table entry: a first-class id, an alias, plus its
+/// A named credential table entry: a first-class id, a name, plus its
 /// [`CredentialBody`].
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Credential {
     /// Stable, globally-unique identity for this credential. The OS-keyring
-    /// account key is derived from this id (not the alias), so renaming a
+    /// account key is derived from this id (not the name), so renaming a
     /// credential never orphans its keyring password.
     pub id: Ulid,
-    pub alias: String,
+    pub name: String,
     #[serde(flatten)]
     pub body: CredentialBody,
 }
@@ -322,12 +322,12 @@ impl Auth {
 
 /// A single managed host entry. Auth is an enum; `user` lives inside `auth`.
 /// The first-class `id` is the stable identity (keyring key, cross-host
-/// reference target) — independent of the alias, which the user may rename.
+/// reference target) — independent of the name, which the user may rename.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Host {
     /// Stable, globally-unique identity for this host.
     pub id: Ulid,
-    pub alias: String,
+    pub name: String,
     pub host: String,
     #[serde(default = "default_port")]
     pub port: u16,
@@ -377,9 +377,9 @@ impl Default for SshrackConfig {
 }
 
 impl SshrackConfig {
-    /// Find a host by alias.
-    pub fn find_host_by_alias(&self, alias: &str) -> Option<&Host> {
-        self.hosts.iter().find(|h| h.alias == alias)
+    /// Find a host by name.
+    pub fn find_host_by_name(&self, name: &str) -> Option<&Host> {
+        self.hosts.iter().find(|h| h.name == name)
     }
 
     /// Find a host by id.
@@ -387,9 +387,9 @@ impl SshrackConfig {
         self.hosts.iter().find(|h| &h.id == id)
     }
 
-    /// Find a credential by alias.
-    pub fn find_credential_by_alias(&self, alias: &str) -> Option<&Credential> {
-        self.credentials.iter().find(|c| c.alias == alias)
+    /// Find a credential by name.
+    pub fn find_credential_by_name(&self, name: &str) -> Option<&Credential> {
+        self.credentials.iter().find(|c| c.name == name)
     }
 
     /// Find a credential by id.
@@ -443,7 +443,7 @@ mod tests {
         let input = r#"
 [[hosts]]
 id = "01HXYZ0000000000000000000E"
-alias = "h"
+name = "h"
 host = "x"
 auth = { user = "root" }
 "#;
@@ -468,14 +468,14 @@ auth = { user = "root" }
         // Owners carry first-class ids; two unrelated owners must not collide.
         let h = Host {
             id: crate::id::new_id(),
-            alias: "h".into(),
+            name: "h".into(),
             host: "x".into(),
             port: 22,
             auth: Auth::inline(CredentialBody::new("u")),
         };
         let c = Credential {
             id: crate::id::new_id(),
-            alias: "c".into(),
+            name: "c".into(),
             body: CredentialBody::new("u"),
         };
         assert_ne!(h.id, c.id);
@@ -512,23 +512,23 @@ auth = { user = "root" }
             r#"
 [[hosts]]
 id = "01HXYZ000000000000000000A1"
-alias = "web1"
+name = "web1"
 host = "10.0.0.5"
 auth = {{ credential = "{cid}" }}
 
 [[credentials]]
 id = "{cid}"
-alias = "team-dev"
+name = "team-dev"
 user = "deploy"
 key = "~/.ssh/team_ed25519"
 "#
         );
         let cfg: SshrackConfig = toml::from_str(&input).unwrap();
-        let h = cfg.find_host_by_alias("web1").unwrap();
+        let h = cfg.find_host_by_name("web1").unwrap();
         assert_eq!(h.auth.credential_id(), Some(cid));
         assert!(h.auth.inline_body().is_none());
         let c = cfg.find_credential_by_id(&cid).unwrap();
-        assert_eq!(c.alias, "team-dev");
+        assert_eq!(c.name, "team-dev");
         assert_eq!(c.body.user, "deploy");
         assert_eq!(
             c.body.key.as_deref(),
@@ -541,13 +541,13 @@ key = "~/.ssh/team_ed25519"
         let input = r#"
 [[hosts]]
 id = "01HXYZ0000000000000000000A"
-alias = "db"
+name = "db"
 host = "db.example.com"
 auth = { user = "postgres", password = "s3cret" }
 "#;
         let cfg: SshrackConfig = toml::from_str(input).unwrap();
         let body = cfg
-            .find_host_by_alias("db")
+            .find_host_by_name("db")
             .unwrap()
             .auth
             .inline_body()
@@ -562,13 +562,13 @@ auth = { user = "postgres", password = "s3cret" }
         let input = r#"
 [[hosts]]
 id = "01HXYZ0000000000000000000B"
-alias = "gw"
+name = "gw"
 host = "gw.example.com"
 auth = { user = "ops", key = "~/.ssh/gw_ed25519" }
 "#;
         let cfg: SshrackConfig = toml::from_str(input).unwrap();
         let body = cfg
-            .find_host_by_alias("gw")
+            .find_host_by_name("gw")
             .unwrap()
             .auth
             .inline_body()
@@ -581,13 +581,13 @@ auth = { user = "ops", key = "~/.ssh/gw_ed25519" }
         let input = r#"
 [[hosts]]
 id = "01HXYZ0000000000000000000C"
-alias = "jump"
+name = "jump"
 host = "jump.example.com"
 auth = { user = "ec2-user" }
 "#;
         let cfg: SshrackConfig = toml::from_str(input).unwrap();
         let body = cfg
-            .find_host_by_alias("jump")
+            .find_host_by_name("jump")
             .unwrap()
             .auth
             .inline_body()
@@ -602,12 +602,12 @@ auth = { user = "ec2-user" }
         let input = r#"
 [[hosts]]
 id = "01HXYZ0000000000000000000D"
-alias = "mini"
+name = "mini"
 host = "10.0.0.5"
 auth = { user = "root" }
 "#;
         let cfg: SshrackConfig = toml::from_str(input).unwrap();
-        assert_eq!(cfg.find_host_by_alias("mini").unwrap().port, 22);
+        assert_eq!(cfg.find_host_by_name("mini").unwrap().port, 22);
     }
 
     #[test]
@@ -616,14 +616,14 @@ auth = { user = "root" }
         let cfg = SshrackConfig {
             hosts: vec![Host {
                 id: crate::id::new_id(),
-                alias: "web1".into(),
+                name: "web1".into(),
                 host: "10.0.0.5".into(),
                 port: 22,
                 auth: Auth::reference(cid),
             }],
             credentials: vec![Credential {
                 id: cid,
-                alias: "team-dev".into(),
+                name: "team-dev".into(),
                 body: CredentialBody::new("deploy").with_password("p"),
             }],
             ..Default::default()
@@ -638,7 +638,7 @@ auth = { user = "root" }
         let cid = Ulid::from_string("01HXYZ0000000000000000000Z").unwrap();
         let h = Host {
             id: crate::id::new_id(),
-            alias: "web1".into(),
+            name: "web1".into(),
             host: "10.0.0.5".into(),
             port: 22,
             auth: Auth::reference(cid),
@@ -693,7 +693,7 @@ auth = { user = "root" }
     #[test]
     fn find_credential_returns_none_when_absent() {
         let cfg = SshrackConfig::default();
-        assert!(cfg.find_credential_by_alias("nope").is_none());
+        assert!(cfg.find_credential_by_name("nope").is_none());
         let id = crate::id::new_id();
         assert!(cfg.find_credential_by_id(&id).is_none());
     }
@@ -705,20 +705,20 @@ auth = { user = "root" }
         let cfg = SshrackConfig {
             hosts: vec![Host {
                 id: hid,
-                alias: "h".into(),
+                name: "h".into(),
                 host: "x".into(),
                 port: 22,
                 auth: Auth::inline(CredentialBody::new("u")),
             }],
             credentials: vec![Credential {
                 id: cid,
-                alias: "c".into(),
+                name: "c".into(),
                 body: CredentialBody::new("u"),
             }],
             ..Default::default()
         };
-        assert_eq!(cfg.find_host_by_id(&hid).unwrap().alias, "h");
-        assert_eq!(cfg.find_credential_by_id(&cid).unwrap().alias, "c");
+        assert_eq!(cfg.find_host_by_id(&hid).unwrap().name, "h");
+        assert_eq!(cfg.find_credential_by_id(&cid).unwrap().name, "c");
         // Wrong id misses.
         let other = crate::id::new_id();
         assert!(cfg.find_host_by_id(&other).is_none());
@@ -741,7 +741,7 @@ auth = { user = "root" }
         let input = r#"
 [[credentials]]
 id = "01HXYZ00000000000000000002"
-alias = "team"
+name = "team"
 user = "deploy"
 password = "s3cret"
 "#;
@@ -869,7 +869,7 @@ password = "s3cret"
         let input = r#"
 [[credentials]]
 id = "01HXYZ00000000000000000003"
-alias = "team"
+name = "team"
 user = "deploy"
 keyring = true
 "#;

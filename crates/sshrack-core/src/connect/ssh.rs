@@ -14,13 +14,13 @@ pub struct Overrides {
     pub user: Option<String>,
     pub port: Option<u16>,
     pub identity: Option<PathBuf>,
-    /// `--credential <alias>`: reuse a `[[credentials]]` entry for this one
+    /// `--credential <name>`: reuse a `[[credentials]]` entry for this one
     /// connection (overlays the resolved auth). For an ad-hoc target this is
-    /// the identity source. The CLI resolves the alias to the credential's
+    /// the identity source. The CLI resolves the name to the credential's
     /// stable [`Ulid`] before constructing this; the argv builder never sees
-    /// the alias.
+    /// the name.
     pub credential: Option<Ulid>,
-    /// `--ad-hoc`: the target is a literal address, not a config alias.
+    /// `--ad-hoc`: the target is a literal address, not a config name.
     pub ad_hoc: bool,
 }
 
@@ -67,7 +67,7 @@ mod tests {
     fn host() -> Host {
         Host {
             id: crate::id::new_id(),
-            alias: "web1".into(),
+            name: "web1".into(),
             host: "192.168.1.10".into(),
             port: 2222,
             auth: Auth::inline(CredentialBody::new("deploy").with_key("~/.ssh/id_ed25519")),

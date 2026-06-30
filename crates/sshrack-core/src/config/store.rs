@@ -64,7 +64,7 @@ mod tests {
         let cfg = SshrackConfig {
             hosts: vec![Host {
                 id: crate::id::new_id(),
-                alias: "round".into(),
+                name: "round".into(),
                 host: "h".into(),
                 port: 22,
                 auth: Auth::inline(CredentialBody::new("u").with_password("pw")),
@@ -75,7 +75,7 @@ mod tests {
         save(tmp.path(), &cfg).unwrap();
         let back = load(tmp.path()).unwrap();
         assert_eq!(back.hosts.len(), 1);
-        assert_eq!(back.hosts[0].alias, "round");
+        assert_eq!(back.hosts[0].name, "round");
         assert_eq!(
             back.hosts[0].auth.inline_body().unwrap().password_plain(),
             Some("pw")
@@ -95,7 +95,7 @@ mod tests {
         let cfg = SshrackConfig {
             hosts: vec![Host {
                 id: crate::id::new_id(),
-                alias: "x".into(),
+                name: "x".into(),
                 host: "h".into(),
                 port: 22,
                 auth: Auth::inline(CredentialBody::new("u").with_password("secret")),

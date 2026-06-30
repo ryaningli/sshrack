@@ -5,7 +5,7 @@
 //! it was last used (`recency`) via the zoxide 4-tier decay: a connection within
 //! the last hour multiplies the running score by 4, within a day by 2, within a
 //! week by 0.5, and older than a week by 0.25 — then adds 1. Keyed by host
-//! [`Ulid`] (rename-safe: renaming a host's alias never orphans its score).
+//! [`Ulid`] (rename-safe: renaming a host's name never orphans its score).
 //!
 //! Persistence lives in [`store`] (atomic 0600 TOML under the data dir).
 
@@ -101,7 +101,7 @@ pub struct RankedHost<'a> {
 /// Sorts by `last_used` descending: the host used most recently sorts first.
 /// Hosts that have never been recorded (`last_used == None`) sort last, after
 /// every recorded host, and tie-break among themselves (and among hosts that
-/// happen to share a `last_used`) alphabetically by alias. Unlike [`rank`],
+/// happen to share a `last_used`) alphabetically by name. Unlike [`rank`],
 /// the frecency **score** is ignored for ordering — a frequently-used-but-stale
 /// host ranks lower here than a host used once moments ago. The returned
 /// [`RankedHost`] still carries the score so callers can surface it.
@@ -118,25 +118,25 @@ pub fn rank_by_recent<'a>(hosts: &'a [&Host], frec: &Frecency) -> Vec<RankedHost
         let lb = frec.map.get(&b.host.id).and_then(|e| e.last_used);
         // Descending by last_used; Some > None, so compare b.then(a) puts Some
         // first. Within the Some/Some arm, greater time first. None/None falls
-        // through to the alias tie-break.
+        // through to the name tie-break.
         match (lb, la) {
             (Some(b_t), Some(a_t)) => b_t.cmp(&a_t),
             (Some(_), None) => std::cmp::Ordering::Greater,
             (None, Some(_)) => std::cmp::Ordering::Less,
             (None, None) => std::cmp::Ordering::Equal,
         }
-        .then_with(|| a.host.alias.cmp(&b.host.alias))
+        .then_with(|| a.host.name.cmp(&b.host.name))
     });
     out
 }
 
-/// Rank hosts by substring-match presence, then frecency score, then alias.
+/// Rank hosts by substring-match presence, then frecency score, then name.
 ///
-/// Pure. `query` is matched case-insensitively as a substring of the alias
-/// (`alias.to_lowercase().contains(query.to_lowercase())`); hosts whose alias
+/// Pure. `query` is matched case-insensitively as a substring of the name
+/// (`name.to_lowercase().contains(query.to_lowercase())`); hosts whose name
 /// contains the query sort ahead of non-matches, then by descending frecency
-/// score, then alphabetically by alias to break ties. An empty query matches
-/// every host, so the order is purely score-then-alias.
+/// score, then alphabetically by name to break ties. An empty query matches
+/// every host, so the order is purely score-then-name.
 ///
 /// This is a first-period matcher: substring `contains` only. True fuzzy
 /// matching (strsim/nucleo-style) is deferred to the TUI launcher phase.
@@ -151,15 +151,15 @@ pub fn rank<'a>(hosts: &'a [&Host], query: &str, frec: &Frecency) -> Vec<RankedH
         .collect();
     out.sort_by(|a, b| {
         // Matches first (true > false → descending), so compare b.contains then a.contains.
-        let am = a.host.alias.to_lowercase().contains(&q) as u8;
-        let bm = b.host.alias.to_lowercase().contains(&q) as u8;
+        let am = a.host.name.to_lowercase().contains(&q) as u8;
+        let bm = b.host.name.to_lowercase().contains(&q) as u8;
         bm.cmp(&am)
             .then_with(|| {
                 b.score
                     .partial_cmp(&a.score)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
-            .then_with(|| a.host.alias.cmp(&b.host.alias))
+            .then_with(|| a.host.name.cmp(&b.host.name))
     });
     out
 }
@@ -170,11 +170,11 @@ mod tests {
     use crate::config::schema::{Auth, CredentialBody, Host};
     use std::time::{Duration, UNIX_EPOCH};
 
-    /// Build a host with a fixed id and alias for deterministic tests.
-    fn host(id: u128, alias: &str) -> Host {
+    /// Build a host with a fixed id and name for deterministic tests.
+    fn host(id: u128, name: &str) -> Host {
         Host {
             id: Ulid::from_string(&format!("{id:026X}")).unwrap(),
-            alias: alias.into(),
+            name: name.into(),
             host: "h".into(),
             port: 22,
             auth: Auth::inline(CredentialBody::new("u")),
@@ -289,18 +289,18 @@ mod tests {
     // ---- rank tests ----
 
     #[test]
-    fn rank_empty_query_orders_by_score_desc_then_alias() {
+    fn rank_empty_query_orders_by_score_desc_then_name() {
         let a = host(1, "alpha");
         let b = host(2, "bravo");
         let c = host(3, "charlie");
         let hosts = [&a, &b, &c];
         let mut frec = Frecency::default();
-        // bravo used most, alpha and charlie never recorded (tie → alias asc).
+        // bravo used most, alpha and charlie never recorded (tie → name asc).
         frec.record_at(&b.id, now());
 
         let ranked = rank(&hosts, "", &frec);
-        let aliases: Vec<_> = ranked.iter().map(|r| r.host.alias.as_str()).collect();
-        assert_eq!(aliases, vec!["bravo", "alpha", "charlie"]);
+        let names: Vec<_> = ranked.iter().map(|r| r.host.name.as_str()).collect();
+        assert_eq!(names, vec!["bravo", "alpha", "charlie"]);
         assert_eq!(ranked[0].score, 1.0);
     }
 
@@ -320,13 +320,13 @@ mod tests {
         // alpha: 0.0
 
         let ranked = rank(&hosts, "", &frec);
-        let aliases: Vec<_> = ranked.iter().map(|r| r.host.alias.as_str()).collect();
-        assert_eq!(aliases, vec!["charlie", "bravo", "alpha"]);
+        let names: Vec<_> = ranked.iter().map(|r| r.host.name.as_str()).collect();
+        assert_eq!(names, vec!["charlie", "bravo", "alpha"]);
     }
 
     #[test]
     fn rank_query_puts_matches_ahead_of_non_matches() {
-        // The brief's Step 1: a query puts hosts whose alias contains the query
+        // The brief's Step 1: a query puts hosts whose name contains the query
         // ahead of non-matches — even when a non-match has a higher score.
         let web1 = host(1, "web-prod-1");
         let web2 = host(2, "web-staging");
@@ -341,8 +341,8 @@ mod tests {
 
         let ranked = rank(&hosts, "web", &frec);
         // Both web-* hosts match and sort ahead of db1; web1 (score 1.0) > web2 (0.0).
-        let aliases: Vec<_> = ranked.iter().map(|r| r.host.alias.as_str()).collect();
-        assert_eq!(aliases, vec!["web-prod-1", "web-staging", "db-prod"]);
+        let names: Vec<_> = ranked.iter().map(|r| r.host.name.as_str()).collect();
+        assert_eq!(names, vec!["web-prod-1", "web-staging", "db-prod"]);
     }
 
     #[test]
@@ -353,21 +353,21 @@ mod tests {
         let frec = Frecency::default();
 
         let ranked = rank(&hosts, "WEB", &frec);
-        assert_eq!(ranked[0].host.alias, "Web-Prod");
+        assert_eq!(ranked[0].host.name, "Web-Prod");
     }
 
     #[test]
-    fn rank_query_match_ties_break_by_score_then_alias() {
+    fn rank_query_match_ties_break_by_score_then_name() {
         let web_b = host(1, "web-bravo");
         let web_a = host(2, "web-alpha");
         let hosts = [&web_b, &web_a];
         let mut frec = Frecency::default();
-        // web_b has a higher score → sorts first despite later alias.
+        // web_b has a higher score → sorts first despite later name.
         frec.record_at(&web_b.id, now());
 
         let ranked = rank(&hosts, "web", &frec);
-        let aliases: Vec<_> = ranked.iter().map(|r| r.host.alias.as_str()).collect();
-        assert_eq!(aliases, vec!["web-bravo", "web-alpha"]);
+        let names: Vec<_> = ranked.iter().map(|r| r.host.name.as_str()).collect();
+        assert_eq!(names, vec!["web-bravo", "web-alpha"]);
     }
 
     #[test]
@@ -379,7 +379,7 @@ mod tests {
 
     #[test]
     fn rank_no_query_no_match_difference_orders_by_score() {
-        // Empty query matches everyone, so it reduces to score-then-alias.
+        // Empty query matches everyone, so it reduces to score-then-name.
         let a = host(1, "alpha");
         let b = host(2, "bravo");
         let hosts = [&a, &b];
@@ -387,8 +387,8 @@ mod tests {
         frec.record_at(&a.id, now());
 
         let ranked = rank(&hosts, "", &frec);
-        assert_eq!(ranked[0].host.alias, "alpha");
-        assert_eq!(ranked[1].host.alias, "bravo");
+        assert_eq!(ranked[0].host.name, "alpha");
+        assert_eq!(ranked[1].host.name, "bravo");
     }
 
     // ---- rank_by_recent tests ----
@@ -406,9 +406,9 @@ mod tests {
         frec.record_at(&b.id, t0 + Duration::from_secs(60));
 
         let ranked = rank_by_recent(&hosts, &frec);
-        let aliases: Vec<_> = ranked.iter().map(|r| r.host.alias.as_str()).collect();
+        let names: Vec<_> = ranked.iter().map(|r| r.host.name.as_str()).collect();
         // bravo (most recent), alpha (older), charlie (never used, sorts last).
-        assert_eq!(aliases, vec!["bravo", "alpha", "charlie"]);
+        assert_eq!(names, vec!["bravo", "alpha", "charlie"]);
     }
 
     #[test]
@@ -418,12 +418,12 @@ mod tests {
         let hosts = [&z, &a];
         let mut frec = Frecency::default();
         // Only alpha is recorded; zulu never used. alpha must rank first even
-        // though its alias would sort after zulu alphabetically.
+        // though its name would sort after zulu alphabetically.
         frec.record_at(&a.id, now());
 
         let ranked = rank_by_recent(&hosts, &frec);
-        let aliases: Vec<_> = ranked.iter().map(|r| r.host.alias.as_str()).collect();
-        assert_eq!(aliases, vec!["alpha", "zulu"]);
+        let names: Vec<_> = ranked.iter().map(|r| r.host.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "zulu"]);
     }
 
     #[test]
@@ -447,27 +447,27 @@ mod tests {
 
         // Frecency (score) order: frequent first (high score).
         let by_score = rank(&hosts, "", &frec);
-        assert_eq!(by_score[0].host.alias, "frequent");
+        assert_eq!(by_score[0].host.name, "frequent");
 
         // Recent order: fresh first (most-recently-used).
         let by_recent = rank_by_recent(&hosts, &frec);
-        assert_eq!(by_recent[0].host.alias, "fresh");
+        assert_eq!(by_recent[0].host.name, "fresh");
         // And the orders genuinely differ.
         assert_ne!(
             by_score
                 .iter()
-                .map(|r| r.host.alias.as_str())
+                .map(|r| r.host.name.as_str())
                 .collect::<Vec<_>>(),
             by_recent
                 .iter()
-                .map(|r| r.host.alias.as_str())
+                .map(|r| r.host.name.as_str())
                 .collect::<Vec<_>>(),
         );
     }
 
     #[test]
-    fn rank_by_recent_ties_break_by_alias() {
-        // Two hosts recorded at the same instant tie on last_used → alias asc.
+    fn rank_by_recent_ties_break_by_name() {
+        // Two hosts recorded at the same instant tie on last_used → name asc.
         let b = host(1, "bravo");
         let a = host(2, "alpha");
         let hosts = [&b, &a];
@@ -477,7 +477,7 @@ mod tests {
         frec.record_at(&a.id, t0);
 
         let ranked = rank_by_recent(&hosts, &frec);
-        let aliases: Vec<_> = ranked.iter().map(|r| r.host.alias.as_str()).collect();
-        assert_eq!(aliases, vec!["alpha", "bravo"]);
+        let names: Vec<_> = ranked.iter().map(|r| r.host.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "bravo"]);
     }
 }

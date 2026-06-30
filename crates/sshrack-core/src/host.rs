@@ -1,4 +1,4 @@
-//! Host CRUD pure logic: alias validation, immutable config transforms, and
+//! Host CRUD pure logic: name validation, immutable config transforms, and
 //! connect-time target resolution.
 //!
 //! Everything here is decision logic lifted out of the (forthcoming) CLI's
@@ -9,9 +9,9 @@
 //! so they stay unit-testable without a daemon.
 //!
 //! Ref-by-id invariant ([`crate::credential`]): a host holds an [`Auth::Ref`]
-//! pointing at a credential's stable [`Ulid`], never its alias. None of the
+//! pointing at a credential's stable [`Ulid`], never its name. None of the
 //! transforms here rewrite that id on rename — the host keeps referencing the
-//! same credential regardless of alias edits.
+//! same credential regardless of name edits.
 
 use std::path::PathBuf;
 
@@ -23,24 +23,24 @@ use crate::id::{OwnerKind, new_id};
 use crate::secret::{self, SecretBackend};
 use crate::suggest;
 
-/// Characters forbidden in a host alias: they break sshrack's own syntax (`:` is
-/// the scp `alias:path` separator; `@` is reserved for the future `user@alias`
+/// Characters forbidden in a host name: they break sshrack's own syntax (`:` is
+/// the scp `name:path` separator; `@` is reserved for the future `user@name`
 /// form) or argv/token splitting (whitespace). `add` rejects these up front;
 /// the soft warning pass in the CLI surfaces them when they appear in a
 /// hand-edited config. Hosts and credentials share the same rule.
-pub const FORBIDDEN_ALIAS_CHARS: &[char] = &[':', '@', ' ', '\t', '\n', '\r'];
+pub const FORBIDDEN_NAME_CHARS: &[char] = &[':', '@', ' ', '\t', '\n', '\r'];
 
-/// The first forbidden character in `alias`, if any. Shared by the hard
+/// The first forbidden character in `name`, if any. Shared by the hard
 /// rejection in `add` and the soft warning pass.
-pub fn forbidden_char_in(alias: &str) -> Option<char> {
-    alias.chars().find(|c| FORBIDDEN_ALIAS_CHARS.contains(c))
+pub fn forbidden_char_in(name: &str) -> Option<char> {
+    name.chars().find(|c| FORBIDDEN_NAME_CHARS.contains(c))
 }
 
-/// Reject `alias` if it contains a [`FORBIDDEN_ALIAS_CHARS`] character.
-pub fn validate_alias_chars(alias: &str) -> Result<(), SshrackError> {
-    if let Some(ch) = forbidden_char_in(alias) {
-        return Err(SshrackError::InvalidAliasChar {
-            alias: alias.to_string(),
+/// Reject `name` if it contains a [`FORBIDDEN_NAME_CHARS`] character.
+pub fn validate_name_chars(name: &str) -> Result<(), SshrackError> {
+    if let Some(ch) = forbidden_char_in(name) {
+        return Err(SshrackError::InvalidNameChar {
+            name: name.to_string(),
             ch,
         });
     }
@@ -48,73 +48,71 @@ pub fn validate_alias_chars(alias: &str) -> Result<(), SshrackError> {
 }
 
 /// Build a [`SshrackError::HostNotFound`] with a "did you mean" hint computed
-/// from the config's host aliases. Shared by every host lookup that fails:
+/// from the config's host names. Shared by every host lookup that fails:
 /// resolve, show, rm, cp, edit.
-pub fn host_not_found(cfg: &SshrackConfig, alias: &str) -> SshrackError {
-    let candidates: Vec<&str> = cfg.hosts.iter().map(|h| h.alias.as_str()).collect();
+pub fn host_not_found(cfg: &SshrackConfig, name: &str) -> SshrackError {
+    let candidates: Vec<&str> = cfg.hosts.iter().map(|h| h.name.as_str()).collect();
     SshrackError::HostNotFound {
-        alias: alias.into(),
-        hint: DidYouMean::from_option(suggest::closest(&candidates, alias)),
+        name: name.into(),
+        hint: DidYouMean::from_option(suggest::closest(&candidates, name)),
     }
 }
 
-/// Reject a duplicate alias unless `force` is set.
+/// Reject a duplicate name unless `force` is set.
 pub fn validate_no_duplicate(
     cfg: &SshrackConfig,
-    alias: &str,
+    name: &str,
     force: bool,
 ) -> Result<(), SshrackError> {
-    if cfg.find_host_by_alias(alias).is_some() && !force {
-        return Err(SshrackError::HostAlreadyExists {
-            alias: alias.into(),
-        });
+    if cfg.find_host_by_name(name).is_some() && !force {
+        return Err(SshrackError::HostAlreadyExists { name: name.into() });
     }
     Ok(())
 }
 
-/// Validate a rename target against the config (excludes the current alias).
+/// Validate a rename target against the config (excludes the current name).
 pub fn validate_rename(
     cfg: &SshrackConfig,
-    current_alias: &str,
-    new_alias: &str,
+    current_name: &str,
+    new_name: &str,
 ) -> Result<(), SshrackError> {
-    validate_alias_chars(new_alias)?;
+    validate_name_chars(new_name)?;
     let taken_by_other = cfg
         .hosts
         .iter()
-        .any(|h| h.alias == new_alias && h.alias != current_alias);
+        .any(|h| h.name == new_name && h.name != current_name);
     if taken_by_other {
-        return Err(SshrackError::AliasTaken {
-            alias: new_alias.to_string(),
+        return Err(SshrackError::NameTaken {
+            name: new_name.to_string(),
         });
     }
     Ok(())
 }
 
-/// Validate the destination alias for a copy: legal characters and global
-/// uniqueness. `cp` never overwrites, so this always rejects an existing alias
+/// Validate the destination name for a copy: legal characters and global
+/// uniqueness. `cp` never overwrites, so this always rejects an existing name
 /// (including the source's own name — a host cannot be copied onto itself).
 pub fn validate_dst(cfg: &SshrackConfig, dst: &str) -> Result<(), SshrackError> {
-    validate_alias_chars(dst)?;
+    validate_name_chars(dst)?;
     validate_no_duplicate(cfg, dst, false)
 }
 
 /// Return a new config with a fresh host appended, or `Err` on a forbidden
-/// alias character. Pure: does not mutate `cfg`, does not touch the filesystem.
+/// name character. Pure: does not mutate `cfg`, does not touch the filesystem.
 /// The caller supplies the stable `id` (generated via [`new_id`]).
 pub fn add_host(
     cfg: &SshrackConfig,
     id: Ulid,
-    alias: &str,
+    name: &str,
     host: &str,
     port: u16,
     auth: Auth,
 ) -> Result<SshrackConfig, SshrackError> {
-    validate_alias_chars(alias)?;
+    validate_name_chars(name)?;
     let mut next = cfg.clone();
     next.hosts.push(Host {
         id,
-        alias: alias.into(),
+        name: name.into(),
         host: host.into(),
         port,
         auth,
@@ -122,33 +120,33 @@ pub fn add_host(
     Ok(next)
 }
 
-/// Return a new config with `alias` removed, or `None` if it was not present.
+/// Return a new config with `name` removed, or `None` if it was not present.
 ///
 /// Pure transform: does not mutate `cfg`, does not touch the filesystem or the
 /// keyring. The caller is responsible for persisting the returned config and
 /// (via [`delete_host_with_secret`]) forgetting any keyring entry.
-pub fn remove_host(cfg: &SshrackConfig, alias: &str) -> Option<SshrackConfig> {
-    if !cfg.hosts.iter().any(|h| h.alias == alias) {
+pub fn remove_host(cfg: &SshrackConfig, name: &str) -> Option<SshrackConfig> {
+    if !cfg.hosts.iter().any(|h| h.name == name) {
         return None;
     }
     let mut next = cfg.clone();
-    next.hosts.retain(|h| h.alias != alias);
+    next.hosts.retain(|h| h.name != name);
     Some(next)
 }
 
-/// Clone `src` into a fresh [`Host`] that shares every field except `alias` and
+/// Clone `src` into a fresh [`Host`] that shares every field except `name` and
 /// `id`. The copy gets a **fresh id** so it is an independent keyring identity
-/// (a shared id would make the two hosts alias one keyring entry and diverge
+/// (a shared id would make the two hosts name one keyring entry and diverge
 /// confusingly). The keyring entry itself is best-effort copied by the caller
 /// via [`copy_keyring_entry`].
 ///
 /// A credential reference is copied as a shared id string — the copy references
 /// the same credential, the credential itself is never duplicated. An inline
 /// body is duplicated verbatim (its secret travels with the body).
-pub fn clone_host_as(src: &Host, dst_id: Ulid, dst_alias: &str) -> Host {
+pub fn clone_host_as(src: &Host, dst_id: Ulid, dst_name: &str) -> Host {
     Host {
         id: dst_id,
-        alias: dst_alias.to_string(),
+        name: dst_name.to_string(),
         host: src.host.clone(),
         port: src.port,
         auth: src.auth.clone(),
@@ -158,11 +156,11 @@ pub fn clone_host_as(src: &Host, dst_id: Ulid, dst_alias: &str) -> Host {
 /// Connection-time overrides that influence how a connect target is resolved.
 /// Borrows from the CLI layer so this core module stays free of CLI coupling.
 ///
-/// `credential` is a [`Ulid`] (the CLI resolves `--credential <alias>` to an id
+/// `credential` is a [`Ulid`] (the CLI resolves `--credential <name>` to an id
 /// before constructing this), matching [`crate::connect::ssh::Overrides::credential`].
 #[derive(Debug, Clone, Copy)]
 pub struct ResolveOverrides<'a> {
-    /// `--ad-hoc`: treat an unknown target as a literal address, not an alias.
+    /// `--ad-hoc`: treat an unknown target as a literal address, not a name.
     pub ad_hoc: bool,
     /// `--credential <id>`: reuse a `[[credentials]]` entry's identity.
     pub credential: Option<Ulid>,
@@ -178,9 +176,9 @@ pub struct ResolveOverrides<'a> {
 const DEFAULT_PORT: u16 = 22;
 
 /// Resolve a connect `target` into a concrete [`Host`], whether it names a
-/// configured alias or an ad-hoc address. Decision table:
+/// configured name or an ad-hoc address. Decision table:
 ///
-/// | alias hit | `--ad-hoc` | result |
+/// | name hit  | `--ad-hoc` | result |
 /// |-----------|------------|--------|
 /// | yes       | any        | the host entry; `--credential` overrides its auth |
 /// | no        | yes        | an ephemeral host `{ host = target, … }` |
@@ -196,7 +194,7 @@ pub fn resolve_target(
     target: &str,
     overrides: &ResolveOverrides<'_>,
 ) -> Result<Host, SshrackError> {
-    if let Some(found) = cfg.find_host_by_alias(target) {
+    if let Some(found) = cfg.find_host_by_name(target) {
         let mut host = found.clone();
         if let Some(cred) = overrides.credential {
             host.auth = Auth::reference(cred);
@@ -236,13 +234,13 @@ fn ad_hoc_auth(overrides: &ResolveOverrides<'_>) -> Result<Auth, SshrackError> {
 }
 
 /// Build an ephemeral [`Host`] for an ad-hoc address + auth. Never persisted:
-/// `alias` mirrors the address (cosmetic — ad-hoc hosts are never looked up by
-/// alias after construction). The `id` is fresh so a keyring password (if any)
+/// `name` mirrors the address (cosmetic — ad-hoc hosts are never looked up by
+/// name after construction). The `id` is fresh so a keyring password (if any)
 /// keys off a stable identity.
 fn ad_hoc_host(address: &str, port: u16, auth: Auth) -> Host {
     Host {
         id: new_id(),
-        alias: address.to_string(),
+        name: address.to_string(),
         host: address.to_string(),
         port,
         auth,
@@ -261,7 +259,7 @@ pub struct AddOptions {
     /// Remote hostname or IP. Required in `--no-input` mode.
     pub host: Option<String>,
     pub port: Option<u16>,
-    /// Reference a `[[credentials]]` entry by alias. The CLI resolves this to a
+    /// Reference a `[[credentials]]` entry by name. The CLI resolves this to a
     /// stable [`Ulid`] before building the host. When set alongside `user` or
     /// `identity`, the interactive `prompt_auth` menu is skipped.
     pub credential: Option<Ulid>,
@@ -272,7 +270,7 @@ pub struct AddOptions {
     /// Non-interactive: all required fields must come from flags (a password
     /// host cannot be created in this mode — passwords never enter argv).
     pub no_input: bool,
-    /// Overwrite an existing alias.
+    /// Overwrite an existing name.
     pub force: bool,
 }
 
@@ -298,19 +296,19 @@ pub fn auth_supplied_by_flags(opts: &AddOptions) -> bool {
     opts.credential.is_some() || opts.user.is_some() || opts.identity.is_some()
 }
 
-/// Build a [`Host`] from alias + options + a caller-supplied id, applying
+/// Build a [`Host`] from name + options + a caller-supplied id, applying
 /// defaults and the required-`host` check. The body's password is attached by
-/// the CLI (interactive only — never via flags). Pure: validates the alias and
+/// the CLI (interactive only — never via flags). Pure: validates the name and
 /// assembles the struct, no config mutation.
-pub fn merge_fields(id: Ulid, alias: &str, opts: &AddOptions) -> Result<Host, SshrackError> {
-    validate_alias_chars(alias)?;
+pub fn merge_fields(id: Ulid, name: &str, opts: &AddOptions) -> Result<Host, SshrackError> {
+    validate_name_chars(name)?;
     let host_addr = opts
         .host
         .clone()
         .ok_or(SshrackError::MissingRequiredField { field: "host" })?;
     Ok(Host {
         id,
-        alias: alias.into(),
+        name: name.into(),
         host: host_addr,
         port: opts.port.unwrap_or(DEFAULT_PORT),
         auth: build_auth(opts),
@@ -323,7 +321,7 @@ pub fn merge_fields(id: Ulid, alias: &str, opts: &AddOptions) -> Result<Host, Ss
 pub struct EditOptions {
     pub host: Option<String>,
     pub port: Option<u16>,
-    /// Reference a `[[credentials]]` entry by id (the CLI resolves the alias).
+    /// Reference a `[[credentials]]` entry by id (the CLI resolves the name).
     /// Setting this implies switching the host's auth to [`Auth::Ref`] — the
     /// host's inline user/identity fields are not patched in this case.
     /// Mutually exclusive with `clear_credential`.
@@ -348,7 +346,7 @@ pub struct EditOptions {
 /// untouched by user/identity flags, and only an inline body is patched
 /// field-by-field.
 pub fn apply_patch(orig: &Host, opts: &EditOptions) -> Result<Host, SshrackError> {
-    let alias = opts.rename.clone().unwrap_or_else(|| orig.alias.clone());
+    let name = opts.rename.clone().unwrap_or_else(|| orig.name.clone());
     let host = opts.host.clone().unwrap_or_else(|| orig.host.clone());
     let port = opts.port.unwrap_or(orig.port);
 
@@ -369,7 +367,7 @@ pub fn apply_patch(orig: &Host, opts: &EditOptions) -> Result<Host, SshrackError
 
     Ok(Host {
         id: orig.id,
-        alias,
+        name,
         host,
         port,
         auth,
@@ -411,10 +409,10 @@ fn patch_body(body: &CredentialBody, opts: &EditOptions) -> Result<CredentialBod
 /// `edit.rs` did this via `new_body.retain_id(orig_body)`; with the id now on
 /// the host (not the body), the equivalent is to stamp the original id onto the
 /// freshly prompted host. Returns a [`Host`] with `orig_id` and the new fields.
-pub fn finalize_body(orig_id: Ulid, alias: &str, host: &str, port: u16, auth: Auth) -> Host {
+pub fn finalize_body(orig_id: Ulid, name: &str, host: &str, port: u16, auth: Auth) -> Host {
     Host {
         id: orig_id,
-        alias: alias.into(),
+        name: name.into(),
         host: host.into(),
         port,
         auth,
@@ -439,7 +437,7 @@ pub fn edit_has_any_flag(opts: &EditOptions) -> bool {
 // rm / cp keyring-aware helpers (backend-injected; no direct I/O)
 // ===========================================================================
 
-/// Remove the host named `alias` from `cfg` and best-effort forget its keyring
+/// Remove the host named `name` from `cfg` and best-effort forget its keyring
 /// entry when the host's inline body was keyring-marked. Returns the new config
 /// (keyring already cleaned), or `Err(HostNotFound)` if absent.
 ///
@@ -449,32 +447,32 @@ pub fn edit_has_any_flag(opts: &EditOptions) -> bool {
 /// returned config.
 pub fn delete_host_with_secret(
     cfg: &SshrackConfig,
-    alias: &str,
+    name: &str,
     backend: &dyn SecretBackend,
 ) -> Result<SshrackConfig, SshrackError> {
-    let Some(host) = cfg.find_host_by_alias(alias) else {
-        return Err(host_not_found(cfg, alias));
+    let Some(host) = cfg.find_host_by_name(name) else {
+        return Err(host_not_found(cfg, name));
     };
     // Snapshot the keyring-relevant fields before the (cloned) remove, so the
     // forget decision reflects the host as it stood at call time.
     let (host_id, keyring) = (host.id, host.auth.inline_body().is_some_and(|b| b.keyring));
-    let next = remove_host(cfg, alias).expect("invariant: host present (checked above)");
+    let next = remove_host(cfg, name).expect("invariant: host present (checked above)");
     secret::forget_keyring_secret(backend, OwnerKind::Host, &host_id, keyring);
     Ok(next)
 }
 
-/// Best-effort forget the keyring entry of the host currently at `alias`, when
+/// Best-effort forget the keyring entry of the host currently at `name`, when
 /// that host is about to be overwritten in place (e.g. `host add --force` on an
-/// existing alias, which generates a fresh id). If the existing host's inline
+/// existing name, which generates a fresh id). If the existing host's inline
 /// body was keyring-marked, its keyring entry — keyed by the *old* id — is
 /// deleted so no orphaned secret is left behind, mirroring [`delete_host_with_secret`].
 ///
-/// No-op when `alias` is absent (nothing to overwrite) or when the existing
+/// No-op when `name` is absent (nothing to overwrite) or when the existing
 /// host was not keyring-marked. Pure w.r.t. the filesystem; the caller persists
 /// the replacement config separately. Never returns an error (best-effort, like
 /// the rm path).
-pub fn forget_keyring_on_overwrite(cfg: &SshrackConfig, alias: &str, backend: &dyn SecretBackend) {
-    let Some(old) = cfg.find_host_by_alias(alias) else {
+pub fn forget_keyring_on_overwrite(cfg: &SshrackConfig, name: &str, backend: &dyn SecretBackend) {
+    let Some(old) = cfg.find_host_by_name(name) else {
         return;
     };
     let keyring = old.auth.inline_body().is_some_and(|b| b.keyring);
@@ -509,11 +507,11 @@ mod tests {
     use crate::config::schema::{Auth, CredentialBody, Host, SshrackConfig};
     use crate::secret::test_doubles::FakeBackend;
 
-    fn cfg_with(alias: &str) -> SshrackConfig {
+    fn cfg_with(name: &str) -> SshrackConfig {
         SshrackConfig {
             hosts: vec![Host {
                 id: new_id(),
-                alias: alias.into(),
+                name: name.into(),
                 host: "h".into(),
                 port: 22,
                 auth: Auth::inline(CredentialBody::new("u")),
@@ -522,13 +520,13 @@ mod tests {
         }
     }
 
-    fn cfg_with_aliases(aliases: &[&str]) -> SshrackConfig {
+    fn cfg_with_names(names: &[&str]) -> SshrackConfig {
         SshrackConfig {
-            hosts: aliases
+            hosts: names
                 .iter()
-                .map(|&a| Host {
+                .map(|&n| Host {
                     id: new_id(),
-                    alias: a.into(),
+                    name: n.into(),
                     host: "h".into(),
                     port: 22,
                     auth: Auth::inline(CredentialBody::new("u")),
@@ -545,17 +543,17 @@ mod tests {
         }
     }
 
-    fn inline_host(alias: &str, body: CredentialBody) -> Host {
+    fn inline_host(name: &str, body: CredentialBody) -> Host {
         Host {
             id: new_id(),
-            alias: alias.into(),
-            host: format!("{alias}.example.com"),
+            name: name.into(),
+            host: format!("{name}.example.com"),
             port: 2222,
             auth: Auth::inline(body),
         }
     }
 
-    // --- forbidden_char_in / validate_alias_chars ---
+    // --- forbidden_char_in / validate_name_chars ---
 
     #[test]
     fn forbidden_char_in_detects_colon_at_whitespace() {
@@ -567,16 +565,16 @@ mod tests {
     }
 
     #[test]
-    fn validate_alias_chars_accepts_clean_alias() {
-        assert!(validate_alias_chars("web-1.db_2").is_ok());
+    fn validate_name_chars_accepts_clean_name() {
+        assert!(validate_name_chars("web-1.db_2").is_ok());
     }
 
     #[test]
-    fn validate_alias_chars_reports_offending_char() {
-        let err = validate_alias_chars("a:b").unwrap_err();
+    fn validate_name_chars_reports_offending_char() {
+        let err = validate_name_chars("a:b").unwrap_err();
         assert!(matches!(
             err,
-            SshrackError::InvalidAliasChar { ref alias, ch: ':' } if alias == "a:b"
+            SshrackError::InvalidNameChar { ref name, ch: ':' } if name == "a:b"
         ));
     }
 
@@ -623,9 +621,9 @@ mod tests {
 
     #[test]
     fn rename_taken_by_other_rejected() {
-        let cfg = cfg_with_aliases(&["web1", "web2"]);
+        let cfg = cfg_with_names(&["web1", "web2"]);
         let err = validate_rename(&cfg, "web1", "web2").unwrap_err();
-        assert!(matches!(err, SshrackError::AliasTaken { alias } if alias == "web2"));
+        assert!(matches!(err, SshrackError::NameTaken { name } if name == "web2"));
     }
 
     // --- add_host ---
@@ -646,7 +644,7 @@ mod tests {
         assert_eq!(next.hosts.len(), 1);
         let h = &next.hosts[0];
         assert_eq!(h.id, id);
-        assert_eq!(h.alias, "web1");
+        assert_eq!(h.name, "web1");
         assert_eq!(h.host, "10.0.0.5");
         assert_eq!(h.port, 2222);
         // The input config is untouched (immutable transform).
@@ -664,7 +662,7 @@ mod tests {
             Auth::inline(CredentialBody::new("u")),
         )
         .unwrap_err();
-        assert!(matches!(err, SshrackError::InvalidAliasChar { .. }));
+        assert!(matches!(err, SshrackError::InvalidNameChar { .. }));
     }
 
     // --- remove_host ---
@@ -684,10 +682,10 @@ mod tests {
 
     #[test]
     fn other_hosts_preserved() {
-        let cfg = cfg_with_aliases(&["a", "b"]);
+        let cfg = cfg_with_names(&["a", "b"]);
         let next = remove_host(&cfg, "a").expect("present host should be removed");
         assert_eq!(next.hosts.len(), 1);
-        assert_eq!(next.hosts[0].alias, "b");
+        assert_eq!(next.hosts[0].name, "b");
     }
 
     #[test]
@@ -702,14 +700,14 @@ mod tests {
         let cfg = SshrackConfig {
             hosts: vec![Host {
                 id: new_id(),
-                alias: "web1".into(),
+                name: "web1".into(),
                 host: "h".into(),
                 port: 22,
                 auth: Auth::inline(CredentialBody::new("u")),
             }],
             credentials: vec![crate::config::schema::Credential {
                 id: new_id(),
-                alias: "team-dev".into(),
+                name: "team-dev".into(),
                 body: CredentialBody::new("deploy"),
             }],
             ..Default::default()
@@ -722,18 +720,18 @@ mod tests {
     // --- clone_host_as / validate_dst ---
 
     #[test]
-    fn clone_replaces_alias_and_id_keeps_fields() {
+    fn clone_replaces_name_and_id_keeps_fields() {
         let src = inline_host("web1", CredentialBody::new("deploy").with_key("/k"));
         let dst_id = new_id();
         let cloned = clone_host_as(&src, dst_id, "web2");
         assert_eq!(cloned.id, dst_id);
-        assert_eq!(cloned.alias, "web2");
+        assert_eq!(cloned.name, "web2");
         assert_eq!(cloned.host, src.host);
         assert_eq!(cloned.port, src.port);
         let body = cloned.auth.inline_body().unwrap();
         assert_eq!(body.user, "deploy");
         assert_eq!(body.key.as_deref(), Some(std::path::Path::new("/k")));
-        assert_eq!(src.alias, "web1");
+        assert_eq!(src.name, "web1");
     }
 
     #[test]
@@ -751,7 +749,7 @@ mod tests {
         let cid = new_id();
         let src = Host {
             id: new_id(),
-            alias: "web1".into(),
+            name: "web1".into(),
             host: "10.0.0.5".into(),
             port: 22,
             auth: Auth::reference(cid),
@@ -768,7 +766,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_dst_rejects_existing_alias() {
+    fn validate_dst_rejects_existing_name() {
         let cfg = cfg_with_hosts(vec![inline_host("web1", CredentialBody::new("u"))]);
         assert!(matches!(
             validate_dst(&cfg, "web1"),
@@ -781,12 +779,12 @@ mod tests {
         let cfg = cfg_with_hosts(vec![]);
         assert!(matches!(
             validate_dst(&cfg, "a:b"),
-            Err(SshrackError::InvalidAliasChar { .. })
+            Err(SshrackError::InvalidNameChar { .. })
         ));
     }
 
     #[test]
-    fn validate_dst_accepts_fresh_alias() {
+    fn validate_dst_accepts_fresh_name() {
         let cfg = cfg_with_hosts(vec![inline_host("web1", CredentialBody::new("u"))]);
         assert!(validate_dst(&cfg, "web2").is_ok());
     }
@@ -804,17 +802,17 @@ mod tests {
     }
 
     #[test]
-    fn resolve_target_alias_hit_returns_entry_unchanged() {
+    fn resolve_target_name_hit_returns_entry_unchanged() {
         let cfg = cfg_with("web1");
         let host = resolve_target(&cfg, "web1", &ro_none()).unwrap();
-        assert_eq!(host.alias, "web1");
+        assert_eq!(host.name, "web1");
         assert_eq!(host.host, "h");
         assert_eq!(host.port, 22);
         assert!(host.auth.inline_body().is_some());
     }
 
     #[test]
-    fn resolve_target_alias_hit_with_credential_overrides_auth() {
+    fn resolve_target_name_hit_with_credential_overrides_auth() {
         let cfg = cfg_with("web1");
         let cid = new_id();
         let mut o = ro_none();
@@ -827,7 +825,7 @@ mod tests {
 
     #[test]
     fn resolve_target_ad_hoc_with_credential_builds_ephemeral_ref() {
-        let cfg = cfg_with("web1"); // "1.2.3.4" is not an alias here
+        let cfg = cfg_with("web1"); // "1.2.3.4" is not a name here
         let cid = new_id();
         let mut o = ro_none();
         o.ad_hoc = true;
@@ -869,7 +867,7 @@ mod tests {
         let err = resolve_target(&cfg, "web2", &ro_none()).unwrap_err();
         assert!(matches!(
             err,
-            SshrackError::HostNotFound { alias, .. } if alias == "web2"
+            SshrackError::HostNotFound { name, .. } if name == "web2"
         ));
     }
 
@@ -877,7 +875,7 @@ mod tests {
     fn ad_hoc_host_mirrors_address_and_carries_auth() {
         let cid = new_id();
         let host = ad_hoc_host("10.0.0.5", 2222, Auth::reference(cid));
-        assert_eq!(host.alias, "10.0.0.5");
+        assert_eq!(host.name, "10.0.0.5");
         assert_eq!(host.host, "10.0.0.5");
         assert_eq!(host.port, 2222);
         assert_eq!(host.auth.credential_id(), Some(cid));
@@ -963,7 +961,7 @@ mod tests {
     #[test]
     fn merge_rejects_forbidden_char() {
         let err = merge_fields(new_id(), "a:b", &opts_host(Some("h"))).unwrap_err();
-        assert!(matches!(err, SshrackError::InvalidAliasChar { .. }));
+        assert!(matches!(err, SshrackError::InvalidNameChar { .. }));
     }
 
     // --- apply_patch / patch_body / finalize_body / edit_has_any_flag ---
@@ -973,7 +971,7 @@ mod tests {
         let orig = inline_host("web1", CredentialBody::new("deploy").with_key("/k"));
         let out = apply_patch(&orig, &EditOptions::default()).unwrap();
         assert_eq!(out.id, orig.id);
-        assert_eq!(out.alias, "web1");
+        assert_eq!(out.name, "web1");
         assert_eq!(out.host, orig.host);
         assert_eq!(out.port, 2222);
         let body = out.auth.inline_body().unwrap();
@@ -1011,7 +1009,7 @@ mod tests {
         let old_cid = new_id();
         let orig = Host {
             id: new_id(),
-            alias: "web1".into(),
+            name: "web1".into(),
             host: "10.0.0.5".into(),
             port: 22,
             auth: Auth::reference(old_cid),
@@ -1047,7 +1045,7 @@ mod tests {
             ..Default::default()
         };
         let out = apply_patch(&orig, &opts).unwrap();
-        assert_eq!(out.alias, "web2");
+        assert_eq!(out.name, "web2");
         assert_eq!(out.id, orig.id, "id must survive a patch");
     }
 
@@ -1056,7 +1054,7 @@ mod tests {
         // A keyring-password body edited for user/rename must stay keyring-marked.
         let orig = Host {
             id: new_id(),
-            alias: "web1".into(),
+            name: "web1".into(),
             host: "10.0.0.5".into(),
             port: 22,
             auth: Auth::inline(CredentialBody {
@@ -1081,7 +1079,7 @@ mod tests {
     fn patch_body_clear_password_drops_keyring_marker() {
         let orig = Host {
             id: new_id(),
-            alias: "web1".into(),
+            name: "web1".into(),
             host: "10.0.0.5".into(),
             port: 22,
             auth: Auth::inline(CredentialBody {
@@ -1115,7 +1113,7 @@ mod tests {
             Auth::inline(CredentialBody::new("deploy")),
         );
         assert_eq!(h.id, id);
-        assert_eq!(h.alias, "web1");
+        assert_eq!(h.name, "web1");
     }
 
     #[test]
@@ -1141,7 +1139,7 @@ mod tests {
         let cfg = SshrackConfig {
             hosts: vec![Host {
                 id,
-                alias: "kr-rm".into(),
+                name: "kr-rm".into(),
                 host: "10.0.0.99".into(),
                 port: 22,
                 auth: Auth::inline(CredentialBody {
@@ -1195,7 +1193,7 @@ mod tests {
         let cfg = SshrackConfig {
             hosts: vec![Host {
                 id: old_id,
-                alias: "kr-overwrite".into(),
+                name: "kr-overwrite".into(),
                 host: "10.0.0.99".into(),
                 port: 22,
                 auth: Auth::inline(CredentialBody {
@@ -1232,8 +1230,8 @@ mod tests {
     }
 
     #[test]
-    fn forget_keyring_on_overwrite_is_noop_when_alias_absent() {
-        // Overwriting a non-existent alias is a no-op (there is nothing to clean).
+    fn forget_keyring_on_overwrite_is_noop_when_name_absent() {
+        // Overwriting a non-existent name is a no-op (there is nothing to clean).
         let backend = FakeBackend::new();
         let id = new_id();
         backend.set(OwnerKind::Host, &id, "unrelated").unwrap();
@@ -1257,7 +1255,7 @@ mod tests {
         backend.set(OwnerKind::Host, &src_id, "topsecret").unwrap();
         let src = Host {
             id: src_id,
-            alias: "web1".into(),
+            name: "web1".into(),
             host: "h".into(),
             port: 22,
             auth: Auth::inline(CredentialBody {
@@ -1294,7 +1292,7 @@ mod tests {
         let backend = FakeBackend::new();
         let src = Host {
             id: new_id(),
-            alias: "web1".into(),
+            name: "web1".into(),
             host: "h".into(),
             port: 22,
             auth: Auth::inline(CredentialBody {
@@ -1315,7 +1313,7 @@ mod tests {
         let cid = new_id();
         let src = Host {
             id: new_id(),
-            alias: "web1".into(),
+            name: "web1".into(),
             host: "h".into(),
             port: 22,
             auth: Auth::reference(cid),

@@ -2,7 +2,7 @@
 //!
 //! Every host and credential carries a first-class, immutable `Ulid`. The
 //! keyring account key is derived from the owner kind plus that id (never the
-//! alias), so renaming an owner never moves its keyring entry.
+//! name), so renaming an owner never moves its keyring entry.
 
 use ulid::Ulid;
 
@@ -18,7 +18,7 @@ pub enum OwnerKind {
     Credential,
 }
 
-/// Pure: the keyring account key for an owner kind + id. Alias-free on purpose
+/// Pure: the keyring account key for an owner kind + id. Name-free on purpose
 /// so renames are safe.
 pub fn keyring_key(kind: OwnerKind, id: &Ulid) -> String {
     match kind {
