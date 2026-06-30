@@ -15,9 +15,6 @@ use std::path::Path;
 /// ([`crate::error::SshrackError::ConfigWrite`] vs
 /// [`crate::error::SshrackError::CacheIo`]). Non-Unix targets fall back to a
 /// plain write (Windows ACL hardening is out of scope for phase 1).
-// Wired up in later tasks (config::store, secret::vault::cache). Allowed for
-// now so the foundational helper can land ahead of its first caller.
-#[allow(dead_code)]
 pub(crate) fn write_private(path: &Path, contents: &[u8]) -> Result<(), std::io::Error> {
     #[cfg(target_family = "unix")]
     {
