@@ -11,6 +11,7 @@ pub mod config;
 pub mod connect;
 pub mod credential;
 pub mod error;
+pub mod frecency;
 pub mod fsutil;
 pub mod host;
 pub mod hostkey;
