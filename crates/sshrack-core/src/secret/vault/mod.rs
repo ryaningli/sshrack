@@ -1,14 +1,16 @@
 //! Master-passphrase encryption for stored passwords ("vault" mode).
 //!
-//! Split into a pure cryptography core ([`crypto`]) and an I/O-only key cache
-//! ([`cache`]). The orchestration that ties them to the CLI, plus the body
-//! transforms, land in later tasks.
+//! Split into a pure cryptography core ([`crypto`]), pure body/config
+//! transforms ([`transform`]), and an I/O-only key cache ([`cache`]). The
+//! orchestration that ties them to the CLI (unlock/enable/rekey/seal_body) lands
+//! in a later task.
 //!
 //! Design rule: nothing in this module ever prints, logs, or returns a
 //! passphrase, master key, or plaintext in an error message.
 
 pub mod cache;
 pub mod crypto;
+pub mod transform;
 
 /// The derived 32-byte master key. Wrapped in [`Zeroizing`] so it is wiped on
 /// drop. Produced by [`crypto::derive_key`]; consumed by

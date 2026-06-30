@@ -20,6 +20,7 @@ use crate::config::schema::{Auth, Credential, CredentialBody, Host, SshrackConfi
 use crate::error::{DidYouMean, SshrackError};
 use crate::host::validate_alias_chars;
 use crate::id::{OwnerKind, keyring_key};
+use crate::secret::{self, SecretBackend};
 use crate::suggest;
 
 /// Where a resolved password lives, if any.
@@ -192,6 +193,205 @@ pub fn find_referrers(cfg: &SshrackConfig, cred_id: &Ulid) -> Vec<Ulid> {
             _ => None,
         })
         .collect()
+}
+
+// ===========================================================================
+// add / edit / rm pure helpers (lifted from sshrack-old's cmd/cred/{add,edit,rm}.rs)
+// ===========================================================================
+
+/// Field values supplied via CLI flags for `cred add`. `None` means "not
+/// provided" (interactive mode prompts; `--no-input` mode errors for required
+/// `user`). The CLI fills this struct; core never reads the TTY. A password is
+/// never a flag (passwords never enter argv) — it is attached by the CLI's
+/// interactive path and sealed via the (forthcoming) vault orchestration.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AddOptions {
+    /// Login user. Required in `--no-input` mode.
+    pub user: Option<String>,
+    /// Inline private key path.
+    pub identity: Option<PathBuf>,
+    /// Non-interactive: all required fields must come from flags.
+    pub no_input: bool,
+    /// Overwrite an existing alias.
+    pub force: bool,
+}
+
+/// Field updates supplied via CLI flags for `cred edit`. `None` keeps the
+/// existing value; `Some` overwrites; `clear_*` drops it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct EditOptions {
+    pub user: Option<String>,
+    pub identity: Option<PathBuf>,
+    /// Drop an existing identity key (mutually exclusive with `identity`).
+    pub clear_identity: bool,
+    /// Rename to a new alias. The caller validates the new name against the
+    /// config via [`validate_rename_credential`] before applying.
+    pub rename: Option<String>,
+    /// Non-interactive mode (does not change patch behaviour itself; the CLI
+    /// uses it to decide between the patch path and the full-prompt path).
+    pub no_input: bool,
+}
+
+/// Build a body from add flags (`--no-input` mode). The password is never set
+/// here — it cannot come from a flag. [`AddOptions::user`] is required in this
+/// mode.
+pub fn build_body(opts: &AddOptions) -> Result<CredentialBody, SshrackError> {
+    let user = opts
+        .user
+        .clone()
+        .ok_or(SshrackError::MissingRequiredField { field: "user" })?;
+    let mut body = CredentialBody::new(user);
+    if let Some(k) = &opts.identity {
+        body = body.with_key(k.clone());
+    }
+    body.validate()?;
+    Ok(body)
+}
+
+/// True when the caller supplied any field-setting flag, so the interactive
+/// `prompt_credential_body` path is skipped in favour of the patch path.
+pub fn edit_has_any_flag(opts: &EditOptions) -> bool {
+    opts.user.is_some() || opts.identity.is_some() || opts.clear_identity || opts.rename.is_some()
+}
+
+/// Return a new config with a credential appended, or `Err` on a forbidden
+/// alias character. Pure: does not mutate `cfg`, does not touch the filesystem.
+/// The caller supplies the stable `id` (generated via [`crate::id::new_id`]);
+/// the body's password is sealed by the CLI's interactive path before this is
+/// called.
+///
+/// Does NOT check for duplicate aliases — the caller runs
+/// [`validate_no_duplicate_credential`] first (the `--force` flag belongs there,
+/// not on the pure append).
+pub fn add_credential(
+    cfg: &SshrackConfig,
+    id: Ulid,
+    alias: &str,
+    body: CredentialBody,
+) -> Result<SshrackConfig, SshrackError> {
+    validate_alias_chars(alias)?;
+    body.validate()?;
+    let mut next = cfg.clone();
+    next.credentials.push(Credential {
+        id,
+        alias: alias.into(),
+        body,
+    });
+    Ok(next)
+}
+
+/// Insert or replace the credential keyed by alias, preserving insertion order
+/// on replace (an existing alias is overwritten in place; a new alias is
+/// appended). Pure: returns a new config. Shared by `add --force` and `edit`.
+pub fn upsert_credential(cfg: &SshrackConfig, cred: Credential) -> SshrackConfig {
+    let mut next = cfg.clone();
+    if let Some(existing) = next
+        .credentials
+        .iter_mut()
+        .find(|c| c.alias == cred.alias.as_str())
+    {
+        *existing = cred;
+    } else {
+        next.credentials.push(cred);
+    }
+    next
+}
+
+/// Pure transform: apply edit flags to a credential. The original password is
+/// preserved only when no new key is being set: a credential carries at most
+/// one secret, so once `--identity` (or a preserved key) is in play the password
+/// must be dropped rather than silently re-attached (`with_password` would
+/// otherwise clear the key). The password itself is only ever changed
+/// interactively (the CLI re-seals via the vault path after this).
+///
+/// The credential's `id` is preserved verbatim so a patch (including
+/// `--rename`) never orphans the keyring entry keyed by that id. The body's
+/// `keyring` marker is cleared when switching to/clearing an identity (the old
+/// keyring entry is then orphaned, which is the caller's concern).
+pub fn apply_credential_patch(
+    orig: &Credential,
+    opts: &EditOptions,
+) -> Result<Credential, SshrackError> {
+    let alias = opts.rename.clone().unwrap_or_else(|| orig.alias.clone());
+    validate_alias_chars(&alias)?;
+    let user = opts.user.clone().unwrap_or_else(|| orig.body.user.clone());
+    let key = if opts.clear_identity {
+        None
+    } else {
+        opts.identity.clone().or(orig.body.key.clone())
+    };
+    let (password, keyring) = if opts.identity.is_some() || opts.clear_identity {
+        // Switching to / clearing a key drops any password/marker.
+        (None, false)
+    } else {
+        (orig.body.password.clone(), orig.body.keyring)
+    };
+    let mut body = CredentialBody {
+        user,
+        password,
+        key: None,
+        keyring,
+    };
+    if let Some(k) = key {
+        body = body.with_key(k);
+    }
+    body.validate()?;
+    Ok(Credential {
+        // Preserve the original stable id: the keyring entry and every host
+        // Auth::Ref are keyed by it; a patch must never mint a new identity.
+        id: orig.id,
+        alias,
+        body,
+    })
+}
+
+/// Remove the credential named `alias` from `cfg` and best-effort forget its
+/// keyring entry when the credential's body was keyring-marked. Returns the new
+/// config (keyring already cleaned), or `Err(CredentialNotFound)` if absent.
+///
+/// The keyring cleanup goes through [`secret::forget_keyring_secret`] with
+/// [`OwnerKind::Credential`] and the credential's stable id (the body no longer
+/// carries an id — the owner does). Pure w.r.t. the filesystem: the caller
+/// persists the returned config.
+pub fn delete_credential_with_secret(
+    cfg: &SshrackConfig,
+    alias: &str,
+    backend: &dyn SecretBackend,
+) -> Result<SshrackConfig, SshrackError> {
+    let Some(cred) = cfg.find_credential_by_alias(alias) else {
+        return Err(credential_not_found(cfg, alias));
+    };
+    // Snapshot the keyring-relevant fields before the (cloned) remove, so the
+    // forget decision reflects the credential as it stood at call time.
+    let (cred_id, keyring) = (cred.id, cred.body.keyring);
+    let next = remove_credential(cfg, alias)
+        // remove_credential returns None only when the alias is absent, which
+        // the find_credential_by_alias above already ruled out.
+        .expect("invariant: credential present (checked above)");
+    secret::forget_keyring_secret(backend, OwnerKind::Credential, &cred_id, keyring);
+    Ok(next)
+}
+
+/// Best-effort: if `src` is a keyring-password credential, copy its keyring
+/// entry from the source's id to `dst`'s fresh id so the copy connects
+/// immediately. A missing/unreachable entry is reported via the returned `Err`
+/// (carrying no secret); the caller logs-and-continues. Never materializes the
+/// password outside the backend round-trip.
+///
+/// Used by `cred cp`: the copy gets a fresh id (it is an independent keyring
+/// identity), and this helper re-keys the entry onto it.
+pub fn copy_keyring_entry(
+    src: &Credential,
+    dst: &Credential,
+    backend: &dyn SecretBackend,
+) -> Result<(), SshrackError> {
+    if !src.body.keyring {
+        return Ok(());
+    }
+    match backend.get(&keyring_key(OwnerKind::Credential, &src.id))? {
+        Some(pw) => backend.set(OwnerKind::Credential, &dst.id, &pw),
+        None => Ok(()),
+    }
 }
 
 /// Decrypt a stored password secret into plaintext, given an optional master
@@ -828,5 +1028,416 @@ mod tests {
         // find_referrers is keyed by id, so it still lists the host after the
         // alias rename — delete warnings stay accurate across renames.
         assert_eq!(find_referrers(&cfg, &cid), vec![host_id]);
+    }
+
+    // ---- add / edit / rm pure helpers ----
+
+    use crate::config::schema::SecretKind;
+    use crate::id::new_id;
+    use crate::secret::SecretBackend;
+    use crate::secret::test_doubles::FakeBackend;
+
+    #[test]
+    fn build_body_requires_user_in_no_input_mode() {
+        let err = build_body(&AddOptions::default()).unwrap_err();
+        assert!(matches!(
+            err,
+            SshrackError::MissingRequiredField { field: "user" }
+        ));
+    }
+
+    #[test]
+    fn build_body_user_and_key() {
+        let opts = AddOptions {
+            user: Some("ops".into()),
+            identity: Some(PathBuf::from("/k")),
+            ..Default::default()
+        };
+        let b = build_body(&opts).unwrap();
+        assert_eq!(b.user, "ops");
+        assert_eq!(b.secret_kind(), SecretKind::Key);
+    }
+
+    #[test]
+    fn edit_has_any_flag_detects_each_flag() {
+        assert!(!edit_has_any_flag(&EditOptions::default()));
+        assert!(edit_has_any_flag(&EditOptions {
+            user: Some("u".into()),
+            ..Default::default()
+        }));
+        assert!(edit_has_any_flag(&EditOptions {
+            identity: Some(PathBuf::from("/k")),
+            ..Default::default()
+        }));
+        assert!(edit_has_any_flag(&EditOptions {
+            clear_identity: true,
+            ..Default::default()
+        }));
+        assert!(edit_has_any_flag(&EditOptions {
+            rename: Some("d".into()),
+            ..Default::default()
+        }));
+    }
+
+    #[test]
+    fn add_credential_appends_to_config() {
+        let cfg = SshrackConfig::default();
+        let id = new_id();
+        let next = add_credential(&cfg, id, "team", body("deploy")).unwrap();
+        assert_eq!(next.credentials.len(), 1);
+        assert_eq!(next.credentials[0].id, id);
+        assert_eq!(next.credentials[0].alias, "team");
+        // Original config is untouched (immutable).
+        assert!(cfg.credentials.is_empty());
+    }
+
+    #[test]
+    fn add_credential_rejects_forbidden_alias_char() {
+        let cfg = SshrackConfig::default();
+        assert!(matches!(
+            add_credential(&cfg, new_id(), "a:b", body("u")),
+            Err(SshrackError::InvalidAliasChar { .. })
+        ));
+    }
+
+    #[test]
+    fn add_credential_rejects_invalid_body() {
+        // Mutual-exclusion violation surfaces via body.validate().
+        let bad = CredentialBody {
+            user: "u".into(),
+            password: Some(crate::config::schema::Secret::Plain("p".into())),
+            key: Some(PathBuf::from("/k")),
+            keyring: false,
+        };
+        assert!(matches!(
+            add_credential(&SshrackConfig::default(), new_id(), "a", bad),
+            Err(SshrackError::InvalidCredentialBody { .. })
+        ));
+    }
+
+    #[test]
+    fn upsert_replaces_in_place_on_alias_match() {
+        let cfg = cfg_with_cred("team");
+        let original_id = cfg.credentials[0].id;
+        // Clone-then-build so we can hand ownership into upsert.
+        let next = cfg.clone();
+        let replacement = Credential {
+            id: original_id,
+            alias: "team".into(),
+            body: body("new-user"),
+        };
+        let out = upsert_credential(&next, replacement);
+        assert_eq!(
+            out.credentials.len(),
+            1,
+            "must not duplicate on alias match"
+        );
+        assert_eq!(out.credentials[0].body.user, "new-user");
+    }
+
+    #[test]
+    fn upsert_appends_when_alias_is_new() {
+        let cfg = cfg_with_cred("a");
+        let added = Credential {
+            id: new_id(),
+            alias: "b".into(),
+            body: body("u"),
+        };
+        let out = upsert_credential(&cfg, added);
+        assert_eq!(out.credentials.len(), 2);
+    }
+
+    #[test]
+    fn apply_patch_overwrites_user_and_key() {
+        let orig = Credential {
+            id: new_id(),
+            alias: "c".into(),
+            body: CredentialBody::new("u").with_key("/k"),
+        };
+        let opts = EditOptions {
+            user: Some("new".into()),
+            identity: Some(PathBuf::from("/k2")),
+            ..Default::default()
+        };
+        let out = apply_credential_patch(&orig, &opts).unwrap();
+        assert_eq!(out.body.user, "new");
+        assert_eq!(out.body.key.as_deref(), Some(std::path::Path::new("/k2")));
+    }
+
+    #[test]
+    fn apply_patch_clear_identity_drops_key() {
+        let orig = Credential {
+            id: new_id(),
+            alias: "c".into(),
+            body: CredentialBody::new("u").with_key("/k"),
+        };
+        let opts = EditOptions {
+            clear_identity: true,
+            ..Default::default()
+        };
+        let out = apply_credential_patch(&orig, &opts).unwrap();
+        assert!(out.body.key.is_none());
+    }
+
+    #[test]
+    fn apply_patch_identity_on_password_credential_drops_password() {
+        // C1 regression: `cred edit <pw-cred> --identity /k` must convert the
+        // body to a Key-kind body with password == None. Re-attaching the
+        // original password via `with_password` after setting the key would
+        // silently clear the key.
+        let orig = Credential {
+            id: new_id(),
+            alias: "c".into(),
+            body: CredentialBody::new("u").with_password("topsecret"),
+        };
+        let opts = EditOptions {
+            identity: Some(PathBuf::from("/k")),
+            ..Default::default()
+        };
+        let out = apply_credential_patch(&orig, &opts).unwrap();
+        assert_eq!(out.body.secret_kind(), SecretKind::Key);
+        assert_eq!(out.body.key.as_deref(), Some(std::path::Path::new("/k")));
+        assert!(
+            out.body.password.is_none(),
+            "password must be dropped when switching to a key"
+        );
+    }
+
+    #[test]
+    fn apply_patch_preserves_password_when_no_key_in_play() {
+        // Password-only credential edited for user/rename keeps its password.
+        let orig = Credential {
+            id: new_id(),
+            alias: "c".into(),
+            body: CredentialBody::new("u").with_password("topsecret"),
+        };
+        let opts = EditOptions {
+            user: Some("ops".into()),
+            ..Default::default()
+        };
+        let out = apply_credential_patch(&orig, &opts).unwrap();
+        assert_eq!(out.body.user, "ops");
+        assert_eq!(out.body.password_plain(), Some("topsecret"));
+        assert!(out.body.key.is_none());
+    }
+
+    #[test]
+    fn apply_patch_rename_updates_alias() {
+        let orig = Credential {
+            id: new_id(),
+            alias: "c".into(),
+            body: body("u"),
+        };
+        let opts = EditOptions {
+            rename: Some("d".into()),
+            ..Default::default()
+        };
+        assert_eq!(apply_credential_patch(&orig, &opts).unwrap().alias, "d");
+    }
+
+    #[test]
+    fn apply_patch_rename_rejects_forbidden_char() {
+        let orig = Credential {
+            id: new_id(),
+            alias: "c".into(),
+            body: body("u"),
+        };
+        let opts = EditOptions {
+            rename: Some("a:b".into()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            apply_credential_patch(&orig, &opts),
+            Err(SshrackError::InvalidAliasChar { .. })
+        ));
+    }
+
+    #[test]
+    fn apply_patch_preserves_original_id() {
+        // The id is on the owner; a patch must carry it through unchanged so
+        // the keyring entry (keyed by id) and every host Auth::Ref survive.
+        let id = new_id();
+        let orig = Credential {
+            id,
+            alias: "c".into(),
+            body: body("u"),
+        };
+        let opts = EditOptions {
+            rename: Some("d".into()),
+            ..Default::default()
+        };
+        let out = apply_credential_patch(&orig, &opts).unwrap();
+        assert_eq!(out.id, id, "credential id must survive a patch");
+    }
+
+    #[test]
+    fn apply_patch_identity_drops_keyring_marker() {
+        // Switching a keyring-marker credential to an identity must clear the
+        // marker: the body now carries a key, so `keyring = true` would
+        // misreport the auth kind (and resolve to a stale Keyring source).
+        let orig = Credential {
+            id: new_id(),
+            alias: "c".into(),
+            body: CredentialBody {
+                user: "u".into(),
+                password: None,
+                key: None,
+                keyring: true,
+            },
+        };
+        let opts = EditOptions {
+            identity: Some(PathBuf::from("/k")),
+            ..Default::default()
+        };
+        let out = apply_credential_patch(&orig, &opts).unwrap();
+        assert_eq!(out.body.secret_kind(), SecretKind::Key);
+        assert!(
+            !out.body.keyring,
+            "keyring marker must be dropped when switching to an identity"
+        );
+    }
+
+    #[test]
+    fn delete_credential_with_secret_forgets_keyring_entry() {
+        // A keyring-password credential's entry must be deleted on rm so it does
+        // not leak. Seeded into a FakeBackend (no daemon dependency); asserted
+        // by observing the entry vanish.
+        let backend = FakeBackend::new();
+        let id = new_id();
+        backend
+            .set(OwnerKind::Credential, &id, "topsecret")
+            .unwrap();
+        let cfg = SshrackConfig {
+            credentials: vec![Credential {
+                id,
+                alias: "kr-cred-rm".into(),
+                body: CredentialBody {
+                    user: "root".into(),
+                    password: None,
+                    key: None,
+                    keyring: true,
+                },
+            }],
+            ..Default::default()
+        };
+        let next = delete_credential_with_secret(&cfg, "kr-cred-rm", &backend).unwrap();
+        assert!(next.credentials.is_empty());
+        assert!(
+            backend
+                .get(&keyring_key(OwnerKind::Credential, &id))
+                .unwrap()
+                .is_none(),
+            "keyring entry must be deleted on rm"
+        );
+    }
+
+    #[test]
+    fn delete_credential_with_secret_leaves_unmarked_entry_alone() {
+        // A plaintext/password credential has no keyring entry; rm must not
+        // touch the backend (forget is delete-if-marked).
+        let backend = FakeBackend::new();
+        let id = new_id();
+        backend
+            .set(OwnerKind::Credential, &id, "unrelated")
+            .unwrap();
+        let cfg = SshrackConfig {
+            credentials: vec![Credential {
+                id,
+                alias: "plain-cred".into(),
+                body: CredentialBody::new("u").with_password("p"),
+            }],
+            ..Default::default()
+        };
+        let next = delete_credential_with_secret(&cfg, "plain-cred", &backend).unwrap();
+        assert!(next.credentials.is_empty());
+        // The unrelated entry is untouched (body was not keyring-marked).
+        assert!(
+            backend
+                .get(&keyring_key(OwnerKind::Credential, &id))
+                .unwrap()
+                .is_some(),
+            "unmarked credential's entry must survive rm"
+        );
+    }
+
+    #[test]
+    fn delete_credential_with_secret_errors_when_absent() {
+        let cfg = SshrackConfig::default();
+        let backend = FakeBackend::new();
+        assert!(matches!(
+            delete_credential_with_secret(&cfg, "ghost", &backend),
+            Err(SshrackError::CredentialNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn copy_keyring_entry_copies_when_source_marked() {
+        let backend = FakeBackend::new();
+        let src = Credential {
+            id: new_id(),
+            alias: "s".into(),
+            body: CredentialBody {
+                user: "u".into(),
+                password: None,
+                key: None,
+                keyring: true,
+            },
+        };
+        let dst = Credential {
+            id: new_id(),
+            alias: "d".into(),
+            body: CredentialBody {
+                user: "u".into(),
+                password: None,
+                key: None,
+                keyring: true,
+            },
+        };
+        backend
+            .set(OwnerKind::Credential, &src.id, "hunter2")
+            .unwrap();
+        copy_keyring_entry(&src, &dst, &backend).unwrap();
+        assert_eq!(
+            backend
+                .get(&keyring_key(OwnerKind::Credential, &dst.id))
+                .unwrap()
+                .as_deref()
+                .map(String::as_str),
+            Some("hunter2")
+        );
+        // Source entry survives (copy, not move).
+        assert_eq!(
+            backend
+                .get(&keyring_key(OwnerKind::Credential, &src.id))
+                .unwrap()
+                .as_deref()
+                .map(String::as_str),
+            Some("hunter2")
+        );
+    }
+
+    #[test]
+    fn copy_keyring_entry_noop_when_source_unmarked() {
+        // A non-keyring credential has nothing to copy; the helper returns Ok
+        // without touching the backend.
+        let backend = FakeBackend::new();
+        let src = Credential {
+            id: new_id(),
+            alias: "s".into(),
+            body: CredentialBody::new("u").with_key("/k"),
+        };
+        let dst = Credential {
+            id: new_id(),
+            alias: "d".into(),
+            body: CredentialBody::new("u"),
+        };
+        copy_keyring_entry(&src, &dst, &backend).unwrap();
+        // Nothing was written for dst.
+        assert!(
+            backend
+                .get(&keyring_key(OwnerKind::Credential, &dst.id))
+                .unwrap()
+                .is_none()
+        );
     }
 }
