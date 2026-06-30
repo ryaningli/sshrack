@@ -5,12 +5,13 @@
 //!
 //! 1. Resolve `--credential <name>` → `Ulid` (fail-fast if unknown).
 //! 2. Load config (a missing file is an empty config).
-//! 3. Vault unlock if needed (env-passphrase under `--no-input`, else TTY).
+//! 3. Vault unlock if needed (env-passphrase from `SSHRACK_PASSPHRASE`).
 //! 4. [`connect::scp::build`] — resolves every `name:path` operand to
 //!    `user@host:path`, assembles the argv, and resolves the first remote's
 //!    [`PasswordSource`] once (carried in [`ScpPlan`]) so the launch path does
 //!    not re-resolve after the host-key check.
-//! 5. [`hostkey::run_host_key_flow`] for each deduplicated remote endpoint.
+//! 5. [`hostkey::run_host_key_flow`] for each deduplicated remote endpoint
+//!    (new keys accepted only with `--accept-new`).
 //! 6. [`connect::launch`].
 //!
 //! ## Validation order
@@ -33,14 +34,12 @@ use sshrack_core::config::store;
 use sshrack_core::connect;
 use sshrack_core::error::SshrackError;
 use sshrack_core::hostkey;
-use sshrack_core::secret::PassphraseProvider;
 use sshrack_core::secret::vault;
 
 use crate::cli::args::{Cli, Command};
-use crate::cli::prompt::{self, DialoguerPassphrase};
 use crate::shared::exit_code;
 
-use super::shared::NoInputPassphrase;
+use super::shared::EnvPassphrase;
 
 /// Dispatch for the `Scp` arm of the CLI.
 ///
@@ -48,8 +47,6 @@ use super::shared::NoInputPassphrase;
 /// token, then runs the 6-step scp flow. Returns the scp exit code, or an
 /// [`exit_code`] constant on a local error.
 pub fn run(cli: &Cli) -> i32 {
-    let no_input = cli.no_input;
-
     let (args, opts) = match &cli.cmd {
         Some(Command::Scp { opts, args }) => {
             let merged = opts.clone().overlay(&cli.connect_opts);
@@ -95,14 +92,10 @@ pub fn run(cli: &Cli) -> i32 {
     // ── Step 2: config loaded above. ──────────────────────────────────────────
 
     // ── Step 3: Vault unlock (no-op when not in vault mode). ─────────────────
-    let passphrase_provider: &dyn PassphraseProvider = if no_input {
-        &NoInputPassphrase
-    } else {
-        &DialoguerPassphrase
-    };
+    let passphrase_provider = EnvPassphrase;
     let env_pw = vault::passphrase_from_env();
     let vault_key =
-        match vault::ensure_unlocked_vault_key(&cfg, env_pw.as_ref(), passphrase_provider) {
+        match vault::ensure_unlocked_vault_key(&cfg, env_pw.as_ref(), &passphrase_provider) {
             Ok(k) => k,
             Err(e) => {
                 eprintln!("sshrack: vault unlock failed: {e}");
@@ -151,18 +144,14 @@ pub fn run(cli: &Cli) -> i32 {
     };
 
     // ── Step 5: Host-key pre-flight for every remote endpoint. ────────────────
-    // run_host_key_flow takes the confirm closure by value (FnOnce), and the two
-    // closure factories return distinct opaque types, so dispatch on `no_input`
-    // inside the loop rather than binding one variable. The first confirmed
-    // host is appended to known_hosts and counts as known to the rest; an
-    // unknown endpoint gets its own prompt (or, under --no-input, is refused).
+    // run_host_key_flow only calls confirm for NEW keys; changed keys are
+    // rejected upstream by ssh. `accept_new` (OR'd across top-level + scp)
+    // accepts a first-seen key iff --accept-new was given. The closure is
+    // FnOnce, so rebuild it per iteration.
+    let accept_new = opts.accept_new;
     for (host_str, port) in &plan.remote_hosts {
-        let hk_result = if no_input {
-            hostkey::run_host_key_flow(host_str, *port, prompt::host_key_confirm_closure_no_input())
-        } else {
-            hostkey::run_host_key_flow(host_str, *port, prompt::host_key_confirm_closure())
-        };
-        if let Err(e) = hk_result {
+        let confirm = move |_fingerprint: &str| accept_new;
+        if let Err(e) = hostkey::run_host_key_flow(host_str, *port, confirm) {
             eprintln!("sshrack: host key: {e}");
             return exit_code::CONNECT;
         }

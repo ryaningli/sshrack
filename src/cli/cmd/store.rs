@@ -13,15 +13,14 @@
 //! - **target = keyring**: probe [`OsKeyring::available`] first — if the daemon
 //!   is unreachable, error `STORE` and do NOT migrate (a migration that drops
 //!   plaintext on the floor because the keyring is gone would lose passwords).
-//! - **target = vault**: collect a confirmed passphrase (under `--no-input` the
-//!   passphrase must come from `SSHRACK_PASSPHRASE` env, else error); then
-//!   [`vault::enable`] derives a fresh key, writes the verifier, and migrates
-//!   every existing password into vault mode before flipping `cfg.store`.
-//! - **target = plaintext**: a security downgrade — confirm unless `--yes`;
-//!   under `--no-input` require an explicit `--yes` or error (a destructive
-//!   switch never proceeds unattended). When the source is vault, unlock first
-//!   (the source key is needed to decrypt every body before re-sealing as
-//!   plaintext).
+//! - **target = vault**: the passphrase must come from `SSHRACK_PASSPHRASE`
+//!   (errors if unset); [`vault::enable`] then derives a fresh key, writes the
+//!   verifier, and migrates every existing password into vault mode before
+//!   flipping `cfg.store`.
+//! - **target = plaintext**: a security downgrade — an explicit `--yes` is
+//!   required or the switch is refused (a destructive action never proceeds
+//!   unattended). When the source is vault, unlock first (the source key is
+//!   needed to decrypt every body before re-sealing as plaintext).
 //!
 //! Leaving keyring mode also requires `available()` (the keyring entries must be
 //! readable to migrate them off the keyring).
@@ -38,18 +37,14 @@
 use sshrack_core::config::schema::{SecretStore, SshrackConfig, VaultMeta};
 use sshrack_core::error::SshrackError;
 use sshrack_core::secret::OsKeyring;
-use sshrack_core::secret::PassphraseProvider;
 use sshrack_core::secret::SecretBackend;
 use sshrack_core::secret::vault;
 
 use crate::cli::args::{Cli, OutputFormat, StoreAction, StoreMode};
-use crate::cli::prompt::DialoguerPassphrase;
 use crate::shared::exit_code;
 use crate::shared::format as fmt;
 
-use super::shared::{
-    NoInputPassphrase, confirm_destructive, fail, load_config, save_config, unlock_vault_key,
-};
+use super::shared::{EnvPassphrase, fail, load_config, save_config, unlock_vault_key};
 
 /// The single tunable vault runtime field exposed by `store config`: the
 /// master-key cache TTL in seconds (`0` disables caching). KDF cost params
@@ -156,11 +151,9 @@ fn use_mode(cli: &Cli, mode: StoreMode, cache_ttl_secs: Option<u64>, yes: bool) 
     let backend = OsKeyring;
 
     let result = match mode {
-        StoreMode::Keyring => switch_to_keyring(&mut cfg, &path, cli.no_input, &backend),
-        StoreMode::Vault => {
-            switch_to_vault(&mut cfg, &path, cache_ttl_secs, cli.no_input, &backend)
-        }
-        StoreMode::Plaintext => switch_to_plaintext(&mut cfg, &path, cli.no_input, yes, &backend),
+        StoreMode::Keyring => switch_to_keyring(&mut cfg, &path, &backend),
+        StoreMode::Vault => switch_to_vault(&mut cfg, &path, cache_ttl_secs, &backend),
+        StoreMode::Plaintext => switch_to_plaintext(&mut cfg, &path, yes, &backend),
     };
     match result {
         Ok(code) => code,
@@ -202,7 +195,6 @@ fn classify(cfg: &SshrackConfig, mode: StoreMode) -> Switch {
 fn switch_to_keyring(
     cfg: &mut SshrackConfig,
     path: &std::path::Path,
-    no_input: bool,
     backend: &OsKeyring,
 ) -> Result<i32, (String, i32)> {
     if matches!(classify(cfg, StoreMode::Keyring), Switch::AlreadyThere) {
@@ -222,7 +214,7 @@ fn switch_to_keyring(
             needs_source_key: true
         }
     ) {
-        unlock_vault_key(cfg, no_input)?
+        unlock_vault_key(cfg)?
     } else {
         None
     };
@@ -240,14 +232,13 @@ fn switch_to_keyring(
     Ok(exit_code::SUCCESS)
 }
 
-/// Switch to vault mode. Collect a confirmed passphrase (env under
-/// `--no-input`), then [`vault::enable`] derives the key, writes the verifier,
-/// and migrates every existing password before flipping `cfg.store`.
+/// Switch to vault mode. The passphrase must come from `SSHRACK_PASSPHRASE`
+/// (errors if unset); [`vault::enable`] then derives the key, writes the
+/// verifier, and migrates every existing password before flipping `cfg.store`.
 fn switch_to_vault(
     cfg: &mut SshrackConfig,
     path: &std::path::Path,
     cache_ttl_secs: Option<u64>,
-    no_input: bool,
     backend: &OsKeyring,
 ) -> Result<i32, (String, i32)> {
     if matches!(classify(cfg, StoreMode::Vault), Switch::AlreadyThere) {
@@ -262,24 +253,15 @@ fn switch_to_vault(
         ));
     }
     vault::cache::clear_default_cache();
-    let passphrase = if no_input {
-        // Under --no-input the passphrase must come from the env; refuse to
-        // prompt. An unset env surfaces as a store error, not a TTY hang.
-        match vault::passphrase_from_env() {
-            Some(p) => p,
-            None => {
-                return Err((
-                    "sshrack: vault passphrase required (set SSHRACK_PASSPHRASE or run without --no-input)"
-                        .into(),
-                    exit_code::STORE,
-                ));
-            }
-        }
-    } else {
-        match DialoguerPassphrase.passphrase_confirm() {
-            Ok(p) => p,
-            Err(SshrackError::Interrupted) => return Ok(130), // silent cancel
-            Err(e) => return Err((format!("sshrack: {e}"), exit_code::USAGE)),
+    // The passphrase must come from the env; refuse to prompt. An unset env
+    // surfaces as a store error.
+    let passphrase = match vault::passphrase_from_env() {
+        Some(p) => p,
+        None => {
+            return Err((
+                "sshrack: vault passphrase required (set SSHRACK_PASSPHRASE)".into(),
+                exit_code::STORE,
+            ));
         }
     };
     vault::enable(cfg, &passphrase, cache_ttl_secs, backend)
@@ -289,14 +271,13 @@ fn switch_to_vault(
     Ok(exit_code::SUCCESS)
 }
 
-/// Switch to plaintext mode. A security downgrade: confirm unless `--yes`.
-/// Under `--no-input`, an explicit `--yes` is required or the switch is refused
-/// (a destructive action never proceeds unattended). When the source is vault,
-/// unlock first (the source key decrypts every body before re-sealing).
+/// Switch to plaintext mode. A security downgrade: an explicit `--yes` is
+/// required or the switch is refused (a destructive action never proceeds
+/// unattended). When the source is vault, unlock first (the source key
+/// decrypts every body before re-sealing).
 fn switch_to_plaintext(
     cfg: &mut SshrackConfig,
     path: &std::path::Path,
-    no_input: bool,
     yes: bool,
     backend: &OsKeyring,
 ) -> Result<i32, (String, i32)> {
@@ -304,19 +285,12 @@ fn switch_to_plaintext(
         println!("already in plaintext mode");
         return Ok(exit_code::SUCCESS);
     }
-    // A destructive downgrade: under --no-input require an explicit --yes, else
-    // refuse (confirm_with_fallback returns false under --no-input, so a bare
-    // `store use plaintext --no-input` errors rather than silently downgrading).
-    if no_input && !yes {
+    // A destructive downgrade: require an explicit --yes.
+    if !yes {
         return Err((
             "sshrack: switching to plaintext is a security downgrade; pass --yes to confirm".into(),
             exit_code::USAGE,
         ));
-    }
-    if !confirm_plaintext_downgrade(yes, no_input)? {
-        // User declined the interactive prompt (default No).
-        println!("plaintext switch cancelled");
-        return Ok(exit_code::SUCCESS);
     }
     vault::cache::clear_default_cache();
     let source_key = if matches!(
@@ -325,7 +299,7 @@ fn switch_to_plaintext(
             needs_source_key: true
         }
     ) {
-        unlock_vault_key(cfg, no_input)?
+        unlock_vault_key(cfg)?
     } else {
         None
     };
@@ -349,17 +323,6 @@ fn switch_to_plaintext(
     Ok(exit_code::SUCCESS)
 }
 
-/// Confirm the irreversible plaintext write unless `--yes`. Returns true to
-/// proceed. Under `--no-input` the caller has already verified `--yes`, so this
-/// is only reached interactively.
-fn confirm_plaintext_downgrade(yes: bool, no_input: bool) -> Result<bool, (String, i32)> {
-    if yes {
-        return Ok(true);
-    }
-    confirm_destructive(no_input, "Store ALL passwords in plaintext?")
-        .map_err(|code| (String::new(), code))
-}
-
 /// Wrap a vault/migrate error into a printed-message + exit-code pair.
 fn store_err(context: &'static str) -> impl Fn(SshrackError) -> (String, i32) {
     move |e| (format!("sshrack: {context}: {e}"), exit_code::STORE)
@@ -372,7 +335,8 @@ fn store_err(context: &'static str) -> impl Fn(SshrackError) -> (String, i32) {
 /// `sshrack store rekey`: change the master passphrase. Unlock under the
 /// current passphrase, decrypt everything to plaintext, clear the vault, then
 /// re-enable under a fresh passphrase (new salt, new verifier). Errors
-/// `VaultNotEnabled` when no vault is configured.
+/// `VaultNotEnabled` when no vault is configured. Both the old and new
+/// passphrases come from `SSHRACK_PASSPHRASE` (env-only).
 fn rekey(cli: &Cli) -> i32 {
     let (path, mut cfg) = match load_config(cli.config.as_deref()) {
         Ok(v) => v,
@@ -390,15 +354,11 @@ fn rekey(cli: &Cli) -> i32 {
         );
     }
 
-    let provider: &dyn sshrack_core::secret::PassphraseProvider = if cli.no_input {
-        &NoInputPassphrase
-    } else {
-        &DialoguerPassphrase
-    };
+    let provider = EnvPassphrase;
     let env_pw = vault::passphrase_from_env();
 
     // Unlock with the current passphrase, decrypt everything to plaintext.
-    let old_key = match vault::ensure_unlocked_vault_key(&cfg, env_pw.as_ref(), provider) {
+    let old_key = match vault::ensure_unlocked_vault_key(&cfg, env_pw.as_ref(), &provider) {
         Ok(Some(k)) => k,
         Ok(None) => {
             // Unreachable: is_vault() is true above, so ensure_unlocked_vault_key
@@ -422,22 +382,14 @@ fn rekey(cli: &Cli) -> i32 {
     let preserved_ttl = cfg.vault_meta().map(|m| m.cache_ttl_secs);
     cfg.store = None;
 
-    // Re-enable under a fresh passphrase (new salt, new verifier).
-    let new_passphrase = if cli.no_input {
-        match vault::passphrase_from_env() {
-            Some(p) => p,
-            None => {
-                return fail(
-                    "sshrack: new vault passphrase required (set SSHRACK_PASSPHRASE or run without --no-input)",
-                    exit_code::STORE,
-                );
-            }
-        }
-    } else {
-        match DialoguerPassphrase.passphrase_confirm() {
-            Ok(p) => p,
-            Err(SshrackError::Interrupted) => return 130,
-            Err(e) => return fail(&format!("sshrack: {e}"), exit_code::USAGE),
+    // Re-enable under a fresh passphrase (new salt, new verifier). Env-only.
+    let new_passphrase = match vault::passphrase_from_env() {
+        Some(p) => p,
+        None => {
+            return fail(
+                "sshrack: new vault passphrase required (set SSHRACK_PASSPHRASE)",
+                exit_code::STORE,
+            );
         }
     };
     if let Err(e) = vault::enable(&mut cfg, &new_passphrase, preserved_ttl, &backend) {
@@ -474,7 +426,7 @@ fn lock(cli: &Cli) -> i32 {
 
 /// `sshrack store unlock`: pre-warm the cached master key so subsequent
 /// non-interactive invocations hit the cache. Idempotent. Errors `STORE` when
-/// no vault is configured.
+/// no vault is configured. The passphrase comes from `SSHRACK_PASSPHRASE`.
 fn unlock(cli: &Cli) -> i32 {
     let (_path, cfg) = match load_config(cli.config.as_deref()) {
         Ok(v) => v,
@@ -486,13 +438,9 @@ fn unlock(cli: &Cli) -> i32 {
             exit_code::STORE,
         );
     }
-    let provider: &dyn sshrack_core::secret::PassphraseProvider = if cli.no_input {
-        &NoInputPassphrase
-    } else {
-        &DialoguerPassphrase
-    };
+    let provider = EnvPassphrase;
     let env_pw = vault::passphrase_from_env();
-    match vault::ensure_unlocked_vault_key(&cfg, env_pw.as_ref(), provider) {
+    match vault::ensure_unlocked_vault_key(&cfg, env_pw.as_ref(), &provider) {
         Ok(_) => {}
         Err(SshrackError::Interrupted) => return 130,
         Err(e) => {

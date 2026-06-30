@@ -24,12 +24,12 @@ fn bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_sshrack"))
 }
 
-/// Run `sshrack <args...>` with `--config <tmp>` and `--no-input`, returning
-/// (exit_code, stdout, stderr). `extra_env` lets the caller add env vars (none
-/// by default — kept hermetic).
+/// Run `sshrack <args...>` with `--config <tmp>`, returning (exit_code,
+/// stdout, stderr). `extra_env` lets the caller add env vars (none by default
+/// — kept hermetic).
 fn run(args: &[&str], config: &std::path::Path) -> (i32, String, String) {
     let mut cmd = Command::new(bin());
-    cmd.arg("--config").arg(config).arg("--no-input");
+    cmd.arg("--config").arg(config);
     for a in args {
         cmd.arg(a);
     }

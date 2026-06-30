@@ -10,8 +10,9 @@
 //!
 //! The single orchestration entry is [`run_host_key_flow`]. Its only
 //! side-effect seam beyond the `ssh-keyscan`/`ssh-keygen` spawns is the
-//! injected `confirm` callback: the CLI passes a dialoguer confirm, tests pass
-//! a closure. Core never depends on a UI crate.
+//! injected `confirm` callback: the CLI passes a closure over `--accept-new`,
+//! the TUI passes a dialoguer confirm, tests pass a closure. Core never
+//! depends on a UI crate.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -275,7 +276,7 @@ pub fn append_to_known_hosts(
 /// side-effect seam beyond the `ssh-keyscan`/`ssh-keygen` spawns is the
 /// injected `confirm` callback — core never calls a UI crate directly. The
 /// caller decides how the "trust this new fingerprint?" question is answered
-/// (CLI: dialoguer; tests: a closure).
+/// (CLI: a closure over `--accept-new`; TUI: dialoguer; tests: a closure).
 ///
 /// - known key            -> `Ok(())` (a changed key is detected and rejected
 ///   by ssh itself at connect time; `ssh-keygen -F` only checks for presence,

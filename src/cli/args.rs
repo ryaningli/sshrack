@@ -52,6 +52,13 @@ pub struct ConnectOptions {
     /// to reach an IP/host that is not a configured name.
     #[arg(long = "ad-hoc")]
     pub ad_hoc: bool,
+
+    /// Accept a host key seen for the first time (like ssh's `accept-new`).
+    /// Default refuses unknown keys. Changed keys are always rejected (ssh
+    /// upstream handles that). The only non-interactive way to accept a new
+    /// key.
+    #[arg(long = "accept-new")]
+    pub accept_new: bool,
 }
 
 impl ConnectOptions {
@@ -65,8 +72,9 @@ impl ConnectOptions {
             port: self.port.or(base.port),
             identity: self.identity.or_else(|| base.identity.clone()),
             credential: self.credential.or_else(|| base.credential.clone()),
-            // Either level opting into ad-hoc is enough (OR, not override).
+            // Either level opting into ad-hoc / accept-new is enough (OR).
             ad_hoc: self.ad_hoc || base.ad_hoc,
+            accept_new: self.accept_new || base.accept_new,
         }
     }
 }
@@ -103,10 +111,6 @@ pub struct Cli {
     /// Parsed for future use; Phase 1 tracing is driven by RUST_LOG.
     #[arg(short, long, global = true, display_order = 100)]
     pub verbose: bool,
-
-    /// Non-interactive: never prompt. Required fields must come from flags.
-    #[arg(long, global = true, display_order = 101)]
-    pub no_input: bool,
 
     /// Output format for list/show commands.
     #[arg(
@@ -200,12 +204,12 @@ pub enum Command {
 /// Sub-actions of `sshrack host …`.
 #[derive(Debug, Subcommand)]
 pub enum HostAction {
-    /// Add a host (interactive by default; --no-input for scripts).
+    /// Add a host. All required fields must come from flags (missing `--host`
+    /// errors); the interactive wizard lives in the TUI.
     Add {
-        /// Host name to add (or overwrite when --force is set). Omit for
-        /// interactive mode (you'll be prompted for a fresh name).
+        /// Host name to add (or overwrite when --force is set). Required.
         name: Option<String>,
-        /// Remote hostname or IP.
+        /// Remote hostname or IP. Required.
         #[arg(long)]
         host: Option<String>,
         /// Login user (defaults to `root`).
@@ -221,10 +225,6 @@ pub enum HostAction {
         /// Resolved from name to id by the CLI layer, not by clap.
         #[arg(long)]
         credential: Option<String>,
-        /// Non-interactive: all required fields must come from flags (a
-        /// password host cannot be created in this mode).
-        #[arg(long = "no-input")]
-        no_input: bool,
         /// Overwrite an existing name.
         #[arg(long)]
         force: bool,
@@ -252,10 +252,10 @@ pub enum HostAction {
         reveal: bool,
     },
 
-    /// Edit an existing host's fields (patch via flags; interactive pre-fill
-    /// when no flags are given).
+    /// Edit an existing host's fields. Patch-only: only flagged fields change.
+    /// With no flags, prints "no changes". The full edit wizard lives in the TUI.
     Edit {
-        /// Host name to edit. Omit for interactive mode (pick from a menu).
+        /// Host name to edit. Required.
         name: Option<String>,
         /// New remote hostname or IP.
         #[arg(long)]
@@ -285,27 +285,25 @@ pub enum HostAction {
         /// Drop any credential reference, falling back to inline default user.
         #[arg(long)]
         clear_credential: bool,
-        /// Non-interactive: only apply flags; never prompt.
-        #[arg(long = "no-input")]
-        no_input: bool,
     },
 
-    /// Remove a host from the config (prompts unless --yes).
+    /// Remove a host from the config. Requires `--yes` (the destructive
+    /// confirmation). Interactive confirmation lives in the TUI.
     Rm {
-        /// Host name to remove. Omit for interactive mode (pick from a menu).
+        /// Host name to remove. Required.
         name: Option<String>,
-        /// Skip the confirmation prompt.
+        /// Required: confirm the destructive removal.
         #[arg(short = 'y', long)]
         yes: bool,
     },
 
-    /// Copy a host's config to a new name. Two args = non-interactive copy;
-    /// no args = pick the source from a menu and type the new name. The
-    /// destination must be globally unique (no overwrite).
+    /// Copy a host's config to a new name. Both `<src>` and `<dst>` are
+    /// required. The destination must be globally unique (no overwrite).
+    /// The interactive source picker lives in the TUI.
     Cp {
-        /// Source host name (omit both for interactive mode).
+        /// Source host name. Required.
         src: Option<String>,
-        /// Destination name (omit both for interactive mode).
+        /// Destination name. Required.
         dst: Option<String>,
     },
 }
@@ -313,28 +311,26 @@ pub enum HostAction {
 /// Subcommands of `sshrack cred …`.
 #[derive(Debug, Subcommand)]
 pub enum CredAction {
-    /// Add a reusable credential (interactive by default; --no-input for scripts).
+    /// Add a reusable credential. `--user` (and the name) are required; a
+    /// password credential cannot be created from the CLI (passwords never
+    /// enter argv) — use the TUI for that.
     Add {
-        /// Credential name to add (or overwrite when --force is set). Omit
-        /// for interactive mode (you'll be prompted for a fresh name).
+        /// Credential name to add (or overwrite when --force is set). Required.
         name: Option<String>,
-        /// Login user (required in --no-input mode).
+        /// Login user. Required.
         #[arg(long)]
         user: Option<String>,
         /// Path to a private key file.
         #[arg(long)]
         identity: Option<PathBuf>,
-        /// Non-interactive: fields must come from flags (a password credential
-        /// cannot be created in this mode).
-        #[arg(long = "no-input")]
-        no_input: bool,
         /// Overwrite an existing credential name.
         #[arg(long)]
         force: bool,
     },
-    /// Edit an existing credential (patch via flags; interactive when none given).
+    /// Edit an existing credential. Patch-only: only flagged fields change.
+    /// With no flags, prints "no changes". The full edit wizard lives in the TUI.
     Edit {
-        /// Credential name to edit. Omit for interactive mode (pick from a menu).
+        /// Credential name to edit. Required.
         name: Option<String>,
         /// New login user.
         #[arg(long)]
@@ -348,13 +344,11 @@ pub enum CredAction {
         /// Rename the credential to this new name.
         #[arg(long)]
         rename: Option<String>,
-        /// Non-interactive: only apply flags; never prompt.
-        #[arg(long = "no-input")]
-        no_input: bool,
     },
-    /// Remove a credential (prompts unless --yes).
+    /// Remove a credential. Requires `--yes`. Interactive confirmation lives in
+    /// the TUI.
     Rm {
-        /// Credential name to remove. Omit for interactive mode (pick from a menu).
+        /// Credential name to remove. Required.
         name: Option<String>,
         #[arg(short = 'y', long)]
         yes: bool,

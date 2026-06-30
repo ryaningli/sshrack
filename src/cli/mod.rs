@@ -1,10 +1,14 @@
-//! Non-interactive command surface. All handlers are flags-only; missing
-//! required fields error instead of prompting. Interaction lives in `tui`.
+//! Non-interactive command surface. The CLI is fail-closed: every required
+//! field must come from a flag (missing `--host`/`--user`/`<name>` errors with
+//! `VALIDATION`/`USAGE`), the vault passphrase comes only from the
+//! `SSHRACK_PASSPHRASE` env var, destructive actions (`host rm`, `cred rm`,
+//! `store use plaintext`) require `--yes`, and a first-seen host key is only
+//! accepted with `--accept-new`. There is no `--no-input` toggle and no TTY
+//! prompting anywhere in this layer — the interactive wizard lives in `tui`.
 use clap::CommandFactory;
 
 pub mod args;
 pub mod cmd;
-pub mod prompt; // deleted in Block 3
 pub mod table;
 
 use crate::shared::exit_code;

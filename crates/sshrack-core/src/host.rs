@@ -251,12 +251,12 @@ fn ad_hoc_host(address: &str, port: u16, auth: Auth) -> Host {
 // add / edit pure helpers (lifted from sshrack-old's cmd/host/{add,edit}.rs)
 // ===========================================================================
 
-/// Field values supplied via CLI flags for `add`. `None` means "not provided"
-/// (interactive mode prompts; `--no-input` mode errors for required `host`).
-/// The CLI fills this struct; core never reads the TTY.
+/// Field values supplied via CLI/TUI flags for `add`. `None` means "not
+/// provided" (the non-interactive CLI errors for a missing required `host`;
+/// the TUI fills it interactively). Core never reads the TTY.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct AddOptions {
-    /// Remote hostname or IP. Required in `--no-input` mode.
+    /// Remote hostname or IP. Required.
     pub host: Option<String>,
     pub port: Option<u16>,
     /// Reference a `[[credentials]]` entry by name. The CLI resolves this to a
@@ -267,9 +267,6 @@ pub struct AddOptions {
     pub user: Option<String>,
     /// Inline private key path.
     pub identity: Option<PathBuf>,
-    /// Non-interactive: all required fields must come from flags (a password
-    /// host cannot be created in this mode — passwords never enter argv).
-    pub no_input: bool,
     /// Overwrite an existing name.
     pub force: bool,
 }
@@ -420,7 +417,7 @@ pub fn finalize_body(orig_id: Ulid, name: &str, host: &str, port: u16, auth: Aut
 }
 
 /// True when `opts` carries any field-setting flag (used by `edit` to decide
-/// between the patch path and the full-prompt path).
+/// between the patch path and the no-op "no changes" path).
 pub fn edit_has_any_flag(opts: &EditOptions) -> bool {
     opts.host.is_some()
         || opts.port.is_some()

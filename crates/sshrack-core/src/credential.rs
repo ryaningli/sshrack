@@ -198,18 +198,16 @@ pub fn find_referrers(cfg: &SshrackConfig, cred_id: &Ulid) -> Vec<Ulid> {
 // ===========================================================================
 
 /// Field values supplied via CLI flags for `cred add`. `None` means "not
-/// provided" (interactive mode prompts; `--no-input` mode errors for required
-/// `user`). The CLI fills this struct; core never reads the TTY. A password is
-/// never a flag (passwords never enter argv) — it is attached by the CLI's
-/// interactive path and sealed via the (forthcoming) vault orchestration.
+/// provided" (the non-interactive CLI errors for a missing required `user`).
+/// The CLI fills this struct; core never reads the TTY. A password is never a
+/// flag (passwords never enter argv) — the TUI attaches and seals any inline
+/// password.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct AddOptions {
-    /// Login user. Required in `--no-input` mode.
+    /// Login user. Required.
     pub user: Option<String>,
     /// Inline private key path.
     pub identity: Option<PathBuf>,
-    /// Non-interactive: all required fields must come from flags.
-    pub no_input: bool,
     /// Overwrite an existing name.
     pub force: bool,
 }
@@ -225,14 +223,10 @@ pub struct EditOptions {
     /// Rename to a new name. The caller validates the new name against the
     /// config via [`validate_rename_credential`] before applying.
     pub rename: Option<String>,
-    /// Non-interactive mode (does not change patch behaviour itself; the CLI
-    /// uses it to decide between the patch path and the full-prompt path).
-    pub no_input: bool,
 }
 
-/// Build a body from add flags (`--no-input` mode). The password is never set
-/// here — it cannot come from a flag. [`AddOptions::user`] is required in this
-/// mode.
+/// Build a body from add flags. The password is never set here — it cannot
+/// come from a flag. [`AddOptions::user`] is required.
 pub fn build_body(opts: &AddOptions) -> Result<CredentialBody, SshrackError> {
     let user = opts
         .user
@@ -1036,7 +1030,7 @@ mod tests {
     use crate::secret::test_doubles::FakeBackend;
 
     #[test]
-    fn build_body_requires_user_in_no_input_mode() {
+    fn build_body_requires_user() {
         let err = build_body(&AddOptions::default()).unwrap_err();
         assert!(matches!(
             err,

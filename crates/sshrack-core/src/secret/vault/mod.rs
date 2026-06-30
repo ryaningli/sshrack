@@ -21,10 +21,9 @@
 //! The env-passphrase is injected as a parameter (not read inside [`unlock`])
 //! so the precedence is testable without mutating `std::env` — which the
 //! project forbids in tests. The env value shadows the TTY prompt, so CI /
-//! `--no-input` callers can inject the passphrase without a terminal. The
-//! connect path passes `--no-input` through to the provider; under `--no-input`
-//! the CLI's [`PassphraseProvider`] impl errors instead of prompting, so if
-//! neither the cache nor the env value is available the call fails fast.
+//! scripts can inject the passphrase without a terminal. The CLI's
+//! [`PassphraseProvider`] impl errors instead of prompting, so if neither the
+//! cache nor the env value is available the call fails fast.
 //!
 //! # Design rules
 //!
@@ -53,7 +52,7 @@ use crate::secret::SecretBackend;
 pub type VaultKey = Zeroizing<[u8; 32]>;
 
 /// Environment variable that supplies the master passphrase for non-interactive
-/// use (CI, scripts, `--no-input`). When set, [`unlock`] skips the TTY prompt.
+/// use (CI, scripts, the CLI). When set, [`unlock`] skips the TTY prompt.
 pub const PASSPHRASE_ENV: &str = "SSHRACK_PASSPHRASE";
 
 /// Plaintext encrypted as the vault verifier. Decrypting it under the master
@@ -167,9 +166,9 @@ pub fn unlock(
 ///   → derive, verify, cache, return.
 /// - Otherwise → `provider.passphrase()` → derive, verify, cache, return.
 ///
-/// Under `--no-input`, the CLI's provider errors on `passphrase()`, so the
-/// call fails here when neither the cache nor the env value is available —
-/// exactly the right behavior for unattended runs.
+/// In the CLI, the provider errors on `passphrase()` when the env value is
+/// unset, so the call fails here when neither the cache nor the env value is
+/// available — exactly the right behavior for unattended runs.
 ///
 /// `env_passphrase` is injected (read by the caller via
 /// [`passphrase_from_env`]) so this function is testable without touching

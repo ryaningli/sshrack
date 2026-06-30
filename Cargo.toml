@@ -27,8 +27,6 @@ zeroize = "1"
 ulid = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-dialoguer = { version = "0.12", features = ["fuzzy-select"] } # removed in Block 3
-console = "0.16" # removed in Block 3
 
 [dev-dependencies]
 tempfile = "3"

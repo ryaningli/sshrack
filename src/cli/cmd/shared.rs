@@ -2,16 +2,16 @@
 //!
 //! These wrap the cross-cutting concerns every CRUD handler repeats: loading
 //! and saving the config, resolving a `--credential <name>` to a stable
-//! [`Ulid`] before a pure core call, deciding the active password-storage mode
-//! (the first-use prompt lives here, not in core), and ranking hosts by
-//! frecency for `host ls --sort frecency`.
+//! [`Ulid`] before a pure core call, and ranking hosts by frecency for
+//! `host ls --sort frecency`.
+//!
+//! The only passphrase source in this layer is [`EnvPassphrase`] (the
+//! `SSHRACK_PASSPHRASE` env var). There are no TTY prompts anywhere here.
 //!
 //! Nothing here prints, logs, or returns a password in an error message.
 
 use std::path::{Path, PathBuf};
 
-use dialoguer::theme::ColorfulTheme;
-use dialoguer::{Input, Password};
 use ulid::Ulid;
 use zeroize::Zeroizing;
 
@@ -21,12 +21,10 @@ use sshrack_core::config::store;
 use sshrack_core::credential;
 use sshrack_core::error::SshrackError;
 use sshrack_core::frecency;
-use sshrack_core::secret::OsKeyring;
 use sshrack_core::secret::PassphraseProvider;
 use sshrack_core::secret::vault;
 
 use crate::cli::args::SortMode;
-use crate::cli::prompt::{self, DialoguerPassphrase};
 use crate::shared::exit_code;
 
 /// Load the config at `override_path` (or the XDG default). A missing file is
@@ -79,75 +77,14 @@ pub fn resolve_credential_name(
     }
 }
 
-/// Decide the password-storage mode when an inline password is being collected.
-///
-/// If the config already has a mode (`cfg.store.is_some()`), this is a no-op.
-/// Otherwise: under `--no-input`, refuse (first-use needs the TTY menu); else
-/// run the [`prompt::password_mode`] menu and, for the encrypted choice, call
-/// [`vault::enable`] to mint the salt/verifier and migrate any existing
-/// passwords. The keyring choice needs no setup here (per-entry staging happens
-/// at seal time); the plaintext choice needs none either.
-///
-/// Returns the updated config (mode now decided) on success, or an `Err`
-/// (message + exit code) on refusal / unlock failure.
-pub fn ensure_storage_mode_decided(
-    cfg: &mut SshrackConfig,
-    no_input: bool,
-    backend: &OsKeyring,
-) -> Result<(), (String, i32)> {
-    if cfg.mode_chosen() {
-        return Ok(());
-    }
-    if no_input {
-        return Err((
-            "sshrack: password storage mode is undecided; run interactively once to choose, or `sshrack store use <mode>`"
-                .into(),
-            exit_code::STORE,
-        ));
-    }
-    let choice = prompt::password_mode().map_err(prompt_err_to_exit)?;
-    if choice.is_encrypted() {
-        // Vault mode: derive a fresh key from a confirmed passphrase, write the
-        // verifier, and migrate any existing plaintext passwords into vault
-        // mode before flipping cfg.store.
-        let provider = DialoguerPassphrase;
-        let passphrase = provider
-            .passphrase_confirm()
-            .map_err(|e| (format!("sshrack: {e}"), exit_code::USAGE))?;
-        vault::enable(cfg, &passphrase, None, backend).map_err(|e| {
-            (
-                format!("sshrack: failed to enable vault mode: {e}"),
-                exit_code::STORE,
-            )
-        })?;
-    }
-    Ok(())
-}
-
-/// Map a prompt-side [`SshrackError`] to a printed message + exit code. A
-/// Ctrl+C cancel is silent (exits 130) — consistent with the connect path.
-fn prompt_err_to_exit(e: SshrackError) -> (String, i32) {
-    if matches!(e, SshrackError::Interrupted) {
-        return (String::new(), 130);
-    }
-    (format!("sshrack: {e}"), exit_code::USAGE)
-}
-
 /// Unlock the vault when vault mode is active, returning the master key (or
-/// `None` when not in vault mode). Used by `host/cred add` (inline password)
-/// and `show --reveal` paths. Under `--no-input` the env-passphrase must supply
-/// the key; otherwise the TTY provider prompts.
-pub fn unlock_vault_key(
-    cfg: &SshrackConfig,
-    no_input: bool,
-) -> Result<Option<vault::VaultKey>, (String, i32)> {
-    let provider: &dyn PassphraseProvider = if no_input {
-        &NoInputPassphrase
-    } else {
-        &DialoguerPassphrase
-    };
+/// `None` when not in vault mode). Used by `host/cred show --reveal`. The
+/// passphrase comes only from `SSHRACK_PASSPHRASE` (via [`EnvPassphrase`]);
+/// an unset env var surfaces as a `STORE` error.
+pub fn unlock_vault_key(cfg: &SshrackConfig) -> Result<Option<vault::VaultKey>, (String, i32)> {
+    let provider = EnvPassphrase;
     let env_pw = vault::passphrase_from_env();
-    vault::ensure_unlocked_vault_key(cfg, env_pw.as_ref(), provider).map_err(|e| {
+    vault::ensure_unlocked_vault_key(cfg, env_pw.as_ref(), &provider).map_err(|e| {
         (
             format!("sshrack: vault unlock failed: {e}"),
             exit_code::STORE,
@@ -155,83 +92,24 @@ pub fn unlock_vault_key(
     })
 }
 
-/// A [`PassphraseProvider`] that refuses every prompt. Used under `--no-input`
-/// so the vault unlock path fails unless `SSHRACK_PASSPHRASE` is set.
-pub(crate) struct NoInputPassphrase;
+/// The only passphrase source in the non-interactive CLI: the
+/// `SSHRACK_PASSPHRASE` env var. Errors if unset (mapped to
+/// [`SshrackError::Interrupted`] so the vault unlock path produces a clean
+/// "vault unlock failed" message rather than a TTY hang).
+pub struct EnvPassphrase;
 
-impl PassphraseProvider for NoInputPassphrase {
+impl PassphraseProvider for EnvPassphrase {
     fn passphrase(&self) -> Result<Zeroizing<String>, SshrackError> {
-        Err(SshrackError::Interrupted)
+        vault::passphrase_from_env().ok_or(SshrackError::Interrupted)
     }
 
     fn passphrase_confirm(&self) -> Result<Zeroizing<String>, SshrackError> {
-        Err(SshrackError::Interrupted)
+        self.passphrase()
     }
 
     fn confirm(&self, _text: &str) -> Result<bool, SshrackError> {
         Ok(false)
     }
-}
-
-// ===========================================================================
-// generic prompt helpers (shared by host and cred)
-// ===========================================================================
-
-/// Read a free-text string from the TTY.
-pub(crate) fn prompt_string(label: &str) -> Result<String, i32> {
-    prompt_string_with_default(label, "")
-}
-
-/// Read a free-text string, pre-filled with `default` when non-empty.
-pub(crate) fn prompt_string_with_default(label: &str, default: &str) -> Result<String, i32> {
-    let theme = ColorfulTheme::default();
-    let mut input = Input::with_theme(&theme).with_prompt(label);
-    if !default.is_empty() {
-        input = input.default(default.to_owned());
-    }
-    match input.interact_text() {
-        Ok(s) => Ok(s),
-        Err(e) => Err(prompt_fail(&SshrackError::from_prompt_io(e))),
-    }
-}
-
-/// Read a port number, pre-filled with `default`.
-pub(crate) fn prompt_port(default: u16) -> Result<u16, i32> {
-    let theme = ColorfulTheme::default();
-    match Input::with_theme(&theme)
-        .with_prompt("Port")
-        .default(default)
-        .interact_text()
-    {
-        Ok(p) => Ok(p),
-        Err(e) => Err(prompt_fail(&SshrackError::from_prompt_io(e))),
-    }
-}
-
-/// Read a password (no echo).
-pub(crate) fn prompt_password(label: &str) -> Result<String, i32> {
-    let theme = ColorfulTheme::default();
-    match Password::with_theme(&theme).with_prompt(label).interact() {
-        Ok(s) => Ok(s),
-        Err(e) => Err(prompt_fail(&SshrackError::from_prompt_io(e))),
-    }
-}
-
-/// A `--no-input`-aware confirm: under `--no-input` returns `Ok(false)` (fail-
-/// closed — destructive actions do not proceed unattended); otherwise delegates
-/// to [`prompt::confirm_with_fallback`]. Used by `host rm` / `cred rm`.
-pub(crate) fn confirm_destructive(no_input: bool, text: &str) -> Result<bool, i32> {
-    prompt::confirm_with_fallback(no_input, text).map_err(|e| prompt_fail(&e))
-}
-
-/// Convert a prompt-side error into a silent exit (130 for cancel) or a printed
-/// USAGE exit.
-pub(crate) fn prompt_fail(e: &SshrackError) -> i32 {
-    if matches!(e, SshrackError::Interrupted) {
-        return 130;
-    }
-    eprintln!("sshrack: {e}");
-    exit_code::USAGE
 }
 
 // ===========================================================================
