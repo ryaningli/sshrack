@@ -329,36 +329,39 @@ pub(crate) fn fail(msg: &str, code: i32) -> i32 {
 /// Rank/sort hosts per `--sort`. `None` keeps config order. Loads the frecency
 /// table from the data dir for the frecency/recent modes (best-effort: a
 /// missing/corrupt file falls back to an empty table).
-pub fn sort_hosts(hosts: Vec<&Host>, sort: Option<SortMode>) -> Vec<&Host> {
+///
+/// Borrows the input slice so the returned `&Host` refs share the caller's
+/// lifetime (the underlying `Host` storage), not a function-local one — this is
+/// what lets the frecency/recent arms go through the core `rank` / `rank_by_recent`
+/// helpers, whose `RankedHost<'a>` borrows the input.
+pub fn sort_hosts<'a>(hosts: &'a [&'a Host], sort: Option<SortMode>) -> Vec<&'a Host> {
     let Some(mode) = sort else {
-        return hosts;
+        return hosts.to_vec();
     };
     let data_dir = config_path::default_data_dir();
     let frec = data_dir
         .as_ref()
         .map(|d| frecency::store::load(d).unwrap_or_default())
         .unwrap_or_default();
-    // Bind hosts to a stable local so every branch borrows the same storage.
-    let host_refs = hosts;
     match mode {
-        SortMode::Frecency | SortMode::Recent => {
-            // Order by descending frecency score, breaking ties alphabetically
-            // by alias. (rank() would do match-then-score-then-alias, but its
-            // return type borrows the input slice, which confuses the borrow
-            // checker across this match — score-then-alias here is equivalent
-            // for the empty-query case both --sort modes feed it.)
-            let mut v = host_refs;
-            v.sort_by(|a, b| {
-                let sa = frec.score(&a.id);
-                let sb = frec.score(&b.id);
-                sb.partial_cmp(&sa)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.alias.cmp(&b.alias))
-            });
-            v
+        SortMode::Frecency => {
+            // match-then-score-then-alias; an empty query reduces it to
+            // score-then-alias, which is the documented `--sort frecency` order.
+            frecency::rank(hosts, "", &frec)
+                .into_iter()
+                .map(|r| r.host)
+                .collect()
+        }
+        SortMode::Recent => {
+            // Most-recently-used first (strict recency), distinct from the
+            // score-based frecency order.
+            frecency::rank_by_recent(hosts, &frec)
+                .into_iter()
+                .map(|r| r.host)
+                .collect()
         }
         SortMode::Alias => {
-            let mut v = host_refs;
+            let mut v = hosts.to_vec();
             v.sort_by(|a, b| a.alias.cmp(&b.alias));
             v
         }

@@ -200,8 +200,11 @@ fn add(
     // add_host validates alias chars again (cheap) and appends; force replaces.
     let next = if force {
         // Replace in place on --force, preserving nothing (the alias is the
-        // key). A fresh id is correct: the old keyring entry (if any) is
-        // orphaned — but the user asked to overwrite.
+        // key). A fresh id is correct — but if the host being overwritten was
+        // keyring-marked, its keyring entry (keyed by the OLD id) must be
+        // cleaned up so no orphaned secret is left behind, exactly like `rm`.
+        // Best-effort: a missing/unreachable entry is silently ignored.
+        host::forget_keyring_on_overwrite(&cfg, &alias, &OsKeyring);
         let mut replaced = cfg.clone();
         if let Some(slot) = replaced.hosts.iter_mut().find(|h| h.alias == alias) {
             *slot = new_host;
@@ -250,9 +253,9 @@ fn ls(cli: &Cli, fields_spec: Option<&str>, sort: Option<crate::cli::SortMode>) 
         Err((msg, code)) => return fail(&msg, code),
     };
 
-    // Sort: rank/sort_hosts returns a Vec<&Host>.
+    // Sort: rank/sort_hosts returns a Vec<&Host> borrowing cfg.hosts.
     let host_refs: Vec<&Host> = cfg.hosts.iter().collect();
-    let ordered = sort_hosts(host_refs, sort);
+    let ordered = sort_hosts(&host_refs, sort);
 
     match cli.format {
         OutputFormat::Json => {
@@ -300,20 +303,17 @@ fn show(cli: &Cli, alias: &str, reveal: bool, no_input: bool) -> i32 {
 
     match cli.format {
         OutputFormat::Json => {
+            // Serialize the row (with the reveal password attached when --reveal)
+            // through serde so the password is correctly JSON-escaped. Never
+            // hand-splice: a password with `"`, `\`, or control chars must
+            // round-trip as valid JSON.
             let id_str = host.id.to_string();
-            let row = fmt::host_detail_row(host, &id_str, cred_alias);
+            let row = fmt::host_detail_row(host, &id_str, cred_alias, revealed_pw.json_password());
             let json = serde_json::to_string(&row).unwrap_or_else(|e| {
                 eprintln!("sshrack: json error: {e}");
                 String::from("{}")
             });
-            // Attach the revealed password under a `password` field when --reveal.
-            if let Some(pw) = revealed_pw.as_json_field() {
-                // Inject the password field into the JSON object.
-                let trimmed = json.trim_end_matches('}');
-                println!("{trimmed},\"password\":\"{pw}\"}}");
-            } else {
-                println!("{json}");
-            }
+            println!("{json}");
         }
         OutputFormat::Text => {
             print!("{}", format_detail(&cfg, host, cred_alias, &revealed_pw));
@@ -718,8 +718,11 @@ enum RevealedPassword {
 }
 
 impl RevealedPassword {
-    /// The value to inject as the JSON `password` field, or `None` to omit it.
-    fn as_json_field(&self) -> Option<Cow<'_, str>> {
+    /// The value to attach as the JSON `password` field on the reveal row, or
+    /// `None` to omit it (non-reveal paths). Returned as a `Cow` so the row
+    /// builder can borrow the plaintext without copying. serde owns the
+    /// escaping — this is never hand-spliced into the JSON.
+    fn json_password(&self) -> Option<Cow<'_, str>> {
         match self {
             RevealedPassword::Plaintext(p) => Some(Cow::Borrowed(p.as_str())),
             RevealedPassword::Masked => None,

@@ -463,6 +463,24 @@ pub fn delete_host_with_secret(
     Ok(next)
 }
 
+/// Best-effort forget the keyring entry of the host currently at `alias`, when
+/// that host is about to be overwritten in place (e.g. `host add --force` on an
+/// existing alias, which generates a fresh id). If the existing host's inline
+/// body was keyring-marked, its keyring entry — keyed by the *old* id — is
+/// deleted so no orphaned secret is left behind, mirroring [`delete_host_with_secret`].
+///
+/// No-op when `alias` is absent (nothing to overwrite) or when the existing
+/// host was not keyring-marked. Pure w.r.t. the filesystem; the caller persists
+/// the replacement config separately. Never returns an error (best-effort, like
+/// the rm path).
+pub fn forget_keyring_on_overwrite(cfg: &SshrackConfig, alias: &str, backend: &dyn SecretBackend) {
+    let Some(old) = cfg.find_host_by_alias(alias) else {
+        return;
+    };
+    let keyring = old.auth.inline_body().is_some_and(|b| b.keyring);
+    secret::forget_keyring_secret(backend, OwnerKind::Host, &old.id, keyring);
+}
+
 /// Best-effort: if `src` is a keyring-password host, copy its keyring entry from
 /// the source's id to `dst`'s fresh id so the copy connects immediately. A
 /// missing/unreachable entry is reported via the returned `Err` (carrying no
@@ -1162,6 +1180,74 @@ mod tests {
         let cfg = cfg_with("web1");
         let err = delete_host_with_secret(&cfg, "ghost", &backend).unwrap_err();
         assert!(matches!(err, SshrackError::HostNotFound { .. }));
+    }
+
+    // ---- forget_keyring_on_overwrite (host add --force cleanup) ----
+
+    #[test]
+    fn forget_keyring_on_overwrite_deletes_old_entry_when_marked() {
+        // `host add --force` overwrites by generating a fresh id; the old
+        // keyring entry (keyed by the OLD id) must be cleaned up so no orphaned
+        // secret remains.
+        let backend = FakeBackend::new();
+        let old_id = new_id();
+        backend.set(OwnerKind::Host, &old_id, "topsecret").unwrap();
+        let cfg = SshrackConfig {
+            hosts: vec![Host {
+                id: old_id,
+                alias: "kr-overwrite".into(),
+                host: "10.0.0.99".into(),
+                port: 22,
+                auth: Auth::inline(CredentialBody {
+                    user: "root".into(),
+                    password: None,
+                    key: None,
+                    keyring: true,
+                }),
+            }],
+            ..Default::default()
+        };
+
+        forget_keyring_on_overwrite(&cfg, "kr-overwrite", &backend);
+
+        assert!(
+            backend
+                .get(&crate::id::keyring_key(OwnerKind::Host, &old_id))
+                .unwrap()
+                .is_none(),
+            "old keyring entry must be deleted on --force overwrite"
+        );
+    }
+
+    #[test]
+    fn forget_keyring_on_overwrite_leaves_non_keyring_host_alone() {
+        // A plaintext/key/default host has no keyring entry to forget; the
+        // helper is a no-op (and must not touch any unrelated entry).
+        let backend = FakeBackend::new();
+        let cfg = cfg_with("web1"); // plaintext-style host, no keyring marking
+        forget_keyring_on_overwrite(&cfg, "web1", &backend);
+        // Nothing was ever set; nothing should appear. A non-keyring host must
+        // not spuriously delete an unrelated entry.
+        assert!(backend.entries.borrow().is_empty());
+    }
+
+    #[test]
+    fn forget_keyring_on_overwrite_is_noop_when_alias_absent() {
+        // Overwriting a non-existent alias is a no-op (there is nothing to clean).
+        let backend = FakeBackend::new();
+        let id = new_id();
+        backend.set(OwnerKind::Host, &id, "unrelated").unwrap();
+        let cfg = SshrackConfig::default(); // no hosts
+        forget_keyring_on_overwrite(&cfg, "ghost", &backend);
+        // The unrelated entry is untouched.
+        assert_eq!(
+            backend
+                .get(&crate::id::keyring_key(OwnerKind::Host, &id))
+                .unwrap()
+                .as_deref()
+                .map(String::as_str),
+            Some("unrelated")
+        );
     }
 
     #[test]

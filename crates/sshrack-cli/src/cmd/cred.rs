@@ -16,6 +16,8 @@
 
 #![allow(clippy::question_mark)]
 
+use std::borrow::Cow;
+
 use dialoguer::FuzzySelect;
 use dialoguer::theme::ColorfulTheme;
 use zeroize::Zeroizing;
@@ -186,7 +188,7 @@ fn ls(cli: &Cli, fields_spec: Option<&str>) -> i32 {
             let rows: Vec<_> = cfg
                 .credentials
                 .iter()
-                .map(fmt::credential_list_row)
+                .map(|c| fmt::credential_list_row(c, None))
                 .collect();
             print_json_array(&rows);
         }
@@ -224,18 +226,16 @@ fn show(cli: &Cli, alias: &str, reveal: bool, no_input: bool) -> i32 {
 
     match cli.format {
         OutputFormat::Json => {
-            // The credential's locked JSON shape (no secret value).
-            let row = fmt::credential_list_row(cred);
+            // Serialize the row (with the reveal password attached when --reveal)
+            // through serde so the password is correctly JSON-escaped. Never
+            // hand-splice: a password with `"`, `\`, or control chars must
+            // round-trip as valid JSON.
+            let row = fmt::credential_list_row(cred, revealed_pw.json_password());
             let json = serde_json::to_string(&row).unwrap_or_else(|e| {
                 eprintln!("sshrack: json error: {e}");
                 String::from("{}")
             });
-            if let Some(pw) = revealed_pw.as_json_field() {
-                let trimmed = json.trim_end_matches('}');
-                println!("{trimmed},\"password\":\"{pw}\"}}");
-            } else {
-                println!("{json}");
-            }
+            println!("{json}");
         }
         OutputFormat::Text => {
             print!("{}", format_detail(cred, &revealed_pw));
@@ -567,11 +567,15 @@ enum RevealedPassword {
 }
 
 impl RevealedPassword {
-    fn as_json_field(&self) -> Option<&str> {
+    /// The value to attach as the JSON `password` field on the reveal row, or
+    /// `None` to omit it (non-reveal paths). Returned as a `Cow` so the row
+    /// builder can borrow the plaintext without copying. serde owns the
+    /// escaping — this is never hand-spliced into the JSON.
+    fn json_password(&self) -> Option<Cow<'_, str>> {
         match self {
-            RevealedPassword::Plaintext(p) => Some(p.as_str()),
-            RevealedPassword::KeyringMissing => Some("(not in keyring)"),
-            _ => None,
+            RevealedPassword::Plaintext(p) => Some(Cow::Borrowed(p.as_str())),
+            RevealedPassword::KeyringMissing => Some(Cow::Borrowed("(not in keyring)")),
+            RevealedPassword::Masked | RevealedPassword::None => None,
         }
     }
 

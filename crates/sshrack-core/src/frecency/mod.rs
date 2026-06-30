@@ -95,6 +95,41 @@ pub struct RankedHost<'a> {
     pub score: f64,
 }
 
+/// Rank hosts by most-recently-used first (a strict recency order, distinct
+/// from the score-based [`rank`]). Pure.
+///
+/// Sorts by `last_used` descending: the host used most recently sorts first.
+/// Hosts that have never been recorded (`last_used == None`) sort last, after
+/// every recorded host, and tie-break among themselves (and among hosts that
+/// happen to share a `last_used`) alphabetically by alias. Unlike [`rank`],
+/// the frecency **score** is ignored for ordering — a frequently-used-but-stale
+/// host ranks lower here than a host used once moments ago. The returned
+/// [`RankedHost`] still carries the score so callers can surface it.
+pub fn rank_by_recent<'a>(hosts: &'a [&Host], frec: &Frecency) -> Vec<RankedHost<'a>> {
+    let mut out: Vec<RankedHost<'a>> = hosts
+        .iter()
+        .map(|h| RankedHost {
+            host: h,
+            score: frec.score(&h.id),
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        let la = frec.map.get(&a.host.id).and_then(|e| e.last_used);
+        let lb = frec.map.get(&b.host.id).and_then(|e| e.last_used);
+        // Descending by last_used; Some > None, so compare b.then(a) puts Some
+        // first. Within the Some/Some arm, greater time first. None/None falls
+        // through to the alias tie-break.
+        match (lb, la) {
+            (Some(b_t), Some(a_t)) => b_t.cmp(&a_t),
+            (Some(_), None) => std::cmp::Ordering::Greater,
+            (None, Some(_)) => std::cmp::Ordering::Less,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+        .then_with(|| a.host.alias.cmp(&b.host.alias))
+    });
+    out
+}
+
 /// Rank hosts by substring-match presence, then frecency score, then alias.
 ///
 /// Pure. `query` is matched case-insensitively as a substring of the alias
@@ -354,5 +389,95 @@ mod tests {
         let ranked = rank(&hosts, "", &frec);
         assert_eq!(ranked[0].host.alias, "alpha");
         assert_eq!(ranked[1].host.alias, "bravo");
+    }
+
+    // ---- rank_by_recent tests ----
+
+    #[test]
+    fn rank_by_recent_puts_most_recent_first() {
+        let a = host(1, "alpha");
+        let b = host(2, "bravo");
+        let c = host(3, "charlie");
+        let hosts = [&a, &b, &c];
+        let mut frec = Frecency::default();
+        let t0 = now();
+        // alpha used first, bravo used last → bravo should rank first.
+        frec.record_at(&a.id, t0);
+        frec.record_at(&b.id, t0 + Duration::from_secs(60));
+
+        let ranked = rank_by_recent(&hosts, &frec);
+        let aliases: Vec<_> = ranked.iter().map(|r| r.host.alias.as_str()).collect();
+        // bravo (most recent), alpha (older), charlie (never used, sorts last).
+        assert_eq!(aliases, vec!["bravo", "alpha", "charlie"]);
+    }
+
+    #[test]
+    fn rank_by_recent_never_used_hosts_sort_last() {
+        let a = host(1, "alpha");
+        let z = host(2, "zulu");
+        let hosts = [&z, &a];
+        let mut frec = Frecency::default();
+        // Only alpha is recorded; zulu never used. alpha must rank first even
+        // though its alias would sort after zulu alphabetically.
+        frec.record_at(&a.id, now());
+
+        let ranked = rank_by_recent(&hosts, &frec);
+        let aliases: Vec<_> = ranked.iter().map(|r| r.host.alias.as_str()).collect();
+        assert_eq!(aliases, vec!["alpha", "zulu"]);
+    }
+
+    #[test]
+    fn rank_by_recent_differs_from_frecency_for_stale_but_frequent_host() {
+        // The proof that `recent` != `frecency`: a host that was used many
+        // times (high score) but long ago ranks LOWER under `recent` than a
+        // host used once moments ago, even though under `frecency` the frequent
+        // host ranks higher.
+        let frequent = host(1, "frequent");
+        let fresh = host(2, "fresh");
+        let hosts = [&frequent, &fresh];
+        let mut frec = Frecency::default();
+        let t0 = now();
+        // frequent: hammered 5x within an hour, long ago (score grows, but
+        // last_used is t0 — stale relative to fresh).
+        for _ in 0..5 {
+            frec.record_at(&frequent.id, t0);
+        }
+        // fresh: a single use right now (low score, but most-recent last_used).
+        frec.record_at(&fresh.id, t0 + Duration::from_secs(10 * DAY));
+
+        // Frecency (score) order: frequent first (high score).
+        let by_score = rank(&hosts, "", &frec);
+        assert_eq!(by_score[0].host.alias, "frequent");
+
+        // Recent order: fresh first (most-recently-used).
+        let by_recent = rank_by_recent(&hosts, &frec);
+        assert_eq!(by_recent[0].host.alias, "fresh");
+        // And the orders genuinely differ.
+        assert_ne!(
+            by_score
+                .iter()
+                .map(|r| r.host.alias.as_str())
+                .collect::<Vec<_>>(),
+            by_recent
+                .iter()
+                .map(|r| r.host.alias.as_str())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn rank_by_recent_ties_break_by_alias() {
+        // Two hosts recorded at the same instant tie on last_used → alias asc.
+        let b = host(1, "bravo");
+        let a = host(2, "alpha");
+        let hosts = [&b, &a];
+        let mut frec = Frecency::default();
+        let t0 = now();
+        frec.record_at(&b.id, t0);
+        frec.record_at(&a.id, t0);
+
+        let ranked = rank_by_recent(&hosts, &frec);
+        let aliases: Vec<_> = ranked.iter().map(|r| r.host.alias.as_str()).collect();
+        assert_eq!(aliases, vec!["alpha", "bravo"]);
     }
 }

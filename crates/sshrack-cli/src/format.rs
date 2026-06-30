@@ -15,10 +15,18 @@
 //! sees.
 //!
 //! Security rule: **no struct in this module ever carries a password, key, or
-//! any secret material.** Rows expose only routing/identity metadata (alias,
-//! host, port, user, an auth-kind label, and the referenced credential alias).
-//! A password is represented only by its *kind* (`"password"`, `"key"`,
-//! `"keyring"`, `"default"`), never its value.
+//! any secret material — with one documented exception.** Rows expose only
+//! routing/identity metadata (alias, host, port, user, an auth-kind label, and
+//! the referenced credential alias). A password is represented only by its
+//! *kind* (`"password"`, `"key"`, `"keyring"`, `"default"`), never its value.
+//! The single exception is the **reveal row**: when the user explicitly runs
+//! `show --reveal` (host or credential), the revealed plaintext is attached as
+//! a `password` field on the detail/list row and serialized through `serde` so
+//! it is correctly JSON-escaped. The field is `Option`, filled only under
+//! `--reveal`, and `skip_serializing_if = "Option::is_none"` so non-reveal JSON
+//! is byte-identical to before (no `password` key). This keeps the locked
+//! `--format json` contract: hand-splicing is forbidden, and serde owns the
+//! escaping.
 
 use std::borrow::Cow;
 
@@ -49,6 +57,11 @@ pub struct HostListRow<'a> {
 /// A single `host show` row — the same fields as [`HostListRow`] plus the
 /// stable id and the identity-file path (when an inline key is set). The id is
 /// the non-sensitive stable identity used by the OS-keyring account label.
+///
+/// `password` is the **reveal exception**: `Some` only when the caller is
+/// rendering a `show --reveal` result, carrying the decrypted plaintext so serde
+/// escapes it correctly. It is `None` (and therefore absent from the JSON, via
+/// `skip_serializing_if`) for every non-reveal path.
 #[derive(Debug, Clone, Serialize)]
 pub struct HostDetailRow<'a> {
     pub alias: &'a str,
@@ -64,14 +77,30 @@ pub struct HostDetailRow<'a> {
     /// still serialize.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identity: Option<Cow<'a, str>>,
+    /// The revealed plaintext, present only under `show --reveal`. See the
+    /// module-level "reveal exception" note for why this is the one row that
+    /// carries a secret.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<Cow<'a, str>>,
 }
 
-/// A single `cred ls` row. Field names are the stable `--format json` schema.
+/// A single `cred ls` / `cred show` row. Field names are the stable
+/// `--format json` schema.
+///
+/// `password` is the **reveal exception**: `Some` only when the caller is
+/// rendering a `show --reveal` result, carrying the decrypted plaintext so serde
+/// escapes it correctly. It is `None` (and therefore absent from the JSON, via
+/// `skip_serializing_if`) for every non-reveal path (including plain `cred ls`,
+/// which never reveals).
 #[derive(Debug, Clone, Serialize)]
 pub struct CredentialListRow<'a> {
     pub alias: &'a str,
     pub user: &'a str,
     pub secret_kind: &'static str,
+    /// The revealed plaintext, present only under `show --reveal`. See the
+    /// module-level "reveal exception" note.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<Cow<'a, str>>,
 }
 
 /// A `store status` row describing the active password-storage mode.
@@ -135,11 +164,15 @@ pub fn host_list_row<'a>(host: &'a Host, credential_alias: Option<&'a str>) -> H
 
 /// Build a [`HostDetailRow`] from a host plus its referenced credential alias
 /// and the string form of its id. Pure. `identity` borrows the inline body's
-/// key path when present; for a credential reference it is `None`.
+/// key path when present; for a credential reference it is `None`. `password`
+/// is the revealed plaintext under `--reveal` (`None` otherwise); passing it
+/// here (rather than hand-splicing it into the JSON) is what keeps the password
+/// correctly escaped.
 pub fn host_detail_row<'a>(
     host: &'a Host,
     id_str: &'a str,
     credential_alias: Option<&'a str>,
+    password: Option<Cow<'a, str>>,
 ) -> HostDetailRow<'a> {
     HostDetailRow {
         alias: &host.alias,
@@ -154,15 +187,23 @@ pub fn host_detail_row<'a>(
             .inline_body()
             .and_then(|b| b.key.as_deref())
             .map(|p| p.to_string_lossy()),
+        password,
     }
 }
 
-/// Build a [`CredentialListRow`] from a credential. Pure.
-pub fn credential_list_row(cred: &Credential) -> CredentialListRow<'_> {
+/// Build a [`CredentialListRow`] from a credential. Pure. `password` is the
+/// revealed plaintext under `--reveal` (`None` for `cred ls`, which never
+/// reveals); passing it here (rather than hand-splicing it into the JSON) is
+/// what keeps the password correctly escaped.
+pub fn credential_list_row<'a>(
+    cred: &'a Credential,
+    password: Option<Cow<'a, str>>,
+) -> CredentialListRow<'a> {
     CredentialListRow {
         alias: &cred.alias,
         user: &cred.body.user,
         secret_kind: secret_kind_label(&cred.body.secret_kind()),
+        password,
     }
 }
 
@@ -299,7 +340,7 @@ mod tests {
             auth: Auth::Inline(CredentialBody::new("root").with_key("/home/u/.ssh/id_ed25519")),
         };
         let id_str = host.id.to_string();
-        let row = host_detail_row(&host, &id_str, None);
+        let row = host_detail_row(&host, &id_str, None, None);
         let json = serde_json::to_string(&row).unwrap();
         let v: Value = serde_json::from_str(&json).unwrap();
         let obj = v.as_object().unwrap();
@@ -317,7 +358,7 @@ mod tests {
             alias: "team-dev".into(),
             body: CredentialBody::new("deploy").with_password("s3cret"),
         };
-        let row = credential_list_row(&cred);
+        let row = credential_list_row(&cred, None);
         let json = serde_json::to_string(&row).unwrap();
         let v: Value = serde_json::from_str(&json).unwrap();
         let obj = v.as_object().unwrap();
@@ -335,6 +376,103 @@ mod tests {
             !json.contains("s3cret"),
             "JSON row must not carry a secret value: {json}"
         );
+    }
+
+    // ---- reveal-row JSON escaping tests (Finding 1) ----
+    //
+    // The reveal path must serialize the password through serde so characters
+    // that would break hand-spliced JSON (`"`, `\`, newlines, control chars)
+    // round-trip as valid JSON. Non-reveal JSON must never carry a password.
+
+    #[test]
+    fn host_detail_row_reveal_escapes_quotes_and_backslashes() {
+        // A password containing both `"` and `\` — the classic injection pair.
+        let host = inline_host();
+        let id_str = host.id.to_string();
+        let pw = r#"p"a\th"#; // contains " and \
+        let row = host_detail_row(&host, &id_str, None, Some(Cow::Borrowed(pw)));
+        let json = serde_json::to_string(&row).unwrap();
+
+        // Must parse back as valid JSON (hand-splicing would break here).
+        let v: Value = serde_json::from_str(&json).expect("reveal JSON must be valid");
+        let obj = v.as_object().unwrap();
+        assert_eq!(obj["password"], pw, "password must round-trip exactly");
+        // And no raw `"` leaked unescaped into the wire form.
+        assert!(
+            json.contains(r#"\"a\\th"#),
+            "expected escaped form in: {json}"
+        );
+    }
+
+    #[test]
+    fn host_detail_row_reveal_escapes_newline_and_control_char() {
+        let host = inline_host();
+        let id_str = host.id.to_string();
+        // A newline plus a NUL-like control char (U+0001). Both are illegal
+        // bare inside a JSON string and must be escaped by serde.
+        let pw = "line1\nline2\u{0001}end";
+        let row = host_detail_row(&host, &id_str, None, Some(Cow::Borrowed(pw)));
+        let json = serde_json::to_string(&row).unwrap();
+
+        let v: Value = serde_json::from_str(&json).expect("reveal JSON must be valid");
+        assert_eq!(v["password"], pw);
+        // The raw newline must not appear unescaped in the wire form.
+        assert!(
+            !json.contains('\n'),
+            "raw newline must be escaped in reveal JSON: {json:?}"
+        );
+    }
+
+    #[test]
+    fn host_detail_row_non_reveal_has_no_password_field() {
+        // The non-reveal path passes `None`; the `password` key must be absent
+        // (not just empty) so the locked `--format json` contract is preserved.
+        let host = inline_host();
+        let id_str = host.id.to_string();
+        let row = host_detail_row(&host, &id_str, None, None);
+        let json = serde_json::to_string(&row).unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(
+            !obj.contains_key("password"),
+            "non-reveal JSON must not carry a password field: {json}"
+        );
+    }
+
+    #[test]
+    fn credential_list_row_reveal_round_trips_through_json() {
+        let cred = sshrack_core::config::schema::Credential {
+            id: Ulid::new(),
+            alias: "team-dev".into(),
+            body: CredentialBody::new("deploy").with_password("ignored"),
+        };
+        // A nasty password mixing every escapable class.
+        let pw = "a\"b\\c\nd\te\u{0000}f";
+        let row = credential_list_row(&cred, Some(Cow::Borrowed(pw)));
+        let json = serde_json::to_string(&row).unwrap();
+
+        let v: Value = serde_json::from_str(&json).expect("reveal JSON must be valid");
+        assert_eq!(v["password"], pw);
+        assert_eq!(v["alias"], "team-dev");
+    }
+
+    #[test]
+    fn credential_list_row_non_reveal_has_no_password_field() {
+        let cred = sshrack_core::config::schema::Credential {
+            id: Ulid::new(),
+            alias: "team-dev".into(),
+            body: CredentialBody::new("deploy").with_password("s3cret"),
+        };
+        let row = credential_list_row(&cred, None);
+        let json = serde_json::to_string(&row).unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(
+            !obj.contains_key("password"),
+            "non-reveal JSON must not carry a password field: {json}"
+        );
+        // And the actual secret still must not leak.
+        assert!(!json.contains("s3cret"));
     }
 
     #[test]
