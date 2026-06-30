@@ -36,16 +36,16 @@ use sshrack_core::id::{OwnerKind, new_id};
 use sshrack_core::secret::OsKeyring;
 use sshrack_core::secret::vault;
 
-use crate::cli::{Cli, HostAction, OutputFormat};
-use crate::exit_code;
-use crate::format as fmt;
+use crate::cli::args::{Cli, HostAction, OutputFormat};
+use crate::shared::exit_code;
+use crate::shared::format as fmt;
 
 use super::shared::{
     confirm_destructive, ensure_storage_mode_decided, fail, load_config, print_json_array,
-    print_text_table, prompt_fail, prompt_password, prompt_port, prompt_string,
-    prompt_string_with_default, resolve_credential_name, save_config, selected_fields, sort_hosts,
-    unlock_vault_key,
+    prompt_fail, prompt_password, prompt_port, prompt_string, prompt_string_with_default,
+    resolve_credential_name, save_config, selected_fields, sort_hosts, unlock_vault_key,
 };
+use crate::cli::table::print_text_table;
 
 /// Dispatch for the `Host` arm of the CLI.
 pub fn run(cli: &Cli, action: &HostAction) -> i32 {
@@ -237,7 +237,7 @@ fn add(
 // ls
 // ===========================================================================
 
-fn ls(cli: &Cli, fields_spec: Option<&str>, sort: Option<crate::cli::SortMode>) -> i32 {
+fn ls(cli: &Cli, fields_spec: Option<&str>, sort: Option<crate::cli::args::SortMode>) -> i32 {
     let (_path, cfg) = match load_config(cli.config.as_deref()) {
         Ok(v) => v,
         Err((msg, code)) => return fail(&msg, code),

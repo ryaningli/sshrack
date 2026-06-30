@@ -42,10 +42,10 @@ use sshrack_core::secret::PassphraseProvider;
 use sshrack_core::secret::SecretBackend;
 use sshrack_core::secret::vault;
 
-use crate::cli::{Cli, OutputFormat, StoreAction, StoreMode};
-use crate::exit_code;
-use crate::format as fmt;
-use crate::prompt::DialoguerPassphrase;
+use crate::cli::args::{Cli, OutputFormat, StoreAction, StoreMode};
+use crate::cli::prompt::DialoguerPassphrase;
+use crate::shared::exit_code;
+use crate::shared::format as fmt;
 
 use super::shared::{
     NoInputPassphrase, confirm_destructive, fail, load_config, save_config, unlock_vault_key,
@@ -514,15 +514,15 @@ fn unlock(cli: &Cli) -> i32 {
 /// non-secret vault runtime fields. Currently only `cache-ttl-secs` (the one
 /// field whose change needs no re-encryption). `show` with no sub-action lists
 /// every field.
-fn config(cli: &Cli, action: Option<&crate::cli::ConfigAction>) -> i32 {
+fn config(cli: &Cli, action: Option<&crate::cli::args::ConfigAction>) -> i32 {
     let (path, mut cfg) = match load_config(cli.config.as_deref()) {
         Ok(v) => v,
         Err((msg, code)) => return fail(&msg, code),
     };
     match action {
-        None | Some(crate::cli::ConfigAction::Show) => config_show(&cfg),
-        Some(crate::cli::ConfigAction::Get { field }) => config_get(&cfg, field),
-        Some(crate::cli::ConfigAction::Set { field, value }) => {
+        None | Some(crate::cli::args::ConfigAction::Show) => config_show(&cfg),
+        Some(crate::cli::args::ConfigAction::Get { field }) => config_get(&cfg, field),
+        Some(crate::cli::args::ConfigAction::Set { field, value }) => {
             config_set(&mut cfg, &path, field, value)
         }
     }

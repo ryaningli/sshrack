@@ -8,7 +8,6 @@
 //!
 //! Nothing here prints, logs, or returns a password in an error message.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use dialoguer::theme::ColorfulTheme;
@@ -26,9 +25,9 @@ use sshrack_core::secret::OsKeyring;
 use sshrack_core::secret::PassphraseProvider;
 use sshrack_core::secret::vault;
 
-use crate::cli::SortMode;
-use crate::exit_code;
-use crate::prompt::{self, DialoguerPassphrase};
+use crate::cli::args::SortMode;
+use crate::cli::prompt::{self, DialoguerPassphrase};
+use crate::shared::exit_code;
 
 /// Load the config at `override_path` (or the XDG default). A missing file is
 /// an empty config. Returns the resolved path and the config, or an `Err`
@@ -284,38 +283,6 @@ pub(crate) fn print_json_array<T: serde::Serialize>(rows: &[T]) {
         String::from("[]")
     });
     println!("{json}");
-}
-
-/// Render the aligned-text table. `cell_fn` produces the value for one
-/// (field, row) pair.
-pub(crate) fn print_text_table<T, F>(rows: &[&T], fields: &[&str], cell_fn: F)
-where
-    F: Fn(&str, &T) -> String,
-{
-    let body: Vec<Vec<String>> = rows
-        .iter()
-        .map(|r| fields.iter().map(|f| cell_fn(f, r)).collect())
-        .collect();
-    let widths: Vec<usize> = (0..fields.len())
-        .map(|col| {
-            fields[col]
-                .len()
-                .max(body.iter().map(|r| r[col].len()).max().unwrap_or(0))
-        })
-        .collect();
-    let header_row: Vec<String> = fields.iter().map(|f| f.to_uppercase()).collect();
-    let mut out = std::io::stdout().lock();
-    let _ = write_row(&mut out, &header_row, &widths);
-    for r in &body {
-        let _ = write_row(&mut out, r, &widths);
-    }
-}
-
-fn write_row<W: Write>(w: &mut W, row: &[String], widths: &[usize]) -> std::io::Result<()> {
-    for (cell, w_) in row.iter().zip(widths) {
-        write!(w, "{:<width$}  ", cell, width = w_)?;
-    }
-    writeln!(w)
 }
 
 /// Print `msg` to stderr and return `code`. The single point for failure exits.

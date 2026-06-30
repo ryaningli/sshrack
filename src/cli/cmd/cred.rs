@@ -30,15 +30,16 @@ use sshrack_core::id::{OwnerKind, new_id};
 use sshrack_core::secret::OsKeyring;
 use sshrack_core::secret::vault;
 
-use crate::cli::{Cli, CredAction, OutputFormat};
-use crate::exit_code;
-use crate::format as fmt;
+use crate::cli::args::{Cli, CredAction, OutputFormat};
+use crate::shared::exit_code;
+use crate::shared::format as fmt;
 
 use super::shared::{
     confirm_destructive, ensure_storage_mode_decided, fail, load_config, print_json_array,
-    print_text_table, prompt_fail, prompt_password, prompt_string, prompt_string_with_default,
-    save_config, selected_fields, unlock_vault_key,
+    prompt_fail, prompt_password, prompt_string, prompt_string_with_default, save_config,
+    selected_fields, unlock_vault_key,
 };
+use crate::cli::table::print_text_table;
 
 /// Dispatch for the `Cred` arm of the CLI.
 pub fn run(cli: &Cli, action: &CredAction) -> i32 {

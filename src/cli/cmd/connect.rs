@@ -38,9 +38,9 @@ use sshrack_core::hostkey;
 use sshrack_core::secret::PassphraseProvider;
 use sshrack_core::secret::vault;
 
-use crate::cli::{Cli, Command};
-use crate::exit_code;
-use crate::prompt::{self, DialoguerPassphrase};
+use crate::cli::args::{Cli, Command};
+use crate::cli::prompt::{self, DialoguerPassphrase};
+use crate::shared::exit_code;
 
 use super::shared::NoInputPassphrase;
 
