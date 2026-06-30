@@ -1,0 +1,6 @@
+/target
+/docs/tmp
+/docs/superpowers/*
+!/docs/superpowers/specs
+/.claude
+/.superpowers
