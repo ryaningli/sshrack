@@ -551,6 +551,9 @@ fn vault_meta_mut(cfg: &mut SshrackConfig) -> Option<&mut VaultMeta> {
 
 #[cfg(test)]
 mod tests {
+    //! Unit tests for the CLI `store` command's pure decisions: status
+    //! formatting, the mode-switch argument matrix, and the migrate/rekey
+    //! wiring. Process and keyring behavior is covered by integration tests.
     use super::*;
     use sshrack_core::config::schema::{Credential, CredentialBody, Host, Secret, VaultMeta};
 

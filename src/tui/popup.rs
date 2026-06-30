@@ -64,6 +64,9 @@ pub fn render_popup<W: Widget>(frame: &mut Frame, title: &str, body: W) {
 
 #[cfg(test)]
 mod tests {
+    //! Geometry tests for the centered popup rect (clamping against tiny
+    //! viewports) and the paragraph layout. Rendering itself is ratatui's
+    //! job; these pin our `centered_rect` math.
     use super::*;
 
     #[test]

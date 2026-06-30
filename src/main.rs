@@ -44,6 +44,17 @@ fn run_main() -> i32 {
         }
     };
 
+    // `host edit` and `cred edit` REQUIRE a name (Finding #3): without one the
+    // user picked the edit verb but named nothing to edit. Surfacing this as a
+    // usage error here — rather than silently opening the ADD wizard (the old
+    // behavior, because `route_is_tui` ignored `name` for Edit) — keeps the
+    // edit/add verbs distinct. The user can still run the bare `sshrack` (which
+    // routes to the launcher) or `host add` (add wizard) explicitly.
+    if let Some(msg) = edit_requires_name_error(&cli) {
+        eprintln!("{msg}");
+        return exit_code::USAGE;
+    }
+
     if route_is_tui(&cli) {
         // The TUI returns None (user quit, no connect) or a ConnectRequest for
         // main to exec. The TerminalGuard is dropped inside tui::run before
@@ -86,17 +97,59 @@ fn run_main() -> i32 {
 /// `host edit <name>` with no edit flags returns true → TUI edit wizard;
 /// `host edit <name> --port 22` returns false → CLI patch (the hard rule:
 /// a flagged field is a patch, never a wizard).
+///
+/// # `--format json` with no subcommand (Finding #9)
+///
+/// A bare `sshrack --format json` does NOT route to the TUI: there is nothing
+/// to format, and silently ignoring the flag while opening the alternate
+/// screen would surprise scripts. It falls through to the CLI (clap prints
+/// help; the flag is a no-op there). Only a TRULY bare `sshrack` (no
+/// subcommand AND default text format) opens the launcher.
+///
+/// # `host/cred edit` without a name (Finding #3)
+///
+/// `host edit` / `cred edit` with no name returns false here so it never
+/// reaches the TUI; [`edit_requires_name_error`] surfaces a usage error before
+/// any routing decision runs. (Edit needs a target; add does not.)
 fn route_is_tui(cli: &cli::Cli) -> bool {
     match &cli.cmd {
-        None => true,
+        // Finding #9: a bare `sshrack` opens the TUI ONLY under the default
+        // text format. `--format json` with no subcommand falls through to the
+        // CLI (help), never the alternate screen.
+        None => matches!(cli.format, cli::args::OutputFormat::Text),
         Some(Command::Host { action }) => host_add_or_edit_is_empty(action),
         Some(Command::Cred { action }) => cred_add_or_edit_is_empty(action),
         _ => false,
     }
 }
 
+/// If the CLI is a `host edit` / `cred edit` with no name, return a usage error
+/// message (Finding #3). `None` otherwise. This runs BEFORE [`route_is_tui`] so
+/// the user gets a clear "edit needs <name>" message instead of the add wizard
+/// or a confusing launcher. The launcher is still reachable via bare `sshrack`
+/// (the user can pick a host there and press `^e`), and add is unaffected.
+fn edit_requires_name_error(cli: &cli::Cli) -> Option<String> {
+    let needs_name = matches!(
+        &cli.cmd,
+        Some(Command::Host {
+            action: HostAction::Edit { name: None, .. },
+        }) | Some(Command::Cred {
+            action: CredAction::Edit { name: None, .. },
+        })
+    );
+    if needs_name {
+        Some(
+            "edit requires <name>: run `sshrack host edit <name>` or `sshrack cred edit <name>`, or run a bare `sshrack` to open the launcher and pick one.".into(),
+        )
+    } else {
+        None
+    }
+}
+
 /// `host add` with no content fields → TUI add wizard; `host edit <name>` with
 /// no edit flags → TUI edit wizard. Any other `host` sub-action is CLI.
+/// `host edit` with NO name returns false ([`edit_requires_name_error`] handles
+/// the usage error before routing).
 fn host_add_or_edit_is_empty(action: &HostAction) -> bool {
     match action {
         HostAction::Add {
@@ -121,6 +174,7 @@ fn host_add_or_edit_is_empty(action: &HostAction) -> bool {
                 && !*force
         }
         HostAction::Edit {
+            name,
             host,
             user,
             port,
@@ -130,11 +184,11 @@ fn host_add_or_edit_is_empty(action: &HostAction) -> bool {
             clear_identity,
             clear_password,
             clear_credential,
-            ..
         } => {
-            // name may be set (`host edit <name>`); what matters is that NO
-            // edit flag is set — that is the patch vs wizard line.
-            host.is_none()
+            // Finding #3: edit REQUIRES a name — without one it is a usage
+            // error (handled by edit_requires_name_error), not the TUI.
+            name.is_some()
+                && host.is_none()
                 && user.is_none()
                 && port.is_none()
                 && identity.is_none()
@@ -150,6 +204,8 @@ fn host_add_or_edit_is_empty(action: &HostAction) -> bool {
 
 /// `cred add` with no content fields → TUI add wizard; `cred edit <name>` with
 /// no edit flags → TUI edit wizard. Any other `cred` sub-action is CLI.
+/// `cred edit` with NO name returns false ([`edit_requires_name_error`] handles
+/// the usage error before routing).
 fn cred_add_or_edit_is_empty(action: &CredAction) -> bool {
     match action {
         CredAction::Add {
@@ -159,12 +215,20 @@ fn cred_add_or_edit_is_empty(action: &CredAction) -> bool {
             force,
         } => name.is_none() && user.is_none() && identity.is_none() && !*force,
         CredAction::Edit {
+            name,
             user,
             identity,
             clear_identity,
             rename,
-            ..
-        } => user.is_none() && identity.is_none() && !*clear_identity && rename.is_none(),
+        } => {
+            // Finding #3: edit REQUIRES a name — without one it is a usage
+            // error, not the TUI.
+            name.is_some()
+                && user.is_none()
+                && identity.is_none()
+                && !*clear_identity
+                && rename.is_none()
+        }
         _ => false,
     }
 }
@@ -175,7 +239,7 @@ mod tests {
     //! contract: bare / empty-add / empty-edit → TUI; everything else → CLI.
     use super::*;
     use crate::cli::args::{
-        Cli, Command, ConfigAction, CredAction, HostAction, SortMode, StoreAction,
+        Cli, Command, ConfigAction, CredAction, HostAction, OutputFormat, SortMode, StoreAction,
     };
     use clap::Parser;
 
@@ -190,6 +254,101 @@ mod tests {
     #[test]
     fn bare_routes_to_tui() {
         assert!(route_is_tui(&cli_with_cmd(None)));
+    }
+
+    #[test]
+    fn bare_with_format_json_does_not_route_to_tui() {
+        // Finding #9: `sshrack --format json` (no subcommand) must NOT open the
+        // alternate screen; the flag is silently ignored by the TUI otherwise.
+        // It falls through to the CLI (clap prints help). Only a TRULY bare
+        // `sshrack` (default text format) opens the launcher.
+        let mut cli = cli_with_cmd(None);
+        cli.format = OutputFormat::Json;
+        assert!(
+            !route_is_tui(&cli),
+            "--format json + no subcommand = not TUI"
+        );
+    }
+
+    #[test]
+    fn host_edit_no_name_does_not_route_to_tui() {
+        // Finding #3: `host edit` with no name is a usage error, not the TUI
+        // (and not the add wizard, which the old routing silently opened).
+        let cmd = Command::Host {
+            action: HostAction::Edit {
+                name: None,
+                host: None,
+                user: None,
+                port: None,
+                identity: None,
+                rename: None,
+                credential: None,
+                clear_identity: false,
+                clear_password: false,
+                clear_credential: false,
+            },
+        };
+        assert!(!route_is_tui(&cli_with_cmd(Some(cmd))));
+    }
+
+    #[test]
+    fn host_edit_no_name_surfaces_usage_error() {
+        // Finding #3: edit_requires_name_error fires for nameless host edit.
+        let cmd = Command::Host {
+            action: HostAction::Edit {
+                name: None,
+                host: None,
+                user: None,
+                port: None,
+                identity: None,
+                rename: None,
+                credential: None,
+                clear_identity: false,
+                clear_password: false,
+                clear_credential: false,
+            },
+        };
+        let cli = cli_with_cmd(Some(cmd));
+        assert!(edit_requires_name_error(&cli).is_some());
+    }
+
+    #[test]
+    fn cred_edit_no_name_does_not_route_to_tui() {
+        // Finding #3: `cred edit` with no name is a usage error, not the TUI.
+        let mk = || Command::Cred {
+            action: CredAction::Edit {
+                name: None,
+                user: None,
+                identity: None,
+                clear_identity: false,
+                rename: None,
+            },
+        };
+        assert!(!route_is_tui(&cli_with_cmd(Some(mk()))));
+        assert!(edit_requires_name_error(&cli_with_cmd(Some(mk()))).is_some());
+    }
+
+    #[test]
+    fn host_edit_named_still_routes_to_tui() {
+        // Regression guard for Finding #3: the fix must NOT break the named
+        // `host edit <name>` → TUI edit-wizard route. Only nameless edit errors.
+        let cmd = Command::Host {
+            action: HostAction::Edit {
+                name: Some("h".into()),
+                host: None,
+                user: None,
+                port: None,
+                identity: None,
+                rename: None,
+                credential: None,
+                clear_identity: false,
+                clear_password: false,
+                clear_credential: false,
+            },
+        };
+        let cli = cli_with_cmd(Some(cmd));
+        assert!(route_is_tui(&cli));
+        assert!(edit_requires_name_error(&cli).is_none());
     }
 
     #[test]

@@ -258,6 +258,9 @@ fn user_of(body: Option<&CredentialBody>) -> &str {
 
 #[cfg(test)]
 mod tests {
+    //! Tests for the JSON/text output shapes of `ls`/`show`: field-name
+    //! stability (the `--format json` contract), text alignment, and the
+    //! credential-name reverse lookup. Pure: feeds fixtures, asserts strings.
     use super::*;
     use serde_json::Value;
     use sshrack_core::config::schema::{CredentialBody, Host, SshrackConfig, VaultMeta};

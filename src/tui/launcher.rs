@@ -553,6 +553,9 @@ fn credential_label(host: &Host, credential_names: &CredentialNames) -> String {
 
 #[cfg(test)]
 mod tests {
+    //! Purity tests for the launcher's ranking/filter/selection logic: the
+    //! frecency-tier sort, the fuzzy-match filter, and the cursor + Enter →
+    //! pending_connect intent. No terminal or event source is touched.
     use super::*;
     use sshrack_core::config::schema::{Auth, CredentialBody, Host};
     use sshrack_core::frecency::Frecency;

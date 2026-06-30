@@ -66,7 +66,7 @@ sshrack/                       # workspace root
   helper (ssh forks `SSH_ASKPASS`, which points back at sshrack). Role dispatch lives in the root
   `src/main.rs`; the askpass *protocol* logic lives in core.
 
-## 3. CLI Command Surface (first期)
+## 3. CLI Command Surface
 
 Verb-noun grouping, all parsed with **clap derive** (no hand-written parse/dispatch — see §6).
 
@@ -82,13 +82,22 @@ sshrack store status|use|rekey|lock|unlock|config   # storage mode
 
 Deferred to the TUI phase: `sshrack sftp` (interactive/batch SFTP browsing).
 
-### 3.1 Non-interactive contract (first期)
+### 3.1 Non-interactive contract
+
+There is no global `--no-input` flag. The CLI was rewritten so the non-interactive surface is the
+default: every query/CRUD/connect verb completes with zero interaction when its flags are fully
+supplied, and errors with a stable exit code when a required field is missing. The interactive
+wizards live in the TUI (§9), reached only by a bare `sshrack` or a flag-less `host|cred add|edit`.
+Scripts drive the CLI directly; the connect path pulls the master passphrase from the environment
+when present.
 
 | Capability | Behavior |
 |---|---|
-| `--no-input` | Missing fields do **not** prompt; the command errors and exits. Full flags ⇒ zero-interaction completion. Safe for scripts/CI. |
+| `--accept-new` | Permits accepting a host key seen for the first time (like ssh's `accept-new`). Default refuses unknown keys; changed keys are always rejected (ssh upstream handles that). The only non-interactive way to accept a new key. |
+| `--yes` | Confirms destructive prompts non-interactively (e.g. the plaintext-downgrade warning in `store use plaintext`, force-overwrite in `host add --force`). Without it the command errors instead of prompting. |
+| `SSHRACK_PASSPHRASE` (env) | Supplies the vault master passphrase for scripts; shadows the interactive prompt entirely. The only way to unlock vault mode without a TTY. |
 | `--format json` (global) | Query/management commands emit structured JSON (with error codes). Default is human-readable tables. |
-| Stable exit codes | `0` success; distinct non-zero codes for not-found / duplicate / validation-failure / connection-failure. |
+| Stable exit codes | `0` success; `2` usage; `4` not-found; `5` duplicate; `6` validation; `7` connect; `8` store. |
 
 ### 3.2 `host ls` sorting (frecency透出)
 
@@ -270,7 +279,8 @@ Each slice obeys the hard rules (pure-logic TDD, clippy `-D warnings`, fmt, Engl
 4. **askpass + connect** — port askpass protocol (core) + role dispatch (cli main); zero-copy
    launcher; ssh/scp argv assembly; host-key pre-flight with injected confirm.
 5. **CLI command surface** — clap derive for `<name>`/`ssh`/`scp`/`host`/`cred`/`store`;
-   `--no-input`, `--format json`, stable exit codes; dialoguer interaction in cli only.
+   `--accept-new`, `--yes`, `SSHRACK_PASSPHRASE`, `--format json`, stable exit codes; non-interactive
+   by default (no `--no-input` flag), interaction lives in the TUI only.
 6. **frecency** — `rank()` + machine-local persistence; `host ls --sort frecency`.
 7. **Test pass + polish** — integration coverage, clippy, fmt, docs.
 

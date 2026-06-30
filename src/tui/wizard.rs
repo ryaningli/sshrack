@@ -1110,14 +1110,7 @@ impl CredForm {
     /// mode after this. An empty password under the Password choice leaves the
     /// password unset (the loop preserves the existing password in edit mode).
     pub fn build_body(&self) -> CredentialBody {
-        let user = self.user.trim().to_string();
-        let trimmed_user = if user.is_empty() {
-            // validate_cred rejects an empty user, so this branch is unreachable
-            // on the save path; keep the body total regardless.
-            user
-        } else {
-            user
-        };
+        let trimmed_user = self.user.trim().to_string();
         match self.secret_kind {
             SecretChoice::Password => {
                 let pw = self.password.as_str();
@@ -1256,7 +1249,10 @@ impl CredForm {
 
 #[cfg(test)]
 mod tests {
-
+    //! Purity tests for the host/credential wizard state machines: field
+    //! navigation, char/backspace editing, pure validation, and the
+    //! `build_auth`/`build_body` builders. Key handling is driven directly
+    //! (no terminal); the persist half lives in `app.rs`.
     use super::*;
     use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 
