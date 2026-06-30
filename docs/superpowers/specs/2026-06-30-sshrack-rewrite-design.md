@@ -200,7 +200,7 @@ trait SecretBackend {
 }
 ```
 
-## 7. Frecency (first期, backend capability)
+## 7. Frecency (first phase, backend capability)
 
 frecency = **frequency + recency** scoring (Firefox / zoxide lineage). It ranks objects so the
 most-likely-wanted float to the top: frequently-used *and* recently-used win.
@@ -212,7 +212,7 @@ most-likely-wanted float to the top: frequently-used *and* recently-used win.
   the record).
 - Stored at `~/.local/share/sshrack/frecency.toml`, **separate** from config (machine-local,
   high write frequency, must NOT sync across machines), atomic write.
-- First期 surface: `host ls --sort frecency`. Primary consumer (the TUI launcher) comes later;
+- First-phase surface: `host ls --sort frecency`. Primary consumer (the TUI launcher) comes later;
   the backend capability ships now.
 
 ## 8. On-disk Layout
