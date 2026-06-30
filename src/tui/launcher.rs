@@ -242,8 +242,10 @@ impl Launcher {
     ///   [`Outcome::ConnectRequested`] (pure intent; the loop runs the
     ///   I/O-heavy connect orchestration). When no host is under the cursor,
     ///   sets a "no host selected" status and returns [`Outcome::Continue`].
-    /// - `^a` / `^e` / `^d` / `F1` → set a "not yet implemented" status
-    ///   (Tasks 16/19/20); does **not** build the wizards
+    /// - `^a` / `^e` → set a "not yet implemented" status (the App-level
+    ///   `on_key` intercepts these to open the wizard before reaching here, so
+    ///   these branches are fallbacks); `^d` and `F1`/`?` are intercepted at the
+    ///   App level too (delete intent / help overlay)
     pub fn on_key(&mut self, key: KeyEvent, hosts: &[Host], frecency: &Frecency) -> Outcome {
         // Only react to Press events; Release/Repeat are ignored (crossterm
         // emits them on some platforms).
@@ -319,14 +321,6 @@ impl Launcher {
                 self.status = Some("edit host — not yet implemented".into());
                 Outcome::Continue
             }
-            KeyCode::Char('d') if ctrl => {
-                self.status = Some("delete host — not yet implemented".into());
-                Outcome::Continue
-            }
-            KeyCode::F(1) => {
-                self.status = Some("help — not yet implemented".into());
-                Outcome::Continue
-            }
             KeyCode::Char(c) if !ctrl => {
                 self.query.push(c);
                 self.recompute(hosts, frecency);
@@ -337,9 +331,10 @@ impl Launcher {
         }
     }
 
-    /// Render the launcher: a top query bar, the ranked host list (with fuzzy-
-    /// matched characters highlighted and the frecency tier on the right), and
-    /// a status line. Only writes to the frame; no stdout access.
+    /// Render the launcher. Delegates to [`Launcher::draw_with_status`] with an
+    /// empty (default) [`super::app::Status`]; the live render path in
+    /// [`super::app::App::draw`] always passes the consolidated status.
+    #[allow(dead_code)]
     pub fn draw(
         &self,
         frame: &mut Frame,
@@ -348,7 +343,36 @@ impl Launcher {
         frecency: &Frecency,
         credential_names: &CredentialNames,
     ) {
-        // Three vertical regions: query bar (1 line), list (fills), status (1).
+        self.draw_with_status(
+            frame,
+            area,
+            hosts,
+            frecency,
+            credential_names,
+            &super::app::Status::empty(),
+        );
+    }
+
+    /// Render with the consolidated [`super::app::Status`] taking precedence over
+    /// this launcher's own local navigation hint. Priority:
+    /// 1. `app_status` message (red if error) — set by the loop after an action
+    ///    (save/delete/switch/cancel/error).
+    /// 2. `self.status` — a launcher-local navigation hint (e.g. "no host
+    ///    selected to delete").
+    /// 3. [`STATUS_LINE`] — the default key-binding hint.
+    ///
+    /// This is the launcher's integration point for the Task 20 status-bar
+    /// unification: the launcher keeps its own status line but yields it to the
+    /// consolidated channel when the loop has set one.
+    pub fn draw_with_status(
+        &self,
+        frame: &mut Frame,
+        area: ratatui::layout::Rect,
+        hosts: &[Host],
+        frecency: &Frecency,
+        credential_names: &CredentialNames,
+        app_status: &super::app::Status,
+    ) {
         let [query_area, list_area, status_area] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Fill(1),
@@ -358,7 +382,27 @@ impl Launcher {
 
         self.draw_query(frame, query_area);
         self.draw_list(frame, list_area, hosts, frecency, credential_names);
-        self.draw_status(frame, status_area);
+
+        let line = if let Some(msg) = &app_status.message {
+            let style = if app_status.is_error {
+                Style::new().fg(Color::Red)
+            } else {
+                Style::new()
+            };
+            Line::from(vec![
+                Span::styled("status: ", Style::new().dim()),
+                Span::styled(msg.clone(), style),
+            ])
+        } else {
+            match &self.status {
+                Some(msg) => Line::from(vec![
+                    Span::styled("status: ", Style::new().dim()),
+                    Span::raw(msg.clone()),
+                ]),
+                None => Line::from(STATUS_LINE).style(Style::new().dim()),
+            }
+        };
+        frame.render_widget(Paragraph::new(line), status_area);
     }
 
     /// Render the query input bar: `> <query>` with a cursor-style block.
@@ -428,7 +472,14 @@ impl Launcher {
     }
 
     /// Render the status line: the transient notice if set, else the default
-    /// key-binding hint.
+    /// key-binding hint. Legacy entry point; the live render path uses
+    /// [`Launcher::draw_with_status`] so the consolidated
+    /// [`super::app::Status`] takes precedence. Kept private and unused outside
+    /// this impl as documentation of the pre-consolidation rendering.
+    #[expect(
+        dead_code,
+        reason = "documented legacy; live path uses draw_with_status"
+    )]
     fn draw_status(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
         let line = match &self.status {
             Some(msg) => Line::from(vec![
@@ -889,14 +940,16 @@ mod tests {
     }
 
     #[test]
-    fn on_key_ctrl_a_e_d_f1_set_not_yet_implemented_status() {
+    fn on_key_ctrl_a_e_set_not_yet_implemented_status() {
+        // `^d` and `F1` are now handled at the App level (delete intent / help
+        // overlay), so the launcher only falls back to a "not yet implemented"
+        // status for `^a` and `^e` (the App layer normally intercepts these too,
+        // but the launcher keeps the fallback). Drive the launcher directly.
         let hosts = vec![host(1, "web")];
         let fr = Frecency::default();
         for k in [
             key(KeyCode::Char('a'), KeyModifiers::CONTROL),
             key(KeyCode::Char('e'), KeyModifiers::CONTROL),
-            key(KeyCode::Char('d'), KeyModifiers::CONTROL),
-            key(KeyCode::F(1), KeyModifiers::NONE),
         ] {
             let mut launcher = Launcher::new(&hosts, &fr);
             let outcome = launcher.on_key(k, &hosts, &fr);

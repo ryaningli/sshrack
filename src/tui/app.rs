@@ -30,10 +30,12 @@ use ulid::Ulid;
 use super::ConnectRequest;
 use super::CredentialNames;
 use super::connect::connect_host;
+use super::help::draw_help;
 use super::launcher::Launcher;
 use super::prompt::TuiPassphrase;
 use super::store::StoreView;
 use super::wizard::{CredForm, HostForm};
+use sshrack_core::secret::PassphraseProvider;
 
 /// ratatui backend bound to stdout via crossterm.
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;
@@ -177,6 +179,23 @@ pub enum Outcome {
     ///
     /// [`vault::transform::migrate`]: sshrack_core::secret::vault::transform::migrate
     SwitchToPlaintext,
+    /// Pure intent: the user pressed `^d` on the selected host. The launcher's
+    /// `on_key` set `pending_delete` to the host's id and returned this. The
+    /// event loop drives a "Remove <name>? (y/n)" confirm popup via
+    /// [`TuiPassphrase::confirm`]; on Yes it calls
+    /// [`host::delete_host_with_secret`] (remove + keyring cleanup so no secret
+    /// is orphaned), persists, reloads, and returns to the launcher with a
+    /// "removed <name>" status. No / Esc cancels. `on_key` itself does NO I/O.
+    ///
+    /// [`host::delete_host_with_secret`]: sshrack_core::host::delete_host_with_secret
+    DeleteHost,
+    /// Pure intent: the user pressed `F1` (or `?`) anywhere. `on_key` already
+    /// flipped the mode to [`Mode::Help`] (and stashed the prior mode so the
+    /// overlay dismisses back to it). The loop has nothing to do — the help
+    /// overlay is rendered from static text, and Esc/F1 dismiss it inside
+    /// `on_key`. This variant exists only so the loop can distinguish "a real
+    /// key was handled" (Continue) from "open the help overlay" for clarity.
+    OpenHelp,
 }
 
 /// Which view the TUI is showing. The launcher is the default; the host wizard
@@ -195,6 +214,49 @@ pub enum Mode {
     CredWizard,
     /// The store-mode switch view (keyring / vault / plaintext).
     Store,
+    /// The full-screen help overlay (`F1`). Dismissed by `F1`/`Esc` back to the
+    /// mode that was active when the overlay opened (stored in
+    /// [`App::help_prev_mode`]).
+    Help,
+}
+
+/// The consolidated status-bar message: a transient one-liner the user reads as
+/// feedback after every action (save, cancel, delete, switch, error). Carried on
+/// [`App::status`] and rendered as a single footer line across every view
+/// (Task 20: unify the per-action status into one channel). `is_error` tints the
+/// line red so failures stand out from informational notices.
+#[derive(Debug, Clone, Default)]
+pub struct Status {
+    /// The message text, or `None` to show the default key-binding hint.
+    pub message: Option<String>,
+    /// `true` for failures (red); `false` for informational notices (normal).
+    pub is_error: bool,
+}
+
+impl Status {
+    /// An informational status (e.g. "host saved").
+    pub fn info(message: impl Into<String>) -> Self {
+        Self {
+            message: Some(message.into()),
+            is_error: false,
+        }
+    }
+
+    /// An error status (rendered red).
+    pub fn error(message: impl Into<String>) -> Self {
+        Self {
+            message: Some(message.into()),
+            is_error: true,
+        }
+    }
+
+    /// No status — the footer falls back to the default key-binding hint.
+    pub fn empty() -> Self {
+        Self {
+            message: None,
+            is_error: false,
+        }
+    }
 }
 
 /// TUI application state. The launcher is the primary mode; the host wizard is
@@ -235,6 +297,19 @@ pub struct App {
     cred_wizard: Option<CredForm>,
     /// The store-mode switch view, present only when [`Mode::Store`] is active.
     store_view: Option<StoreView>,
+    /// The consolidated status-bar message (Task 20). Every action sets it; the
+    /// footer rendered in [`App::draw`] shows it. Errors tint red. This is the
+    /// user's single feedback channel across all views.
+    status: Status,
+    /// Set by `on_key` when the user presses `^d` on a host. The event loop
+    /// reads this (clearing it on cancel), drives the confirm popup, and runs
+    /// the I/O-heavy delete. `on_key` does NO I/O, so this is the pure bridge
+    /// to the loop (mirrors `pending_connect`).
+    pending_delete: Option<Ulid>,
+    /// The mode that was active when the help overlay opened, so `F1`/`Esc`
+    /// dismiss the overlay back to it. `None` means no overlay is open (the
+    /// current mode IS the real mode).
+    help_prev_mode: Option<Mode>,
 }
 
 impl App {
@@ -260,6 +335,9 @@ impl App {
             wizard: None,
             cred_wizard: None,
             store_view: None,
+            status: Status::empty(),
+            pending_delete: None,
+            help_prev_mode: None,
         }
     }
 
@@ -465,6 +543,52 @@ impl App {
         self.config = config;
     }
 
+    /// Set an informational status (normal color). The footer shows it on the
+    /// next render.
+    pub fn set_status(&mut self, message: String) {
+        self.status = Status::info(message);
+    }
+
+    /// Set an error status (red). Used when an action fails (connect failed,
+    /// switch failed, delete failed).
+    pub fn set_status_error(&mut self, message: String) {
+        self.status = Status::error(message);
+    }
+
+    /// The consolidated status, for the footer to render. Exposed for tests
+    /// that assert the status an action set.
+    #[allow(dead_code)]
+    pub fn status(&self) -> &Status {
+        &self.status
+    }
+
+    /// Open the help overlay, stashing the current mode so `Esc`/`F1` dismiss
+    /// back to it. No-op when already in [`Mode::Help`] (a second `F1` should
+    /// dismiss, not stack).
+    pub fn open_help(&mut self) {
+        if self.mode == Mode::Help {
+            return;
+        }
+        self.help_prev_mode = Some(self.mode.clone());
+        self.mode = Mode::Help;
+    }
+
+    /// Close the help overlay and restore the mode that was active when it
+    /// opened. Defensive: if no prior mode was recorded, fall back to the
+    /// launcher (the overlay must never strand the user).
+    pub fn close_help(&mut self) {
+        let prev = self.help_prev_mode.take().unwrap_or(Mode::Launcher);
+        self.mode = prev;
+    }
+
+    /// The pending-delete host id set by `^d` on the launcher. The loop reads
+    /// (and clears) this to drive the delete confirm popup. Exposed for tests
+    /// that drive the delete intent directly.
+    #[cfg(test)]
+    pub fn pending_delete(&self) -> Option<Ulid> {
+        self.pending_delete
+    }
+
     /// Pure: decide what should happen next for a given key. Performs **no**
     /// I/O — no reads, no writes, no terminal access — so it is safe to call
     /// from a unit test without an event source.
@@ -476,6 +600,21 @@ impl App {
     /// - HostWizard → the wizard's `on_key`. `SaveHost`/`Cancel` are returned
     ///   to the loop, which does the persist + reload.
     pub fn on_key(&mut self, key: KeyEvent) -> Outcome {
+        // Global F1 (and `?`) opens the help overlay from anywhere — even mid-
+        // wizard — so the user never has to back out to read a binding. This
+        // runs before the per-mode match so it wins over a mode-local binding.
+        // Pressing F1 while already in Help is handled by the Help arm below
+        // (it dismisses).
+        if key.kind == crossterm::event::KeyEventKind::Press
+            && key.modifiers.is_empty()
+            && self.mode != Mode::Help
+            && (key.code == crossterm::event::KeyCode::F(1)
+                || key.code == crossterm::event::KeyCode::Char('?'))
+        {
+            self.open_help();
+            return Outcome::OpenHelp;
+        }
+
         match self.mode {
             Mode::Launcher => {
                 // Intercept ^a / ^e before the launcher so they open the wizard
@@ -539,6 +678,23 @@ impl App {
                         self.open_store_view();
                         return Outcome::Continue;
                     }
+                    // `^d` on the selected host → delete intent. Pure: sets
+                    // pending_delete and returns DeleteHost; the loop drives the
+                    // confirm popup + core delete. No host under the cursor →
+                    // status hint.
+                    if ctrl && key.code == crossterm::event::KeyCode::Char('d') {
+                        match self.launcher.selected_host(&self.config.hosts) {
+                            Some(h) => {
+                                let id = h.id;
+                                self.pending_delete = Some(id);
+                                return Outcome::DeleteHost;
+                            }
+                            None => {
+                                self.launcher.status = Some("no host selected to delete".into());
+                            }
+                        }
+                        return Outcome::Continue;
+                    }
                 }
                 let outcome = self
                     .launcher
@@ -564,37 +720,100 @@ impl App {
                 Some(v) => v.on_key(key),
                 None => Outcome::Continue,
             },
+            Mode::Help => {
+                // The help overlay dismisses on F1 (toggle), Esc, or `q`.
+                // Release/Repeat events are ignored (only Press acts).
+                if key.kind == crossterm::event::KeyEventKind::Press
+                    && key.modifiers.is_empty()
+                    && matches!(
+                        key.code,
+                        crossterm::event::KeyCode::F(1)
+                            | crossterm::event::KeyCode::Esc
+                            | crossterm::event::KeyCode::Char('q')
+                    )
+                {
+                    self.close_help();
+                }
+                Outcome::Continue
+            }
         }
     }
 
     /// Render current state to the frame. Only writes to the frame (no stdout
-    /// access of its own). Routes by [`Mode`] to the active view's render.
+    /// access of its own). Routes by [`Mode`] to the active view's render, and
+    /// overlays the help overlay on top when active. The launcher already owns
+    /// its own status line (which doubles as the footer in launcher mode); the
+    /// other views leave the bottom row to the consolidated status footer.
     pub fn draw(&self, frame: &mut Frame) {
         let area = frame.area();
         match self.mode {
-            Mode::Launcher => self.launcher.draw(
-                frame,
-                area,
-                &self.config.hosts,
-                &self.frecency,
-                &self.credential_names,
-            ),
+            Mode::Launcher => {
+                // The launcher renders its own query/list/status layout; its
+                // status line is the consolidated footer in this mode (it shows
+                // `self.status` when set, else the default key-binding hint).
+                self.launcher.draw_with_status(
+                    frame,
+                    area,
+                    &self.config.hosts,
+                    &self.frecency,
+                    &self.credential_names,
+                    &self.status,
+                );
+            }
             Mode::HostWizard => {
                 if let Some(w) = &self.wizard {
                     w.draw(frame, area);
                 }
+                Self::draw_status_footer(frame, area, &self.status);
             }
             Mode::CredWizard => {
                 if let Some(w) = &self.cred_wizard {
                     w.draw(frame, area);
                 }
+                Self::draw_status_footer(frame, area, &self.status);
             }
             Mode::Store => {
                 if let Some(v) = &self.store_view {
                     v.draw(frame, area);
                 }
+                Self::draw_status_footer(frame, area, &self.status);
+            }
+            Mode::Help => {
+                // The help overlay covers the whole frame; no footer (the
+                // overlay itself shows its dismiss hint).
+                draw_help(frame, area);
             }
         }
+    }
+
+    /// Render the consolidated status footer in the bottom row of `area`. Errors
+    /// are tinted red; informational notices render normal; `None` shows the
+    /// default key-binding hint. Only called for the non-launcher views — the
+    /// launcher integrates the status into its own bottom line.
+    fn draw_status_footer(frame: &mut Frame, area: ratatui::layout::Rect, status: &Status) {
+        let [_, footer] = ratatui::layout::Layout::vertical([
+            ratatui::layout::Constraint::Fill(1),
+            ratatui::layout::Constraint::Length(1),
+        ])
+        .areas(area);
+        let line = match &status.message {
+            Some(msg) => {
+                let style = if status.is_error {
+                    ratatui::style::Style::new().fg(ratatui::style::Color::Red)
+                } else {
+                    ratatui::style::Style::new()
+                };
+                ratatui::text::Line::from(vec![
+                    ratatui::text::Span::styled("status: ", ratatui::style::Style::new().dim()),
+                    ratatui::text::Span::styled(msg.clone(), style),
+                ])
+            }
+            None => ratatui::text::Line::from(
+                "F1 help  ·  Esc back/cancel  ·  (the active view's keys are live)",
+            )
+            .style(ratatui::style::Style::new().dim()),
+        };
+        frame.render_widget(ratatui::widgets::Paragraph::new(line), footer);
     }
 }
 
@@ -658,14 +877,14 @@ pub fn run_loop(
                         Err(SshrackError::Interrupted) => {
                             // User cancelled a popup (Esc/Ctrl-C). Return to the
                             // launcher, NOT an exit.
-                            app.launcher.status = Some("connect cancelled".into());
+                            app.set_status("connect cancelled".to_string());
                         }
                         Err(e) => {
                             // A real error (vault unlock fail, host-key reject,
                             // dangling credential, frecency save fail). Surface
-                            // it in the status line and return to the launcher
-                            // so the user can read it.
-                            app.launcher.status = Some(format!("connect failed: {e}"));
+                            // it in the status line (red) and return to the
+                            // launcher so the user can read it.
+                            app.set_status_error(format!("connect failed: {e}"));
                         }
                     }
                 }
@@ -675,7 +894,7 @@ pub fn run_loop(
                     // add or apply-patch, write config, reload, close the wizard.
                     match persist_host_save(app) {
                         Ok(()) => {
-                            app.launcher.status = Some("host saved".into());
+                            app.set_status("host saved".to_string());
                             app.close_host_wizard();
                         }
                         Err(e) => {
@@ -697,7 +916,7 @@ pub fn run_loop(
                     // close the wizard.
                     match persist_cred_save(app, &handle) {
                         Ok(()) => {
-                            app.launcher.status = Some("credential saved".into());
+                            app.set_status("credential saved".to_string());
                             app.close_cred_wizard();
                         }
                         Err(SshrackError::Interrupted) => {
@@ -721,7 +940,7 @@ pub fn run_loop(
                 Outcome::Cancel => {
                     // A view's Esc / Ctrl-C: discard the active view and return
                     // to the launcher. Which view to close depends on mode.
-                    app.launcher.status = Some("cancelled".into());
+                    app.set_status("cancelled".to_string());
                     match app.mode {
                         Mode::HostWizard => app.close_host_wizard(),
                         Mode::CredWizard => app.close_cred_wizard(),
@@ -733,7 +952,7 @@ pub fn run_loop(
                     match persist_store_switch(app, StoreSwitchTarget::Keyring, &handle) {
                         Ok(true) => {
                             app.close_store_view();
-                            app.launcher.status = Some("switched to keyring mode".into());
+                            app.set_status("switched to keyring mode".to_string());
                         }
                         Ok(false) => {
                             // Keyring unavailable or a transient error surfaced in
@@ -757,7 +976,7 @@ pub fn run_loop(
                     match persist_store_switch(app, StoreSwitchTarget::Vault, &handle) {
                         Ok(true) => {
                             app.close_store_view();
-                            app.launcher.status = Some("switched to vault mode".into());
+                            app.set_status("switched to vault mode".to_string());
                         }
                         Ok(false) => {}
                         Err(SshrackError::Interrupted) => {
@@ -777,7 +996,7 @@ pub fn run_loop(
                     match persist_store_switch(app, StoreSwitchTarget::Plaintext, &handle) {
                         Ok(true) => {
                             app.close_store_view();
-                            app.launcher.status = Some("switched to plaintext mode".into());
+                            app.set_status("switched to plaintext mode".to_string());
                         }
                         Ok(false) => {}
                         Err(SshrackError::Interrupted) => {
@@ -793,6 +1012,49 @@ pub fn run_loop(
                             }
                         }
                     }
+                }
+                Outcome::DeleteHost => {
+                    // Pure intent: ^d on a host set pending_delete. Drive the
+                    // confirm popup, then (on Yes) core delete + keyring cleanup
+                    // + persist + reload. A cancel (Esc/Ctrl-C in the popup)
+                    // surfaces as Interrupted → "cancelled" status, NOT an exit.
+                    let Some(host_id) = app.pending_delete.take() else {
+                        continue;
+                    };
+                    // Resolve id → name for the confirm message BEFORE deleting
+                    // (the host is gone after delete). None is defensive (the
+                    // launcher only hands out ids from the loaded config).
+                    let name = app
+                        .config
+                        .find_host_by_id(&host_id)
+                        .map(|h| h.name.clone())
+                        .unwrap_or_else(|| host_id.to_string());
+                    let provider = TuiPassphrase::new(handle.clone());
+                    let prompt = format!("Remove host '{name}'?");
+                    match provider.confirm(&prompt) {
+                        Ok(true) => match persist_host_delete(app, &name) {
+                            Ok(()) => {
+                                app.set_status(format!("removed '{name}'"));
+                            }
+                            Err(e) => {
+                                app.set_status_error(format!("delete failed: {e}"));
+                            }
+                        },
+                        Ok(false) => {
+                            app.set_status("delete cancelled".to_string());
+                        }
+                        Err(SshrackError::Interrupted) => {
+                            app.set_status("delete cancelled".to_string());
+                        }
+                        Err(e) => {
+                            app.set_status_error(format!("delete failed: {e}"));
+                        }
+                    }
+                }
+                Outcome::OpenHelp => {
+                    // on_key already flipped the mode to Help. Nothing for the
+                    // loop to do here; the help overlay renders from static text
+                    // and dismisses inside on_key (Esc/F1/q).
                 }
                 Outcome::Continue => {}
             }
@@ -886,6 +1148,38 @@ fn persist_host_save(app: &mut App) -> Result<(), SshrackError> {
         // memory only. The launcher will still show the host this session.
         app.set_config(new_cfg);
     }
+    Ok(())
+}
+
+/// Fulfill a [`Outcome::DeleteHost`] intent (after the user confirmed the
+/// popup): call [`host::delete_host_with_secret`] — which removes the host and
+/// best-effort forgets its keyring entry when the host's inline body was
+/// keyring-marked (so no orphaned secret is left behind) — then persist +
+/// reload + re-rank the launcher. Mirrors the CLI's `host rm` sequence
+/// (`cli::cmd::host::rm` → `host::delete_host_with_secret` → save). The
+/// keyring backend is [`OsKeyring`] (the production backend); a down keyring
+/// daemon is tolerated by `forget_keyring_secret` as a best-effort no-op.
+///
+/// `name` is the host's name at confirm time (the caller resolved id→name
+/// before deleting). An absent host surfaces as [`SshrackError::HostNotFound`]
+/// (defensive: the launcher only hands out ids from the loaded config, but a
+/// concurrent edit could race — the error is clearer than a silent no-op).
+fn persist_host_delete(app: &mut App, name: &str) -> Result<(), SshrackError> {
+    use sshrack_core::host;
+    use sshrack_core::secret::OsKeyring;
+
+    let backend = OsKeyring;
+    let new_cfg = host::delete_host_with_secret(&app.config, name, &backend)?;
+    if let Some(path) = app.config_path() {
+        sshrack_core::config::store::save(path, &new_cfg)?;
+        let reloaded = sshrack_core::config::store::load(path)?;
+        app.set_config(reloaded);
+    } else {
+        app.set_config(new_cfg);
+    }
+    // Re-rank so the launcher reflects the (shorter) host list and the
+    // selection clamps back into range.
+    app.launcher.recompute(&app.config.hosts, &app.frecency);
     Ok(())
 }
 
@@ -2216,5 +2510,192 @@ mod tests {
             Ok(true) => {}
             Err(e) => panic!("keyring switch should not error in a no-daemon env: {e}"),
         }
+    }
+
+    // ===============================================================
+    // Task 19: delete flow (^d → confirm → core delete).
+    // ===============================================================
+
+    #[test]
+    fn ctrl_d_on_selected_host_signals_delete_intent_pure() {
+        // ^d sets pending_delete to the host under the cursor and returns
+        // DeleteHost. on_key does NO I/O; the loop drives the popup + core
+        // delete. This pins the pure half.
+        let mut app = app_with_host("web");
+        let expected_id = app.config.hosts[0].id;
+        let outcome = app.on_key(press(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert!(matches!(outcome, Outcome::DeleteHost));
+        assert_eq!(app.pending_delete(), Some(expected_id));
+    }
+
+    #[test]
+    fn ctrl_d_with_no_host_sets_launcher_status_and_stays() {
+        let cfg = SshrackConfig::default();
+        let mut app = App::new(cfg, None, Frecency::default(), HashMap::new());
+        let outcome = app.on_key(press(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert!(matches!(outcome, Outcome::Continue));
+        assert_eq!(*app.mode(), Mode::Launcher);
+        assert!(
+            app.launcher
+                .status
+                .as_deref()
+                .unwrap_or("")
+                .contains("no host selected to delete")
+        );
+    }
+
+    #[test]
+    fn persist_host_delete_removes_host_and_persists() {
+        // The I/O half of the delete flow: core remove + keyring cleanup + save
+        // + reload + re-rank. Driven here directly (the loop's wiring is the
+        // popup → yes → this fn).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = SshrackConfig {
+            hosts: vec![
+                Host {
+                    id: Ulid::new(),
+                    name: "web".into(),
+                    host: "h".into(),
+                    port: 22,
+                    auth: Auth::inline(CredentialBody::new("u")),
+                },
+                Host {
+                    id: Ulid::new(),
+                    name: "db".into(),
+                    host: "h2".into(),
+                    port: 22,
+                    auth: Auth::inline(CredentialBody::new("u")),
+                },
+            ],
+            ..SshrackConfig::default()
+        };
+        sshrack_core::config::store::save(&path, &cfg).unwrap();
+        let mut app = App::new(cfg, Some(path.clone()), Frecency::default(), HashMap::new());
+        assert_eq!(app.config().hosts.len(), 2);
+
+        persist_host_delete(&mut app, "web").expect("delete should succeed");
+
+        let reloaded = sshrack_core::config::store::load(&path).unwrap();
+        assert_eq!(reloaded.hosts.len(), 1, "only one host remains");
+        assert_eq!(reloaded.hosts[0].name, "db");
+        // Launcher re-ranked so the surviving host shows up.
+        assert_eq!(app.launcher.ranked.len(), 1);
+    }
+
+    #[test]
+    fn persist_host_delete_unknown_host_errors() {
+        // A name absent from the config surfaces as HostNotFound (defensive:
+        // the launcher only hands out ids from the loaded config, but a race or
+        // a stale confirm must not silently no-op).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        sshrack_core::config::store::save(&path, &SshrackConfig::default()).unwrap();
+        let mut app = App::new(
+            sshrack_core::config::store::load(&path).unwrap(),
+            Some(path),
+            Frecency::default(),
+            HashMap::new(),
+        );
+        let err = persist_host_delete(&mut app, "ghost").unwrap_err();
+        assert!(matches!(err, SshrackError::HostNotFound { .. }));
+    }
+
+    // ===============================================================
+    // Task 20: help overlay (F1 / ? / Esc) + consolidated status.
+    // ===============================================================
+
+    #[test]
+    fn f1_in_launcher_opens_help_overlay() {
+        let mut app = app_with_host("web");
+        let outcome = app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
+        assert!(matches!(outcome, Outcome::OpenHelp));
+        assert_eq!(*app.mode(), Mode::Help);
+        assert_eq!(app.help_prev_mode, Some(Mode::Launcher));
+    }
+
+    #[test]
+    fn question_mark_opens_help_overlay() {
+        let mut app = app_with_host("web");
+        let outcome = app.on_key(press(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert!(matches!(outcome, Outcome::OpenHelp));
+        assert_eq!(*app.mode(), Mode::Help);
+    }
+
+    #[test]
+    fn f1_opens_help_from_inside_wizard_then_esc_restores_mode() {
+        // Help is reachable mid-wizard (you should not have to back out to read
+        // a binding). Esc dismisses back to the wizard, not the launcher.
+        let mut app = app_with_host("web");
+        app.on_key(press(KeyCode::Char('a'), KeyModifiers::CONTROL)); // -> HostWizard
+        assert_eq!(*app.mode(), Mode::HostWizard);
+        app.on_key(press(KeyCode::F(1), KeyModifiers::NONE)); // -> Help
+        assert_eq!(*app.mode(), Mode::Help);
+        assert_eq!(app.help_prev_mode, Some(Mode::HostWizard));
+        // Esc (or q, or F1) dismisses back to the wizard.
+        app.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(*app.mode(), Mode::HostWizard, "Esc restores the prior mode");
+        assert!(app.help_prev_mode.is_none());
+    }
+
+    #[test]
+    fn help_dismiss_keys_are_f1_esc_and_q() {
+        for key in [
+            press(KeyCode::F(1), KeyModifiers::NONE),
+            press(KeyCode::Esc, KeyModifiers::NONE),
+            press(KeyCode::Char('q'), KeyModifiers::NONE),
+        ] {
+            let mut app = app_with_host("web");
+            app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
+            assert_eq!(*app.mode(), Mode::Help);
+            app.on_key(key);
+            assert_eq!(*app.mode(), Mode::Launcher, "dismiss key must restore mode");
+        }
+    }
+
+    #[test]
+    fn f1_inside_help_dismisses_does_not_stack() {
+        // A second F1 dismisses rather than nesting a second overlay.
+        let mut app = app_with_host("web");
+        app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
+        assert_eq!(*app.mode(), Mode::Help);
+        app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
+        assert_eq!(*app.mode(), Mode::Launcher);
+        assert!(app.help_prev_mode.is_none());
+    }
+
+    #[test]
+    fn help_other_keys_continue_without_dismissing() {
+        // Random keys inside the help overlay must NOT dismiss or change mode.
+        let mut app = app_with_host("web");
+        app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
+        let outcome = app.on_key(press(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(matches!(outcome, Outcome::Continue));
+        assert_eq!(*app.mode(), Mode::Help, "x must not dismiss help");
+    }
+
+    #[test]
+    fn help_release_events_are_ignored() {
+        let mut app = app_with_host("web");
+        app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
+        let release =
+            KeyEvent::new_with_kind(KeyCode::Esc, KeyModifiers::NONE, KeyEventKind::Release);
+        app.on_key(release);
+        assert_eq!(*app.mode(), Mode::Help, "release must not dismiss help");
+    }
+
+    #[test]
+    fn set_status_and_set_status_error_round_trip() {
+        let mut app = app_with_host("web");
+        assert!(app.status().message.is_none());
+        app.set_status("host saved".to_string());
+        assert_eq!(app.status().message.as_deref(), Some("host saved"));
+        assert!(!app.status().is_error);
+        app.set_status_error("connect failed: timeout".to_string());
+        assert_eq!(
+            app.status().message.as_deref(),
+            Some("connect failed: timeout")
+        );
+        assert!(app.status().is_error);
     }
 }
