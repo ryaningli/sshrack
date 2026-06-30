@@ -1,4 +1,281 @@
-//! Secret storage: storage-mode backends behind injected traits.
+//! Secret storage backends behind injected traits.
+//!
+//! Core defines two side-effect seams so the vault orchestration and the
+//! host-key pre-flight can be unit-tested without a running keyring daemon or a
+//! TTY:
+//!
+//! - [`SecretBackend`] — where stored secrets live (the OS keyring or a test
+//!   double).
+//! - [`PassphraseProvider`] — how a vault passphrase is obtained.
+//!
+//! The CLI supplies concrete impls ([`OsKeyring`] plus its own prompt impl);
+//! tests supply the fakes in [`test_doubles`]. Nothing here prints, logs, or
+//! returns a passphrase or plaintext in an error message.
+//!
+//! Submodules:
+//! - [`vault`] — master-passphrase encryption (crypto + key cache).
+//! - [`keyring`] — OS keyring I/O over raw account keys.
 
+use ulid::Ulid;
+use zeroize::Zeroizing;
+
+use crate::error::SshrackError;
+use crate::id::OwnerKind;
+
+pub mod keyring;
 pub mod vault;
-// keyring + the SecretBackend/PassphraseProvider traits are added in the next task.
+
+/// The OS keyring (or a test double) behind a single seam. The vault
+/// write/migrate path and the rm/cp keyring cleanup go through this, so they
+/// are unit-testable without a running Secret Service daemon.
+///
+/// Keying is `OwnerKind + Ulid` at this layer; the derived account key
+/// (`<kind>:<ulid>`) is built via [`crate::id::keyring_key`]. [`get`] takes the
+/// raw key because the askpass helper only knows the key.
+pub trait SecretBackend {
+    /// Store `password` under the owner + id-derived key (overwrites). I/O.
+    fn set(&self, kind: OwnerKind, id: &Ulid, password: &str) -> Result<(), SshrackError>;
+    /// Fetch the password for a raw account key; `Ok(None)` when absent.
+    fn get(&self, key: &str) -> Result<Option<Zeroizing<String>>, SshrackError>;
+    /// Delete the entry for owner + id if present. A missing entry is success.
+    fn delete(&self, kind: OwnerKind, id: &Ulid) -> Result<(), SshrackError>;
+    /// True when the backend is reachable (a daemon is running / keychain
+    /// unlocked). Probed before migrating into keyring mode.
+    fn available(&self) -> bool;
+}
+
+/// Where a vault passphrase comes from. Methods that read a passphrase return
+/// [`Zeroizing<String>`] so the plaintext is wiped on drop.
+///
+/// The first-use password-mode menu (keyring / vault / plaintext) is a CLI
+/// interaction concern and is NOT on this trait — see Task 17.
+pub trait PassphraseProvider {
+    /// Read the vault master passphrase once, no echo.
+    fn passphrase(&self) -> Result<Zeroizing<String>, SshrackError>;
+    /// Read a new passphrase, looping until two entries match. Used by
+    /// enable/rekey and the first-use vault prompt.
+    fn passphrase_confirm(&self) -> Result<Zeroizing<String>, SshrackError>;
+    /// A yes/no confirmation with `text` as the prompt, defaulting to No.
+    fn confirm(&self, text: &str) -> Result<bool, SshrackError>;
+}
+
+/// The real OS keyring. Delegates to [`keyring`].
+pub struct OsKeyring;
+
+impl SecretBackend for OsKeyring {
+    fn set(&self, kind: OwnerKind, id: &Ulid, password: &str) -> Result<(), SshrackError> {
+        keyring::set_by_key(&crate::id::keyring_key(kind, id), password)
+    }
+    fn get(&self, key: &str) -> Result<Option<Zeroizing<String>>, SshrackError> {
+        keyring::get(key)
+    }
+    fn delete(&self, kind: OwnerKind, id: &Ulid) -> Result<(), SshrackError> {
+        keyring::delete_by_key(&crate::id::keyring_key(kind, id))
+    }
+    fn available(&self) -> bool {
+        keyring::daemon_available()
+    }
+}
+
+/// Best-effort delete of a keyring entry when the owning body was keyring-marked.
+/// Centralizes the rm cleanup policy (delete-if-marked, ignore errors) so host
+/// and credential removal share one implementation. Never returns an error.
+pub fn forget_keyring_secret(
+    backend: &dyn SecretBackend,
+    kind: OwnerKind,
+    id: &Ulid,
+    marked: bool,
+) {
+    if marked {
+        let _ = backend.delete(kind, id);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_doubles {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    /// In-memory keyring for tests. Keyed by the derived account key, so it
+    /// honours [`crate::id::keyring_key`] exactly like the OS backend.
+    pub(crate) struct FakeBackend {
+        /// `account key -> plaintext`. Public so tests can seed/inspect it.
+        pub entries: RefCell<HashMap<String, String>>,
+        /// Drives [`SecretBackend::available`]. Defaults to `true`.
+        pub available: bool,
+    }
+
+    impl FakeBackend {
+        /// Empty keyring, reported as available.
+        pub(crate) fn new() -> Self {
+            Self {
+                entries: Default::default(),
+                available: true,
+            }
+        }
+    }
+
+    impl SecretBackend for FakeBackend {
+        fn set(&self, kind: OwnerKind, id: &Ulid, password: &str) -> Result<(), SshrackError> {
+            self.entries
+                .borrow_mut()
+                .insert(crate::id::keyring_key(kind, id), password.to_string());
+            Ok(())
+        }
+        fn get(&self, key: &str) -> Result<Option<Zeroizing<String>>, SshrackError> {
+            Ok(self
+                .entries
+                .borrow()
+                .get(key)
+                .map(|p| Zeroizing::new(p.clone())))
+        }
+        fn delete(&self, kind: OwnerKind, id: &Ulid) -> Result<(), SshrackError> {
+            self.entries
+                .borrow_mut()
+                .remove(&crate::id::keyring_key(kind, id));
+            Ok(())
+        }
+        fn available(&self) -> bool {
+            self.available
+        }
+    }
+
+    /// Minimal passphrase provider for vault tests: each method returns a
+    /// canned answer, or the given error (simulating no-tty / a cancelled
+    /// prompt). The scripted value is held in a `RefCell<Option<Result<…>>>`
+    /// and consumed via `Option::take`, because [`SshrackError`] is not
+    /// `Clone`. A second call after the scripted value is consumed falls back
+    /// to [`SshrackError::Interrupted`].
+    pub(crate) struct FakePassphraseProvider {
+        pub passphrase: RefCell<Option<Result<String, SshrackError>>>,
+        pub passphrase_confirm: RefCell<Option<Result<String, SshrackError>>>,
+        pub confirm: RefCell<Option<Result<bool, SshrackError>>>,
+    }
+
+    impl PassphraseProvider for FakePassphraseProvider {
+        fn passphrase(&self) -> Result<Zeroizing<String>, SshrackError> {
+            self.passphrase
+                .borrow_mut()
+                .take()
+                .unwrap_or(Err(SshrackError::Interrupted))
+                .map(Zeroizing::new)
+        }
+        fn passphrase_confirm(&self) -> Result<Zeroizing<String>, SshrackError> {
+            self.passphrase_confirm
+                .borrow_mut()
+                .take()
+                .unwrap_or(Err(SshrackError::Interrupted))
+                .map(Zeroizing::new)
+        }
+        fn confirm(&self, _text: &str) -> Result<bool, SshrackError> {
+            self.confirm
+                .borrow_mut()
+                .take()
+                .unwrap_or(Err(SshrackError::Interrupted))
+        }
+    }
+
+    /// A passphrase provider that refuses every method: `confirm` returns
+    /// `false`, every other method errors `Interrupted`. Used by tests whose
+    /// vault is already unlocked (so the passphrase branch is never reached)
+    /// or that exercise a fall-through-to-prompt path expecting it to error
+    /// off-tty.
+    pub(crate) fn deny() -> FakePassphraseProvider {
+        FakePassphraseProvider {
+            passphrase: RefCell::new(Some(Err(SshrackError::Interrupted))),
+            passphrase_confirm: RefCell::new(Some(Err(SshrackError::Interrupted))),
+            confirm: RefCell::new(Some(Ok(false))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::id::{OwnerKind, keyring_key};
+    use ulid::Ulid;
+
+    #[test]
+    fn fake_backend_round_trips_via_keyring_key() {
+        let b = test_doubles::FakeBackend::new();
+        let id = Ulid::new();
+        b.set(OwnerKind::Credential, &id, "hunter2").unwrap();
+        let got = b.get(&keyring_key(OwnerKind::Credential, &id)).unwrap();
+        assert_eq!(got.as_deref().map(String::as_str), Some("hunter2"));
+        b.delete(OwnerKind::Credential, &id).unwrap();
+        assert!(
+            b.get(&keyring_key(OwnerKind::Credential, &id))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn fake_backend_keys_host_and_credential_distinctly() {
+        // Same id, different kind -> different key (the prefix disambiguates).
+        let b = test_doubles::FakeBackend::new();
+        let id = Ulid::new();
+        b.set(OwnerKind::Host, &id, "host-pw").unwrap();
+        b.set(OwnerKind::Credential, &id, "cred-pw").unwrap();
+        assert_eq!(
+            b.get(&keyring_key(OwnerKind::Host, &id))
+                .unwrap()
+                .as_deref()
+                .map(String::as_str),
+            Some("host-pw")
+        );
+        assert_eq!(
+            b.get(&keyring_key(OwnerKind::Credential, &id))
+                .unwrap()
+                .as_deref()
+                .map(String::as_str),
+            Some("cred-pw")
+        );
+    }
+
+    #[test]
+    fn forget_deletes_only_when_marked() {
+        let b = test_doubles::FakeBackend::new();
+        let id = Ulid::new();
+        b.set(OwnerKind::Host, &id, "p").unwrap();
+        // Not marked: entry must survive (the cleanup is delete-if-marked).
+        forget_keyring_secret(&b, OwnerKind::Host, &id, false);
+        assert!(b.get(&keyring_key(OwnerKind::Host, &id)).unwrap().is_some());
+        // Marked: entry is removed, best-effort.
+        forget_keyring_secret(&b, OwnerKind::Host, &id, true);
+        assert!(b.get(&keyring_key(OwnerKind::Host, &id)).unwrap().is_none());
+    }
+
+    #[test]
+    fn fake_passphrase_provider_returns_canned_passphrase() {
+        use test_doubles::FakePassphraseProvider;
+        let p = FakePassphraseProvider {
+            passphrase: std::cell::RefCell::new(Some(Ok("hunter2".into()))),
+            passphrase_confirm: std::cell::RefCell::new(Some(Ok("hunter2".into()))),
+            confirm: std::cell::RefCell::new(Some(Ok(true))),
+        };
+        let got: Zeroizing<String> = p.passphrase().unwrap();
+        assert_eq!(got.as_str(), "hunter2");
+        assert!(p.confirm("ok?").unwrap());
+    }
+
+    #[test]
+    fn fake_passphrase_provider_propagates_error() {
+        use test_doubles::FakePassphraseProvider;
+        let p = FakePassphraseProvider {
+            passphrase: std::cell::RefCell::new(Some(Err(SshrackError::Interrupted))),
+            passphrase_confirm: std::cell::RefCell::new(Some(Ok("x".into()))),
+            confirm: std::cell::RefCell::new(Some(Ok(false))),
+        };
+        assert!(matches!(p.passphrase(), Err(SshrackError::Interrupted)));
+    }
+
+    #[test]
+    fn deny_passphrase_provider_refuses_everything() {
+        use test_doubles::deny;
+        let p = deny();
+        assert!(matches!(p.passphrase(), Err(SshrackError::Interrupted)));
+        assert!(!p.confirm("sure?").unwrap());
+    }
+}
