@@ -1,0 +1,23 @@
+[package]
+name = "sshrack-cli"
+description = "Command-line front end for sshrack."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "sshrack"
+path = "src/main.rs"
+
+[dependencies]
+sshrack-core = { path = "../sshrack-core" }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+dialoguer = { version = "0.12.0", features = ["fuzzy-select"] }
+console = "0.16"
+strsim = "0.11.1"
+ctrlc = "3.5.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

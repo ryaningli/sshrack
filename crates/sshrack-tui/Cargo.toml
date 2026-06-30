@@ -1,0 +1,11 @@
+[package]
+name = "sshrack-tui"
+description = "Interactive TUI front end for sshrack (deferred)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+path = "src/lib.rs"

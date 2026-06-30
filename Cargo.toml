@@ -1,0 +1,20 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/sshrack-core",
+    "crates/sshrack-cli",
+    "crates/sshrack-tui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.86"
+license = "MIT"
+authors = ["ryaningli"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

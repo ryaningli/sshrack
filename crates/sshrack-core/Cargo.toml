@@ -1,0 +1,33 @@
+[package]
+name = "sshrack-core"
+description = "Capability core for sshrack: hosts, credentials, secrets, connection, transfer."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+thiserror = "2"
+directories = "6"
+zeroize = { version = "1", features = ["derive"] }
+ulid = { version = "1", features = ["serde"] }
+argon2 = "0.5.3"
+chacha20poly1305 = "0.10.1"
+getrandom = "0.4.3"
+base64 = "0.22.1"
+tracing = "0.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["async-secret-service", "crypto-rust", "async-io"] }
+
+[dev-dependencies]
+tempfile = "3"
