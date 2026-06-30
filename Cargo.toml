@@ -27,6 +27,11 @@ zeroize = "1"
 ulid = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# TUI front end (Block 5). Declared now so the routing fork in main lands
+# without a dangling import; the stub does not yet use them.
+ratatui = "0.30"
+crossterm = "0.28"
+nucleo-matcher = "0.3"
 
 [dev-dependencies]
 tempfile = "3"
