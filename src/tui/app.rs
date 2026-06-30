@@ -31,7 +31,8 @@ use super::ConnectRequest;
 use super::CredentialNames;
 use super::connect::connect_host;
 use super::launcher::Launcher;
-use super::wizard::HostForm;
+use super::prompt::TuiPassphrase;
+use super::wizard::{CredForm, HostForm};
 
 /// ratatui backend bound to stdout via crossterm.
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;
@@ -134,21 +135,34 @@ pub enum Outcome {
     ///
     /// [`host::add_host`]: sshrack_core::host::add_host
     SaveHost,
+    /// Pure intent: the credential wizard wants to persist its form. The
+    /// wizard's `on_key` validated the fields already; the loop builds a
+    /// [`sshrack_core::config::schema::CredentialBody`], seals any password
+    /// per the configured store mode (keyring / vault / plaintext) via core's
+    /// [`sshrack_core::secret::vault::seal_body`], calls
+    /// `credential::add_credential` (add) or splices in place preserving the
+    /// original id (edit), persists the config, reloads, and returns to the
+    /// launcher.
+    SaveCred,
     /// Pure intent: the user pressed Esc / Ctrl-C inside the wizard. The loop
     /// discards the wizard and returns to the launcher.
     Cancel,
 }
 
 /// Which view the TUI is showing. The launcher is the default; the host wizard
-/// is entered via `^a` (add) / `^e` (edit) and left via save / cancel. Keeping
-/// this on [`App`] (not the launcher) means the launcher's own state machine
-/// never has to know about non-launcher keys — routing happens here.
+/// is entered via `^a` (add) / `^e` (edit), and the credential wizard via `c`
+/// (add) / the in-TUI edit key, or directly via entry routing when the user
+/// runs `sshrack cred add|edit`. Keeping this on [`App`] (not the launcher)
+/// means the launcher's own state machine never has to know about non-launcher
+/// keys — routing happens here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     /// The host launcher (query + ranked list + connect).
     Launcher,
     /// The host add/edit wizard.
     HostWizard,
+    /// The credential add/edit wizard.
+    CredWizard,
 }
 
 /// TUI application state. The launcher is the primary mode; the host wizard is
@@ -185,6 +199,8 @@ pub struct App {
     /// on `App` (not created on demand each frame) so its state survives across
     /// keystrokes.
     wizard: Option<HostForm>,
+    /// The credential wizard, present only when [`Mode::CredWizard`] is active.
+    cred_wizard: Option<CredForm>,
 }
 
 impl App {
@@ -208,6 +224,7 @@ impl App {
             launcher,
             mode: Mode::Launcher,
             wizard: None,
+            cred_wizard: None,
         }
     }
 
@@ -303,6 +320,75 @@ impl App {
         self.launcher.recompute(&self.config.hosts, &self.frecency);
     }
 
+    /// Open the credential wizard in add mode with a blank form. Discards any
+    /// cred wizard already open.
+    pub fn open_cred_wizard_add(&mut self) {
+        self.cred_wizard = Some(CredForm::new_add());
+        self.mode = Mode::CredWizard;
+    }
+
+    /// Open the credential wizard in edit mode, prefilled from the credential
+    /// with the given name. No-op (returns false) when the name is not in the
+    /// config.
+    pub fn open_cred_wizard_edit(&mut self, name: &str) -> bool {
+        let Some(cred) = self.config.find_credential_by_name(name).cloned() else {
+            return false;
+        };
+        self.cred_wizard = Some(CredForm::new_edit(&cred));
+        self.mode = Mode::CredWizard;
+        true
+    }
+
+    /// Leave the cred wizard and return to the launcher. Used by the loop after
+    /// a save or a cancel. The host ranking is unchanged (crediting does not
+    /// move hosts), but re-running `recompute` is cheap and keeps the launcher
+    /// in sync if a credential rename affected a host's display label.
+    pub fn close_cred_wizard(&mut self) {
+        self.cred_wizard = None;
+        self.mode = Mode::Launcher;
+        self.launcher.recompute(&self.config.hosts, &self.frecency);
+    }
+
+    /// Open the host wizard in edit mode, prefilled from the host named `name`.
+    /// No-op (returns false) when the name is not in the config. Used by the
+    /// entry-routing path (`host edit <name>` → TUI) where the host is
+    /// identified by name, not by the launcher cursor.
+    pub fn open_host_wizard_edit_by_name(&mut self, name: &str) -> bool {
+        let Some(host) = self.config.find_host_by_name(name).cloned() else {
+            return false;
+        };
+        // open_host_wizard_edit takes an id; resolve the name → id here.
+        self.open_host_wizard_edit(host.id)
+    }
+
+    /// Apply the entry-routing decision (derived from `cli.cmd` in
+    /// [`super::entry_mode_from_cmd`]) before the first frame. Called once from
+    /// [`super::run`] after the config is loaded and before the alternate
+    /// screen is entered. A missing edit target (name not in the config) falls
+    /// back to the launcher rather than erroring — the user lands in the host
+    /// list and can fix the typo, mirroring how the in-TUI edit path degrades.
+    pub fn apply_entry_mode(&mut self, mode: super::EntryMode) {
+        match mode {
+            super::EntryMode::Launcher => {}
+            super::EntryMode::HostWizard { edit_name: None } => self.open_host_wizard_add(),
+            super::EntryMode::HostWizard {
+                edit_name: Some(name),
+            } => {
+                if !self.open_host_wizard_edit_by_name(&name) {
+                    self.launcher.status = Some(format!("host '{name}' not found"));
+                }
+            }
+            super::EntryMode::CredWizard { edit_name: None } => self.open_cred_wizard_add(),
+            super::EntryMode::CredWizard {
+                edit_name: Some(name),
+            } => {
+                if !self.open_cred_wizard_edit(&name) {
+                    self.launcher.status = Some(format!("credential '{name}' not found"));
+                }
+            }
+        }
+    }
+
     /// Replace the in-memory config (after a wizard save) and rebuild the
     /// credential-name lookup the launcher renders. The caller persists + (re)
     /// loads first, then hands the new config here.
@@ -349,6 +435,40 @@ impl App {
                         }
                         return Outcome::Continue;
                     }
+                    // `c` opens the credential add wizard; `C` (Shift-C) opens
+                    // the credential edit wizard for the credential referenced
+                    // by the host under the launcher cursor (intuitive entry:
+                    // the host you are looking at uses that credential). A host
+                    // without a credential reference sets a status hint.
+                    if !ctrl
+                        && key.code == crossterm::event::KeyCode::Char('c')
+                        && key.modifiers.is_empty()
+                    {
+                        self.open_cred_wizard_add();
+                        return Outcome::Continue;
+                    }
+                    if key.modifiers == crossterm::event::KeyModifiers::SHIFT
+                        && key.code == crossterm::event::KeyCode::Char('C')
+                    {
+                        match self
+                            .launcher
+                            .selected_host(&self.config.hosts)
+                            .and_then(|h| h.auth.credential_id())
+                            .and_then(|id| {
+                                self.config
+                                    .find_credential_by_id(&id)
+                                    .map(|c| c.name.clone())
+                            }) {
+                            Some(name) => {
+                                self.open_cred_wizard_edit(&name);
+                            }
+                            None => {
+                                self.launcher.status =
+                                    Some("selected host has no credential to edit".into());
+                            }
+                        }
+                        return Outcome::Continue;
+                    }
                 }
                 let outcome = self
                     .launcher
@@ -366,6 +486,10 @@ impl App {
                 // The loop also treats Cancel like a return-to-launcher.
                 outcome
             }
+            Mode::CredWizard => match self.cred_wizard.as_mut() {
+                Some(w) => w.on_key(key),
+                None => Outcome::Continue,
+            },
         }
     }
 
@@ -383,6 +507,11 @@ impl App {
             ),
             Mode::HostWizard => {
                 if let Some(w) = &self.wizard {
+                    w.draw(frame, area);
+                }
+            }
+            Mode::CredWizard => {
+                if let Some(w) = &self.cred_wizard {
                     w.draw(frame, area);
                 }
             }
@@ -481,10 +610,44 @@ pub fn run_loop(
                         }
                     }
                 }
+                Outcome::SaveCred => {
+                    // The cred wizard signaled save after its pure validate()
+                    // passed. Persist: build the body, seal any password per
+                    // the configured store mode via core, add or splice-in-
+                    // place preserving the original id, write config, reload,
+                    // close the wizard.
+                    match persist_cred_save(app, &handle) {
+                        Ok(()) => {
+                            app.launcher.status = Some("credential saved".into());
+                            app.close_cred_wizard();
+                        }
+                        Err(SshrackError::Interrupted) => {
+                            // User cancelled a vault-unlock popup (Esc/Ctrl-C).
+                            // Stay in the wizard; surface a status so they know
+                            // why nothing was saved.
+                            if let Some(w) = app.cred_wizard.as_mut() {
+                                w.set_core_error("vault unlock cancelled".into());
+                            }
+                        }
+                        Err(e) => {
+                            // Persist failed (duplicate name, store mode
+                            // undecided, write error). Surface in the wizard's
+                            // core-error line and stay so the user can fix it.
+                            if let Some(w) = app.cred_wizard.as_mut() {
+                                w.set_core_error(e.to_string());
+                            }
+                        }
+                    }
+                }
                 Outcome::Cancel => {
-                    // Wizard Esc / Ctrl-C: discard and return to the launcher.
+                    // Wizard Esc / Ctrl-C: discard the active wizard and return
+                    // to the launcher. Which wizard to close depends on mode.
                     app.launcher.status = Some("cancelled".into());
-                    app.close_host_wizard();
+                    match app.mode {
+                        Mode::HostWizard => app.close_host_wizard(),
+                        Mode::CredWizard => app.close_cred_wizard(),
+                        _ => {}
+                    }
                 }
                 Outcome::Continue => {}
             }
@@ -576,6 +739,128 @@ fn persist_host_save(app: &mut App) -> Result<(), SshrackError> {
     } else {
         // No path resolved (fresh install, no home dir): keep the new config in
         // memory only. The launcher will still show the host this session.
+        app.set_config(new_cfg);
+    }
+    Ok(())
+}
+
+/// Fulfill a [`Outcome::SaveCred`] intent: build the credential body, seal any
+/// password per the configured store mode via core
+/// ([`sshrack_core::secret::vault::seal_body`]), add (fresh id) or splice in
+/// place (preserving the original id — keyring-keyed), persist, reload. Pure
+/// validation already passed inside the wizard; this is the I/O half.
+///
+/// **Store-mode-undecided guard.** When the user picked a Password but
+/// `cfg.store` is `None` (no mode chosen yet), the wizard surfaces a clear
+/// "run `sshrack store use <mode>` first" error instead of silently picking a
+/// mode. Core's `seal_body` treats `None` as plaintext, which would store the
+/// password in the clear without the user ever choosing that — the wizard
+/// refuses to make that choice for them. Vault unlock happens here via
+/// [`TuiPassphrase`] (mirroring [`connect_host`]); a popup cancel surfaces as
+/// [`SshrackError::Interrupted`], which the loop maps to "stay in the wizard".
+///
+/// [`connect_host`]: super::connect::connect_host
+fn persist_cred_save(app: &mut App, handle: &TerminalHandle) -> Result<(), SshrackError> {
+    // Take the form out so we can borrow app.config/launcher without a conflict.
+    let Some(form) = app.cred_wizard.clone() else {
+        return Ok(());
+    };
+
+    use sshrack_core::config::schema::Credential;
+    use sshrack_core::credential as cred_core;
+    use sshrack_core::id::OwnerKind;
+    use sshrack_core::secret::{OsKeyring, vault};
+
+    let name = form.name.trim().to_string();
+
+    // ── Decide the id and the pre-seal body. ────────────────────────────────
+    // Edit mode preserves the original id (the keyring entry + every host
+    // Auth::Ref are keyed by it). When the edit leaves the password field
+    // blank under the Password choice, keep the existing body's password so a
+    // user editing only the user/name does not silently drop the password.
+    let (id, mut body) = if form.editing {
+        let orig_id = form.orig_id.ok_or(SshrackError::MissingRequiredField {
+            field: "orig_id (cred edit mode)",
+        })?;
+        let orig = app
+            .config
+            .find_credential_by_id(&orig_id)
+            .ok_or_else(|| cred_core::credential_not_found(&app.config, &orig_id.to_string()))?;
+        let mut body = form.build_body();
+        if form.secret_kind == super::wizard::SecretChoice::Password
+            && form.password.is_empty()
+            && body.password.is_none()
+        {
+            // Preserve the existing password: re-attach it as plaintext (it is
+            // re-sealed below per the current store mode, so an encrypted body
+            // round-trips through encrypt again cleanly).
+            body.password = orig.body.password.clone();
+        }
+        if orig.name != name {
+            cred_core::validate_rename_credential(&app.config, &orig.name, &name)?;
+        }
+        (orig_id, body)
+    } else {
+        // Add: fresh id. Duplicate-name check runs before the append.
+        cred_core::validate_no_duplicate_credential(&app.config, &name, false)?;
+        (Ulid::new(), form.build_body())
+    };
+
+    // ── Seal the password per the configured store mode. ────────────────────
+    // Only seal when there is a freshly collected plaintext password to re-host
+    // (a key / none body passes through unchanged). And only when a store mode
+    // is decided; a Password choice with no mode decided is a user-facing
+    // error, NOT a silent plaintext fallback.
+    let has_plaintext_password = matches!(
+        body.password,
+        Some(sshrack_core::config::schema::Secret::Plain(_))
+    );
+    if has_plaintext_password {
+        if app.config.store.is_none() {
+            return Err(SshrackError::StoreModeNotDecided);
+        }
+        // Vault unlock (no-op unless vault mode). TuiPassphrase drives a masked
+        // popup; under SSHRACK_PASSPHRASE the env value shadows it. A popup
+        // cancel surfaces as Interrupted, which the loop maps to "stay in the
+        // wizard" rather than an exit.
+        let passphrase_provider = TuiPassphrase::new(handle.clone());
+        let env_pw = vault::passphrase_from_env();
+        let vault_key =
+            vault::ensure_unlocked_vault_key(&app.config, env_pw.as_ref(), &passphrase_provider)?;
+        let backend = OsKeyring;
+        body = vault::seal_body(
+            body,
+            OwnerKind::Credential,
+            &id,
+            &app.config,
+            vault_key.as_ref(),
+            &backend,
+        )?;
+    }
+
+    // ── Build the credential and splice / append. ───────────────────────────
+    let credential = Credential {
+        id,
+        name: name.clone(),
+        body,
+    };
+    let new_cfg = if form.editing {
+        let mut next = app.config.clone();
+        if let Some(slot) = next.credentials.iter_mut().find(|c| c.id == id) {
+            *slot = credential;
+        }
+        next
+    } else {
+        // add_credential validates name chars + body and appends.
+        cred_core::add_credential(&app.config, id, &name, credential.body)?
+    };
+
+    // Persist + reload (the on-disk file is the source of truth).
+    if let Some(path) = app.config_path() {
+        sshrack_core::config::store::save(path, &new_cfg)?;
+        let reloaded = sshrack_core::config::store::load(path)?;
+        app.set_config(reloaded);
+    } else {
         app.set_config(new_cfg);
     }
     Ok(())
@@ -688,12 +973,24 @@ mod tests {
 
     #[test]
     fn plain_c_without_ctrl_is_continue() {
-        // 'c' without Ctrl is just a character, not a quit.
+        // 'c' without Ctrl is now the credential-add-wizard entry key (it used
+        // to be a query character; the in-TUI cred entry now shadows that). The
+        // original invariant — plain 'c' is not a quit — still holds, and the
+        // query is NOT advanced. The wizard-open behavior is pinned by
+        // `launcher_c_key_opens_cred_add_wizard`.
         let mut app = app_with_host("web");
         let outcome = app.on_key(press(KeyCode::Char('c'), KeyModifiers::NONE));
         assert!(matches!(outcome, Outcome::Continue));
         assert!(!app.should_quit);
-        assert_eq!(app.launcher.query, "c");
+        assert!(
+            app.launcher.query.is_empty(),
+            "plain 'c' must not enter the query"
+        );
+        assert_eq!(
+            *app.mode(),
+            Mode::CredWizard,
+            "plain 'c' opens the cred wizard"
+        );
     }
 
     #[test]
@@ -1063,5 +1360,427 @@ mod tests {
         // Nothing persisted.
         let reloaded = sshrack_core::config::store::load(&path).unwrap();
         assert!(reloaded.hosts.is_empty());
+    }
+
+    // ===============================================================
+    // Credential wizard: persist_cred_save + entry routing.
+    // ===============================================================
+
+    use sshrack_core::config::schema::{Credential, SecretKind, SecretStore};
+
+    /// A `TerminalHandle` whose [`Weak::upgrade`] always returns `None`. Used
+    /// in tests that exercise the plaintext store-mode path (no vault unlock
+    /// popup, so the handle is never upgraded). Vault-mode tests would need a
+    /// live terminal; the plaintext path is the unit-testable surface here.
+    fn dead_handle() -> TerminalHandle {
+        std::rc::Weak::new()
+    }
+
+    #[test]
+    fn cred_add_none_kind_persists_user_only_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        sshrack_core::config::store::save(&path, &SshrackConfig::default()).unwrap();
+        let cfg = sshrack_core::config::store::load(&path).unwrap();
+        let mut app = App::new(cfg, Some(path.clone()), Frecency::default(), HashMap::new());
+
+        app.open_cred_wizard_add();
+        let w = app.cred_wizard.as_mut().unwrap();
+        w.name = "ops".into();
+        w.user = "deploy".into();
+        w.secret_kind = super::super::wizard::SecretChoice::None;
+
+        persist_cred_save(&mut app, &dead_handle()).expect("add save");
+
+        let reloaded = sshrack_core::config::store::load(&path).unwrap();
+        assert_eq!(reloaded.credentials.len(), 1);
+        assert_eq!(reloaded.credentials[0].name, "ops");
+        assert_eq!(reloaded.credentials[0].body.user, "deploy");
+        assert_eq!(
+            reloaded.credentials[0].body.secret_kind(),
+            SecretKind::Default
+        );
+    }
+
+    #[test]
+    fn cred_add_identity_kind_persists_key_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // Plaintext store mode so no sealing/vault path is exercised.
+        let cfg = SshrackConfig {
+            store: Some(SecretStore::Plaintext),
+            ..SshrackConfig::default()
+        };
+        sshrack_core::config::store::save(&path, &cfg).unwrap();
+        let mut app = App::new(cfg, Some(path.clone()), Frecency::default(), HashMap::new());
+
+        app.open_cred_wizard_add();
+        let w = app.cred_wizard.as_mut().unwrap();
+        w.name = "ops".into();
+        w.user = "deploy".into();
+        w.secret_kind = super::super::wizard::SecretChoice::IdentityKey;
+        w.identity = "/home/me/.ssh/id_ed25519".into();
+
+        persist_cred_save(&mut app, &dead_handle()).expect("add save");
+
+        let reloaded = sshrack_core::config::store::load(&path).unwrap();
+        let c = &reloaded.credentials[0];
+        assert_eq!(c.body.secret_kind(), SecretKind::Key);
+        assert_eq!(
+            c.body.key.as_deref(),
+            Some(std::path::Path::new("/home/me/.ssh/id_ed25519"))
+        );
+    }
+
+    #[test]
+    fn cred_add_password_with_store_mode_plaintext_persists_plain_secret() {
+        // Password + a decided store mode (Plaintext) → seal_body writes
+        // Secret::Plain inline. The password must be sealed, not stored raw in
+        // argv, and must survive the reload.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = SshrackConfig {
+            store: Some(SecretStore::Plaintext),
+            ..SshrackConfig::default()
+        };
+        sshrack_core::config::store::save(&path, &cfg).unwrap();
+        let mut app = App::new(cfg, Some(path.clone()), Frecency::default(), HashMap::new());
+
+        app.open_cred_wizard_add();
+        let w = app.cred_wizard.as_mut().unwrap();
+        w.name = "ops".into();
+        w.user = "deploy".into();
+        w.secret_kind = super::super::wizard::SecretChoice::Password;
+        *w.password = "hunter2".into();
+
+        persist_cred_save(&mut app, &dead_handle()).expect("add save");
+
+        let reloaded = sshrack_core::config::store::load(&path).unwrap();
+        let c = &reloaded.credentials[0];
+        assert_eq!(c.body.secret_kind(), SecretKind::Password);
+        assert_eq!(c.body.password_plain(), Some("hunter2"));
+    }
+
+    #[test]
+    fn cred_add_password_with_store_mode_undecided_errors_not_silent_plaintext() {
+        // The crux of the "do not auto-pick a mode" rule: a Password choice
+        // with cfg.store == None must surface StoreModeNotDecided, NOT silently
+        // fall through to plaintext (which core's seal would otherwise do).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        sshrack_core::config::store::save(&path, &SshrackConfig::default()).unwrap();
+        let cfg = sshrack_core::config::store::load(&path).unwrap();
+        let mut app = App::new(cfg, Some(path.clone()), Frecency::default(), HashMap::new());
+
+        app.open_cred_wizard_add();
+        let w = app.cred_wizard.as_mut().unwrap();
+        w.name = "ops".into();
+        w.user = "deploy".into();
+        w.secret_kind = super::super::wizard::SecretChoice::Password;
+        *w.password = "hunter2".into();
+
+        let err = persist_cred_save(&mut app, &dead_handle()).unwrap_err();
+        assert!(
+            matches!(err, SshrackError::StoreModeNotDecided),
+            "undecided store mode must error, not silently pick plaintext: {err}"
+        );
+        // Nothing was written.
+        let reloaded = sshrack_core::config::store::load(&path).unwrap();
+        assert!(reloaded.credentials.is_empty());
+    }
+
+    #[test]
+    fn cred_add_duplicate_name_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = SshrackConfig {
+            credentials: vec![Credential {
+                id: Ulid::new(),
+                name: "ops".into(),
+                body: CredentialBody::new("deploy"),
+            }],
+            ..SshrackConfig::default()
+        };
+        sshrack_core::config::store::save(&path, &cfg).unwrap();
+        let mut app = App::new(cfg, Some(path.clone()), Frecency::default(), HashMap::new());
+
+        app.open_cred_wizard_add();
+        let w = app.cred_wizard.as_mut().unwrap();
+        w.name = "ops".into(); // duplicate
+        w.user = "deploy".into();
+
+        let err = persist_cred_save(&mut app, &dead_handle()).unwrap_err();
+        assert!(matches!(err, SshrackError::CredentialAlreadyExists { .. }));
+    }
+
+    #[test]
+    fn cred_edit_preserves_original_id_and_password_when_password_blank() {
+        // Editing only the user/name with the password field left blank MUST
+        // keep the existing password (and the original id). The original body is
+        // a plaintext-password credential under Plaintext store mode.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let orig_id = Ulid::new();
+        let cfg = SshrackConfig {
+            store: Some(SecretStore::Plaintext),
+            credentials: vec![Credential {
+                id: orig_id,
+                name: "ops".into(),
+                body: CredentialBody::new("deploy").with_password("topsecret"),
+            }],
+            ..SshrackConfig::default()
+        };
+        sshrack_core::config::store::save(&path, &cfg).unwrap();
+        let mut app = App::new(cfg, Some(path.clone()), Frecency::default(), HashMap::new());
+
+        assert!(app.open_cred_wizard_edit("ops"));
+        let w = app.cred_wizard.as_mut().unwrap();
+        // The chooser opens on Password (the original kind). Leave the password
+        // field blank and rename.
+        assert_eq!(w.secret_kind, super::super::wizard::SecretChoice::Password);
+        assert!(w.password.is_empty(), "edit form must not echo plaintext");
+        w.name = "ops2".into();
+        w.user = "ops".into();
+
+        persist_cred_save(&mut app, &dead_handle()).expect("edit save");
+
+        let reloaded = sshrack_core::config::store::load(&path).unwrap();
+        assert_eq!(reloaded.credentials.len(), 1);
+        let c = &reloaded.credentials[0];
+        assert_eq!(c.id, orig_id, "edit must preserve the original id");
+        assert_eq!(c.name, "ops2");
+        assert_eq!(
+            c.body.password_plain(),
+            Some("topsecret"),
+            "blank password field must keep the existing password"
+        );
+    }
+
+    #[test]
+    fn cred_edit_changing_user_keeps_id_and_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let orig_id = Ulid::new();
+        let cfg = SshrackConfig {
+            store: Some(SecretStore::Plaintext),
+            credentials: vec![Credential {
+                id: orig_id,
+                name: "ops".into(),
+                body: CredentialBody::new("deploy").with_password("topsecret"),
+            }],
+            ..SshrackConfig::default()
+        };
+        sshrack_core::config::store::save(&path, &cfg).unwrap();
+        let mut app = App::new(cfg, Some(path.clone()), Frecency::default(), HashMap::new());
+
+        assert!(app.open_cred_wizard_edit("ops"));
+        let w = app.cred_wizard.as_mut().unwrap();
+        w.user = "root".into();
+        // password left blank → preserved.
+
+        persist_cred_save(&mut app, &dead_handle()).expect("edit save");
+
+        let reloaded = sshrack_core::config::store::load(&path).unwrap();
+        let c = &reloaded.credentials[0];
+        assert_eq!(c.id, orig_id);
+        assert_eq!(c.body.user, "root");
+        assert_eq!(c.body.password_plain(), Some("topsecret"));
+    }
+
+    // ---- entry routing ----
+
+    #[test]
+    fn entry_mode_cred_add_opens_cred_wizard_directly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        sshrack_core::config::store::save(&path, &SshrackConfig::default()).unwrap();
+        let cfg = sshrack_core::config::store::load(&path).unwrap();
+        let mut app = App::new(cfg, Some(path), Frecency::default(), HashMap::new());
+
+        app.apply_entry_mode(super::super::EntryMode::CredWizard { edit_name: None });
+        assert_eq!(*app.mode(), Mode::CredWizard);
+        assert!(app.cred_wizard.is_some());
+        assert!(
+            !app.cred_wizard.as_ref().unwrap().editing,
+            "add entry must open the add (non-editing) form"
+        );
+    }
+
+    #[test]
+    fn entry_mode_cred_edit_prefills_from_named_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = SshrackConfig {
+            credentials: vec![Credential {
+                id: Ulid::new(),
+                name: "ops".into(),
+                body: CredentialBody::new("deploy"),
+            }],
+            ..SshrackConfig::default()
+        };
+        sshrack_core::config::store::save(&path, &cfg).unwrap();
+        let mut app = App::new(cfg, Some(path), Frecency::default(), HashMap::new());
+
+        app.apply_entry_mode(super::super::EntryMode::CredWizard {
+            edit_name: Some("ops".into()),
+        });
+        assert_eq!(*app.mode(), Mode::CredWizard);
+        let w = app.cred_wizard.as_ref().unwrap();
+        assert!(w.editing);
+        assert_eq!(w.name, "ops");
+        assert_eq!(w.user, "deploy");
+    }
+
+    #[test]
+    fn entry_mode_cred_edit_unknown_name_falls_back_to_launcher_with_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        sshrack_core::config::store::save(&path, &SshrackConfig::default()).unwrap();
+        let cfg = sshrack_core::config::store::load(&path).unwrap();
+        let mut app = App::new(cfg, Some(path), Frecency::default(), HashMap::new());
+
+        app.apply_entry_mode(super::super::EntryMode::CredWizard {
+            edit_name: Some("ghost".into()),
+        });
+        assert_eq!(*app.mode(), Mode::Launcher);
+        assert!(app.cred_wizard.is_none());
+        assert!(
+            app.launcher
+                .status
+                .as_deref()
+                .unwrap_or("")
+                .contains("not found")
+        );
+    }
+
+    #[test]
+    fn entry_mode_host_add_opens_host_wizard() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        sshrack_core::config::store::save(&path, &SshrackConfig::default()).unwrap();
+        let cfg = sshrack_core::config::store::load(&path).unwrap();
+        let mut app = App::new(cfg, Some(path), Frecency::default(), HashMap::new());
+
+        app.apply_entry_mode(super::super::EntryMode::HostWizard { edit_name: None });
+        assert_eq!(*app.mode(), Mode::HostWizard);
+        assert!(app.wizard.is_some());
+    }
+
+    #[test]
+    fn launcher_c_key_opens_cred_add_wizard() {
+        // The in-TUI entry key: bare `c` opens the cred add wizard from the
+        // launcher.
+        let cfg = SshrackConfig {
+            hosts: vec![Host {
+                id: Ulid::new(),
+                name: "web".into(),
+                host: "h".into(),
+                port: 22,
+                auth: Auth::inline(CredentialBody::new("u")),
+            }],
+            ..SshrackConfig::default()
+        };
+        let mut app = App::new(cfg, None, Frecency::default(), HashMap::new());
+        let outcome = app.on_key(press(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(matches!(outcome, Outcome::Continue));
+        assert_eq!(*app.mode(), Mode::CredWizard);
+        assert!(app.cred_wizard.is_some());
+    }
+
+    #[test]
+    fn launcher_shift_c_edits_selected_hosts_credential() {
+        // Shift-C opens the cred edit wizard for the credential referenced by
+        // the host under the launcher cursor.
+        let cid = Ulid::new();
+        let cfg = SshrackConfig {
+            hosts: vec![Host {
+                id: Ulid::new(),
+                name: "web".into(),
+                host: "h".into(),
+                port: 22,
+                auth: Auth::reference(cid),
+            }],
+            credentials: vec![Credential {
+                id: cid,
+                name: "ops".into(),
+                body: CredentialBody::new("deploy"),
+            }],
+            ..SshrackConfig::default()
+        };
+        let mut app = App::new(cfg, None, Frecency::default(), HashMap::new());
+        let outcome = app.on_key(press(KeyCode::Char('C'), KeyModifiers::SHIFT));
+        assert!(matches!(outcome, Outcome::Continue));
+        assert_eq!(*app.mode(), Mode::CredWizard);
+        let w = app.cred_wizard.as_ref().unwrap();
+        assert!(w.editing);
+        assert_eq!(w.name, "ops");
+    }
+
+    #[test]
+    fn launcher_shift_c_with_no_credential_ref_sets_status() {
+        let cfg = SshrackConfig {
+            hosts: vec![Host {
+                id: Ulid::new(),
+                name: "web".into(),
+                host: "h".into(),
+                port: 22,
+                auth: Auth::inline(CredentialBody::new("u")),
+            }],
+            ..SshrackConfig::default()
+        };
+        let mut app = App::new(cfg, None, Frecency::default(), HashMap::new());
+        app.on_key(press(KeyCode::Char('C'), KeyModifiers::SHIFT));
+        assert_eq!(*app.mode(), Mode::Launcher);
+        assert!(
+            app.launcher
+                .status
+                .as_deref()
+                .unwrap_or("")
+                .contains("no credential")
+        );
+    }
+
+    #[test]
+    fn cred_wizard_esc_cancels_back_to_launcher() {
+        let mut app = app_with_host("web");
+        app.open_cred_wizard_add();
+        assert_eq!(*app.mode(), Mode::CredWizard);
+        let outcome = app.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(outcome, Outcome::Cancel));
+        app.close_cred_wizard();
+        assert_eq!(*app.mode(), Mode::Launcher);
+        assert!(app.cred_wizard.is_none());
+    }
+
+    #[test]
+    fn cred_add_flow_via_on_key_then_save_persists() {
+        // End-to-end via on_key (key half) + persist_cred_save (I/O half),
+        // mirroring the host add-flow test. Drives: c opens add wizard, type
+        // name+user, ^s saves.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        sshrack_core::config::store::save(&path, &SshrackConfig::default()).unwrap();
+        let cfg = sshrack_core::config::store::load(&path).unwrap();
+        let mut app = App::new(cfg, Some(path), Frecency::default(), HashMap::new());
+
+        // c → opens cred wizard.
+        app.on_key(press(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert_eq!(*app.mode(), Mode::CredWizard);
+        // Type "ops" into Name, Tab to User, type "deploy", ^s.
+        for ch in "ops".chars() {
+            app.on_key(press(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+        for ch in "deploy".chars() {
+            app.on_key(press(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        let outcome = app.on_key(press(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(matches!(outcome, Outcome::SaveCred));
+
+        persist_cred_save(&mut app, &dead_handle()).expect("save");
+        app.close_cred_wizard();
+        assert_eq!(*app.mode(), Mode::Launcher);
+        assert_eq!(app.config().credentials.len(), 1);
+        assert_eq!(app.config().credentials[0].name, "ops");
     }
 }

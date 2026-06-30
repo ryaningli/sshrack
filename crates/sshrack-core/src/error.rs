@@ -164,6 +164,14 @@ pub enum SshrackError {
     #[error("vault is not enabled — run `sshrack store use vault` first")]
     VaultNotEnabled,
 
+    /// A password was about to be sealed but no storage mode has been chosen
+    /// yet (`[store] mode` unset). Sealing with `cfg.store == None` would
+    /// silently store the password in the clear (plaintext), which is a choice
+    /// the user must make explicitly. The interactive paths (the credential
+    /// wizard) surface this instead of picking a mode on the user's behalf.
+    #[error("no storage mode chosen — run `sshrack store use <keyring|vault|plaintext>` first")]
+    StoreModeNotDecided,
+
     /// `store config` was given a field name that is not a tunable vault field.
     /// `field` is the offending name; it is never a secret.
     #[error("unknown vault config field '{field}'")]

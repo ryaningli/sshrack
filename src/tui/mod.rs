@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 
 use crate::cli::Cli;
+use crate::cli::args::{Command, CredAction, HostAction};
 use sshrack_core::config::path as config_path;
 use sshrack_core::config::store;
 use sshrack_core::error::SshrackError;
@@ -94,6 +95,13 @@ pub fn run(cli: &Cli) -> Result<Option<ConnectRequest>, SshrackError> {
 
     let guard = TerminalGuard::enter()?;
     let mut app = app;
+    // Entry routing: which view opens first depends on the subcommand that
+    // routed us here. `route_is_tui` already guaranteed one of: bare, empty
+    // `host add|edit`, or empty `cred add|edit`. Mirror that user intent by
+    // opening the matching wizard up front (otherwise the launcher opens, the
+    // user has to press ^a/^e/c, and `sshrack cred add` would surprise them by
+    // landing on the host list).
+    app.apply_entry_mode(entry_mode_from_cmd(cli.cmd.as_ref()));
     // A weak handle the prompt layer (vault popup, host-key popup) upgrades to
     // borrow the terminal for rendering. Cloned from the guard so it goes dead
     // the moment the guard drops (RAII restore), never keeping the Tui alive.
@@ -108,4 +116,137 @@ pub fn run(cli: &Cli) -> Result<Option<ConnectRequest>, SshrackError> {
     // LeaveAlternateScreen. The terminal is restored on every path — plain
     // quit, connect, or early return from run_loop — because Drop always runs.
     Ok(request)
+}
+
+/// Which view the TUI should open first, derived from the subcommand that
+/// routed it here. `route_is_tui` already filtered to bare / empty-add /
+/// empty-edit, so this only needs to distinguish those.
+///
+/// - `None` (bare `sshrack`) → launcher.
+/// - `host add` (empty) → host add wizard; `host edit <name>` (empty) → host
+///   edit wizard.
+/// - `cred add` (empty) → cred add wizard; `cred edit <name>` (empty) → cred
+///   edit wizard.
+pub(super) enum EntryMode {
+    /// Bare `sshrack` — open the host launcher.
+    Launcher,
+    /// Empty `host add` (add wizard) or `host edit <name>` (edit wizard).
+    HostWizard { edit_name: Option<String> },
+    /// Empty `cred add` (add wizard) or `cred edit <name>` (edit wizard).
+    CredWizard { edit_name: Option<String> },
+}
+
+/// Map the parsed CLI command to an [`EntryMode`]. Only the
+/// [`route_is_tui`]-true shapes reach here, so the default is the launcher and
+/// every other arm is one of the empty add/edit shapes.
+///
+/// [`route_is_tui`]: crate::route_is_tui
+fn entry_mode_from_cmd(cmd: Option<&Command>) -> EntryMode {
+    let Some(cmd) = cmd else {
+        return EntryMode::Launcher;
+    };
+    match cmd {
+        Command::Host { action } => match action {
+            HostAction::Add { .. } => EntryMode::HostWizard { edit_name: None },
+            HostAction::Edit { name, .. } => EntryMode::HostWizard {
+                edit_name: name.clone(),
+            },
+            _ => EntryMode::Launcher,
+        },
+        Command::Cred { action } => match action {
+            CredAction::Add { .. } => EntryMode::CredWizard { edit_name: None },
+            CredAction::Edit { name, .. } => EntryMode::CredWizard {
+                edit_name: name.clone(),
+            },
+            _ => EntryMode::Launcher,
+        },
+        _ => EntryMode::Launcher,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Decision-table tests for [`entry_mode_from_cmd`]: each `route_is_tui`-
+    //! true shape maps to the wizard that matches user intent.
+    use super::*;
+    use crate::cli::args::{Command, CredAction, HostAction};
+
+    #[test]
+    fn bare_maps_to_launcher() {
+        assert!(matches!(entry_mode_from_cmd(None), EntryMode::Launcher));
+    }
+
+    #[test]
+    fn host_add_empty_maps_to_host_add_wizard() {
+        let cmd = Command::Host {
+            action: HostAction::Add {
+                name: None,
+                host: None,
+                user: None,
+                port: None,
+                identity: None,
+                credential: None,
+                force: false,
+            },
+        };
+        assert!(matches!(
+            entry_mode_from_cmd(Some(&cmd)),
+            EntryMode::HostWizard { edit_name: None }
+        ));
+    }
+
+    #[test]
+    fn host_edit_named_maps_to_host_edit_wizard() {
+        let cmd = Command::Host {
+            action: HostAction::Edit {
+                name: Some("web".into()),
+                host: None,
+                user: None,
+                port: None,
+                identity: None,
+                rename: None,
+                credential: None,
+                clear_identity: false,
+                clear_password: false,
+                clear_credential: false,
+            },
+        };
+        assert!(matches!(
+            entry_mode_from_cmd(Some(&cmd)),
+            EntryMode::HostWizard { edit_name: Some(n) } if n == "web"
+        ));
+    }
+
+    #[test]
+    fn cred_add_empty_maps_to_cred_add_wizard() {
+        let cmd = Command::Cred {
+            action: CredAction::Add {
+                name: None,
+                user: None,
+                identity: None,
+                force: false,
+            },
+        };
+        assert!(matches!(
+            entry_mode_from_cmd(Some(&cmd)),
+            EntryMode::CredWizard { edit_name: None }
+        ));
+    }
+
+    #[test]
+    fn cred_edit_named_maps_to_cred_edit_wizard() {
+        let cmd = Command::Cred {
+            action: CredAction::Edit {
+                name: Some("ops".into()),
+                user: None,
+                identity: None,
+                clear_identity: false,
+                rename: None,
+            },
+        };
+        assert!(matches!(
+            entry_mode_from_cmd(Some(&cmd)),
+            EntryMode::CredWizard { edit_name: Some(n) } if n == "ops"
+        ));
+    }
 }
