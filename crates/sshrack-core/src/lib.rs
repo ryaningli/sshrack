@@ -7,6 +7,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod config;
+pub mod connect;
 pub mod credential;
 pub mod error;
 pub mod fsutil;
