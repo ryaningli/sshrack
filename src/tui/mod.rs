@@ -90,7 +90,7 @@ pub fn run(cli: &Cli) -> Result<Option<ConnectRequest>, SshrackError> {
         .map(|c| (c.id, c.name.clone()))
         .collect();
 
-    let app = App::new(cfg, frecency, credential_names);
+    let app = App::new(cfg, config_path, frecency, credential_names);
 
     let guard = TerminalGuard::enter()?;
     let mut app = app;

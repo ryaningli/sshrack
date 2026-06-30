@@ -24,11 +24,14 @@ use ratatui::{Frame, Terminal, backend::CrosstermBackend};
 use sshrack_core::config::schema::SshrackConfig;
 use sshrack_core::error::SshrackError;
 use sshrack_core::frecency::Frecency;
+use std::path::PathBuf;
+use ulid::Ulid;
 
 use super::ConnectRequest;
 use super::CredentialNames;
 use super::connect::connect_host;
 use super::launcher::Launcher;
+use super::wizard::HostForm;
 
 /// ratatui backend bound to stdout via crossterm.
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;
@@ -122,17 +125,41 @@ pub enum Outcome {
     /// launcher. This variant carries no data because the id lives on the
     /// launcher (single source of truth, clearable on cancel).
     ConnectRequested,
+    /// Pure intent: the host wizard wants to persist its form. The wizard's
+    /// `on_key` validated the fields already; the loop resolves the credential
+    /// name→id, builds a [`Host`], calls [`host::add_host`]/applies the patch,
+    /// persists the config, reloads hosts, and returns to the launcher. The
+    /// intent carries no data because the form lives on the wizard (single
+    /// source of truth, clearable on cancel).
+    ///
+    /// [`host::add_host`]: sshrack_core::host::add_host
+    SaveHost,
+    /// Pure intent: the user pressed Esc / Ctrl-C inside the wizard. The loop
+    /// discards the wizard and returns to the launcher.
+    Cancel,
 }
 
-/// TUI application state. The launcher is the primary mode; later tasks grow
-/// this with wizard/store/help modes via a `mode` enum.
+/// Which view the TUI is showing. The launcher is the default; the host wizard
+/// is entered via `^a` (add) / `^e` (edit) and left via save / cancel. Keeping
+/// this on [`App`] (not the launcher) means the launcher's own state machine
+/// never has to know about non-launcher keys — routing happens here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Mode {
+    /// The host launcher (query + ranked list + connect).
+    Launcher,
+    /// The host add/edit wizard.
+    HostWizard,
+}
+
+/// TUI application state. The launcher is the primary mode; the host wizard is
+/// the secondary. Later tasks grow [`Mode`] with store/help views.
 ///
 /// `App` owns the data (config, hosts, frecency, credential-name lookup)
-/// loaded once at startup from core. The [`Launcher`] inside it owns the
-/// query/selection view state and is the only mode wired up here. The config
-/// is kept here (not just its derived slices) because connect orchestration
-/// needs the credential table and vault meta, which live on the full
-/// [`SshrackConfig`].
+/// loaded once at startup from core, and the on-disk config path so the wizard
+/// save path can persist + reload without re-resolving. The [`Launcher`] /
+/// [`HostForm`] inside it own their respective view states. The config is kept
+/// here (not just its derived slices) because connect orchestration needs the
+/// credential table and vault meta, which live on the full [`SshrackConfig`].
 pub struct App {
     /// Set by [`App::on_key`] when the user presses a quit binding. The loop
     /// checks this as a secondary exit (the primary exit is [`Outcome::Quit`]).
@@ -141,6 +168,10 @@ pub struct App {
     /// can resolve auth, unlock the vault, and look up hosts by id. The host
     /// list and credential table are borrowed out of this via `&self.config`.
     config: SshrackConfig,
+    /// The on-disk path the config was loaded from. `None` when no path was
+    /// resolved (e.g. a fresh install with no home dir); the wizard save path
+    /// treats that as best-effort (build the new config but skip the persist).
+    config_path: Option<PathBuf>,
     /// Machine-local frecency table, loaded from core's data dir.
     frecency: Frecency,
     /// Reverse lookup from a credential ULID to its display name, so the
@@ -148,13 +179,22 @@ pub struct App {
     credential_names: CredentialNames,
     /// The interactive launcher (query + selection + ranked list).
     launcher: Launcher,
+    /// The active view. Routes `on_key`/`draw` to the launcher or the wizard.
+    mode: Mode,
+    /// The host wizard, present only when [`Mode::HostWizard`] is active. Kept
+    /// on `App` (not created on demand each frame) so its state survives across
+    /// keystrokes.
+    wizard: Option<HostForm>,
 }
 
 impl App {
     /// Construct a fresh app from loaded core data. Builds the launcher with
-    /// its initial frecency-ordered ranking.
+    /// its initial frecency-ordered ranking. `config_path` is the on-disk path
+    /// the config was loaded from, used by the wizard save path to persist +
+    /// reload.
     pub fn new(
         config: SshrackConfig,
+        config_path: Option<PathBuf>,
         frecency: Frecency,
         credential_names: CredentialNames,
     ) -> Self {
@@ -162,9 +202,12 @@ impl App {
         Self {
             should_quit: false,
             config,
+            config_path,
             frecency,
             credential_names,
             launcher,
+            mode: Mode::Launcher,
+            wizard: None,
         }
     }
 
@@ -174,40 +217,161 @@ impl App {
         &self.config
     }
 
+    /// Borrow the on-disk config path. Used by the wizard save path to persist.
+    pub fn config_path(&self) -> Option<&std::path::Path> {
+        self.config_path.as_deref()
+    }
+
     /// Borrow the frecency table mutably. Connect orchestration records + saves
     /// it before returning a [`ConnectRequest`].
     pub fn frecency_mut(&mut self) -> &mut Frecency {
         &mut self.frecency
     }
 
+    /// Borrow the launcher mutably. Exposed for tests that drive the launcher
+    /// state machine directly and for the loop's `pending_connect` read.
+    #[allow(dead_code)]
+    pub fn launcher(&mut self) -> &mut Launcher {
+        &mut self.launcher
+    }
+
+    /// The current view mode. Exposed for tests asserting mode routing.
+    #[allow(dead_code)]
+    pub fn mode(&self) -> &Mode {
+        &self.mode
+    }
+
+    /// Borrow the active host wizard, if any. The loop uses this to read the
+    /// form fields when fulfilling a [`Outcome::SaveHost`] intent.
+    #[allow(dead_code)]
+    pub fn wizard(&self) -> Option<&HostForm> {
+        self.wizard.as_ref()
+    }
+
+    /// Open the host wizard in add mode with a blank form. Discards any wizard
+    /// already open (there should be none when the launcher is showing).
+    pub fn open_host_wizard_add(&mut self) {
+        let names: Vec<String> = self
+            .config
+            .credentials
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        self.wizard = Some(HostForm::new_add(names));
+        self.mode = Mode::HostWizard;
+    }
+
+    /// Open the host wizard in edit mode, prefilled from the host with the
+    /// given id. No-op (returns false) when the id is not in the config.
+    pub fn open_host_wizard_edit(&mut self, host_id: Ulid) -> bool {
+        let Some(host) = self.config.find_host_by_id(&host_id).cloned() else {
+            return false;
+        };
+        let names: Vec<String> = self
+            .config
+            .credentials
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        self.wizard = Some(HostForm::new_edit(&host, names));
+        self.mode = Mode::HostWizard;
+        true
+    }
+
+    /// Leave the wizard and return to the launcher, reloading the host ranking
+    /// so a freshly added/edited host shows up. Used by the loop after a save
+    /// or a cancel.
+    pub fn close_host_wizard(&mut self) {
+        self.wizard = None;
+        self.mode = Mode::Launcher;
+        // Re-rank so the launcher reflects the (possibly) updated host list.
+        self.launcher.recompute(&self.config.hosts, &self.frecency);
+    }
+
+    /// Replace the in-memory config (after a wizard save) and rebuild the
+    /// credential-name lookup the launcher renders. The caller persists + (re)
+    /// loads first, then hands the new config here.
+    pub fn set_config(&mut self, config: SshrackConfig) {
+        self.credential_names = config
+            .credentials
+            .iter()
+            .map(|c| (c.id, c.name.clone()))
+            .collect();
+        self.config = config;
+    }
+
     /// Pure: decide what should happen next for a given key. Performs **no**
     /// I/O — no reads, no writes, no terminal access — so it is safe to call
     /// from a unit test without an event source.
     ///
-    /// Routes the key to the launcher. Quit is handled inside the launcher
-    /// (`Esc` with empty query, or `Ctrl-C`); this method sets `should_quit`
-    /// for the loop's secondary exit check.
+    /// Routes the key by [`Mode`]:
+    /// - Launcher → the launcher's `on_key`. `^a`/`^e` open the wizard (pure:
+    ///   they only flip mode + build the form, no persist). Quit sets
+    ///   `should_quit`.
+    /// - HostWizard → the wizard's `on_key`. `SaveHost`/`Cancel` are returned
+    ///   to the loop, which does the persist + reload.
     pub fn on_key(&mut self, key: KeyEvent) -> Outcome {
-        let outcome = self
-            .launcher
-            .on_key(key, &self.config.hosts, &self.frecency);
-        if matches!(outcome, Outcome::Quit) {
-            self.should_quit = true;
+        match self.mode {
+            Mode::Launcher => {
+                // Intercept ^a / ^e before the launcher so they open the wizard
+                // (the launcher used to set a "not yet implemented" status for
+                // them; that is now handled by mode routing).
+                if key.kind == crossterm::event::KeyEventKind::Press {
+                    let ctrl = key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL);
+                    if ctrl && key.code == crossterm::event::KeyCode::Char('a') {
+                        self.open_host_wizard_add();
+                        return Outcome::Continue;
+                    }
+                    if ctrl && key.code == crossterm::event::KeyCode::Char('e') {
+                        // Edit uses the host currently under the launcher cursor.
+                        if let Some(h) = self.launcher.selected_host(&self.config.hosts) {
+                            let id = h.id;
+                            self.open_host_wizard_edit(id);
+                        } else {
+                            self.launcher.status = Some("no host selected to edit".into());
+                        }
+                        return Outcome::Continue;
+                    }
+                }
+                let outcome = self
+                    .launcher
+                    .on_key(key, &self.config.hosts, &self.frecency);
+                if matches!(outcome, Outcome::Quit) {
+                    self.should_quit = true;
+                }
+                outcome
+            }
+            Mode::HostWizard => {
+                let outcome = match self.wizard.as_mut() {
+                    Some(w) => w.on_key(key),
+                    None => Outcome::Continue,
+                };
+                // The loop also treats Cancel like a return-to-launcher.
+                outcome
+            }
         }
-        outcome
     }
 
     /// Render current state to the frame. Only writes to the frame (no stdout
-    /// access of its own). Routes to the launcher's render.
+    /// access of its own). Routes by [`Mode`] to the active view's render.
     pub fn draw(&self, frame: &mut Frame) {
         let area = frame.area();
-        self.launcher.draw(
-            frame,
-            area,
-            &self.config.hosts,
-            &self.frecency,
-            &self.credential_names,
-        );
+        match self.mode {
+            Mode::Launcher => self.launcher.draw(
+                frame,
+                area,
+                &self.config.hosts,
+                &self.frecency,
+                &self.credential_names,
+            ),
+            Mode::HostWizard => {
+                if let Some(w) = &self.wizard {
+                    w.draw(frame, area);
+                }
+            }
+        }
     }
 }
 
@@ -282,6 +446,31 @@ pub fn run_loop(
                         }
                     }
                 }
+                Outcome::SaveHost => {
+                    // The wizard signaled save after its pure validate() passed.
+                    // Persist: build the host, resolve the credential name→id,
+                    // add or apply-patch, write config, reload, close the wizard.
+                    match persist_host_save(app) {
+                        Ok(()) => {
+                            app.launcher.status = Some("host saved".into());
+                            app.close_host_wizard();
+                        }
+                        Err(e) => {
+                            // Persist failed (duplicate name, write error,
+                            // dangling credential). Surface in the wizard's
+                            // core-error line and stay in the wizard so the
+                            // user can fix it.
+                            if let Some(w) = app.wizard.as_mut() {
+                                w.set_core_error(e.to_string());
+                            }
+                        }
+                    }
+                }
+                Outcome::Cancel => {
+                    // Wizard Esc / Ctrl-C: discard and return to the launcher.
+                    app.launcher.status = Some("cancelled".into());
+                    app.close_host_wizard();
+                }
                 Outcome::Continue => {}
             }
         }
@@ -290,6 +479,91 @@ pub fn run_loop(
             return None;
         }
     }
+}
+
+/// Fulfill a [`Outcome::SaveHost`] intent: resolve the form to a [`Host`],
+/// persist via core, reload, and update the app's config. Pure validation
+/// already passed inside the wizard; this is the I/O half — duplicate-name /
+/// config-write failures surface as [`SshrackError`] so the loop can show them
+/// in the wizard's error line.
+///
+/// Add mode: `host::add_host` with a fresh id. Edit mode: `host::apply_patch`
+/// preserving the original id (so the keyring entry is not orphaned). For a
+/// Credential auth choice, the referenced credential name is resolved to its
+/// stable [`Ulid`] here (the wizard only ever holds the name).
+fn persist_host_save(app: &mut App) -> Result<(), SshrackError> {
+    // Take the form out of the app so we can borrow `app.config` for the
+    // credential-name → id resolution without a borrow conflict. Put it back
+    // (cleared of core_error) on the error paths so the loop's error handler
+    // can still see it.
+    let Some(form) = app.wizard.clone() else {
+        return Ok(());
+    };
+
+    // Resolve credential name → id (only when the user picked Credential).
+    let resolved_credential = match form.selected_credential_name() {
+        Some(name) => Some(
+            app.config
+                .find_credential_by_name(name)
+                .map(|c| c.id)
+                .ok_or(SshrackError::CredentialNotFound {
+                    name: name.to_string(),
+                    hint: sshrack_core::error::DidYouMean::none(),
+                })?,
+        ),
+        None => None,
+    };
+
+    let auth = form.build_auth(resolved_credential);
+    let name = form.name.trim().to_string();
+    let host_addr = form.host_addr.trim().to_string();
+    let port = form.parsed_port();
+
+    let new_cfg = if form.editing {
+        // Edit: preserve the original id (keyring-keyed). The form already holds
+        // every field, so stamp the original id onto the freshly built host and
+        // splice it in place of the original. A rename to another host's name
+        // is rejected by validate_rename (excluding the current name).
+        let orig_id = form.orig_id.ok_or(SshrackError::MissingRequiredField {
+            field: "orig_id (edit mode)",
+        })?;
+        let orig = app
+            .config
+            .find_host_by_id(&orig_id)
+            .ok_or(SshrackError::HostNotFound {
+                name: orig_id.to_string(),
+                hint: sshrack_core::error::DidYouMean::none(),
+            })?;
+        if orig.name != name {
+            sshrack_core::host::validate_rename(&app.config, &orig.name, &name)?;
+        }
+        let edited = sshrack_core::host::finalize_body(orig_id, &name, &host_addr, port, auth);
+        let mut next = app.config.clone();
+        if let Some(slot) = next.hosts.iter_mut().find(|h| h.id == orig_id) {
+            *slot = edited;
+        }
+        next
+    } else {
+        // Add: fresh id, append. host::add_host validates the name chars and
+        // appends. The duplicate-name check is host::validate_no_duplicate; we
+        // run it here so the error surfaces before the append (add_host itself
+        // only checks forbidden chars).
+        sshrack_core::host::validate_no_duplicate(&app.config, &name, false)?;
+        sshrack_core::host::add_host(&app.config, Ulid::new(), &name, &host_addr, port, auth)?
+    };
+
+    // Persist + reload (so the on-disk file is the source of truth and the
+    // in-memory config round-trips through TOML).
+    if let Some(path) = app.config_path() {
+        sshrack_core::config::store::save(path, &new_cfg)?;
+        let reloaded = sshrack_core::config::store::load(path)?;
+        app.set_config(reloaded);
+    } else {
+        // No path resolved (fresh install, no home dir): keep the new config in
+        // memory only. The launcher will still show the host this session.
+        app.set_config(new_cfg);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -318,7 +592,7 @@ mod tests {
             hosts: vec![host],
             ..SshrackConfig::default()
         };
-        App::new(cfg, Frecency::default(), HashMap::new())
+        App::new(cfg, None, Frecency::default(), HashMap::new())
     }
 
     fn press(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
@@ -441,7 +715,7 @@ mod tests {
             hosts: vec![h1, h2],
             ..SshrackConfig::default()
         };
-        let mut app = App::new(cfg, Frecency::default(), HashMap::new());
+        let mut app = App::new(cfg, None, Frecency::default(), HashMap::new());
         assert_eq!(app.launcher.selected, 0);
         app.on_key(press(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(
@@ -456,17 +730,323 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_a_sets_not_yet_implemented_status() {
+    fn ctrl_a_opens_add_host_wizard() {
+        // Task 16: ^a now opens the host wizard in add mode (blank form),
+        // routing the app from Launcher to HostWizard mode.
         let mut app = app_with_host("web");
         let outcome = app.on_key(press(KeyCode::Char('a'), KeyModifiers::CONTROL));
         assert!(matches!(outcome, Outcome::Continue));
         assert!(!app.should_quit);
-        assert!(
-            app.launcher
-                .status
-                .as_deref()
-                .unwrap_or("")
-                .contains("not yet implemented")
+        assert_eq!(*app.mode(), Mode::HostWizard);
+        assert!(app.wizard().is_some(), "^a should open the wizard");
+        let w = app.wizard().unwrap();
+        assert!(!w.editing, "add mode must be non-editing");
+        assert!(w.name.is_empty(), "add form must start blank");
+    }
+
+    #[test]
+    fn ctrl_e_opens_edit_host_wizard_prefilled() {
+        // Task 16: ^e on the selected host opens the wizard in edit mode,
+        // prefilled from that host.
+        let mut app = app_with_host("web");
+        let outcome = app.on_key(press(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert!(matches!(outcome, Outcome::Continue));
+        assert_eq!(*app.mode(), Mode::HostWizard);
+        let w = app.wizard().expect("wizard open");
+        assert!(w.editing, "edit mode must be editing");
+        assert_eq!(w.name, "web", "edit form must be prefilled");
+    }
+
+    #[test]
+    fn ctrl_e_with_no_host_sets_status_and_stays_in_launcher() {
+        // ^e with an empty host list cannot pick a host to edit.
+        let cfg = SshrackConfig::default();
+        let mut app = App::new(cfg, None, Frecency::default(), HashMap::new());
+        let outcome = app.on_key(press(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert!(matches!(outcome, Outcome::Continue));
+        assert_eq!(*app.mode(), Mode::Launcher);
+        assert_eq!(
+            app.launcher.status.as_deref(),
+            Some("no host selected to edit")
         );
+    }
+
+    #[test]
+    fn wizard_esc_closes_back_to_launcher() {
+        // Esc inside the wizard signals Cancel; the loop closes the wizard.
+        // Here we drive on_key and then simulate the loop's close.
+        let mut app = app_with_host("web");
+        app.on_key(press(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(*app.mode(), Mode::HostWizard);
+        let outcome = app.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(outcome, Outcome::Cancel));
+        // Loop action: close the wizard.
+        app.close_host_wizard();
+        assert_eq!(*app.mode(), Mode::Launcher);
+        assert!(app.wizard().is_none());
+    }
+
+    // ---- persist_host_save: add + edit round-trips through a real temp file ----
+    // These exercise the I/O half the wizard's pure on_key deliberately leaves
+    // to the loop: name→id resolution, host::add_host / finalize_body, config
+    // save+reload, and the launcher re-ranking afterwards.
+
+    #[test]
+    fn persist_host_save_add_appends_and_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // Start from an empty config persisted to disk (so the reload reads the
+        // file the save wrote).
+        sshrack_core::config::store::save(&path, &SshrackConfig::default()).unwrap();
+        let cfg = sshrack_core::config::store::load(&path).unwrap();
+        let mut app = App::new(cfg, Some(path.clone()), Frecency::default(), HashMap::new());
+
+        // Open the add wizard and fill the form.
+        app.open_host_wizard_add();
+        let w = app.wizard.as_mut().unwrap();
+        w.name = "web-prod".into();
+        w.host_addr = "10.0.0.5".into();
+        w.port = "2222".into();
+        w.user = "deploy".into();
+
+        persist_host_save(&mut app).expect("add save should succeed");
+
+        // Wizard is NOT auto-closed by persist (the loop does that); but the
+        // config has been reloaded with the new host.
+        let reloaded = sshrack_core::config::store::load(&path).unwrap();
+        assert_eq!(reloaded.hosts.len(), 1);
+        assert_eq!(reloaded.hosts[0].name, "web-prod");
+        assert_eq!(reloaded.hosts[0].host, "10.0.0.5");
+        assert_eq!(reloaded.hosts[0].port, 2222);
+        assert_eq!(reloaded.hosts[0].auth.inline_body().unwrap().user, "deploy");
+    }
+
+    #[test]
+    fn persist_host_save_edit_preserves_id_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let orig_id = Ulid::new();
+        let cfg = SshrackConfig {
+            hosts: vec![Host {
+                id: orig_id,
+                name: "web".into(),
+                host: "10.0.0.5".into(),
+                port: 22,
+                auth: Auth::inline(CredentialBody::new("ops")),
+            }],
+            ..SshrackConfig::default()
+        };
+        sshrack_core::config::store::save(&path, &cfg).unwrap();
+        let mut app = App::new(cfg, Some(path.clone()), Frecency::default(), HashMap::new());
+
+        // Open the edit wizard for that host and change the port + name.
+        assert!(app.open_host_wizard_edit(orig_id));
+        let w = app.wizard.as_mut().unwrap();
+        w.port = "2200".into();
+        w.name = "web-renamed".into();
+
+        persist_host_save(&mut app).expect("edit save should succeed");
+
+        let reloaded = sshrack_core::config::store::load(&path).unwrap();
+        assert_eq!(reloaded.hosts.len(), 1);
+        let h = &reloaded.hosts[0];
+        assert_eq!(h.id, orig_id, "edit must preserve the original id");
+        assert_eq!(h.name, "web-renamed");
+        assert_eq!(h.port, 2200);
+    }
+
+    #[test]
+    fn persist_host_save_add_rejects_duplicate_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = SshrackConfig {
+            hosts: vec![Host {
+                id: Ulid::new(),
+                name: "web".into(),
+                host: "h".into(),
+                port: 22,
+                auth: Auth::inline(CredentialBody::new("u")),
+            }],
+            ..SshrackConfig::default()
+        };
+        sshrack_core::config::store::save(&path, &cfg).unwrap();
+        let mut app = App::new(cfg, Some(path.clone()), Frecency::default(), HashMap::new());
+
+        app.open_host_wizard_add();
+        let w = app.wizard.as_mut().unwrap();
+        w.name = "web".into(); // duplicate
+        w.host_addr = "h2".into();
+
+        let err = persist_host_save(&mut app).unwrap_err();
+        assert!(matches!(err, SshrackError::HostAlreadyExists { .. }));
+        // The duplicate host was NOT written.
+        let reloaded = sshrack_core::config::store::load(&path).unwrap();
+        assert_eq!(reloaded.hosts.len(), 1);
+    }
+
+    #[test]
+    fn persist_host_save_credential_choice_resolves_name_to_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cid = Ulid::new();
+        let cfg = SshrackConfig {
+            credentials: vec![sshrack_core::config::schema::Credential {
+                id: cid,
+                name: "ops-key".into(),
+                body: CredentialBody::new("deploy"),
+            }],
+            ..SshrackConfig::default()
+        };
+        sshrack_core::config::store::save(&path, &cfg).unwrap();
+        let mut app = App::new(cfg, Some(path.clone()), Frecency::default(), HashMap::new());
+
+        app.open_host_wizard_add(); // seeds credential_names from config
+        let w = app.wizard.as_mut().unwrap();
+        w.name = "web".into();
+        w.host_addr = "10.0.0.5".into();
+        w.auth_choice = super::super::wizard::AuthChoice::Credential { idx: 0 };
+
+        persist_host_save(&mut app).unwrap();
+
+        let reloaded = sshrack_core::config::store::load(&path).unwrap();
+        let h = &reloaded.hosts[0];
+        assert_eq!(
+            h.auth.credential_id(),
+            Some(cid),
+            "credential name must resolve to id"
+        );
+    }
+
+    #[test]
+    fn persist_host_save_credential_choice_unknown_name_errors() {
+        // A dangling credential (name not in config) must surface as
+        // CredentialNotFound, not silently fall back to inline default.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        sshrack_core::config::store::save(&path, &SshrackConfig::default()).unwrap();
+        let cfg = sshrack_core::config::store::load(&path).unwrap();
+        let mut app = App::new(cfg, Some(path.clone()), Frecency::default(), HashMap::new());
+
+        app.open_host_wizard_add();
+        // No credentials defined; force a Credential choice with idx 0 (which
+        // names nothing). build_auth falls back to inline, but the loop's
+        // selected_credential_name() returns None when the list is empty, so
+        // this path actually skips the resolution. To exercise the unknown-name
+        // branch, inject a credential name that does not exist.
+        let w = app.wizard.as_mut().unwrap();
+        w.name = "web".into();
+        w.host_addr = "10.0.0.5".into();
+        w.credential_names = vec!["ghost".into()]; // not in config
+        w.auth_choice = super::super::wizard::AuthChoice::Credential { idx: 0 };
+
+        let err = persist_host_save(&mut app).unwrap_err();
+        assert!(matches!(err, SshrackError::CredentialNotFound { .. }));
+    }
+
+    // ---- end-to-end add→save→launcher-reflects, driven via on_key + loop actions ----
+
+    #[test]
+    fn add_flow_via_on_key_then_save_reflects_in_launcher() {
+        // Mirrors the smoke: ^a opens add wizard, type name+host, ^s saves,
+        // launcher re-ranks and shows the new host. Uses on_key for the key half
+        // and the loop's actions (persist_host_save + close_host_wizard) for the
+        // I/O half — exactly the loop's wiring.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        sshrack_core::config::store::save(&path, &SshrackConfig::default()).unwrap();
+        let cfg = sshrack_core::config::store::load(&path).unwrap();
+        let mut app = App::new(cfg, Some(path), Frecency::default(), HashMap::new());
+        assert!(app.config().hosts.is_empty());
+
+        // ^a → opens wizard.
+        app.on_key(press(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(*app.mode(), Mode::HostWizard);
+
+        // Type "web" into the Name field, Tab to Host, type address, ^s.
+        for ch in "web".chars() {
+            app.on_key(press(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+        for ch in "10.0.0.5".chars() {
+            app.on_key(press(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        let outcome = app.on_key(press(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(matches!(outcome, Outcome::SaveHost));
+
+        // Loop actions.
+        persist_host_save(&mut app).expect("save");
+        app.close_host_wizard();
+        assert_eq!(*app.mode(), Mode::Launcher);
+        // The launcher now sees the new host (re-ranked on close).
+        assert_eq!(app.config().hosts.len(), 1);
+        assert_eq!(app.launcher.ranked.len(), 1);
+        assert_eq!(app.config().hosts[0].name, "web");
+    }
+
+    #[test]
+    fn edit_flow_via_on_key_prefilled_then_change_port_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let orig_id = Ulid::new();
+        let cfg = SshrackConfig {
+            hosts: vec![Host {
+                id: orig_id,
+                name: "web".into(),
+                host: "10.0.0.5".into(),
+                port: 22,
+                auth: Auth::inline(CredentialBody::new("ops")),
+            }],
+            ..SshrackConfig::default()
+        };
+        sshrack_core::config::store::save(&path, &cfg).unwrap();
+        let mut app = App::new(cfg, Some(path), Frecency::default(), HashMap::new());
+
+        // ^e on the selected (only) host → wizard prefilled.
+        app.on_key(press(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert_eq!(*app.mode(), Mode::HostWizard);
+        let w = app.wizard.as_ref().unwrap();
+        assert_eq!(w.name, "web");
+        assert_eq!(w.host_addr, "10.0.0.5");
+        assert_eq!(w.port, "22");
+
+        // Move focus to Port (Tab x2: Name→Host→Port) and clear+retype.
+        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+        // Clear the "22" and type "2200".
+        for _ in 0..2 {
+            app.on_key(press(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+        for ch in "2200".chars() {
+            app.on_key(press(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        let outcome = app.on_key(press(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(matches!(outcome, Outcome::SaveHost));
+
+        persist_host_save(&mut app).expect("save");
+        app.close_host_wizard();
+        assert_eq!(app.config().hosts.len(), 1);
+        assert_eq!(app.config().hosts[0].port, 2200);
+        assert_eq!(app.config().hosts[0].id, orig_id);
+    }
+
+    #[test]
+    fn add_flow_esc_cancels_and_persists_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        sshrack_core::config::store::save(&path, &SshrackConfig::default()).unwrap();
+        let cfg = sshrack_core::config::store::load(&path).unwrap();
+        let mut app = App::new(cfg, Some(path.clone()), Frecency::default(), HashMap::new());
+
+        app.on_key(press(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        // Type a partial name, then Esc.
+        app.on_key(press(KeyCode::Char('w'), KeyModifiers::NONE));
+        let outcome = app.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(outcome, Outcome::Cancel));
+        app.close_host_wizard();
+
+        assert_eq!(*app.mode(), Mode::Launcher);
+        // Nothing persisted.
+        let reloaded = sshrack_core::config::store::load(&path).unwrap();
+        assert!(reloaded.hosts.is_empty());
     }
 }
