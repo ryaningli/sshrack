@@ -331,28 +331,6 @@ impl Launcher {
         }
     }
 
-    /// Render the launcher. Delegates to [`Launcher::draw_with_status`] with an
-    /// empty (default) [`super::app::Status`]; the live render path in
-    /// [`super::app::App::draw`] always passes the consolidated status.
-    #[allow(dead_code)]
-    pub fn draw(
-        &self,
-        frame: &mut Frame,
-        area: ratatui::layout::Rect,
-        hosts: &[Host],
-        frecency: &Frecency,
-        credential_names: &CredentialNames,
-    ) {
-        self.draw_with_status(
-            frame,
-            area,
-            hosts,
-            frecency,
-            credential_names,
-            &super::app::Status::empty(),
-        );
-    }
-
     /// Render with the consolidated [`super::app::Status`] taking precedence over
     /// this launcher's own local navigation hint. Priority:
     /// 1. `app_status` message (red if error) — set by the loop after an action
@@ -469,26 +447,6 @@ impl Launcher {
         let mut state = ListState::default();
         state.select(Some(self.selected));
         frame.render_stateful_widget(list, area, &mut state);
-    }
-
-    /// Render the status line: the transient notice if set, else the default
-    /// key-binding hint. Legacy entry point; the live render path uses
-    /// [`Launcher::draw_with_status`] so the consolidated
-    /// [`super::app::Status`] takes precedence. Kept private and unused outside
-    /// this impl as documentation of the pre-consolidation rendering.
-    #[expect(
-        dead_code,
-        reason = "documented legacy; live path uses draw_with_status"
-    )]
-    fn draw_status(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
-        let line = match &self.status {
-            Some(msg) => Line::from(vec![
-                Span::styled("status: ", Style::new().dim()),
-                Span::raw(msg),
-            ]),
-            None => Line::from(STATUS_LINE).style(Style::new().dim()),
-        };
-        frame.render_widget(Paragraph::new(line), area);
     }
 }
 

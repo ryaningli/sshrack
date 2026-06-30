@@ -557,7 +557,7 @@ impl App {
 
     /// The consolidated status, for the footer to render. Exposed for tests
     /// that assert the status an action set.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn status(&self) -> &Status {
         &self.status
     }
@@ -600,16 +600,21 @@ impl App {
     /// - HostWizard → the wizard's `on_key`. `SaveHost`/`Cancel` are returned
     ///   to the loop, which does the persist + reload.
     pub fn on_key(&mut self, key: KeyEvent) -> Outcome {
-        // Global F1 (and `?`) opens the help overlay from anywhere — even mid-
-        // wizard — so the user never has to back out to read a binding. This
-        // runs before the per-mode match so it wins over a mode-local binding.
-        // Pressing F1 while already in Help is handled by the Help arm below
-        // (it dismisses).
+        // Global F1 opens the help overlay from anywhere — even mid-wizard —
+        // so the user never has to back out to read a binding. This runs before
+        // the per-mode match so it wins over a mode-local binding. Pressing F1
+        // while already in Help is handled by the Help arm below (it dismisses).
+        //
+        // `?` is also a help shortcut, but ONLY on the launcher: inside a
+        // wizard/store text field, `?` is a printable char the user is typing
+        // (Task 16/17), so it must fall through to the mode's `on_key`. F1 is
+        // the always-global help trigger.
         if key.kind == crossterm::event::KeyEventKind::Press
             && key.modifiers.is_empty()
             && self.mode != Mode::Help
             && (key.code == crossterm::event::KeyCode::F(1)
-                || key.code == crossterm::event::KeyCode::Char('?'))
+                || (self.mode == Mode::Launcher
+                    && key.code == crossterm::event::KeyCode::Char('?')))
         {
             self.open_help();
             return Outcome::OpenHelp;
@@ -2620,6 +2625,26 @@ mod tests {
         let outcome = app.on_key(press(KeyCode::Char('?'), KeyModifiers::NONE));
         assert!(matches!(outcome, Outcome::OpenHelp));
         assert_eq!(*app.mode(), Mode::Help);
+    }
+
+    #[test]
+    fn question_mark_in_wizard_text_field_inserts_char_not_help() {
+        // Regression: `?` is a help shortcut on the launcher only. Inside a
+        // wizard/store text field it is a printable char the user is typing
+        // (Task 16/17), so it must fall through to the wizard's on_key and be
+        // appended to the focused field — NOT open the help overlay.
+        let mut app = app_with_host("web");
+        app.on_key(press(KeyCode::Char('a'), KeyModifiers::CONTROL)); // -> HostWizard
+        assert_eq!(*app.mode(), Mode::HostWizard);
+        // Name field is focused by default; type "a?b".
+        app.on_key(press(KeyCode::Char('a'), KeyModifiers::NONE));
+        app.on_key(press(KeyCode::Char('?'), KeyModifiers::NONE));
+        app.on_key(press(KeyCode::Char('b'), KeyModifiers::NONE));
+        assert_eq!(*app.mode(), Mode::HostWizard, "? must not switch to Help");
+        let form = app
+            .wizard()
+            .expect("invariant: wizard is open in HostWizard mode");
+        assert_eq!(form.name, "a?b", "? must be inserted into the text field");
     }
 
     #[test]
