@@ -199,10 +199,7 @@ mod tests {
     #[test]
     fn confirm_with_fallback_no_input_is_false_fail_closed() {
         // --no-input must never proceed with a destructive action.
-        assert_eq!(
-            confirm_with_fallback(true, "delete everything?").unwrap(),
-            false
-        );
+        assert!(!confirm_with_fallback(true, "delete everything?").unwrap());
     }
 
     #[test]

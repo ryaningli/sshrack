@@ -1523,6 +1523,7 @@ dependencies = [
  "serde_json",
  "sshrack-core",
  "strsim",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
  "ulid",
