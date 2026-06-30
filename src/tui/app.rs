@@ -16,20 +16,17 @@ use std::rc::{Rc, Weak};
 use std::time::Duration;
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{self, Event, KeyEvent},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{
-    Frame, Terminal,
-    backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Layout},
-    style::{Style, Stylize},
-    text::Line,
-    widgets::Paragraph,
-};
+use ratatui::{Frame, Terminal, backend::CrosstermBackend};
+use sshrack_core::config::schema::Host;
+use sshrack_core::frecency::Frecency;
 
 use super::ConnectRequest;
+use super::CredentialNames;
+use super::launcher::Launcher;
 
 /// ratatui backend bound to stdout via crossterm.
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;
@@ -123,65 +120,68 @@ pub enum Outcome {
     Connect(ConnectRequest),
 }
 
-/// TUI application state. Task 11 ships only the quit flag; later tasks add
-/// the host list, query, selection, mode, and popup state.
+/// TUI application state. The launcher is the primary mode; later tasks grow
+/// this with wizard/store/help modes via a `mode` enum.
+///
+/// `App` owns the data (hosts, frecency, credential-name lookup) loaded once
+/// at startup from core. The [`Launcher`] inside it owns the query/selection
+/// view state and is the only mode wired up here.
 pub struct App {
     /// Set by [`App::on_key`] when the user presses a quit binding. The loop
     /// checks this as a secondary exit (the primary exit is [`Outcome::Quit`]).
     pub should_quit: bool,
+    /// The full host list, loaded from core config. The launcher borrows into
+    /// this by index; no data path lives in the view.
+    hosts: Vec<Host>,
+    /// Machine-local frecency table, loaded from core's data dir.
+    frecency: Frecency,
+    /// Reverse lookup from a credential ULID to its display name, so the
+    /// launcher can show `Auth::Ref` targets by name without re-scanning.
+    credential_names: CredentialNames,
+    /// The interactive launcher (query + selection + ranked list).
+    launcher: Launcher,
 }
 
 impl App {
-    /// Construct a fresh app with default state.
-    pub fn new() -> Self {
-        Self { should_quit: false }
+    /// Construct a fresh app from loaded core data. Builds the launcher with
+    /// its initial frecency-ordered ranking.
+    pub fn new(hosts: Vec<Host>, frecency: Frecency, credential_names: CredentialNames) -> Self {
+        let launcher = Launcher::new(&hosts, &frecency);
+        Self {
+            should_quit: false,
+            hosts,
+            frecency,
+            credential_names,
+            launcher,
+        }
     }
 
     /// Pure: decide what should happen next for a given key. Performs **no**
     /// I/O — no reads, no writes, no terminal access — so it is safe to call
     /// from a unit test without an event source.
     ///
-    /// Quit bindings: `Esc` or `Ctrl-C`. Everything else is [`Outcome::Continue`]
-    /// for now; later tasks add navigation, search, and selection.
+    /// Routes the key to the launcher. Quit is handled inside the launcher
+    /// (`Esc` with empty query, or `Ctrl-C`); this method sets `should_quit`
+    /// for the loop's secondary exit check.
     pub fn on_key(&mut self, key: KeyEvent) -> Outcome {
-        // Ctrl-C must be EXACTLY Control+c — `contains` would wrongly treat
-        // Ctrl-Shift-C (terminal paste) as quit. Esc needs no modifier guard
-        // (Shift-Esc and friends are rare and still intent to quit).
-        let is_quit = key.kind == KeyEventKind::Press
-            && (key.code == KeyCode::Esc
-                || (key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c')));
-        if is_quit {
+        let outcome = self.launcher.on_key(key, &self.hosts, &self.frecency);
+        if matches!(outcome, Outcome::Quit) {
             self.should_quit = true;
-            return Outcome::Quit;
         }
-        Outcome::Continue
+        outcome
     }
 
     /// Render current state to the frame. Only writes to the frame (no stdout
-    /// access of its own). Task 11 renders a centered placeholder so the
-    /// screen is never blank; later tasks replace this with the launcher.
+    /// access of its own). Routes to the launcher's render.
     pub fn draw(&self, frame: &mut Frame) {
         let area = frame.area();
-
-        // One vertical region; we center the text within it. `areas` returns
-        // exactly one rect for a single-constraint vertical layout, so the
-        // destructuring cannot fail.
-        let [body] = Layout::vertical([Constraint::Fill(1)]).areas(area);
-
-        let lines = vec![
-            Line::from("sshrack TUI").bold().centered(),
-            Line::from("press Esc (or Ctrl-C) to quit")
-                .style(Style::new().dim())
-                .centered(),
-        ];
-        let paragraph = Paragraph::new(lines).alignment(Alignment::Center);
-        frame.render_widget(paragraph, body);
-    }
-}
-
-impl Default for App {
-    fn default() -> Self {
-        Self::new()
+        self.launcher.draw(
+            frame,
+            area,
+            &self.hosts,
+            &self.frecency,
+            &self.credential_names,
+        );
     }
 }
 
@@ -236,6 +236,23 @@ mod tests {
     //! terminal, no event source) to pin both the behavior and the purity.
 
     use super::*;
+    use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+    use sshrack_core::config::schema::{Auth, CredentialBody};
+    use std::collections::HashMap;
+    use ulid::Ulid;
+
+    /// A one-host app with no frecency and no named credentials. Enough to
+    /// drive the launcher's quit/navigation branches without a config file.
+    fn app_with_host(name: &str) -> App {
+        let host = Host {
+            id: Ulid::new(),
+            name: name.into(),
+            host: "h".into(),
+            port: 22,
+            auth: Auth::inline(CredentialBody::new("u")),
+        };
+        App::new(vec![host], Frecency::default(), HashMap::new())
+    }
 
     fn press(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         // crossterm distinguishes Press/Release/Repeat; the app only acts on
@@ -244,33 +261,55 @@ mod tests {
     }
 
     #[test]
-    fn esc_yields_quit() {
-        let mut app = App::new();
+    fn esc_with_empty_query_yields_quit() {
+        // The launcher starts with an empty query, so the first Esc quits.
+        let mut app = app_with_host("web");
         let outcome = app.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
         assert!(matches!(outcome, Outcome::Quit));
         assert!(app.should_quit, "Esc should set should_quit");
     }
 
     #[test]
+    fn esc_after_typing_clears_query_then_second_esc_quits() {
+        let mut app = app_with_host("web");
+        // Type 'w' (query now non-empty), so the first Esc clears, not quits.
+        app.on_key(press(KeyCode::Char('w'), KeyModifiers::NONE));
+        assert!(!app.should_quit);
+        assert_eq!(app.launcher.query, "w");
+        let outcome = app.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(outcome, Outcome::Continue));
+        assert!(app.launcher.query.is_empty(), "Esc should clear the query");
+        assert!(
+            !app.should_quit,
+            "first Esc must not quit when query had text"
+        );
+        // Second Esc now that the query is empty → quit.
+        let outcome = app.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(outcome, Outcome::Quit));
+        assert!(app.should_quit);
+    }
+
+    #[test]
     fn ctrl_c_yields_quit() {
-        let mut app = App::new();
+        let mut app = app_with_host("web");
         let outcome = app.on_key(press(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(matches!(outcome, Outcome::Quit));
         assert!(app.should_quit, "Ctrl-C should set should_quit");
     }
 
     #[test]
-    fn neutral_key_yields_continue() {
-        let mut app = App::new();
+    fn neutral_key_yields_continue_and_appends_to_query() {
+        let mut app = app_with_host("web");
         let outcome = app.on_key(press(KeyCode::Char('a'), KeyModifiers::NONE));
         assert!(matches!(outcome, Outcome::Continue));
         assert!(!app.should_quit, "a neutral key must not flip should_quit");
+        assert_eq!(app.launcher.query, "a");
     }
 
     #[test]
     fn key_release_is_ignored() {
         // Release events must not be treated as a quit even for Esc.
-        let mut app = App::new();
+        let mut app = app_with_host("web");
         let release =
             KeyEvent::new_with_kind(KeyCode::Esc, KeyModifiers::NONE, KeyEventKind::Release);
         let outcome = app.on_key(release);
@@ -282,7 +321,7 @@ mod tests {
     fn bare_ctrl_c_modifier_combo_only() {
         // Ctrl-Shift-C or Ctrl-Alt-C are NOT quit bindings — only plain Ctrl-C.
         // (Terminal paste, e.g. Ctrl-Shift-C, must not accidentally quit.)
-        let mut app = App::new();
+        let mut app = app_with_host("web");
         let outcome = app.on_key(press(
             KeyCode::Char('c'),
             KeyModifiers::CONTROL | KeyModifiers::SHIFT,
@@ -294,9 +333,72 @@ mod tests {
     #[test]
     fn plain_c_without_ctrl_is_continue() {
         // 'c' without Ctrl is just a character, not a quit.
-        let mut app = App::new();
+        let mut app = app_with_host("web");
         let outcome = app.on_key(press(KeyCode::Char('c'), KeyModifiers::NONE));
         assert!(matches!(outcome, Outcome::Continue));
         assert!(!app.should_quit);
+        assert_eq!(app.launcher.query, "c");
+    }
+
+    #[test]
+    fn enter_sets_connect_pending_status_without_quitting() {
+        // Task 14: Enter is a Continue placeholder (Task 15 wires connect).
+        let mut app = app_with_host("web");
+        let outcome = app.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(outcome, Outcome::Continue));
+        assert!(!app.should_quit);
+        assert!(
+            app.launcher
+                .status
+                .as_deref()
+                .unwrap_or("")
+                .contains("pending")
+        );
+    }
+
+    #[test]
+    fn down_then_up_moves_selection() {
+        // Build a two-host app so ↑↓ has somewhere to go.
+        let h1 = Host {
+            id: Ulid::new(),
+            name: "alpha".into(),
+            host: "h".into(),
+            port: 22,
+            auth: Auth::inline(CredentialBody::new("u")),
+        };
+        let h2 = Host {
+            id: Ulid::new(),
+            name: "bravo".into(),
+            host: "h".into(),
+            port: 22,
+            auth: Auth::inline(CredentialBody::new("u")),
+        };
+        let mut app = App::new(vec![h1, h2], Frecency::default(), HashMap::new());
+        assert_eq!(app.launcher.selected, 0);
+        app.on_key(press(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(
+            app.launcher.selected, 1,
+            "Down should move to the second host"
+        );
+        app.on_key(press(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(
+            app.launcher.selected, 0,
+            "Up should move back to the first host"
+        );
+    }
+
+    #[test]
+    fn ctrl_a_sets_not_yet_implemented_status() {
+        let mut app = app_with_host("web");
+        let outcome = app.on_key(press(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert!(matches!(outcome, Outcome::Continue));
+        assert!(!app.should_quit);
+        assert!(
+            app.launcher
+                .status
+                .as_deref()
+                .unwrap_or("")
+                .contains("not yet implemented")
+        );
     }
 }
