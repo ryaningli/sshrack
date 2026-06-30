@@ -2,9 +2,8 @@
 //!
 //! The host/cred row structs and helpers form the `--format json` contract and
 //! are wired into the `cmd::host`/`cmd::cred` handlers. The `store status` row
-//! ([`StoreStatusRow`] / [`store_status_row`]) is declared up front but is not
-//! consumed until the `store` command lands (Part C); it carries
-//! `#[allow(dead_code)]` so the contract is stable from the first shipped CLI.
+//! ([`StoreStatusRow`] / [`store_status_row`]) is consumed by the
+//! `cmd::store` handler.
 //!
 //! Two output paths exist: human-readable aligned text (the default, rendered
 //! by the command handlers) and machine-readable JSON selected by the global
@@ -110,7 +109,6 @@ pub struct CredentialListRow<'a> {
 /// (`kdf`, `memory_kib`, `time_cost`, `lanes`, `cache_ttl_secs`); a present
 /// `verifier` is reported only as a boolean (the ciphertext itself is never
 /// surfaced).
-#[allow(dead_code)] // consumed by the `store status` command (Part C)
 #[derive(Debug, Clone, Serialize)]
 pub struct StoreStatusRow {
     pub mode: &'static str,
@@ -208,7 +206,6 @@ pub fn credential_list_row<'a>(
 }
 
 /// Build a [`StoreStatusRow`] from a config's active [`SecretStore`]. Pure.
-#[allow(dead_code)] // consumed by the `store status` command (Part C)
 pub fn store_status_row(cfg: &SshrackConfig) -> StoreStatusRow {
     match &cfg.store {
         None => StoreStatusRow {

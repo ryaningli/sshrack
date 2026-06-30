@@ -1,9 +1,7 @@
 //! Interactive prompt helpers built on `dialoguer`.
 //!
 //! These functions and impls are the CLI's prompt surface; they are wired into
-//! command dispatch in Tasks 19–20. Until then they are unused at the call
-//! site, so the module carries `#![allow(dead_code)]` (the same convention
-//! `exit_code` uses for ahead-of-time declarations).
+//! the `connect`/`scp`/`host`/`cred`/`store` command handlers.
 //!
 //! Three concerns live here:
 //!

@@ -37,30 +37,12 @@ use sshrack_core::host;
 use sshrack_core::hostkey;
 use sshrack_core::secret::PassphraseProvider;
 use sshrack_core::secret::vault;
-use zeroize::Zeroizing;
 
 use crate::cli::{Cli, Command};
 use crate::exit_code;
 use crate::prompt::{self, DialoguerPassphrase};
 
-/// A [`PassphraseProvider`] that refuses every prompt. Used under `--no-input`
-/// so the vault unlock path immediately fails unless `SSHRACK_PASSPHRASE` is
-/// set in the environment.
-struct NoInputPassphrase;
-
-impl PassphraseProvider for NoInputPassphrase {
-    fn passphrase(&self) -> Result<Zeroizing<String>, SshrackError> {
-        Err(SshrackError::Interrupted)
-    }
-
-    fn passphrase_confirm(&self) -> Result<Zeroizing<String>, SshrackError> {
-        Err(SshrackError::Interrupted)
-    }
-
-    fn confirm(&self, _text: &str) -> Result<bool, SshrackError> {
-        Ok(false)
-    }
-}
+use super::shared::NoInputPassphrase;
 
 /// Dispatch for the `Ssh`/`Connect` arms of the CLI.
 ///
@@ -161,7 +143,16 @@ pub fn run(cli: &Cli) -> i32 {
     let resolved_auth = match credential::resolve(&resolved_host, &cfg, vault_key.as_ref()) {
         Ok(a) => a,
         Err(SshrackError::CredentialNotFound { alias, hint }) => {
-            eprintln!("sshrack: credential not found: {alias}{hint}");
+            // The ref-by-id path surfaces a bare ULID as `alias` (the host
+            // references the credential by id; the credential is missing so no
+            // alias exists to show). Reword to name the originating host so the
+            // message reads like a host problem, not a stray id. CLI-layer
+            // concern only — core's `credential::resolve` is unchanged.
+            eprintln!(
+                "sshrack: host '{}' references an unknown credential{hint}",
+                resolved_host.alias
+            );
+            let _ = alias; // the bare ULID is intentionally not surfaced
             return exit_code::NOT_FOUND;
         }
         Err(SshrackError::VaultLocked) => {

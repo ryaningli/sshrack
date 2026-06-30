@@ -56,15 +56,9 @@ fn run_cli() -> i32 {
             exit_code::SUCCESS
         }
         Some(cli::Command::Ssh { .. }) | Some(cli::Command::Connect(_)) => cmd::connect::run(&cli),
+        Some(cli::Command::Scp { .. }) => cmd::scp::run(&cli),
         Some(cli::Command::Host { action }) => cmd::host::run(&cli, action),
         Some(cli::Command::Cred { action }) => cmd::cred::run(&cli, action),
-        Some(cli::Command::Scp { .. }) => {
-            eprintln!("sshrack: scp not yet implemented");
-            exit_code::USAGE
-        }
-        Some(cli::Command::Store { .. }) => {
-            eprintln!("sshrack: store not yet implemented");
-            exit_code::USAGE
-        }
+        Some(cli::Command::Store { action }) => cmd::store::run(&cli, action),
     }
 }

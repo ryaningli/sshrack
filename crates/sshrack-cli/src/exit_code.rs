@@ -1,9 +1,5 @@
 //! Stable process exit codes. The CLI maps domain errors to these so scripts
 //! and automation can branch on them.
-//!
-//! Most constants are not referenced until the command handlers land (Tasks
-//! 19–20); they are declared up front so the mapping is stable from the first
-//! shipped CLI.
 
 /// Successful execution.
 pub const SUCCESS: i32 = 0;
