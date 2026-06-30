@@ -54,6 +54,23 @@ pub struct ConnectOptions {
     pub ad_hoc: bool,
 }
 
+impl ConnectOptions {
+    /// Overlay `self` on `base`: a field set here wins; otherwise fall back to
+    /// `base`. Merges top-level flags with those given after the `ssh`/`scp`
+    /// token, so `sshrack --port 9 ssh web1` and `sshrack ssh --port 9 web1`
+    /// behave the same.
+    pub fn overlay(self, base: &ConnectOptions) -> ConnectOptions {
+        ConnectOptions {
+            user: self.user.or_else(|| base.user.clone()),
+            port: self.port.or(base.port),
+            identity: self.identity.or_else(|| base.identity.clone()),
+            credential: self.credential.or_else(|| base.credential.clone()),
+            // Either level opting into ad-hoc is enough (OR, not override).
+            ad_hoc: self.ad_hoc || base.ad_hoc,
+        }
+    }
+}
+
 /// Output format for machine-readable command results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum OutputFormat {
@@ -175,9 +192,7 @@ pub enum Command {
     /// remote command, so flags after the alias reach ssh, not sshrack.
     #[command(external_subcommand)]
     Connect(
-        /// `<alias> [remote command...]`. Read by the connect handler in
-        /// Task 19; unread in this skeleton.
-        #[expect(dead_code, reason = "connect dispatch lands in Task 19")]
+        /// `<alias> [remote command...]`.
         Vec<String>,
     ),
 }

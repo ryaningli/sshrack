@@ -33,10 +33,10 @@ fn main() {
     std::process::exit(code);
 }
 
-/// Parse the CLI and (eventually) dispatch on the parsed subcommand.
+/// Parse the CLI and dispatch on the parsed subcommand.
 ///
-/// Real dispatch lands in later tasks. For now a bare `sshrack` (no
-/// subcommand) prints `--help`, and any subcommand prints a stub message.
+/// The `Ssh` and `Connect` arms run the connect path (Task 19). Other arms
+/// print a stub message until Task 20 wires them up.
 fn run_cli() -> i32 {
     let cli = match cli::Cli::try_parse() {
         Ok(c) => c,
@@ -48,15 +48,16 @@ fn run_cli() -> i32 {
         }
     };
 
-    match cli.cmd {
+    match &cli.cmd {
         None => {
             // No subcommand: print --help (no TUI in this phase).
             cli::Cli::command().print_help().ok();
             exit_code::SUCCESS
         }
+        Some(cli::Command::Ssh { .. }) | Some(cli::Command::Connect(_)) => cmd::connect::run(&cli),
         Some(_) => {
-            // TODO(Task 19+): dispatch on cli.cmd to the cmd:: handlers.
-            eprintln!("sshrack CLI dispatch not yet implemented");
+            // TODO(Task 20): dispatch on cli.cmd to the cmd:: handlers.
+            eprintln!("sshrack CLI dispatch not yet implemented for this subcommand");
             exit_code::SUCCESS
         }
     }

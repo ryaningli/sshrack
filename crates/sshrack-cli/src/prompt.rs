@@ -177,6 +177,18 @@ pub fn host_key_confirm_closure() -> impl FnOnce(&str) -> bool {
     }
 }
 
+/// Build a fail-closed `FnOnce(&str) -> bool` confirm closure for `--no-input`.
+///
+/// Under `--no-input`, the caller must not prompt the user for anything —
+/// every prompt is refused. Returning `false` unconditionally causes
+/// [`run_host_key_flow`] to fail with [`SshrackError::HostKeyNotConfirmed`]
+/// for any new host key, which is the safe default for an unattended run.
+///
+/// [`run_host_key_flow`]: sshrack_core::hostkey::run_host_key_flow
+pub fn host_key_confirm_closure_no_input() -> impl FnOnce(&str) -> bool {
+    |_text: &str| false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
