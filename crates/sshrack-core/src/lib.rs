@@ -6,6 +6,7 @@
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+pub mod askpass;
 pub mod config;
 pub mod connect;
 pub mod credential;
