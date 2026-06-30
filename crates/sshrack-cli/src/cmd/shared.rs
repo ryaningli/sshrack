@@ -345,8 +345,8 @@ pub fn sort_hosts<'a>(hosts: &'a [&'a Host], sort: Option<SortMode>) -> Vec<&'a 
         .unwrap_or_default();
     match mode {
         SortMode::Frecency => {
-            // match-then-score-then-alias; an empty query reduces it to
-            // score-then-alias, which is the documented `--sort frecency` order.
+            // match-then-score-then-name; an empty query reduces it to
+            // score-then-name, which is the documented `--sort frecency` order.
             frecency::rank(hosts, "", &frec)
                 .into_iter()
                 .map(|r| r.host)

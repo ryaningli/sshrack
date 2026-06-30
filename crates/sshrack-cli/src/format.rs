@@ -295,16 +295,16 @@ mod tests {
 
         // Stable field set — adding/removing/renaming any of these is a
         // breaking change to the automation contract.
-        let expected_keys = ["alias", "host", "port", "user", "auth_kind"];
+        let expected_keys = ["name", "host", "port", "user", "auth_kind"];
         for k in expected_keys {
             assert!(obj.contains_key(k), "missing stable field '{k}' in: {json}");
         }
-        // credential_alias is skipped when None (no credential reference).
+        // credential_name is skipped when None (no credential reference).
         assert!(
-            !obj.contains_key("credential_alias"),
-            "credential_alias must be absent when None: {json}"
+            !obj.contains_key("credential_name"),
+            "credential_name must be absent when None: {json}"
         );
-        assert_eq!(obj["alias"], "web1");
+        assert_eq!(obj["name"], "web1");
         assert_eq!(obj["host"], "10.0.0.5");
         assert_eq!(obj["port"], 2222);
         assert_eq!(obj["user"], "deploy");
@@ -312,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn host_list_row_credential_ref_includes_alias() {
+    fn host_list_row_credential_ref_includes_name() {
         let cred_id = Ulid::new();
         let host = ref_host(cred_id);
         let row = host_list_row(&host, Some("team-dev"));
@@ -321,7 +321,7 @@ mod tests {
         let obj = v.as_object().unwrap();
 
         assert_eq!(obj["auth_kind"], "credential");
-        assert_eq!(obj["credential_alias"], "team-dev");
+        assert_eq!(obj["credential_name"], "team-dev");
         // A credential reference has no inline user; the row surfaces an empty
         // string (the caller resolves the credential's user if it wants it).
         assert_eq!(obj["user"], "");
@@ -342,7 +342,7 @@ mod tests {
         let v: Value = serde_json::from_str(&json).unwrap();
         let obj = v.as_object().unwrap();
 
-        assert_eq!(obj["alias"], "box");
+        assert_eq!(obj["name"], "box");
         assert_eq!(obj["id"], id_str);
         assert_eq!(obj["auth_kind"], "key");
         assert_eq!(obj["identity"], "/home/u/.ssh/id_ed25519");
@@ -360,10 +360,10 @@ mod tests {
         let v: Value = serde_json::from_str(&json).unwrap();
         let obj = v.as_object().unwrap();
 
-        for k in ["alias", "user", "secret_kind"] {
+        for k in ["name", "user", "secret_kind"] {
             assert!(obj.contains_key(k), "missing stable field '{k}': {json}");
         }
-        assert_eq!(obj["alias"], "team-dev");
+        assert_eq!(obj["name"], "team-dev");
         assert_eq!(obj["user"], "deploy");
         assert_eq!(obj["secret_kind"], "password");
         // No secret value ever appears in a row: the credential's actual
@@ -450,7 +450,7 @@ mod tests {
 
         let v: Value = serde_json::from_str(&json).expect("reveal JSON must be valid");
         assert_eq!(v["password"], pw);
-        assert_eq!(v["alias"], "team-dev");
+        assert_eq!(v["name"], "team-dev");
     }
 
     #[test]

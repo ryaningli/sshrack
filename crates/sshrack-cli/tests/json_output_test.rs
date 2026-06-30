@@ -44,12 +44,12 @@ fn run(args: &[&str], config: &std::path::Path) -> (i32, String, String) {
 /// Add a key-only host non-interactively so `host ls` has a row to emit. A
 /// key-only host needs no storage-mode decision (no password is collected), so
 /// this works against a fresh, undecided config.
-fn add_key_host(config: &std::path::Path, alias: &str, host_addr: &str, identity: &str) {
+fn add_key_host(config: &std::path::Path, name: &str, host_addr: &str, identity: &str) {
     let (code, _stdout, stderr) = run(
         &[
             "host",
             "add",
-            alias,
+            name,
             "--host",
             host_addr,
             "--user",
@@ -65,8 +65,8 @@ fn add_key_host(config: &std::path::Path, alias: &str, host_addr: &str, identity
 }
 
 /// `host ls --format json` emits a JSON array whose rows carry the stable field
-/// names: `alias`, `host`, `port`, `user`, `auth_kind`. For a key-only host the
-/// `auth_kind` is `"key"` and `credential_alias` is absent (it is omitted via
+/// names: `name`, `host`, `port`, `user`, `auth_kind`. For a key-only host the
+/// `auth_kind` is `"key"` and `credential_name` is absent (it is omitted via
 /// `skip_serializing_if = Option::is_none`).
 #[test]
 fn host_ls_json_has_stable_field_names() {
@@ -81,7 +81,7 @@ fn host_ls_json_has_stable_field_names() {
     assert!(!arr.is_empty(), "at least one row");
     let row = &arr[0];
     // Stable field names must be present (the automation contract).
-    assert_eq!(row["alias"], "web1");
+    assert_eq!(row["name"], "web1");
     assert_eq!(row["host"], "10.0.0.5");
     assert_eq!(row["port"], 2222);
     assert_eq!(row["user"], "deploy");
@@ -89,8 +89,8 @@ fn host_ls_json_has_stable_field_names() {
     // A key-only inline host has no credential reference: the optional field is
     // omitted, NOT null.
     assert!(
-        row.get("credential_alias").is_none() || row["credential_alias"].is_null(),
-        "credential_alias absent for inline auth"
+        row.get("credential_name").is_none() || row["credential_name"].is_null(),
+        "credential_name absent for inline auth"
     );
     // The reveal-only `password` field must never appear on `ls`.
     assert!(
@@ -100,7 +100,7 @@ fn host_ls_json_has_stable_field_names() {
 }
 
 /// `cred ls --format json` emits a JSON array whose rows carry the stable field
-/// names: `alias`, `user`, `secret_kind`. For a key credential `secret_kind` is
+/// names: `name`, `user`, `secret_kind`. For a key credential `secret_kind` is
 /// `"key"`; `password` is absent (it is the reveal exception, never on `ls`).
 #[test]
 fn cred_ls_json_has_stable_field_names() {
@@ -128,7 +128,7 @@ fn cred_ls_json_has_stable_field_names() {
     let arr = parsed.as_array().expect("cred ls json is an array").clone();
     assert!(!arr.is_empty(), "at least one row");
     let row = &arr[0];
-    assert_eq!(row["alias"], "team-dev");
+    assert_eq!(row["name"], "team-dev");
     assert_eq!(row["user"], "deploy");
     assert_eq!(row["secret_kind"], "key");
     // The reveal-only `password` field must never appear on `ls`.
@@ -183,12 +183,12 @@ fn full_pipeline_host_and_cred_json_together() {
     assert_eq!(code, 0, "host ls failed: {stderr}");
     let arr: Vec<Value> = serde_json::from_str(stdout.trim()).expect("host ls json is an array");
     assert_eq!(arr.len(), 2, "both added hosts appear");
-    let aliases: Vec<&str> = arr
+    let names: Vec<&str> = arr
         .iter()
-        .map(|r| r["alias"].as_str().expect("alias is a string"))
+        .map(|r| r["name"].as_str().expect("name is a string"))
         .collect();
-    assert!(aliases.contains(&"web-prod"));
-    assert!(aliases.contains(&"web-staging"));
+    assert!(names.contains(&"web-prod"));
+    assert!(names.contains(&"web-staging"));
     // Every row carries the full stable schema.
     for row in &arr {
         assert!(row.get("host").is_some());
