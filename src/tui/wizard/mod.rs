@@ -122,14 +122,15 @@ impl Field {
         self.idx() == Self::ORDER.len() - 1
     }
 
-    /// Human label shown in the form.
+    /// Human label shown in the form. Capitalized so the add/edit forms read
+    /// "Name" / "Host" / ... rather than lowercase.
     fn label(self) -> &'static str {
         match self {
-            Field::Name => "name",
-            Field::Host => "host",
-            Field::Port => "port",
-            Field::User => "user",
-            Field::Auth => "auth",
+            Field::Name => "Name",
+            Field::Host => "Host",
+            Field::Port => "Port",
+            Field::User => "User",
+            Field::Auth => "Auth",
         }
     }
 }
@@ -268,11 +269,11 @@ impl CredField {
 
     fn label(self) -> &'static str {
         match self {
-            CredField::Name => "name",
-            CredField::User => "user",
-            CredField::Identity => "key",
-            CredField::SecretKind => "secret",
-            CredField::Password => "password",
+            CredField::Name => "Name",
+            CredField::User => "User",
+            CredField::Identity => "Identity",
+            CredField::SecretKind => "Secret",
+            CredField::Password => "Password",
         }
     }
 }
@@ -389,5 +390,65 @@ mod tests {
         let spans = value_spans("x", Some("e.g. web-prod"));
         assert_eq!(spans.len(), 1);
         assert_eq!(&*spans[0].content, "x");
+    }
+
+    // ---- label capitalization: every field/choice label starts uppercase ----
+
+    #[test]
+    fn host_field_labels_are_capitalized() {
+        // Each returned label must start with an uppercase letter so the
+        // add/edit forms read "Name" / "Host" / ... instead of lowercase.
+        for f in Field::ORDER {
+            let label = f.label();
+            let first = label.chars().next().unwrap_or(' ');
+            assert!(
+                first.is_ascii_uppercase(),
+                "Field {:?} label {:?} must start uppercase",
+                f,
+                label
+            );
+        }
+        // Pin the exact wording so a future edit can't silently regress.
+        assert_eq!(Field::Name.label(), "Name");
+        assert_eq!(Field::Host.label(), "Host");
+        assert_eq!(Field::Port.label(), "Port");
+        assert_eq!(Field::User.label(), "User");
+        assert_eq!(Field::Auth.label(), "Auth");
+    }
+
+    #[test]
+    fn cred_field_labels_are_capitalized() {
+        for f in CredField::ORDER {
+            let label = f.label();
+            let first = label.chars().next().unwrap_or(' ');
+            assert!(
+                first.is_ascii_uppercase(),
+                "CredField {:?} label {:?} must start uppercase",
+                f,
+                label
+            );
+        }
+        assert_eq!(CredField::Name.label(), "Name");
+        assert_eq!(CredField::User.label(), "User");
+        assert_eq!(CredField::Identity.label(), "Identity");
+        assert_eq!(CredField::SecretKind.label(), "Secret");
+        assert_eq!(CredField::Password.label(), "Password");
+    }
+
+    #[test]
+    fn secret_choice_labels_are_capitalized() {
+        for s in SecretChoice::ORDER {
+            let label = s.label();
+            let first = label.chars().next().unwrap_or(' ');
+            assert!(
+                first.is_ascii_uppercase(),
+                "SecretChoice {:?} label {:?} must start uppercase",
+                s,
+                label
+            );
+        }
+        assert_eq!(SecretChoice::Password.label(), "Password");
+        assert_eq!(SecretChoice::IdentityKey.label(), "IdentityKey");
+        assert_eq!(SecretChoice::None.label(), "None");
     }
 }
