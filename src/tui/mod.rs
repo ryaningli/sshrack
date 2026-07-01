@@ -30,6 +30,7 @@ pub mod launcher;
 pub mod popup;
 pub mod prompt;
 pub mod store;
+pub mod tab;
 pub mod theme;
 pub mod wizard;
 
