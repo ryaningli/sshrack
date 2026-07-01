@@ -1098,7 +1098,7 @@ impl App {
                 panel_area,
                 &self.config.hosts,
                 &self.frecency,
-                &self.credential_names,
+                &self.config.credentials,
             ),
             Tab::Credentials => {
                 self.cred_panel

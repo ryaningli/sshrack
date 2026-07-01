@@ -31,11 +31,10 @@ use ratatui::{
     text::{Line, Span},
     widgets::{List, ListState, Paragraph},
 };
-use sshrack_core::config::schema::Host;
+use sshrack_core::config::schema::{Auth, Credential, Host};
 use sshrack_core::frecency::Frecency;
 use ulid::Ulid;
 
-use super::CredentialNames;
 use super::app::Outcome;
 use super::theme;
 
@@ -306,21 +305,22 @@ impl Launcher {
     /// shell supplies the brand/tab/footer bands around it, including the
     /// status footer). Splits `area` into `[search(1), list(Fill)]` and renders
     /// the search row + ranked list. Reuses `host_line` / `highlighted_name` /
-    /// `credential_label` / `frecency_tier`. The search row places the real
-    /// terminal cursor at the end of the query via `set_cursor_position`.
+    /// `host_user` / `frecency_tier`. The search row places the real terminal
+    /// cursor at the end of the query via `set_cursor_position`.
     ///
-    /// Selection styling: the selected row carries `theme::selected_gutter()`
-    /// (a Cyan `▎`) as its first span and is rendered `BOLD`; every other row
-    /// is padded with a two-space prefix so the names align under the gutter.
-    /// There is no dark-background selection bar — the gutter + bold is the
-    /// whole signal, matching the Credentials and Settings panels.
+    /// Selection styling: the selected row carries `theme::focus_marker(true)`
+    /// (a Cyan `▶ `) as its first span and is rendered `BOLD`; every other row
+    /// carries `theme::focus_marker(false)` (two spaces) so the names align
+    /// under the marker. There is no dark-background selection bar — the
+    /// marker + bold is the whole signal, matching the wizard's focused-field
+    /// marker.
     pub fn draw_in_shell(
         &self,
         frame: &mut Frame,
         area: ratatui::layout::Rect,
         hosts: &[Host],
         frecency: &Frecency,
-        credential_names: &CredentialNames,
+        credentials: &[Credential],
     ) {
         let [search_area, list_area] =
             Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(area);
@@ -337,10 +337,10 @@ impl Launcher {
         let max_x = search_area.x + search_area.width.saturating_sub(1);
         frame.set_cursor_position((cursor_x.min(max_x), search_area.y));
 
-        self.draw_list(frame, list_area, hosts, frecency, credential_names);
+        self.draw_list(frame, list_area, hosts, frecency, credentials);
     }
 
-    /// Render the ranked host list with the selected-row gutter and per-host
+    /// Render the ranked host list with the selected-row marker and per-host
     /// fuzzy-match highlighting. Shows an empty-state line when there is
     /// nothing to list. No outer border (the shell supplies the chrome).
     fn draw_list(
@@ -349,7 +349,7 @@ impl Launcher {
         area: ratatui::layout::Rect,
         hosts: &[Host],
         frecency: &Frecency,
-        credential_names: &CredentialNames,
+        credentials: &[Credential],
     ) {
         if self.ranked.is_empty() {
             let msg = if hosts.is_empty() {
@@ -366,10 +366,22 @@ impl Launcher {
             return;
         }
 
-        // Bake the gutter into each item: the selected row carries
-        // `theme::selected_gutter()` (Cyan `▎`); every other row carries a
-        // two-space pad so names align. `highlight_style` then adds BOLD to
-        // the whole selected row — no dark-background selection bar.
+        // Adaptive name column: the widest visible name, capped at
+        // NAME_COL_CAP so a single very long name can't squeeze the address
+        // column off the row.
+        let name_w = self
+            .ranked
+            .iter()
+            .map(|r| hosts[r.host_idx].name.chars().count())
+            .max()
+            .unwrap_or(0)
+            .min(NAME_COL_CAP);
+
+        // Bake the marker into each item: the selected row carries
+        // `theme::focus_marker(true)` (Cyan `▶ `); every other row carries
+        // `theme::focus_marker(false)` (two spaces) so names align.
+        // `highlight_style` then adds BOLD to the whole selected row — no
+        // dark-background selection bar.
         let items: Vec<Line> = self
             .ranked
             .iter()
@@ -378,9 +390,11 @@ impl Launcher {
                 host_line(
                     &hosts[r.host_idx],
                     &self.query,
+                    credentials,
                     frecency,
-                    credential_names,
                     i == self.selected,
+                    name_w,
+                    area.width,
                 )
             })
             .collect();
@@ -393,34 +407,70 @@ impl Launcher {
     }
 }
 
-/// Build the display line for one host: the selection gutter (or a two-space
-/// pad when not selected so names align), the name with fuzzy-matched chars
-/// highlighted, the address/port dimmed, the credential name (or inline user)
-/// dimmed, and the frecency tier on the right.
+/// Width cap for the adaptive name column. Names longer than this overflow
+/// gracefully into the gap rather than squeezing the address column.
+const NAME_COL_CAP: usize = 20;
+
+/// The connect user for a host: the referenced credential's user for
+/// [`Auth::Ref`] (resolved from the credential slice), or the inline body's
+/// user. Falls back to `?` when there is no resolvable user (dangling ref or
+/// empty inline user) so the `user@host:port` line always has a user slot.
+fn host_user(host: &Host, credentials: &[Credential]) -> String {
+    match &host.auth {
+        Auth::Ref { credential } => credentials
+            .iter()
+            .find(|c| &c.id == credential)
+            .map(|c| c.body.user.clone())
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(|| "?".into()),
+        Auth::Inline(body) => {
+            if body.user.is_empty() {
+                "?".into()
+            } else {
+                body.user.clone()
+            }
+        }
+    }
+}
+
+/// Build the display line for one host: the focus marker (`▶ ` when selected,
+/// two spaces otherwise), the name padded to `name_w` with fuzzy-match
+/// highlighting, a dimmed `user@host:port` address column, and the frecency
+/// tier right-aligned to `width`. The credential NAME is no longer shown — the
+/// user is the load-bearing piece for "who will I connect as".
 fn host_line(
     host: &Host,
     query: &str,
+    credentials: &[Credential],
     frecency: &Frecency,
-    credential_names: &CredentialNames,
     selected: bool,
+    name_w: usize,
+    width: u16,
 ) -> Line<'static> {
-    let name_spans = highlighted_name(&host.name, query);
-    let addr = format!("  {}:{}", host.host, host.port);
-    let cred = credential_label(host, credential_names);
-    let tier = frecency_tier(frecency.score(&host.id));
+    let mut spans: Vec<Span> = Vec::with_capacity(8);
+    spans.push(theme::focus_marker(selected));
 
-    let mut spans = Vec::with_capacity(name_spans.len() + 5);
-    // Selected row leads with the Cyan gutter mark; others pad to align.
-    spans.push(if selected {
-        theme::selected_gutter()
-    } else {
-        Span::raw("  ")
-    });
-    spans.extend(name_spans);
+    // Name column (padded to name_w) with fuzzy-match highlighting.
+    spans.extend(highlighted_name(&host.name, query));
+    let name_pad = name_w.saturating_sub(host.name.chars().count());
+    spans.push(Span::raw(" ".repeat(name_pad)));
+    spans.push(Span::raw("  ")); // gap between name and address
+
+    // Address column: user@host:port.
+    let user = host_user(host, credentials);
+    let addr = format!("{user}@{}:{}", host.host, host.port);
+    let addr_len = addr.chars().count();
     spans.push(Span::styled(addr, Style::new().dim()));
-    spans.push(Span::styled(format!("  ({cred})"), Style::new().dim()));
+
+    // Tier badge right-aligned to the list area's right edge.
+    let tier = frecency_tier(frecency.score(&host.id));
+    let tier_str = format!("[{tier}]");
+    let used = 2 + name_w + 2 + addr_len;
+    let tier_block = format!("  {tier_str}"); // 2 leading spaces + badge
+    let fill = (width as usize).saturating_sub(used + tier_block.chars().count());
+    spans.push(Span::raw(" ".repeat(fill)));
     spans.push(Span::styled(
-        format!("  [{tier}]"),
+        tier_block,
         Style::new().fg(theme::ACCENT).dim(),
     ));
 
@@ -487,29 +537,13 @@ fn char_to_byte(s: &str, char_idx: u32) -> usize {
         .unwrap_or(s.len())
 }
 
-/// The display label for a host's auth: the referenced credential's name when
-/// it uses `Auth::Ref`, otherwise the inline body's user (falling back to
-/// `ssh default` when there is no inline user — though inline bodies always
-/// carry a user, this is defensive).
-fn credential_label(host: &Host, credential_names: &CredentialNames) -> String {
-    match &host.auth {
-        sshrack_core::config::schema::Auth::Ref { credential } => credential_names
-            .get(credential)
-            .cloned()
-            .unwrap_or_else(|| "<missing credential>".into()),
-        sshrack_core::config::schema::Auth::Inline(body) => {
-            format!("@{}", body.user)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     //! Purity tests for the launcher's ranking/filter/selection logic: the
     //! frecency-tier sort, the fuzzy-match filter, and the cursor + Enter →
     //! pending_connect intent. No terminal or event source is touched.
     use super::*;
-    use sshrack_core::config::schema::{Auth, CredentialBody, Host};
+    use sshrack_core::config::schema::{Credential, CredentialBody, Host};
     use sshrack_core::frecency::Frecency;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use ulid::Ulid;
@@ -528,6 +562,87 @@ mod tests {
     /// A fixed `SystemTime` well after the epoch, for deterministic decay tiers.
     fn now() -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+    }
+
+    /// Build a credential with id derived from `seed`, the given name + user.
+    fn host_cred(user: &str, seed: u128) -> Credential {
+        Credential {
+            id: Ulid::from_string(&format!("{seed:026X}")).unwrap(),
+            name: format!("cred-{user}"),
+            body: CredentialBody::new(user),
+        }
+    }
+
+    /// Build a host named `name` whose auth is the given body, with a fixed id.
+    fn host_with_auth(auth: Auth) -> Host {
+        Host {
+            id: Ulid::from_string("01J00000000000000000000001").unwrap(),
+            name: "h".into(),
+            host: "h".into(),
+            port: 22,
+            auth,
+        }
+    }
+
+    /// Build a host that references `cred`, with the given name/host/port.
+    fn host_referring(cred: &Credential, name: &str, host: &str, port: u16) -> Host {
+        Host {
+            id: Ulid::from_string("01J00000000000000000000002").unwrap(),
+            name: name.into(),
+            host: host.into(),
+            port,
+            auth: Auth::reference(cred.id),
+        }
+    }
+
+    // ---- host_user: resolve the connect user ----
+
+    #[test]
+    fn host_user_resolves_ref_to_credential_user() {
+        let cred = host_cred("ops", 1);
+        let host = host_with_auth(Auth::reference(cred.id));
+        assert_eq!(host_user(&host, &[cred]), "ops");
+    }
+
+    #[test]
+    fn host_user_is_question_mark_for_dangling_ref() {
+        let host = host_with_auth(Auth::reference(
+            Ulid::from_string("01J00000000000000000000000").unwrap(),
+        ));
+        assert_eq!(host_user(&host, &[]), "?");
+    }
+
+    #[test]
+    fn host_user_uses_inline_body_or_question_mark_when_empty() {
+        let host = host_with_auth(Auth::inline(CredentialBody::new("root")));
+        assert_eq!(host_user(&host, &[]), "root");
+        let host_empty = host_with_auth(Auth::inline(CredentialBody::new("")));
+        assert_eq!(host_user(&host_empty, &[]), "?");
+    }
+
+    // ---- host_line: columns + user@host:port ----
+
+    #[test]
+    fn host_line_renders_user_at_host_port_and_aligns_columns() {
+        let cred = host_cred("root", 1);
+        let host = host_referring(&cred, "web1", "1.2.3.4", 22);
+        let fr = Frecency::default();
+        let line = host_line(&host, "", &[cred], &fr, true, 8, 40);
+        let s = format!("{line}");
+        assert!(s.contains("root@1.2.3.4:22"), "row text was: {s}");
+        // Name column is padded to name_w=8: "web1" + 4 spaces, so the address
+        // column starts at the same offset on every row.
+        assert!(s.contains("web1    "), "name not padded to width 8: {s}");
+    }
+
+    #[test]
+    fn host_line_uses_question_mark_when_no_user() {
+        let host = host_with_auth(Auth::reference(
+            Ulid::from_string("01J00000000000000000000000").unwrap(),
+        ));
+        let fr = Frecency::default();
+        let line = host_line(&host, "", &[], &fr, false, 8, 40);
+        assert!(format!("{line}").contains("?@"));
     }
 
     // ---- empty query: frecency order ----
@@ -689,21 +804,21 @@ mod tests {
 
     use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
     use ratatui::{Terminal, backend::TestBackend};
-    use std::collections::HashMap;
 
     /// A Press KeyEvent with the given code and modifiers.
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new_with_kind(code, mods, KeyEventKind::Press)
     }
 
-    // ---- Task 10: visual-unification regression (gutter + real cursor) ----
+    // ---- Task 4: visual-unification regression (focus marker + real cursor) ----
 
     /// Render the launcher inside the shell and assert it (a) does not panic,
     /// (b) calls `set_cursor_position` on the search row (the real terminal
     /// cursor — the fake cursor glyph must be gone), and (c) paints the
-    /// selected-row gutter `▎` (not a dark-background selection bar).
+    /// selected-row focus marker `▶ ` (not the old `▎` gutter, and not a
+    /// dark-background selection bar).
     #[test]
-    fn draw_in_shell_renders_without_panic_sets_cursor_and_uses_gutter() {
+    fn draw_in_shell_renders_without_panic_sets_cursor_and_uses_focus_marker() {
         let backend = TestBackend::new(100, 30);
         let mut term = Terminal::new(backend).unwrap();
         let hosts = vec![host(1, "web")];
@@ -730,10 +845,14 @@ mod tests {
             !view.contains('\u{258d}'),
             "fake cursor glyph leaked: {view}"
         );
-        // The selected row carries the Cyan gutter mark `▎`.
-        assert!(view.contains('▎'), "selected-row gutter missing: {view}");
-        // No dark-background selection: the selected host name is rendered with
-        // bold, not a dark background — assert the host name is present.
+        // The selected row carries the focus marker `▶ `; the old `▎` gutter
+        // must be gone (replaced by the wizard-style arrow marker).
+        assert!(view.contains('▶'), "focus marker missing: {view}");
+        assert!(!view.contains('▎'), "old gutter leaked: {view}");
+        // The new user@host:port address column renders (user "u" from the
+        // inline default, host "h", port 22).
+        assert!(view.contains("u@h:22"), "address column missing: {view}");
+        // No dark-background selection: the selected host name is present.
         assert!(view.contains("web"), "host name missing: {view}");
     }
 
@@ -779,8 +898,8 @@ mod tests {
         );
     }
 
-    fn empty_creds() -> CredentialNames {
-        HashMap::new()
+    fn empty_creds() -> Vec<Credential> {
+        Vec::new()
     }
 
     /// A human-readable stringification of a ratatui `Buffer` (one line per
@@ -1080,48 +1199,5 @@ mod tests {
         assert_eq!(frecency_tier(1.0), "low");
         assert_eq!(frecency_tier(5.0), "mid");
         assert_eq!(frecency_tier(20.0), "high");
-    }
-
-    #[test]
-    fn credential_label_uses_credential_name_for_ref_auth() {
-        let cid = Ulid::from_string("01HXYZ0000000000000000000Z").unwrap();
-        let host = Host {
-            id: Ulid::from_string("01HXYZ0000000000000000000A").unwrap(),
-            name: "h".into(),
-            host: "x".into(),
-            port: 22,
-            auth: sshrack_core::config::schema::Auth::reference(cid),
-        };
-        let mut names = empty_creds();
-        names.insert(cid, "ops-key".into());
-        assert_eq!(credential_label(&host, &names), "ops-key");
-    }
-
-    #[test]
-    fn credential_label_shows_inline_user_for_inline_auth() {
-        let host = Host {
-            id: Ulid::from_string("01HXYZ0000000000000000000A").unwrap(),
-            name: "h".into(),
-            host: "x".into(),
-            port: 22,
-            auth: sshrack_core::config::schema::Auth::inline(CredentialBody::new("root")),
-        };
-        assert_eq!(credential_label(&host, &empty_creds()), "@root");
-    }
-
-    #[test]
-    fn credential_label_missing_credential_shows_placeholder() {
-        let cid = Ulid::from_string("01HXYZ0000000000000000000Z").unwrap();
-        let host = Host {
-            id: Ulid::from_string("01HXYZ0000000000000000000A").unwrap(),
-            name: "h".into(),
-            host: "x".into(),
-            port: 22,
-            auth: sshrack_core::config::schema::Auth::reference(cid),
-        };
-        assert_eq!(
-            credential_label(&host, &empty_creds()),
-            "<missing credential>"
-        );
     }
 }
