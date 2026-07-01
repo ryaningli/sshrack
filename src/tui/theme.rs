@@ -39,6 +39,20 @@ pub fn selected_gutter() -> Span<'static> {
     Span::styled("▎", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD))
 }
 
+/// The selection marker shared by list rows and form fields: `▶ ` accented +
+/// bold when focused/selected, two spaces when not. Both forms are 2 cells
+/// wide, so every row's content starts at the same column regardless of which
+/// row is selected (no selected-row left-shift). Mirrors the wizard's
+/// focused-field marker.
+#[allow(dead_code)]
+pub fn focus_marker(focused: bool) -> Span<'static> {
+    if focused {
+        Span::styled("▶ ", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD))
+    } else {
+        Span::raw("  ")
+    }
+}
+
 /// The brand word `sshrack`, accented + bold. Uses [`BRAND`] so the literal
 /// lives in exactly one place.
 pub fn brand_span() -> Span<'static> {
@@ -71,5 +85,16 @@ mod tests {
     fn brand_span_reads_sshrack() {
         let span = brand_span();
         assert_eq!(span.content.as_ref(), "sshrack");
+    }
+
+    #[test]
+    fn focus_marker_is_accented_arrow_when_focused_else_two_spaces() {
+        let on = focus_marker(true);
+        let off = focus_marker(false);
+        assert_eq!(on.content.as_ref(), "▶ ");
+        assert_eq!(off.content.as_ref(), "  ");
+        // Both markers occupy the same number of cells, so a selected row's
+        // content starts at the same column as an unselected row's — no shift.
+        assert_eq!("▶ ".chars().count(), "  ".chars().count());
     }
 }
