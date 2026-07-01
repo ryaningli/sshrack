@@ -30,10 +30,13 @@ use ulid::Ulid;
 use super::ConnectRequest;
 use super::CredentialNames;
 use super::connect::connect_host;
+use super::dialog::draw_dialog;
 use super::help::draw_help;
 use super::launcher::Launcher;
 use super::prompt::TuiPassphrase;
+use super::shell::draw_shell;
 use super::store::StoreView;
+use super::tab::{Tab, TabKey, tab_key_decision};
 use super::wizard::{CredForm, HostForm};
 use sshrack_core::secret::PassphraseProvider;
 
@@ -131,6 +134,11 @@ impl Drop for TerminalGuard {
 /// in [`App::on_key`], so key logic stays unit-testable without a terminal.
 ///
 /// Later tasks grow this enum (EditHost, AddHost, AddCred, RemoveHost, ...).
+//
+// `dead_code`: the SwitchTo{Keyring,Vault,Plaintext} variants are constructed
+// by the Settings tab's store overlay (Task 8); until then they are unused in
+// the non-test build. Same pre-wired-TUI convention as theme.rs / tab.rs.
+#[allow(dead_code, clippy::large_enum_variant)]
 pub enum Outcome {
     /// User asked to quit; the loop returns `None` (no connect).
     Quit,
@@ -204,35 +212,50 @@ pub enum Outcome {
     ///
     /// [`host::delete_host_with_secret`]: sshrack_core::host::delete_host_with_secret
     DeleteHost,
-    /// Pure intent: the user pressed `F1` (or `?`) anywhere. `on_key` already
-    /// flipped the mode to [`Mode::Help`] (and stashed the prior mode so the
-    /// overlay dismisses back to it). The loop has nothing to do — the help
-    /// overlay is rendered from static text, and Esc/F1 dismiss it inside
-    /// `on_key`. This variant exists only so the loop can distinguish "a real
-    /// key was handled" (Continue) from "open the help overlay" for clarity.
-    OpenHelp,
+    /// Pure intent: switch the active tab (Tab / Shift-Tab / Ctrl-1/2/3).
+    /// `on_key` already set `active_tab`; the loop just re-renders.
+    SwitchTab(Tab),
+    /// Pure intent: open an overlay. `on_key` already stashed the overlay on
+    /// `App::overlay`; the loop just re-renders. The variant carries the overlay
+    /// so the loop can distinguish "a real overlay opened" from `Continue`.
+    OpenOverlay(Overlay),
+    /// Pure intent: close the current overlay (Esc / Ctrl-C inside one). The
+    /// loop clears `App::overlay` and surfaces a default status.
+    CloseOverlay,
 }
 
-/// Which view the TUI is showing. The launcher is the default; the host wizard
-/// is entered via `^a` (add) / `^e` (edit), and the credential wizard via `c`
-/// (add) / the in-TUI edit key, or directly via entry routing when the user
-/// runs `sshrack cred add|edit`. Keeping this on [`App`] (not the launcher)
-/// means the launcher's own state machine never has to know about non-launcher
-/// keys — routing happens here.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Mode {
-    /// The host launcher (query + ranked list + connect).
-    Launcher,
-    /// The host add/edit wizard.
-    HostWizard,
-    /// The credential add/edit wizard.
-    CredWizard,
-    /// The store-mode switch view (keyring / vault / plaintext).
-    Store,
-    /// The full-screen help overlay (`F1`). Dismissed by `F1`/`Esc` back to the
-    /// mode that was active when the overlay opened (stored in
-    /// [`App::help_prev_mode`]).
+/// An overlay layered on top of the shell. The shell keeps rendering behind it
+/// (no dark scrim — terminals cannot do translucency; [`draw_dialog`] clears
+/// the dialog area instead). At most one overlay is open at a time.
+///
+/// `Clone`: `on_key` `take()`s the overlay to route a key into it without a
+/// borrow conflict, then stashes it back unless the overlay signaled a
+/// terminal outcome (save / cancel). Carrying the wizard forms inside their
+/// variants keeps the form state alive across keystrokes without a separate
+/// `Option<HostForm>` field.
+//
+// `dead_code`: StorePicker/DeleteHost are constructed by the Settings tab
+// (Task 8) and the delete-confirm popup path respectively; until then they
+// are unused. `large_enum_variant`: the wizard variants carry full forms
+// while Help/StorePicker/DeleteHost are near-ZSTs — the enum is box-free by
+// intent (a single live overlay, cloned only on OpenOverlay). Both are the
+// pre-wired-TUI convention; revisit when Task 8 lands.
+#[allow(dead_code, clippy::large_enum_variant)]
+#[derive(Clone)]
+pub enum Overlay {
+    /// The Help keymap reference (F1). Static text — no carried state.
     Help,
+    /// Host add/edit wizard. The form lives inside the overlay so its state
+    /// survives across keystrokes.
+    HostWizard(HostForm),
+    /// Credential add/edit wizard.
+    CredWizard(CredForm),
+    /// Storage-mode picker (opened from Settings). Task 8 drives the cursor +
+    /// switch intents; for Task 6 Esc closes it.
+    StorePicker,
+    /// Delete-current-row confirm (driven via [`TuiPassphrase::confirm`] in the
+    /// loop). Carries no state: the host id lives on `App::pending_delete`.
+    DeleteHost,
 }
 
 /// The consolidated status-bar message: a transient one-liner the user reads as
@@ -274,13 +297,15 @@ impl Status {
     }
 }
 
-/// TUI application state. The launcher is the primary mode; the host wizard is
-/// the secondary. Later tasks grow [`Mode`] with store/help views.
+/// TUI application state. The shell (brand + tab bar + footer) is always on
+/// screen; [`App::active_tab`] selects which panel fills the middle band, and
+/// [`App::overlay`] layers a dialog (help / host wizard / cred wizard / store
+/// picker / delete confirm) on top when set.
 ///
-/// `App` owns the data (config, hosts, frecency, credential-name lookup)
-/// loaded once at startup from core, and the on-disk config path so the wizard
-/// save path can persist + reload without re-resolving. The [`Launcher`] /
-/// [`HostForm`] inside it own their respective view states. The config is kept
+/// `App` owns the data (config, frecency, credential-name lookup) loaded once
+/// at startup from core, and the on-disk config path so the wizard save path
+/// can persist + reload without re-resolving. The [`Launcher`] / [`HostForm`] /
+/// [`CredForm`] inside it own their respective view states. The config is kept
 /// here (not just its derived slices) because connect orchestration needs the
 /// credential table and vault meta, which live on the full [`SshrackConfig`].
 pub struct App {
@@ -300,31 +325,41 @@ pub struct App {
     /// Reverse lookup from a credential ULID to its display name, so the
     /// launcher can show `Auth::Ref` targets by name without re-scanning.
     credential_names: CredentialNames,
-    /// The interactive launcher (query + selection + ranked list).
-    launcher: Launcher,
-    /// The active view. Routes `on_key`/`draw` to the launcher or the wizard.
-    mode: Mode,
-    /// The host wizard, present only when [`Mode::HostWizard`] is active. Kept
-    /// on `App` (not created on demand each frame) so its state survives across
-    /// keystrokes.
-    wizard: Option<HostForm>,
-    /// The credential wizard, present only when [`Mode::CredWizard`] is active.
-    cred_wizard: Option<CredForm>,
-    /// The store-mode switch view, present only when [`Mode::Store`] is active.
+    /// The active shell tab. Drives which panel fills the middle band and
+    /// which footer hints show. Switched by Tab / Shift-Tab / Ctrl-1/2/3.
+    active_tab: Tab,
+    /// The overlay layered on top of the shell, if any. At most one at a time.
+    /// The wizard forms live inside their variants so their state survives
+    /// across keystrokes without separate `Option<…>` fields.
+    overlay: Option<Overlay>,
+    /// The interactive launcher (the Hosts panel: query + selection + ranked
+    /// list). Public so the existing tests can drive its state machine directly
+    /// and the loop can read `pending_connect`.
+    pub launcher: Launcher,
+    /// The credential panel. `None` until Task 7 fills it; the Credentials tab
+    /// renders a placeholder until then.
+    #[allow(dead_code)]
+    cred_panel: Option<CredPanel>,
+    /// The settings panel. `None` until Task 8 fills it; the Settings tab
+    /// renders a placeholder until then.
+    #[allow(dead_code)]
+    settings_panel: Option<SettingsPanel>,
+    /// The store-mode switch view, used by the Settings tab. Present only while
+    /// a [`Overlay::StorePicker`] flow or its Task 8 successor is active; kept
+    /// on `App` so its state survives across the loop's popup-driven switch.
     store_view: Option<StoreView>,
-    /// The consolidated status-bar message (Task 20). Every action sets it; the
-    /// footer rendered in [`App::draw`] shows it. Errors tint red. This is the
-    /// user's single feedback channel across all views.
+    /// The consolidated status-bar message. Every action sets it; the footer
+    /// rendered in [`App::draw`] shows it. Errors tint red. This is the user's
+    /// single feedback channel across all views.
     status: Status,
+    /// The pending-connect host id set by Enter on the launcher. The loop reads
+    /// (and clears) this to run connect orchestration. Mirrors `pending_delete`.
+    pending_connect: Option<Ulid>,
     /// Set by `on_key` when the user presses `^d` on a host. The event loop
     /// reads this (clearing it on cancel), drives the confirm popup, and runs
     /// the I/O-heavy delete. `on_key` does NO I/O, so this is the pure bridge
-    /// to the loop (mirrors `pending_connect`).
+    /// to the loop.
     pending_delete: Option<Ulid>,
-    /// The mode that was active when the help overlay opened, so `F1`/`Esc`
-    /// dismiss the overlay back to it. `None` means no overlay is open (the
-    /// current mode IS the real mode).
-    help_prev_mode: Option<Mode>,
 }
 
 impl App {
@@ -345,14 +380,15 @@ impl App {
             config_path,
             frecency,
             credential_names,
+            active_tab: Tab::Hosts,
+            overlay: None,
             launcher,
-            mode: Mode::Launcher,
-            wizard: None,
-            cred_wizard: None,
+            cred_panel: None,
+            settings_panel: None,
             store_view: None,
             status: Status::empty(),
+            pending_connect: None,
             pending_delete: None,
-            help_prev_mode: None,
         }
     }
 
@@ -380,21 +416,42 @@ impl App {
         &mut self.launcher
     }
 
-    /// The current view mode. Exposed for tests asserting mode routing.
+    /// The active shell tab. Exposed for tests asserting tab routing.
     #[allow(dead_code)]
-    pub fn mode(&self) -> &Mode {
-        &self.mode
+    pub fn active_tab(&self) -> Tab {
+        self.active_tab
     }
 
-    /// Borrow the active host wizard, if any. The loop uses this to read the
-    /// form fields when fulfilling a [`Outcome::SaveHost`] intent.
+    /// The current overlay, if any. Exposed for tests asserting overlay
+    /// routing (`matches!(app.overlay(), Some(Overlay::HostWizard(_)))`).
+    #[allow(dead_code)]
+    pub fn overlay(&self) -> Option<&Overlay> {
+        self.overlay.as_ref()
+    }
+
+    /// Borrow the active host wizard, if a [`Overlay::HostWizard`] is open. The
+    /// loop uses this to read the form fields when fulfilling a
+    /// [`Outcome::SaveHost`] intent.
     #[allow(dead_code)]
     pub fn wizard(&self) -> Option<&HostForm> {
-        self.wizard.as_ref()
+        match &self.overlay {
+            Some(Overlay::HostWizard(f)) => Some(f),
+            _ => None,
+        }
     }
 
-    /// Open the host wizard in add mode with a blank form. Discards any wizard
-    /// already open (there should be none when the launcher is showing).
+    /// Borrow the active cred wizard, if a [`Overlay::CredWizard`] is open.
+    #[allow(dead_code)]
+    pub fn cred_wizard(&self) -> Option<&CredForm> {
+        match &self.overlay {
+            Some(Overlay::CredWizard(f)) => Some(f),
+            _ => None,
+        }
+    }
+
+    /// Open the host wizard overlay in add mode with a blank form. Discards any
+    /// overlay already open (there should be none when the launcher is showing).
+    /// The form lives inside the [`Overlay::HostWizard`] variant.
     pub fn open_host_wizard_add(&mut self) {
         let names: Vec<String> = self
             .config
@@ -402,15 +459,15 @@ impl App {
             .iter()
             .map(|c| c.name.clone())
             .collect();
-        self.wizard = Some(HostForm::new_add(names));
-        self.mode = Mode::HostWizard;
+        self.overlay = Some(Overlay::HostWizard(HostForm::new_add(names)));
     }
 
-    /// Open the host wizard in edit mode, prefilled from the host with the
-    /// given id. No-op (returns false) when the id is not in the config. When
-    /// the host's auth is a credential reference, the referenced credential's
-    /// current name is resolved from the config so the chooser can prefill the
-    /// correct index (the wizard works in names; it cannot map id→name alone).
+    /// Open the host wizard overlay in edit mode, prefilled from the host with
+    /// the given id. No-op (returns false) when the id is not in the config.
+    /// When the host's auth is a credential reference, the referenced
+    /// credential's current name is resolved from the config so the chooser can
+    /// prefill the correct index (the wizard works in names; it cannot map
+    /// id→name alone).
     pub fn open_host_wizard_edit(&mut self, host_id: Ulid) -> bool {
         let Some(host) = self.config.find_host_by_id(&host_id).cloned() else {
             return false;
@@ -429,57 +486,60 @@ impl App {
                 .find_credential_by_id(&id)
                 .map(|c| c.name.clone())
         });
-        self.wizard = Some(HostForm::new_edit(
+        self.overlay = Some(Overlay::HostWizard(HostForm::new_edit(
             &host,
             names,
             referenced_credential_name.as_deref(),
-        ));
-        self.mode = Mode::HostWizard;
+        )));
         true
     }
 
-    /// Leave the wizard and return to the launcher, reloading the host ranking
-    /// so a freshly added/edited host shows up. Used by the loop after a save
-    /// or a cancel.
+    /// Leave the host wizard overlay and return to the launcher, reloading the
+    /// host ranking so a freshly added/edited host shows up. Used by the loop
+    /// after a save or a cancel.
     pub fn close_host_wizard(&mut self) {
-        self.wizard = None;
-        self.mode = Mode::Launcher;
+        self.overlay = None;
         // Re-rank so the launcher reflects the (possibly) updated host list.
         self.launcher.recompute(&self.config.hosts, &self.frecency);
     }
 
-    /// Open the credential wizard in add mode with a blank form. Discards any
-    /// cred wizard already open.
+    /// Open the credential wizard overlay in add mode with a blank form.
+    /// Discards any overlay already open.
     pub fn open_cred_wizard_add(&mut self) {
-        self.cred_wizard = Some(CredForm::new_add());
-        self.mode = Mode::CredWizard;
+        self.overlay = Some(Overlay::CredWizard(CredForm::new_add()));
     }
 
-    /// Open the credential wizard in edit mode, prefilled from the credential
-    /// with the given name. No-op (returns false) when the name is not in the
-    /// config.
+    /// Open the credential wizard overlay in edit mode, prefilled from the
+    /// credential with the given name. No-op (returns false) when the name is
+    /// not in the config.
     pub fn open_cred_wizard_edit(&mut self, name: &str) -> bool {
         let Some(cred) = self.config.find_credential_by_name(name).cloned() else {
             return false;
         };
-        self.cred_wizard = Some(CredForm::new_edit(&cred));
-        self.mode = Mode::CredWizard;
+        self.overlay = Some(Overlay::CredWizard(CredForm::new_edit(&cred)));
         true
     }
 
-    /// Leave the cred wizard and return to the launcher. Used by the loop after
-    /// a save or a cancel. The host ranking is unchanged (crediting does not
-    /// move hosts), but re-running `recompute` is cheap and keeps the launcher
-    /// in sync if a credential rename affected a host's display label.
+    /// Leave the cred wizard overlay and return to the launcher. Used by the
+    /// loop after a save or a cancel. The host ranking is unchanged (crediting
+    /// does not move hosts), but re-running `recompute` is cheap and keeps the
+    /// launcher in sync if a credential rename affected a host's display label.
     pub fn close_cred_wizard(&mut self) {
-        self.cred_wizard = None;
-        self.mode = Mode::Launcher;
+        self.overlay = None;
         self.launcher.recompute(&self.config.hosts, &self.frecency);
     }
 
-    /// Open the host wizard in edit mode, prefilled from the host named `name`.
-    /// No-op (returns false) when the name is not in the config. Used by the
-    /// entry-routing path (`host edit <name>` → TUI) where the host is
+    /// Close whatever overlay is open. The loop calls this after a save, a
+    /// cancel, or a switch intent resolved. Re-ranks the launcher so the
+    /// Hosts tab reflects any config change.
+    pub fn close_overlay(&mut self) {
+        self.overlay = None;
+        self.launcher.recompute(&self.config.hosts, &self.frecency);
+    }
+
+    /// Open the host wizard overlay in edit mode, prefilled from the host named
+    /// `name`. No-op (returns false) when the name is not in the config. Used by
+    /// the entry-routing path (`host edit <name>` → TUI) where the host is
     /// identified by name, not by the launcher cursor.
     pub fn open_host_wizard_edit_by_name(&mut self, name: &str) -> bool {
         let Some(host) = self.config.find_host_by_name(name).cloned() else {
@@ -492,6 +552,7 @@ impl App {
     /// The human-readable label for the currently active storage mode, or
     /// `"undecided"` when `cfg.store` is `None`. Used by the store view to mark
     /// the `(active)` row.
+    #[allow(dead_code)]
     fn current_store_mode_label(&self) -> &'static str {
         use sshrack_core::config::schema::SecretStore;
         match &self.config.store {
@@ -503,18 +564,17 @@ impl App {
     }
 
     /// Open the store-mode switch view, snapshotting the active mode for the
-    /// `(active)` marker. Bound to `F2` in the launcher.
+    /// `(active)` marker. Used by the Settings tab (Task 8) and the legacy
+    /// store-pick recovery path.
+    #[allow(dead_code)]
     pub fn open_store_view(&mut self) {
         self.store_view = Some(StoreView::new(Some(self.current_store_mode_label())));
-        self.mode = Mode::Store;
     }
 
-    /// Leave the store view and return to the launcher. The host ranking is
-    /// unaffected by a mode switch, but re-running `recompute` is cheap and
-    /// keeps the launcher in sync.
+    /// Leave the store view. The host ranking is unaffected by a mode switch,
+    /// but re-running `recompute` is cheap and keeps the launcher in sync.
     pub fn close_store_view(&mut self) {
         self.store_view = None;
-        self.mode = Mode::Launcher;
         self.launcher.recompute(&self.config.hosts, &self.frecency);
     }
 
@@ -532,7 +592,7 @@ impl App {
                 edit_name: Some(name),
             } => {
                 if !self.open_host_wizard_edit_by_name(&name) {
-                    self.launcher.status = Some(format!("host '{name}' not found"));
+                    self.status = Status::error(format!("host '{name}' not found"));
                 }
             }
             super::EntryMode::CredWizard { edit_name: None } => self.open_cred_wizard_add(),
@@ -540,7 +600,7 @@ impl App {
                 edit_name: Some(name),
             } => {
                 if !self.open_cred_wizard_edit(&name) {
-                    self.launcher.status = Some(format!("credential '{name}' not found"));
+                    self.status = Status::error(format!("credential '{name}' not found"));
                 }
             }
         }
@@ -577,25 +637,6 @@ impl App {
         &self.status
     }
 
-    /// Open the help overlay, stashing the current mode so `Esc`/`F1` dismiss
-    /// back to it. No-op when already in [`Mode::Help`] (a second `F1` should
-    /// dismiss, not stack).
-    pub fn open_help(&mut self) {
-        if self.mode == Mode::Help {
-            return;
-        }
-        self.help_prev_mode = Some(self.mode.clone());
-        self.mode = Mode::Help;
-    }
-
-    /// Close the help overlay and restore the mode that was active when it
-    /// opened. Defensive: if no prior mode was recorded, fall back to the
-    /// launcher (the overlay must never strand the user).
-    pub fn close_help(&mut self) {
-        let prev = self.help_prev_mode.take().unwrap_or(Mode::Launcher);
-        self.mode = prev;
-    }
-
     /// The pending-delete host id set by `^d` on the launcher. The loop reads
     /// (and clears) this to drive the delete confirm popup. Exposed for tests
     /// that drive the delete intent directly.
@@ -608,234 +649,389 @@ impl App {
     /// I/O — no reads, no writes, no terminal access — so it is safe to call
     /// from a unit test without an event source.
     ///
-    /// Routes the key by [`Mode`]:
-    /// - Launcher → the launcher's `on_key`. `^a`/`^e` open the wizard (pure:
-    ///   they only flip mode + build the form, no persist). Quit sets
-    ///   `should_quit`.
-    /// - HostWizard → the wizard's `on_key`. `SaveHost`/`Cancel` are returned
-    ///   to the loop, which does the persist + reload.
+    /// Three layers, evaluated in order:
+    /// 1. **Global** — `Ctrl-C` quits, `F1` toggles the Help overlay. These win
+    ///    over everything (so the user can always quit / read help, even
+    ///    mid-wizard).
+    /// 2. **Overlay** — when an overlay is open it owns the key. Help dismisses
+    ///    on `F1`/`Esc`/`q`; a wizard's `on_key` returns `SaveHost`/`SaveCred`/
+    ///    `Cancel`/`Continue`; StorePicker/DeleteHost close on `Esc`.
+    /// 3. **Panel/tab** — when no overlay is open: `tab_key_decision` switches
+    ///    tabs (Tab / Shift-Tab / Ctrl-1/2/3), then `Ctrl-A/E/D` + `Enter` +
+    ///    `Esc`, then the active panel consumes printable chars / arrows. For
+    ///    Task 6 only the Hosts branch is real; Credentials/Settings render a
+    ///    placeholder and their `Ctrl-A/E`/`Enter` are no-ops until Tasks 7–8.
     pub fn on_key(&mut self, key: KeyEvent) -> Outcome {
-        // Global F1 opens the help overlay from anywhere — even mid-wizard —
-        // so the user never has to back out to read a binding. This runs before
-        // the per-mode match so it wins over a mode-local binding. Pressing F1
-        // while already in Help is handled by the Help arm below (it dismisses).
-        //
-        // `?` is also a help shortcut, but ONLY on the launcher: inside a
-        // wizard/store text field, `?` is a printable char the user is typing
-        // (Task 16/17), so it must fall through to the mode's `on_key`. F1 is
-        // the always-global help trigger.
-        if key.kind == crossterm::event::KeyEventKind::Press
-            && key.modifiers.is_empty()
-            && self.mode != Mode::Help
-            && (key.code == crossterm::event::KeyCode::F(1)
-                || (self.mode == Mode::Launcher
-                    && key.code == crossterm::event::KeyCode::Char('?')))
+        use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+
+        // Layer 1 — global keys (work with or without an overlay).
+        // Ctrl-C must be EXACTLY Control+c — `contains` would wrongly treat
+        // Ctrl-Shift-C (terminal paste) as quit. Same invariant the launcher
+        // held before the rewrite.
+        if key.kind == KeyEventKind::Press
+            && key.modifiers == KeyModifiers::CONTROL
+            && key.code == KeyCode::Char('c')
         {
-            self.open_help();
-            return Outcome::OpenHelp;
+            self.should_quit = true;
+            return Outcome::Quit;
+        }
+        if key.kind == KeyEventKind::Press && key.modifiers.is_empty() && key.code == KeyCode::F(1)
+        {
+            // Toggle help: open if none, close if Help is already up.
+            if matches!(self.overlay, Some(Overlay::Help)) {
+                self.overlay = None;
+                return Outcome::CloseOverlay;
+            }
+            self.overlay = Some(Overlay::Help);
+            return Outcome::OpenOverlay(Overlay::Help);
         }
 
-        match self.mode {
-            Mode::Launcher => {
-                // Intercept ^a / ^e before the launcher so they open the wizard
-                // (the launcher used to set a "not yet implemented" status for
-                // them; that is now handled by mode routing).
-                if key.kind == crossterm::event::KeyEventKind::Press {
-                    let ctrl = key
-                        .modifiers
-                        .contains(crossterm::event::KeyModifiers::CONTROL);
-                    if ctrl && key.code == crossterm::event::KeyCode::Char('a') {
-                        self.open_host_wizard_add();
-                        return Outcome::Continue;
-                    }
-                    if ctrl && key.code == crossterm::event::KeyCode::Char('e') {
-                        // Edit uses the host currently under the launcher cursor.
-                        if let Some(h) = self.launcher.selected_host(&self.config.hosts) {
-                            let id = h.id;
-                            self.open_host_wizard_edit(id);
-                        } else {
-                            self.launcher.status = Some("no host selected to edit".into());
-                        }
-                        return Outcome::Continue;
-                    }
-                    // `c` opens the credential add wizard; `C` (Shift-C) opens
-                    // the credential edit wizard for the credential referenced
-                    // by the host under the launcher cursor (intuitive entry:
-                    // the host you are looking at uses that credential). A host
-                    // without a credential reference sets a status hint.
-                    if !ctrl
-                        && key.code == crossterm::event::KeyCode::Char('c')
-                        && key.modifiers.is_empty()
-                    {
-                        self.open_cred_wizard_add();
-                        return Outcome::Continue;
-                    }
-                    if key.modifiers == crossterm::event::KeyModifiers::SHIFT
-                        && key.code == crossterm::event::KeyCode::Char('C')
-                    {
-                        match self
-                            .launcher
-                            .selected_host(&self.config.hosts)
-                            .and_then(|h| h.auth.credential_id())
-                            .and_then(|id| {
-                                self.config
-                                    .find_credential_by_id(&id)
-                                    .map(|c| c.name.clone())
-                            }) {
-                            Some(name) => {
-                                self.open_cred_wizard_edit(&name);
-                            }
-                            None => {
-                                self.launcher.status =
-                                    Some("selected host has no credential to edit".into());
-                            }
-                        }
-                        return Outcome::Continue;
-                    }
-                    // F2 opens the store-mode switch view (keyring / vault /
-                    // plaintext). Pure: only flips the mode + builds the view.
-                    if key.modifiers.is_empty() && key.code == crossterm::event::KeyCode::F(2) {
-                        self.open_store_view();
-                        return Outcome::Continue;
-                    }
-                    // `^d` on the selected host → delete intent. Pure: sets
-                    // pending_delete and returns DeleteHost; the loop drives the
-                    // confirm popup + core delete. No host under the cursor →
-                    // status hint.
-                    if ctrl && key.code == crossterm::event::KeyCode::Char('d') {
-                        match self.launcher.selected_host(&self.config.hosts) {
-                            Some(h) => {
-                                let id = h.id;
-                                self.pending_delete = Some(id);
-                                return Outcome::DeleteHost;
-                            }
-                            None => {
-                                self.launcher.status = Some("no host selected to delete".into());
-                            }
-                        }
-                        return Outcome::Continue;
-                    }
-                }
-                let outcome = self
-                    .launcher
-                    .on_key(key, &self.config.hosts, &self.frecency);
-                if matches!(outcome, Outcome::Quit) {
-                    self.should_quit = true;
-                }
-                outcome
-            }
-            Mode::HostWizard => {
-                let outcome = match self.wizard.as_mut() {
-                    Some(w) => w.on_key(key),
-                    None => Outcome::Continue,
-                };
-                // The loop also treats Cancel like a return-to-launcher.
-                outcome
-            }
-            Mode::CredWizard => match self.cred_wizard.as_mut() {
-                Some(w) => w.on_key(key),
-                None => Outcome::Continue,
-            },
-            Mode::Store => match self.store_view.as_mut() {
-                Some(v) => v.on_key(key),
-                None => Outcome::Continue,
-            },
-            Mode::Help => {
-                // The help overlay dismisses on F1 (toggle), Esc, or `q`.
-                // Release/Repeat events are ignored (only Press acts).
-                if key.kind == crossterm::event::KeyEventKind::Press
-                    && key.modifiers.is_empty()
-                    && matches!(
-                        key.code,
-                        crossterm::event::KeyCode::F(1)
-                            | crossterm::event::KeyCode::Esc
-                            | crossterm::event::KeyCode::Char('q')
-                    )
+        // Layer 2 — an open overlay owns the key. take() it so we can borrow
+        // `self` mutably inside route_overlay without a borrow conflict, then
+        // route_overlay stashes it back unless the outcome is terminal.
+        if let Some(ov) = self.overlay.take() {
+            return self.route_overlay(key, ov);
+        }
+
+        // Layer 3 — panel/tab layer (no overlay).
+        self.route_panel(key)
+    }
+
+    /// Layer 2: route a key into the active overlay. The overlay was `take()`n
+    /// by [`on_key`]; this stashes it back unless the outcome is terminal
+    /// (`Cancel`/`CloseOverlay`), so the form state survives across keystrokes.
+    fn route_overlay(&mut self, key: KeyEvent, ov: Overlay) -> Outcome {
+        use crossterm::event::{KeyCode, KeyEventKind};
+        match ov {
+            Overlay::Help => {
+                if key.kind == KeyEventKind::Press
+                    && matches!(key.code, KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('q'))
                 {
-                    self.close_help();
+                    return Outcome::CloseOverlay;
                 }
+                self.overlay = Some(Overlay::Help);
+                Outcome::Continue
+            }
+            Overlay::HostWizard(mut form) => {
+                let out = form.on_key(key);
+                // SaveHost/Continue need the form stashed back so the loop can
+                // read it (on save) or the user can keep editing (on continue).
+                // Cancel/CloseOverlay are terminal — drop the form.
+                let terminal = matches!(out, Outcome::Cancel | Outcome::CloseOverlay);
+                if !terminal {
+                    self.overlay = Some(Overlay::HostWizard(form));
+                }
+                out
+            }
+            Overlay::CredWizard(mut form) => {
+                let out = form.on_key(key);
+                let terminal = matches!(out, Outcome::Cancel | Outcome::CloseOverlay);
+                if !terminal {
+                    self.overlay = Some(Overlay::CredWizard(form));
+                }
+                out
+            }
+            Overlay::StorePicker => {
+                if key.kind == KeyEventKind::Press && key.code == KeyCode::Esc {
+                    return Outcome::CloseOverlay;
+                }
+                self.overlay = Some(Overlay::StorePicker);
+                Outcome::Continue
+            }
+            Overlay::DeleteHost => {
+                if key.kind == KeyEventKind::Press && key.code == KeyCode::Esc {
+                    return Outcome::CloseOverlay;
+                }
+                self.overlay = Some(Overlay::DeleteHost);
                 Outcome::Continue
             }
         }
     }
 
+    /// Layer 3: route a key to the active panel/tab. No overlay is open when
+    /// this runs (the caller checked). Tab switching is decided first so a
+    /// `Tab`/`Ctrl-1/2/3` never reaches a panel's search box.
+    fn route_panel(&mut self, key: KeyEvent) -> Outcome {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        if key.kind != crossterm::event::KeyEventKind::Press {
+            return Outcome::Continue;
+        }
+
+        // Tab switching first (Tab / BackTab / Ctrl-1/2/3).
+        match tab_key_decision(key) {
+            TabKey::To(t) => {
+                self.active_tab = t;
+                return Outcome::SwitchTab(t);
+            }
+            TabKey::Cycle(d) => {
+                let new = if d > 0 {
+                    self.active_tab.next()
+                } else {
+                    self.active_tab.prev()
+                };
+                self.active_tab = new;
+                return Outcome::SwitchTab(new);
+            }
+            TabKey::None => {}
+        }
+
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+        // Ctrl-A/E/D act on the current tab's selected row.
+        if ctrl && key.code == KeyCode::Char('a') {
+            return self.open_add_overlay();
+        }
+        if ctrl && key.code == KeyCode::Char('e') {
+            return self.open_edit_overlay();
+        }
+        if ctrl && key.code == KeyCode::Char('d') {
+            return self.begin_delete();
+        }
+        // Esc: clear the active panel's query, or (if empty) quit.
+        if key.code == KeyCode::Esc && key.modifiers.is_empty() {
+            if self.active_panel_query().is_empty() {
+                self.should_quit = true;
+                return Outcome::Quit;
+            }
+            self.clear_active_panel_query();
+            return Outcome::Continue;
+        }
+        // Enter: tab-specific primary action.
+        if key.code == KeyCode::Enter && key.modifiers.is_empty() {
+            return self.primary_action();
+        }
+        // Otherwise the active panel consumes it (printable chars → query,
+        // arrows → move).
+        self.route_active_panel_key(key)
+    }
+
+    /// Open the add overlay for the active tab. Hosts opens the host wizard;
+    /// Credentials/Settings are Task 7/8.
+    fn open_add_overlay(&mut self) -> Outcome {
+        match self.active_tab {
+            Tab::Hosts => {
+                let names: Vec<String> = self
+                    .config
+                    .credentials
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .collect();
+                let ov = Overlay::HostWizard(HostForm::new_add(names));
+                self.overlay = Some(ov.clone());
+                Outcome::OpenOverlay(ov)
+            }
+            Tab::Credentials | Tab::Settings => Outcome::Continue,
+        }
+    }
+
+    /// Open the edit overlay for the active tab, prefilled from the selected
+    /// row. Hosts edits the host under the launcher cursor; Credentials/Settings
+    /// are Task 7/8.
+    fn open_edit_overlay(&mut self) -> Outcome {
+        match self.active_tab {
+            Tab::Hosts => {
+                if let Some(h) = self.launcher.selected_host(&self.config.hosts) {
+                    let id = h.id;
+                    self.open_host_wizard_edit(id);
+                    // open_host_wizard_edit set self.overlay; mirror it into the
+                    // returned outcome (it is Some when the edit succeeded).
+                    match self.overlay.clone() {
+                        Some(ov) => Outcome::OpenOverlay(ov),
+                        None => Outcome::Continue,
+                    }
+                } else {
+                    self.status = Status::error("no host selected to edit".to_string());
+                    Outcome::Continue
+                }
+            }
+            Tab::Credentials | Tab::Settings => Outcome::Continue,
+        }
+    }
+
+    /// Begin a delete on the selected row. Hosts sets `pending_delete` and
+    /// returns [`Outcome::DeleteHost`] (the loop drives the confirm popup);
+    /// Credentials/Settings are Task 7/8.
+    fn begin_delete(&mut self) -> Outcome {
+        match self.active_tab {
+            Tab::Hosts => match self.launcher.selected_host(&self.config.hosts) {
+                Some(h) => {
+                    self.pending_delete = Some(h.id);
+                    Outcome::DeleteHost
+                }
+                None => {
+                    self.status = Status::error("no host selected to delete".to_string());
+                    Outcome::Continue
+                }
+            },
+            Tab::Credentials | Tab::Settings => Outcome::Continue,
+        }
+    }
+
+    /// The tab-specific primary action on Enter. Hosts delegates to the
+    /// launcher's `on_key` (which sets `pending_connect` and returns
+    /// `ConnectRequested`); Credentials/Settings are Task 7/8.
+    fn primary_action(&mut self) -> Outcome {
+        match self.active_tab {
+            Tab::Hosts => {
+                let out = self
+                    .launcher
+                    .on_key(enter_press(), &self.config.hosts, &self.frecency);
+                self.pending_connect = self.launcher.pending_connect;
+                out
+            }
+            Tab::Credentials | Tab::Settings => Outcome::Continue,
+        }
+    }
+
+    /// Forward a panel-level key to the active panel. Hosts → the launcher's
+    /// `on_key` (query/selection); Credentials/Settings consume nothing yet.
+    fn route_active_panel_key(&mut self, key: KeyEvent) -> Outcome {
+        match self.active_tab {
+            Tab::Hosts => {
+                let out = self
+                    .launcher
+                    .on_key(key, &self.config.hosts, &self.frecency);
+                if matches!(out, Outcome::Quit) {
+                    self.should_quit = true;
+                }
+                out
+            }
+            Tab::Credentials | Tab::Settings => Outcome::Continue,
+        }
+    }
+
+    /// The active panel's query string (for Esc-clears-query). Hosts → the
+    /// launcher query; the placeholder tabs have an empty "query".
+    fn active_panel_query(&self) -> &str {
+        match self.active_tab {
+            Tab::Hosts => &self.launcher.query,
+            Tab::Credentials | Tab::Settings => "",
+        }
+    }
+
+    /// Clear the active panel's query (Esc on a non-empty query). Hosts clears
+    /// the launcher query and re-ranks.
+    fn clear_active_panel_query(&mut self) {
+        match self.active_tab {
+            Tab::Hosts => {
+                self.launcher.query.clear();
+                self.launcher.recompute(&self.config.hosts, &self.frecency);
+            }
+            Tab::Credentials | Tab::Settings => {}
+        }
+    }
+
     /// Render current state to the frame. Only writes to the frame (no stdout
-    /// access of its own). Routes by [`Mode`] to the active view's render, and
-    /// overlays the help overlay on top when active. The launcher already owns
-    /// its own status line (which doubles as the footer in launcher mode); the
-    /// other views leave the bottom row to the consolidated status footer.
+    /// access of its own). Draws the three-band shell, the active panel into the
+    /// middle band, and the overlay (if any) on top.
     pub fn draw(&self, frame: &mut Frame) {
         let area = frame.area();
-        match self.mode {
-            Mode::Launcher => {
-                // The launcher renders its own query/list/status layout; its
-                // status line is the consolidated footer in this mode (it shows
-                // `self.status` when set, else the default key-binding hint).
-                self.launcher.draw_with_status(
+        let footer = self.footer_hints();
+        let panel_area = draw_shell(frame, area, self.active_tab, &footer);
+        match self.active_tab {
+            Tab::Hosts => self.launcher.draw_in_shell(
+                frame,
+                panel_area,
+                &self.config.hosts,
+                &self.frecency,
+                &self.credential_names,
+                &self.status,
+            ),
+            Tab::Credentials => self.draw_placeholder(frame, panel_area, "Credentials"),
+            Tab::Settings => self.draw_placeholder(frame, panel_area, "Settings"),
+        }
+        if let Some(ov) = &self.overlay {
+            self.draw_overlay(frame, ov);
+        }
+    }
+
+    /// The footer hint pairs for the active surface. Overlays show their own
+    /// field/save/cancel hints; the panel footer reflects the active tab's
+    /// bindings.
+    fn footer_hints(&self) -> Vec<(&'static str, &'static str)> {
+        if self.overlay.is_some() {
+            return vec![("Tab", "field"), ("^S", "save"), ("Esc", "cancel")];
+        }
+        match self.active_tab {
+            Tab::Hosts => vec![
+                ("Enter", "connect"),
+                ("^A", "add"),
+                ("^E", "edit"),
+                ("^D", "delete"),
+                ("F1", "help"),
+            ],
+            Tab::Credentials => vec![
+                ("Enter", "edit"),
+                ("^A", "add"),
+                ("^E", "edit"),
+                ("^D", "delete"),
+                ("F1", "help"),
+            ],
+            Tab::Settings => vec![("Enter", "edit"), ("F1", "help")],
+        }
+    }
+
+    /// Render the active overlay on top of the shell. Wizards draw their field
+    /// rows into the body rect [`draw_dialog`] hands them; Help is the static
+    /// keymap reference; StorePicker/DeleteHost render an empty dialog for now
+    /// (Task 8 / the loop's popup path fill them).
+    fn draw_overlay(&self, frame: &mut Frame, ov: &Overlay) {
+        match ov {
+            Overlay::Help => draw_help(frame, frame.area()),
+            Overlay::HostWizard(form) => {
+                let body = draw_dialog(
                     frame,
-                    area,
-                    &self.config.hosts,
-                    &self.frecency,
-                    &self.credential_names,
-                    &self.status,
+                    &form.title(),
+                    0,
+                    &[("Tab", "field"), ("^S", "save"), ("Esc", "cancel")],
                 );
+                form.draw_in_dialog(frame, body);
             }
-            Mode::HostWizard => {
-                if let Some(w) = &self.wizard {
-                    w.draw(frame, area);
-                }
-                Self::draw_status_footer(frame, area, &self.status);
+            Overlay::CredWizard(form) => {
+                let body = draw_dialog(
+                    frame,
+                    &form.title(),
+                    0,
+                    &[("Tab", "field"), ("^S", "save"), ("Esc", "cancel")],
+                );
+                form.draw_in_dialog(frame, body);
             }
-            Mode::CredWizard => {
-                if let Some(w) = &self.cred_wizard {
-                    w.draw(frame, area);
-                }
-                Self::draw_status_footer(frame, area, &self.status);
-            }
-            Mode::Store => {
-                if let Some(v) = &self.store_view {
-                    v.draw(frame, area);
-                }
-                Self::draw_status_footer(frame, area, &self.status);
-            }
-            Mode::Help => {
-                // The help overlay covers the whole frame; no footer (the
-                // overlay itself shows its dismiss hint).
-                draw_help(frame, area);
+            Overlay::StorePicker | Overlay::DeleteHost => {
+                let _ = draw_dialog(frame, "…", 0, &[("Esc", "cancel")]);
             }
         }
     }
 
-    /// Render the consolidated status footer in the bottom row of `area`. Errors
-    /// are tinted red; informational notices render normal; `None` shows the
-    /// default key-binding hint. Only called for the non-launcher views — the
-    /// launcher integrates the status into its own bottom line.
-    fn draw_status_footer(frame: &mut Frame, area: ratatui::layout::Rect, status: &Status) {
-        let [_, footer] = ratatui::layout::Layout::vertical([
-            ratatui::layout::Constraint::Fill(1),
-            ratatui::layout::Constraint::Length(1),
-        ])
-        .areas(area);
-        let line = match &status.message {
-            Some(msg) => {
-                let style = if status.is_error {
-                    ratatui::style::Style::new().fg(ratatui::style::Color::Red)
-                } else {
-                    ratatui::style::Style::new()
-                };
-                ratatui::text::Line::from(vec![
-                    ratatui::text::Span::styled("status: ", ratatui::style::Style::new().dim()),
-                    ratatui::text::Span::styled(msg.clone(), style),
-                ])
-            }
-            None => ratatui::text::Line::from(
-                "F1 help  ·  Esc back/cancel  ·  (the active view's keys are live)",
-            )
-            .style(ratatui::style::Style::new().dim()),
-        };
-        frame.render_widget(ratatui::widgets::Paragraph::new(line), footer);
+    /// Render a centered dim "coming soon" placeholder for the not-yet-built
+    /// Credentials/Settings tabs. Tasks 7/8 replace this.
+    fn draw_placeholder(&self, frame: &mut Frame, area: ratatui::layout::Rect, name: &str) {
+        let line = ratatui::text::Line::from(ratatui::text::Span::styled(
+            format!("{name} tab — coming soon"),
+            ratatui::style::Style::new().dim(),
+        ));
+        frame.render_widget(
+            ratatui::widgets::Paragraph::new(line).alignment(ratatui::layout::Alignment::Center),
+            area,
+        );
     }
 }
+
+/// A synthetic `Enter` Press event, used by [`App::primary_action`] to drive
+/// the launcher's `on_key` (which already owns the Enter→`pending_connect`→
+/// `ConnectRequested` logic) without re-implementing it.
+fn enter_press() -> KeyEvent {
+    use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+    KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Press)
+}
+
+// Placeholder panels for the Credentials/Settings tabs. Task 7 (cred_panel.rs)
+// and Task 8 (settings.rs) replace these with real modules; until then the tabs
+// render the "coming soon" placeholder and their key bindings are no-ops.
+/// Placeholder until Task 7 (cred_panel.rs) replaces it.
+pub struct CredPanel;
+/// Placeholder until Task 8 (settings.rs) replaces it.
+pub struct SettingsPanel;
 
 /// Blocking event loop. Renders `app`, polls crossterm for key events, and
 /// dispatches each key through [`App::on_key`]. Returns `Some(req)` when the
@@ -929,7 +1125,9 @@ pub fn run_loop(
                 Outcome::SaveHost => {
                     // The wizard signaled save after its pure validate() passed.
                     // Persist: build the host, resolve the credential name→id,
-                    // add or apply-patch, write config, reload, close the wizard.
+                    // add or apply-patch, write config, reload, close the wizard
+                    // overlay. on_key's route_overlay stashed the form back on
+                    // SaveHost (non-terminal), so the overlay is still open here.
                     match persist_host_save(app) {
                         Ok(()) => {
                             app.set_status("host saved".to_string());
@@ -938,9 +1136,9 @@ pub fn run_loop(
                         Err(e) => {
                             // Persist failed (duplicate name, write error,
                             // dangling credential). Surface in the wizard's
-                            // core-error line and stay in the wizard so the
+                            // core-error line and stay in the overlay so the
                             // user can fix it.
-                            if let Some(w) = app.wizard.as_mut() {
+                            if let Some(Overlay::HostWizard(w)) = app.overlay.as_mut() {
                                 w.set_core_error(e.to_string());
                             }
                         }
@@ -953,20 +1151,28 @@ pub fn run_loop(
                     fulfill_save_cred(app, &handle);
                 }
                 Outcome::Cancel => {
-                    // A view's Esc / Ctrl-C: discard the active view and return
-                    // to the launcher. Which view to close depends on mode.
+                    // A wizard's Esc / Ctrl-C: on_key's route_overlay already
+                    // dropped the form (terminal outcome) and left the overlay
+                    // clear. Surface a status and re-rank the launcher so the
+                    // Hosts tab reflects any state.
                     app.set_status("cancelled".to_string());
-                    match app.mode {
-                        Mode::HostWizard => app.close_host_wizard(),
-                        Mode::CredWizard => app.close_cred_wizard(),
-                        Mode::Store => app.close_store_view(),
-                        _ => {}
-                    }
+                    app.close_overlay();
+                }
+                Outcome::CloseOverlay => {
+                    // Esc / Ctrl-C inside a non-wizard overlay (Help /
+                    // StorePicker / DeleteHost). on_key already cleared it; just
+                    // surface a status.
+                    app.set_status("cancelled".to_string());
+                }
+                Outcome::SwitchTab(_) | Outcome::OpenOverlay(_) | Outcome::Continue => {
+                    // Pure state changes already applied inside on_key; the next
+                    // draw reflects them. Nothing for the loop to do.
                 }
                 Outcome::SwitchToKeyring => {
                     match persist_store_switch(app, StoreSwitchTarget::Keyring, &handle) {
                         Ok(true) => {
                             app.close_store_view();
+                            app.overlay = None;
                             app.set_status("switched to keyring mode".to_string());
                         }
                         Ok(false) => {
@@ -991,6 +1197,7 @@ pub fn run_loop(
                     match persist_store_switch(app, StoreSwitchTarget::Vault, &handle) {
                         Ok(true) => {
                             app.close_store_view();
+                            app.overlay = None;
                             app.set_status("switched to vault mode".to_string());
                         }
                         Ok(false) => {}
@@ -1011,6 +1218,7 @@ pub fn run_loop(
                     match persist_store_switch(app, StoreSwitchTarget::Plaintext, &handle) {
                         Ok(true) => {
                             app.close_store_view();
+                            app.overlay = None;
                             app.set_status("switched to plaintext mode".to_string());
                         }
                         Ok(false) => {}
@@ -1049,6 +1257,7 @@ pub fn run_loop(
                     match provider.confirm(&prompt) {
                         Ok(true) => match persist_host_delete(app, &name) {
                             Ok(()) => {
+                                app.overlay = None;
                                 app.set_status(format!("removed '{name}'"));
                             }
                             Err(e) => {
@@ -1056,9 +1265,11 @@ pub fn run_loop(
                             }
                         },
                         Ok(false) => {
+                            app.overlay = None;
                             app.set_status("delete cancelled".to_string());
                         }
                         Err(SshrackError::Interrupted) => {
+                            app.overlay = None;
                             app.set_status("delete cancelled".to_string());
                         }
                         Err(e) => {
@@ -1066,12 +1277,6 @@ pub fn run_loop(
                         }
                     }
                 }
-                Outcome::OpenHelp => {
-                    // on_key already flipped the mode to Help. Nothing for the
-                    // loop to do here; the help overlay renders from static text
-                    // and dismisses inside on_key (Esc/F1/q).
-                }
-                Outcome::Continue => {}
             }
         }
 
@@ -1092,11 +1297,11 @@ pub fn run_loop(
 /// Credential auth choice, the referenced credential name is resolved to its
 /// stable [`Ulid`] here (the wizard only ever holds the name).
 fn persist_host_save(app: &mut App) -> Result<(), SshrackError> {
-    // Take the form out of the app so we can borrow `app.config` for the
-    // credential-name → id resolution without a borrow conflict. Put it back
-    // (cleared of core_error) on the error paths so the loop's error handler
-    // can still see it.
-    let Some(form) = app.wizard.clone() else {
+    // Take the form out of the overlay so we can borrow `app.config` for the
+    // credential-name → id resolution without a borrow conflict. The form lives
+    // inside `Overlay::HostWizard`; clone it out (the overlay keeps its copy so
+    // an error-path set_core_error still reaches the user).
+    let Some(Overlay::HostWizard(form)) = app.overlay.clone() else {
         return Ok(());
     };
 
@@ -1215,8 +1420,11 @@ fn persist_host_delete(app: &mut App, name: &str) -> Result<(), SshrackError> {
 ///
 /// [`connect_host`]: super::connect::connect_host
 fn persist_cred_save(app: &mut App, handle: &TerminalHandle) -> Result<(), SshrackError> {
-    // Take the form out so we can borrow app.config/launcher without a conflict.
-    let Some(form) = app.cred_wizard.clone() else {
+    // Take the form out of the overlay so we can borrow app.config/launcher
+    // without a conflict. The form lives inside `Overlay::CredWizard`; clone it
+    // out (the overlay keeps its copy so an error-path set_core_error reaches
+    // the user).
+    let Some(Overlay::CredWizard(form)) = app.overlay.clone() else {
         return Ok(());
     };
 
@@ -1342,7 +1550,7 @@ fn recover_store_mode_and_retry_cred_save(
     let pick = super::prompt::prompt_store_pick(handle)?;
     let Some(target) = pick.map(map_store_pick) else {
         // User cancelled the popup. Stay in the wizard with a clear reason.
-        if let Some(w) = app.cred_wizard.as_mut() {
+        if let Some(Overlay::CredWizard(w)) = app.overlay.as_mut() {
             w.set_core_error("store selection cancelled".into());
         }
         return Ok(false);
@@ -1355,10 +1563,10 @@ fn recover_store_mode_and_retry_cred_save(
         }
         false => {
             // Switch refused (keyring daemon down, plaintext declined, ...).
-            if let Some(w) = app.cred_wizard.as_mut() {
+            if let Some(Overlay::CredWizard(w)) = app.overlay.as_mut() {
                 w.set_core_error(
                     "could not switch store mode (unavailable or declined); \
-                     try Shift-C / F2 in the launcher"
+                     switch via the Settings tab"
                         .into(),
                 );
             }
@@ -1385,24 +1593,24 @@ fn fulfill_save_cred(app: &mut App, handle: &TerminalHandle) {
                 }
                 Ok(false) => {} // cancelled or switch refused; reason already in core-error.
                 Err(SshrackError::Interrupted) => {
-                    if let Some(w) = app.cred_wizard.as_mut() {
+                    if let Some(Overlay::CredWizard(w)) = app.overlay.as_mut() {
                         w.set_core_error("cancelled".into());
                     }
                 }
                 Err(e) => {
-                    if let Some(w) = app.cred_wizard.as_mut() {
+                    if let Some(Overlay::CredWizard(w)) = app.overlay.as_mut() {
                         w.set_core_error(e.to_string());
                     }
                 }
             }
         }
         Err(SshrackError::Interrupted) => {
-            if let Some(w) = app.cred_wizard.as_mut() {
+            if let Some(Overlay::CredWizard(w)) = app.overlay.as_mut() {
                 w.set_core_error("vault unlock cancelled".into());
             }
         }
         Err(e) => {
-            if let Some(w) = app.cred_wizard.as_mut() {
+            if let Some(Overlay::CredWizard(w)) = app.overlay.as_mut() {
                 w.set_core_error(e.to_string());
             }
         }
@@ -1663,7 +1871,9 @@ mod tests {
     #[test]
     fn bare_ctrl_c_modifier_combo_only() {
         // Ctrl-Shift-C or Ctrl-Alt-C are NOT quit bindings — only plain Ctrl-C.
-        // (Terminal paste, e.g. Ctrl-Shift-C, must not accidentally quit.)
+        // (Terminal paste, e.g. Ctrl-Shift-C, must not accidentally quit.) The
+        // global key check requires `modifiers == CONTROL` (not `contains`) so
+        // an extra Shift/Alt modifier exempts the key.
         let mut app = app_with_host("web");
         let outcome = app.on_key(press(
             KeyCode::Char('c'),
@@ -1671,28 +1881,6 @@ mod tests {
         ));
         assert!(matches!(outcome, Outcome::Continue));
         assert!(!app.should_quit);
-    }
-
-    #[test]
-    fn plain_c_without_ctrl_is_continue() {
-        // 'c' without Ctrl is now the credential-add-wizard entry key (it used
-        // to be a query character; the in-TUI cred entry now shadows that). The
-        // original invariant — plain 'c' is not a quit — still holds, and the
-        // query is NOT advanced. The wizard-open behavior is pinned by
-        // `launcher_c_key_opens_cred_add_wizard`.
-        let mut app = app_with_host("web");
-        let outcome = app.on_key(press(KeyCode::Char('c'), KeyModifiers::NONE));
-        assert!(matches!(outcome, Outcome::Continue));
-        assert!(!app.should_quit);
-        assert!(
-            app.launcher.query.is_empty(),
-            "plain 'c' must not enter the query"
-        );
-        assert_eq!(
-            *app.mode(),
-            Mode::CredWizard,
-            "plain 'c' opens the cred wizard"
-        );
     }
 
     #[test]
@@ -1745,27 +1933,39 @@ mod tests {
 
     #[test]
     fn ctrl_a_opens_add_host_wizard() {
-        // Task 16: ^a now opens the host wizard in add mode (blank form),
-        // routing the app from Launcher to HostWizard mode.
+        // Task 16: ^a opens the host wizard overlay in add mode (blank form).
+        // In the new model it returns OpenOverlay(Overlay::HostWizard(_)) and
+        // stashes the overlay on App::overlay.
         let mut app = app_with_host("web");
         let outcome = app.on_key(press(KeyCode::Char('a'), KeyModifiers::CONTROL));
-        assert!(matches!(outcome, Outcome::Continue));
+        assert!(matches!(
+            outcome,
+            Outcome::OpenOverlay(Overlay::HostWizard(_))
+        ));
         assert!(!app.should_quit);
-        assert_eq!(*app.mode(), Mode::HostWizard);
-        assert!(app.wizard().is_some(), "^a should open the wizard");
-        let w = app.wizard().unwrap();
+        assert!(
+            matches!(app.overlay(), Some(Overlay::HostWizard(_))),
+            "^a should open the host wizard overlay"
+        );
+        let w = app.wizard().expect("wizard open");
         assert!(!w.editing, "add mode must be non-editing");
         assert!(w.name.is_empty(), "add form must start blank");
     }
 
     #[test]
     fn ctrl_e_opens_edit_host_wizard_prefilled() {
-        // Task 16: ^e on the selected host opens the wizard in edit mode,
-        // prefilled from that host.
+        // Task 16: ^e on the selected host opens the wizard overlay in edit
+        // mode, prefilled from that host, and returns OpenOverlay(...).
         let mut app = app_with_host("web");
         let outcome = app.on_key(press(KeyCode::Char('e'), KeyModifiers::CONTROL));
-        assert!(matches!(outcome, Outcome::Continue));
-        assert_eq!(*app.mode(), Mode::HostWizard);
+        assert!(matches!(
+            outcome,
+            Outcome::OpenOverlay(Overlay::HostWizard(_))
+        ));
+        assert!(
+            matches!(app.overlay(), Some(Overlay::HostWizard(_))),
+            "^e should open the host wizard overlay"
+        );
         let w = app.wizard().expect("wizard open");
         assert!(w.editing, "edit mode must be editing");
         assert_eq!(w.name, "web", "edit form must be prefilled");
@@ -1773,30 +1973,35 @@ mod tests {
 
     #[test]
     fn ctrl_e_with_no_host_sets_status_and_stays_in_launcher() {
-        // ^e with an empty host list cannot pick a host to edit.
+        // ^e with an empty host list cannot pick a host to edit: it sets the
+        // consolidated status and returns Continue (no overlay).
         let cfg = SshrackConfig::default();
         let mut app = App::new(cfg, None, Frecency::default(), HashMap::new());
         let outcome = app.on_key(press(KeyCode::Char('e'), KeyModifiers::CONTROL));
         assert!(matches!(outcome, Outcome::Continue));
-        assert_eq!(*app.mode(), Mode::Launcher);
+        assert!(app.overlay().is_none(), "no overlay when there is no host");
         assert_eq!(
-            app.launcher.status.as_deref(),
+            app.status().message.as_deref(),
             Some("no host selected to edit")
         );
     }
 
     #[test]
     fn wizard_esc_closes_back_to_launcher() {
-        // Esc inside the wizard signals Cancel; the loop closes the wizard.
-        // Here we drive on_key and then simulate the loop's close.
+        // Esc inside the wizard signals Cancel; route_overlay treats Cancel as
+        // terminal, so the overlay is dropped and the app is back at the panel.
         let mut app = app_with_host("web");
         app.on_key(press(KeyCode::Char('a'), KeyModifiers::CONTROL));
-        assert_eq!(*app.mode(), Mode::HostWizard);
+        assert!(
+            matches!(app.overlay(), Some(Overlay::HostWizard(_))),
+            "wizard opened"
+        );
         let outcome = app.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
         assert!(matches!(outcome, Outcome::Cancel));
-        // Loop action: close the wizard.
-        app.close_host_wizard();
-        assert_eq!(*app.mode(), Mode::Launcher);
+        assert!(
+            app.overlay().is_none(),
+            "Cancel must drop the wizard overlay (back to launcher)"
+        );
         assert!(app.wizard().is_none());
     }
 
@@ -1815,13 +2020,17 @@ mod tests {
         let cfg = sshrack_core::config::store::load(&path).unwrap();
         let mut app = App::new(cfg, Some(path.clone()), Frecency::default(), HashMap::new());
 
-        // Open the add wizard and fill the form.
+        // Open the add wizard and fill the form. The form lives inside the
+        // overlay now, so take/mutate/putback to set fields.
         app.open_host_wizard_add();
-        let w = app.wizard.as_mut().unwrap();
+        let Overlay::HostWizard(mut w) = app.overlay.take().unwrap() else {
+            unreachable!("host wizard open");
+        };
         w.name = "web-prod".into();
         w.host_addr = "10.0.0.5".into();
         w.port = "2222".into();
         w.user = "deploy".into();
+        app.overlay = Some(Overlay::HostWizard(w));
 
         persist_host_save(&mut app).expect("add save should succeed");
 
@@ -1855,9 +2064,12 @@ mod tests {
 
         // Open the edit wizard for that host and change the port + name.
         assert!(app.open_host_wizard_edit(orig_id));
-        let w = app.wizard.as_mut().unwrap();
+        let Overlay::HostWizard(mut w) = app.overlay.take().unwrap() else {
+            unreachable!("host wizard open");
+        };
         w.port = "2200".into();
         w.name = "web-renamed".into();
+        app.overlay = Some(Overlay::HostWizard(w));
 
         persist_host_save(&mut app).expect("edit save should succeed");
 
@@ -1887,9 +2099,12 @@ mod tests {
         let mut app = App::new(cfg, Some(path.clone()), Frecency::default(), HashMap::new());
 
         app.open_host_wizard_add();
-        let w = app.wizard.as_mut().unwrap();
+        let Overlay::HostWizard(mut w) = app.overlay.take().unwrap() else {
+            unreachable!("host wizard open");
+        };
         w.name = "web".into(); // duplicate
         w.host_addr = "h2".into();
+        app.overlay = Some(Overlay::HostWizard(w));
 
         let err = persist_host_save(&mut app).unwrap_err();
         assert!(matches!(err, SshrackError::HostAlreadyExists { .. }));
@@ -1915,10 +2130,13 @@ mod tests {
         let mut app = App::new(cfg, Some(path.clone()), Frecency::default(), HashMap::new());
 
         app.open_host_wizard_add(); // seeds credential_names from config
-        let w = app.wizard.as_mut().unwrap();
+        let Overlay::HostWizard(mut w) = app.overlay.take().unwrap() else {
+            unreachable!("host wizard open");
+        };
         w.name = "web".into();
         w.host_addr = "10.0.0.5".into();
         w.auth_choice = super::super::wizard::AuthChoice::Credential { idx: 0 };
+        app.overlay = Some(Overlay::HostWizard(w));
 
         persist_host_save(&mut app).unwrap();
 
@@ -1947,11 +2165,14 @@ mod tests {
         // selected_credential_name() returns None when the list is empty, so
         // this path actually skips the resolution. To exercise the unknown-name
         // branch, inject a credential name that does not exist.
-        let w = app.wizard.as_mut().unwrap();
+        let Overlay::HostWizard(mut w) = app.overlay.take().unwrap() else {
+            unreachable!("host wizard open");
+        };
         w.name = "web".into();
         w.host_addr = "10.0.0.5".into();
         w.credential_names = vec!["ghost".into()]; // not in config
         w.auth_choice = super::super::wizard::AuthChoice::Credential { idx: 0 };
+        app.overlay = Some(Overlay::HostWizard(w));
 
         let err = persist_host_save(&mut app).unwrap_err();
         assert!(matches!(err, SshrackError::CredentialNotFound { .. }));
@@ -1972,9 +2193,12 @@ mod tests {
         let mut app = App::new(cfg, Some(path), Frecency::default(), HashMap::new());
         assert!(app.config().hosts.is_empty());
 
-        // ^a → opens wizard.
+        // ^a → opens wizard overlay.
         app.on_key(press(KeyCode::Char('a'), KeyModifiers::CONTROL));
-        assert_eq!(*app.mode(), Mode::HostWizard);
+        assert!(
+            matches!(app.overlay(), Some(Overlay::HostWizard(_))),
+            "host wizard overlay open"
+        );
 
         // Type "web" into the Name field, Tab to Host, type address, ^s.
         for ch in "web".chars() {
@@ -1990,7 +2214,7 @@ mod tests {
         // Loop actions.
         persist_host_save(&mut app).expect("save");
         app.close_host_wizard();
-        assert_eq!(*app.mode(), Mode::Launcher);
+        assert!(app.overlay().is_none(), "overlay closed back to launcher");
         // The launcher now sees the new host (re-ranked on close).
         assert_eq!(app.config().hosts.len(), 1);
         assert_eq!(app.launcher.ranked.len(), 1);
@@ -2015,10 +2239,13 @@ mod tests {
         sshrack_core::config::store::save(&path, &cfg).unwrap();
         let mut app = App::new(cfg, Some(path), Frecency::default(), HashMap::new());
 
-        // ^e on the selected (only) host → wizard prefilled.
+        // ^e on the selected (only) host → wizard overlay prefilled.
         app.on_key(press(KeyCode::Char('e'), KeyModifiers::CONTROL));
-        assert_eq!(*app.mode(), Mode::HostWizard);
-        let w = app.wizard.as_ref().unwrap();
+        assert!(
+            matches!(app.overlay(), Some(Overlay::HostWizard(_))),
+            "host wizard overlay open"
+        );
+        let w = app.wizard().expect("wizard open");
         assert_eq!(w.name, "web");
         assert_eq!(w.host_addr, "10.0.0.5");
         assert_eq!(w.port, "22");
@@ -2056,9 +2283,11 @@ mod tests {
         app.on_key(press(KeyCode::Char('w'), KeyModifiers::NONE));
         let outcome = app.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
         assert!(matches!(outcome, Outcome::Cancel));
-        app.close_host_wizard();
 
-        assert_eq!(*app.mode(), Mode::Launcher);
+        assert!(
+            app.overlay().is_none(),
+            "Cancel drops the wizard overlay (back to launcher)"
+        );
         // Nothing persisted.
         let reloaded = sshrack_core::config::store::load(&path).unwrap();
         assert!(reloaded.hosts.is_empty());
@@ -2087,10 +2316,13 @@ mod tests {
         let mut app = App::new(cfg, Some(path.clone()), Frecency::default(), HashMap::new());
 
         app.open_cred_wizard_add();
-        let w = app.cred_wizard.as_mut().unwrap();
+        let Overlay::CredWizard(mut w) = app.overlay.take().unwrap() else {
+            unreachable!("cred wizard open");
+        };
         w.name = "ops".into();
         w.user = "deploy".into();
         w.secret_kind = super::super::wizard::SecretChoice::None;
+        app.overlay = Some(Overlay::CredWizard(w));
 
         persist_cred_save(&mut app, &dead_handle()).expect("add save");
 
@@ -2117,11 +2349,14 @@ mod tests {
         let mut app = App::new(cfg, Some(path.clone()), Frecency::default(), HashMap::new());
 
         app.open_cred_wizard_add();
-        let w = app.cred_wizard.as_mut().unwrap();
+        let Overlay::CredWizard(mut w) = app.overlay.take().unwrap() else {
+            unreachable!("cred wizard open");
+        };
         w.name = "ops".into();
         w.user = "deploy".into();
         w.secret_kind = super::super::wizard::SecretChoice::IdentityKey;
         w.identity = "/home/me/.ssh/id_ed25519".into();
+        app.overlay = Some(Overlay::CredWizard(w));
 
         persist_cred_save(&mut app, &dead_handle()).expect("add save");
 
@@ -2149,11 +2384,14 @@ mod tests {
         let mut app = App::new(cfg, Some(path.clone()), Frecency::default(), HashMap::new());
 
         app.open_cred_wizard_add();
-        let w = app.cred_wizard.as_mut().unwrap();
+        let Overlay::CredWizard(mut w) = app.overlay.take().unwrap() else {
+            unreachable!("cred wizard open");
+        };
         w.name = "ops".into();
         w.user = "deploy".into();
         w.secret_kind = super::super::wizard::SecretChoice::Password;
         *w.password = "hunter2".into();
+        app.overlay = Some(Overlay::CredWizard(w));
 
         persist_cred_save(&mut app, &dead_handle()).expect("add save");
 
@@ -2175,11 +2413,14 @@ mod tests {
         let mut app = App::new(cfg, Some(path.clone()), Frecency::default(), HashMap::new());
 
         app.open_cred_wizard_add();
-        let w = app.cred_wizard.as_mut().unwrap();
+        let Overlay::CredWizard(mut w) = app.overlay.take().unwrap() else {
+            unreachable!("cred wizard open");
+        };
         w.name = "ops".into();
         w.user = "deploy".into();
         w.secret_kind = super::super::wizard::SecretChoice::Password;
         *w.password = "hunter2".into();
+        app.overlay = Some(Overlay::CredWizard(w));
 
         let err = persist_cred_save(&mut app, &dead_handle()).unwrap_err();
         assert!(
@@ -2209,22 +2450,24 @@ mod tests {
         assert!(app.config.store.is_none());
 
         app.open_cred_wizard_add();
-        let w = app.cred_wizard.as_mut().unwrap();
+        let Overlay::CredWizard(mut w) = app.overlay.take().unwrap() else {
+            unreachable!("cred wizard open");
+        };
         w.name = "ops".into();
         w.user = "deploy".into();
         w.secret_kind = super::super::wizard::SecretChoice::Password;
         *w.password = "hunter2".into();
+        app.overlay = Some(Overlay::CredWizard(w));
 
         fulfill_save_cred(&mut app, &dead_handle());
 
         // The wizard stayed open (popup upgrade failed → Interrupted → cancel).
         assert!(
-            app.cred_wizard.is_some(),
+            app.cred_wizard().is_some(),
             "stayed in wizard on popup cancel"
         );
         let msg = app
-            .cred_wizard
-            .as_ref()
+            .cred_wizard()
             .and_then(|w| w.core_error.as_deref())
             .unwrap_or_default();
         assert!(
@@ -2252,9 +2495,12 @@ mod tests {
         let mut app = App::new(cfg, Some(path.clone()), Frecency::default(), HashMap::new());
 
         app.open_cred_wizard_add();
-        let w = app.cred_wizard.as_mut().unwrap();
+        let Overlay::CredWizard(mut w) = app.overlay.take().unwrap() else {
+            unreachable!("cred wizard open");
+        };
         w.name = "ops".into(); // duplicate
         w.user = "deploy".into();
+        app.overlay = Some(Overlay::CredWizard(w));
 
         let err = persist_cred_save(&mut app, &dead_handle()).unwrap_err();
         assert!(matches!(err, SshrackError::CredentialAlreadyExists { .. }));
@@ -2281,13 +2527,16 @@ mod tests {
         let mut app = App::new(cfg, Some(path.clone()), Frecency::default(), HashMap::new());
 
         assert!(app.open_cred_wizard_edit("ops"));
-        let w = app.cred_wizard.as_mut().unwrap();
+        let Overlay::CredWizard(mut w) = app.overlay.take().unwrap() else {
+            unreachable!("cred wizard open");
+        };
         // The chooser opens on Password (the original kind). Leave the password
         // field blank and rename.
         assert_eq!(w.secret_kind, super::super::wizard::SecretChoice::Password);
         assert!(w.password.is_empty(), "edit form must not echo plaintext");
         w.name = "ops2".into();
         w.user = "ops".into();
+        app.overlay = Some(Overlay::CredWizard(w));
 
         persist_cred_save(&mut app, &dead_handle()).expect("edit save");
 
@@ -2321,9 +2570,12 @@ mod tests {
         let mut app = App::new(cfg, Some(path.clone()), Frecency::default(), HashMap::new());
 
         assert!(app.open_cred_wizard_edit("ops"));
-        let w = app.cred_wizard.as_mut().unwrap();
+        let Overlay::CredWizard(mut w) = app.overlay.take().unwrap() else {
+            unreachable!("cred wizard open");
+        };
         w.user = "root".into();
         // password left blank → preserved.
+        app.overlay = Some(Overlay::CredWizard(w));
 
         persist_cred_save(&mut app, &dead_handle()).expect("edit save");
 
@@ -2345,10 +2597,12 @@ mod tests {
         let mut app = App::new(cfg, Some(path), Frecency::default(), HashMap::new());
 
         app.apply_entry_mode(super::super::EntryMode::CredWizard { edit_name: None });
-        assert_eq!(*app.mode(), Mode::CredWizard);
-        assert!(app.cred_wizard.is_some());
         assert!(
-            !app.cred_wizard.as_ref().unwrap().editing,
+            matches!(app.overlay(), Some(Overlay::CredWizard(_))),
+            "cred entry opens the cred wizard overlay"
+        );
+        assert!(
+            !app.cred_wizard().unwrap().editing,
             "add entry must open the add (non-editing) form"
         );
     }
@@ -2371,8 +2625,11 @@ mod tests {
         app.apply_entry_mode(super::super::EntryMode::CredWizard {
             edit_name: Some("ops".into()),
         });
-        assert_eq!(*app.mode(), Mode::CredWizard);
-        let w = app.cred_wizard.as_ref().unwrap();
+        assert!(
+            matches!(app.overlay(), Some(Overlay::CredWizard(_))),
+            "cred edit entry opens the cred wizard overlay"
+        );
+        let w = app.cred_wizard().expect("cred wizard open");
         assert!(w.editing);
         assert_eq!(w.name, "ops");
         assert_eq!(w.user, "deploy");
@@ -2389,11 +2646,11 @@ mod tests {
         app.apply_entry_mode(super::super::EntryMode::CredWizard {
             edit_name: Some("ghost".into()),
         });
-        assert_eq!(*app.mode(), Mode::Launcher);
-        assert!(app.cred_wizard.is_none());
+        assert!(app.overlay().is_none(), "unknown name opens no overlay");
+        assert!(app.cred_wizard().is_none());
         assert!(
-            app.launcher
-                .status
+            app.status()
+                .message
                 .as_deref()
                 .unwrap_or("")
                 .contains("not found")
@@ -2409,94 +2666,28 @@ mod tests {
         let mut app = App::new(cfg, Some(path), Frecency::default(), HashMap::new());
 
         app.apply_entry_mode(super::super::EntryMode::HostWizard { edit_name: None });
-        assert_eq!(*app.mode(), Mode::HostWizard);
-        assert!(app.wizard.is_some());
-    }
-
-    #[test]
-    fn launcher_c_key_opens_cred_add_wizard() {
-        // The in-TUI entry key: bare `c` opens the cred add wizard from the
-        // launcher.
-        let cfg = SshrackConfig {
-            hosts: vec![Host {
-                id: Ulid::new(),
-                name: "web".into(),
-                host: "h".into(),
-                port: 22,
-                auth: Auth::inline(CredentialBody::new("u")),
-            }],
-            ..SshrackConfig::default()
-        };
-        let mut app = App::new(cfg, None, Frecency::default(), HashMap::new());
-        let outcome = app.on_key(press(KeyCode::Char('c'), KeyModifiers::NONE));
-        assert!(matches!(outcome, Outcome::Continue));
-        assert_eq!(*app.mode(), Mode::CredWizard);
-        assert!(app.cred_wizard.is_some());
-    }
-
-    #[test]
-    fn launcher_shift_c_edits_selected_hosts_credential() {
-        // Shift-C opens the cred edit wizard for the credential referenced by
-        // the host under the launcher cursor.
-        let cid = Ulid::new();
-        let cfg = SshrackConfig {
-            hosts: vec![Host {
-                id: Ulid::new(),
-                name: "web".into(),
-                host: "h".into(),
-                port: 22,
-                auth: Auth::reference(cid),
-            }],
-            credentials: vec![Credential {
-                id: cid,
-                name: "ops".into(),
-                body: CredentialBody::new("deploy"),
-            }],
-            ..SshrackConfig::default()
-        };
-        let mut app = App::new(cfg, None, Frecency::default(), HashMap::new());
-        let outcome = app.on_key(press(KeyCode::Char('C'), KeyModifiers::SHIFT));
-        assert!(matches!(outcome, Outcome::Continue));
-        assert_eq!(*app.mode(), Mode::CredWizard);
-        let w = app.cred_wizard.as_ref().unwrap();
-        assert!(w.editing);
-        assert_eq!(w.name, "ops");
-    }
-
-    #[test]
-    fn launcher_shift_c_with_no_credential_ref_sets_status() {
-        let cfg = SshrackConfig {
-            hosts: vec![Host {
-                id: Ulid::new(),
-                name: "web".into(),
-                host: "h".into(),
-                port: 22,
-                auth: Auth::inline(CredentialBody::new("u")),
-            }],
-            ..SshrackConfig::default()
-        };
-        let mut app = App::new(cfg, None, Frecency::default(), HashMap::new());
-        app.on_key(press(KeyCode::Char('C'), KeyModifiers::SHIFT));
-        assert_eq!(*app.mode(), Mode::Launcher);
         assert!(
-            app.launcher
-                .status
-                .as_deref()
-                .unwrap_or("")
-                .contains("no credential")
+            matches!(app.overlay(), Some(Overlay::HostWizard(_))),
+            "host entry opens the host wizard overlay"
         );
+        assert!(app.wizard().is_some());
     }
 
     #[test]
     fn cred_wizard_esc_cancels_back_to_launcher() {
         let mut app = app_with_host("web");
         app.open_cred_wizard_add();
-        assert_eq!(*app.mode(), Mode::CredWizard);
+        assert!(
+            matches!(app.overlay(), Some(Overlay::CredWizard(_))),
+            "cred wizard overlay open"
+        );
         let outcome = app.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
         assert!(matches!(outcome, Outcome::Cancel));
-        app.close_cred_wizard();
-        assert_eq!(*app.mode(), Mode::Launcher);
-        assert!(app.cred_wizard.is_none());
+        assert!(
+            app.overlay().is_none(),
+            "Cancel drops the cred wizard overlay (back to launcher)"
+        );
+        assert!(app.cred_wizard().is_none());
     }
 
     #[test]
@@ -2510,9 +2701,13 @@ mod tests {
         let cfg = sshrack_core::config::store::load(&path).unwrap();
         let mut app = App::new(cfg, Some(path), Frecency::default(), HashMap::new());
 
-        // c → opens cred wizard.
-        app.on_key(press(KeyCode::Char('c'), KeyModifiers::NONE));
-        assert_eq!(*app.mode(), Mode::CredWizard);
+        // Open the cred wizard directly (bare `c` is now a query char, not the
+        // cred-add binding).
+        app.open_cred_wizard_add();
+        assert!(
+            matches!(app.overlay(), Some(Overlay::CredWizard(_))),
+            "cred wizard overlay open"
+        );
         // Type "ops" into Name, Tab to User, type "deploy", ^s.
         for ch in "ops".chars() {
             app.on_key(press(KeyCode::Char(ch), KeyModifiers::NONE));
@@ -2526,80 +2721,16 @@ mod tests {
 
         persist_cred_save(&mut app, &dead_handle()).expect("save");
         app.close_cred_wizard();
-        assert_eq!(*app.mode(), Mode::Launcher);
+        assert!(app.overlay().is_none(), "overlay closed back to launcher");
         assert_eq!(app.config().credentials.len(), 1);
         assert_eq!(app.config().credentials[0].name, "ops");
     }
 
     // ===============================================================
-    // Store mode view: F2 entry, Esc cancel, persist_store_switch.
+    // Store mode view: persist_store_switch (I/O layer). The F2 entry +
+    // Esc/cursor tests were removed when F2 was dropped as a binding (Task 6
+    // conflict fix); these two open the view directly via open_store_view().
     // ===============================================================
-
-    #[test]
-    fn f2_opens_store_view() {
-        // F2 in the launcher opens the store view (pure mode flip, no I/O).
-        let mut app = app_with_host("web");
-        let outcome = app.on_key(press(KeyCode::F(2), KeyModifiers::NONE));
-        assert!(matches!(outcome, Outcome::Continue));
-        assert_eq!(*app.mode(), Mode::Store);
-        assert!(app.store_view.is_some(), "F2 should open the store view");
-        // The active marker snapshots the current mode (undecided here).
-        assert_eq!(app.store_view.as_ref().unwrap().active_label, "undecided");
-    }
-
-    #[test]
-    fn f2_snapshots_active_mode_label_for_marker() {
-        // A config already in plaintext mode shows "plaintext (active)".
-        let cfg = SshrackConfig {
-            store: Some(SecretStore::Plaintext),
-            ..SshrackConfig::default()
-        };
-        let mut app = App::new(cfg, None, Frecency::default(), HashMap::new());
-        app.on_key(press(KeyCode::F(2), KeyModifiers::NONE));
-        assert_eq!(app.store_view.as_ref().unwrap().active_label, "plaintext");
-    }
-
-    #[test]
-    fn store_view_esc_signals_cancel() {
-        // Esc in the store view returns Cancel (pure); the loop closes the view.
-        let mut app = app_with_host("web");
-        app.on_key(press(KeyCode::F(2), KeyModifiers::NONE));
-        let outcome = app.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(matches!(outcome, Outcome::Cancel));
-        // Loop action: close the store view.
-        app.close_store_view();
-        assert_eq!(*app.mode(), Mode::Launcher);
-        assert!(app.store_view.is_none());
-    }
-
-    #[test]
-    fn store_view_down_then_enter_signals_switch_to_plaintext() {
-        // Down x2 from keyring→vault→plaintext, then Enter signals the switch.
-        let mut app = app_with_host("web");
-        app.on_key(press(KeyCode::F(2), KeyModifiers::NONE));
-        app.on_key(press(KeyCode::Down, KeyModifiers::NONE));
-        app.on_key(press(KeyCode::Down, KeyModifiers::NONE));
-        let outcome = app.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(matches!(outcome, Outcome::SwitchToPlaintext));
-    }
-
-    #[test]
-    fn store_view_enter_on_keyring_signals_switch_to_keyring() {
-        let mut app = app_with_host("web");
-        app.on_key(press(KeyCode::F(2), KeyModifiers::NONE));
-        // cursor at index 0 = keyring
-        let outcome = app.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(matches!(outcome, Outcome::SwitchToKeyring));
-    }
-
-    #[test]
-    fn store_view_enter_on_vault_signals_switch_to_vault() {
-        let mut app = app_with_host("web");
-        app.on_key(press(KeyCode::F(2), KeyModifiers::NONE));
-        app.on_key(press(KeyCode::Down, KeyModifiers::NONE)); // -> vault
-        let outcome = app.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(matches!(outcome, Outcome::SwitchToVault));
-    }
 
     #[test]
     fn persist_store_switch_already_in_target_is_noop_status() {
@@ -2683,10 +2814,10 @@ mod tests {
         let mut app = App::new(cfg, None, Frecency::default(), HashMap::new());
         let outcome = app.on_key(press(KeyCode::Char('d'), KeyModifiers::CONTROL));
         assert!(matches!(outcome, Outcome::Continue));
-        assert_eq!(*app.mode(), Mode::Launcher);
+        assert!(app.overlay().is_none(), "no overlay when there is no host");
         assert!(
-            app.launcher
-                .status
+            app.status()
+                .message
                 .as_deref()
                 .unwrap_or("")
                 .contains("no host selected to delete")
@@ -2751,60 +2882,115 @@ mod tests {
     }
 
     // ===============================================================
-    // Task 20: help overlay (F1 / ? / Esc) + consolidated status.
+    // New-model bindings: tab switching, conflict-fix query chars,
+    // overlay-open intents, and Esc-closes-overlay purity.
+    // ===============================================================
+
+    #[test]
+    fn ctrl_digits_and_tab_switch_tab() {
+        let mut app = app_with_host("web");
+        assert!(matches!(
+            app.on_key(press(KeyCode::Char('2'), KeyModifiers::CONTROL)),
+            Outcome::SwitchTab(Tab::Credentials)
+        ));
+        assert!(matches!(
+            app.on_key(press(KeyCode::Tab, KeyModifiers::NONE)),
+            Outcome::SwitchTab(Tab::Settings)
+        ));
+    }
+
+    #[test]
+    fn bare_chars_c_and_question_and_digit_reach_query() {
+        // The conflict fix: these used to be hotkeys (c cred-add, ? help). No more.
+        let mut app = app_with_host("web");
+        for ch in ['c', '?', '1', 'a'] {
+            app.on_key(press(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        assert_eq!(app.launcher.query, "c?1a");
+    }
+
+    #[test]
+    fn ctrl_a_opens_host_wizard_overlay() {
+        let mut app = app_with_host("web");
+        let out = app.on_key(press(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert!(matches!(out, Outcome::OpenOverlay(Overlay::HostWizard(_))));
+        assert!(app.overlay().is_some());
+    }
+
+    #[test]
+    fn f1_opens_help_overlay() {
+        let mut app = app_with_host("web");
+        let out = app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
+        assert!(matches!(out, Outcome::OpenOverlay(Overlay::Help)));
+    }
+
+    #[test]
+    fn esc_inside_overlay_closes_it_and_does_not_touch_query() {
+        let mut app = app_with_host("web");
+        app.on_key(press(KeyCode::Char('a'), KeyModifiers::CONTROL)); // open host wizard
+        let q_before = app.launcher.query.clone();
+        let out = app.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(out, Outcome::Cancel) || matches!(out, Outcome::CloseOverlay));
+        assert_eq!(app.launcher.query, q_before);
+    }
+
+    // ===============================================================
+    // Task 20: help overlay (F1 only) + consolidated status.
     // ===============================================================
 
     #[test]
     fn f1_in_launcher_opens_help_overlay() {
         let mut app = app_with_host("web");
         let outcome = app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
-        assert!(matches!(outcome, Outcome::OpenHelp));
-        assert_eq!(*app.mode(), Mode::Help);
-        assert_eq!(app.help_prev_mode, Some(Mode::Launcher));
-    }
-
-    #[test]
-    fn question_mark_opens_help_overlay() {
-        let mut app = app_with_host("web");
-        let outcome = app.on_key(press(KeyCode::Char('?'), KeyModifiers::NONE));
-        assert!(matches!(outcome, Outcome::OpenHelp));
-        assert_eq!(*app.mode(), Mode::Help);
+        assert!(matches!(outcome, Outcome::OpenOverlay(Overlay::Help)));
+        assert!(matches!(app.overlay(), Some(Overlay::Help)));
     }
 
     #[test]
     fn question_mark_in_wizard_text_field_inserts_char_not_help() {
-        // Regression: `?` is a help shortcut on the launcher only. Inside a
-        // wizard/store text field it is a printable char the user is typing
-        // (Task 16/17), so it must fall through to the wizard's on_key and be
-        // appended to the focused field — NOT open the help overlay.
+        // Regression: `?` is a printable char in a wizard text field. It must
+        // fall through to the wizard's on_key and be appended to the focused
+        // field — NOT open the help overlay. (`?` no longer opens Help
+        // anywhere; this still pins the wizard insertion path.)
         let mut app = app_with_host("web");
-        app.on_key(press(KeyCode::Char('a'), KeyModifiers::CONTROL)); // -> HostWizard
-        assert_eq!(*app.mode(), Mode::HostWizard);
+        app.on_key(press(KeyCode::Char('a'), KeyModifiers::CONTROL)); // -> HostWizard overlay
+        assert!(
+            matches!(app.overlay(), Some(Overlay::HostWizard(_))),
+            "host wizard overlay open"
+        );
         // Name field is focused by default; type "a?b".
         app.on_key(press(KeyCode::Char('a'), KeyModifiers::NONE));
         app.on_key(press(KeyCode::Char('?'), KeyModifiers::NONE));
         app.on_key(press(KeyCode::Char('b'), KeyModifiers::NONE));
-        assert_eq!(*app.mode(), Mode::HostWizard, "? must not switch to Help");
+        assert!(
+            matches!(app.overlay(), Some(Overlay::HostWizard(_))),
+            "? must not switch the overlay away from HostWizard"
+        );
         let form = app
             .wizard()
-            .expect("invariant: wizard is open in HostWizard mode");
+            .expect("invariant: wizard is open in HostWizard overlay");
         assert_eq!(form.name, "a?b", "? must be inserted into the text field");
     }
 
     #[test]
-    fn f1_opens_help_from_inside_wizard_then_esc_restores_mode() {
+    fn f1_opens_help_from_inside_wizard_then_esc_closes_overlay() {
         // Help is reachable mid-wizard (you should not have to back out to read
-        // a binding). Esc dismisses back to the wizard, not the launcher.
+        // a binding). In the new single-overlay model F1 REPLACES the
+        // HostWizard overlay with Help; Esc closes Help, leaving no overlay
+        // (back at the launcher, not the wizard — there is no overlay stacking).
         let mut app = app_with_host("web");
-        app.on_key(press(KeyCode::Char('a'), KeyModifiers::CONTROL)); // -> HostWizard
-        assert_eq!(*app.mode(), Mode::HostWizard);
-        app.on_key(press(KeyCode::F(1), KeyModifiers::NONE)); // -> Help
-        assert_eq!(*app.mode(), Mode::Help);
-        assert_eq!(app.help_prev_mode, Some(Mode::HostWizard));
-        // Esc (or q, or F1) dismisses back to the wizard.
-        app.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
-        assert_eq!(*app.mode(), Mode::HostWizard, "Esc restores the prior mode");
-        assert!(app.help_prev_mode.is_none());
+        app.on_key(press(KeyCode::Char('a'), KeyModifiers::CONTROL)); // -> HostWizard overlay
+        assert!(
+            matches!(app.overlay(), Some(Overlay::HostWizard(_))),
+            "host wizard overlay open"
+        );
+        let outcome = app.on_key(press(KeyCode::F(1), KeyModifiers::NONE)); // -> Help
+        assert!(matches!(outcome, Outcome::OpenOverlay(Overlay::Help)));
+        assert!(matches!(app.overlay(), Some(Overlay::Help)));
+        // Esc dismisses the Help overlay.
+        let outcome = app.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(outcome, Outcome::CloseOverlay));
+        assert!(app.overlay().is_none(), "Esc closed the help overlay");
     }
 
     #[test]
@@ -2816,31 +3002,38 @@ mod tests {
         ] {
             let mut app = app_with_host("web");
             app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
-            assert_eq!(*app.mode(), Mode::Help);
-            app.on_key(key);
-            assert_eq!(*app.mode(), Mode::Launcher, "dismiss key must restore mode");
+            assert!(matches!(app.overlay(), Some(Overlay::Help)));
+            let outcome = app.on_key(key);
+            assert!(
+                matches!(outcome, Outcome::CloseOverlay),
+                "dismiss key must close the help overlay"
+            );
+            assert!(app.overlay().is_none(), "overlay cleared after dismiss");
         }
     }
 
     #[test]
     fn f1_inside_help_dismisses_does_not_stack() {
-        // A second F1 dismisses rather than nesting a second overlay.
+        // A second F1 toggles Help off rather than nesting a second overlay.
         let mut app = app_with_host("web");
         app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
-        assert_eq!(*app.mode(), Mode::Help);
-        app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
-        assert_eq!(*app.mode(), Mode::Launcher);
-        assert!(app.help_prev_mode.is_none());
+        assert!(matches!(app.overlay(), Some(Overlay::Help)));
+        let outcome = app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
+        assert!(matches!(outcome, Outcome::CloseOverlay));
+        assert!(app.overlay().is_none());
     }
 
     #[test]
     fn help_other_keys_continue_without_dismissing() {
-        // Random keys inside the help overlay must NOT dismiss or change mode.
+        // Random keys inside the help overlay must NOT dismiss or change it.
         let mut app = app_with_host("web");
         app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
         let outcome = app.on_key(press(KeyCode::Char('x'), KeyModifiers::NONE));
         assert!(matches!(outcome, Outcome::Continue));
-        assert_eq!(*app.mode(), Mode::Help, "x must not dismiss help");
+        assert!(
+            matches!(app.overlay(), Some(Overlay::Help)),
+            "x must not dismiss help"
+        );
     }
 
     #[test]
@@ -2850,7 +3043,10 @@ mod tests {
         let release =
             KeyEvent::new_with_kind(KeyCode::Esc, KeyModifiers::NONE, KeyEventKind::Release);
         app.on_key(release);
-        assert_eq!(*app.mode(), Mode::Help, "release must not dismiss help");
+        assert!(
+            matches!(app.overlay(), Some(Overlay::Help)),
+            "release must not dismiss help"
+        );
     }
 
     #[test]

@@ -28,7 +28,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::Paragraph,
 };
 use ulid::Ulid;
 
@@ -581,24 +581,22 @@ impl HostForm {
         }
     }
 
-    /// Render the form inside `area`. The chrome (bordered block + title) is the
-    /// caller's responsibility; this draws the field rows + the error line.
-    /// Pure: only writes to the frame.
-    pub fn draw(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
+    /// Render the field rows + error/hint lines into `body` (the rect a
+    /// [`crate::tui::dialog::draw_dialog`] hands the form). No outer border —
+    /// the dialog already drew the chrome. Places the real terminal cursor on
+    /// the focused text field, offset into `body`. Task 9 finalizes the styling;
+    /// Task 6 only needs the layout right and no panics.
+    pub fn draw_in_dialog(&self, frame: &mut Frame, body: ratatui::layout::Rect) {
         let rows: Vec<Line> = Field::ORDER.iter().map(|f| self.render_row(*f)).collect();
 
-        let block = Block::new().borders(Borders::ALL).title(self.title());
-        frame.render_widget(&block, area);
-        let [inner] = Layout::vertical([Constraint::Fill(1)]).areas(block.inner(area));
-
-        // Split inner into the field rows (5) + an error/hint row (1) + a key
+        // Split body into the field rows (5) + an error/hint row (1) + a key
         // hint row (1).
         let [fields_area, error_area, hint_area] = Layout::vertical([
             Constraint::Length(Field::ORDER.len() as u16),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
-        .areas(inner);
+        .areas(body);
 
         frame.render_widget(Paragraph::new(rows), fields_area);
 
@@ -658,8 +656,9 @@ impl HostForm {
         Some((row, offset))
     }
 
-    /// Block title: distinguishes add vs edit mode.
-    fn title(&self) -> String {
+    /// Block title: distinguishes add vs edit mode. Public so the App's overlay
+    /// renderer can pass it to [`crate::tui::dialog::draw_dialog`].
+    pub fn title(&self) -> String {
         if self.editing {
             " edit host ".into()
         } else {
@@ -1175,21 +1174,19 @@ impl CredForm {
         }
     }
 
-    /// Render the form inside `area`. Pure: only writes to the frame.
-    pub fn draw(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
+    /// Render the field rows + error/hint lines into `body` (the rect a
+    /// [`crate::tui::dialog::draw_dialog`] hands the form). No outer border —
+    /// the dialog already drew the chrome.
+    pub fn draw_in_dialog(&self, frame: &mut Frame, body: ratatui::layout::Rect) {
         let reachable = self.reachable_fields();
         let rows: Vec<Line> = reachable.iter().map(|f| self.render_row(*f)).collect();
-
-        let block = Block::new().borders(Borders::ALL).title(self.title());
-        frame.render_widget(&block, area);
-        let [inner] = Layout::vertical([Constraint::Fill(1)]).areas(block.inner(area));
 
         let [fields_area, error_area, hint_area] = Layout::vertical([
             Constraint::Length(reachable.len() as u16),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
-        .areas(inner);
+        .areas(body);
 
         frame.render_widget(Paragraph::new(rows), fields_area);
 
@@ -1217,7 +1214,7 @@ impl CredForm {
         frame.render_widget(Paragraph::new(hint).style(Style::new().dim()), hint_area);
 
         // Place the real terminal cursor on the focused text field (no drawn
-        // glyph — see HostForm::draw). SecretKind is a chooser (no cursor).
+        // glyph — see HostForm::draw_in_dialog). SecretKind is a chooser.
         if let Some((row, offset)) = self.cursor_target() {
             let max_x = fields_area.x + fields_area.width.saturating_sub(1);
             let x = (fields_area.x + CRED_VALUE_COL + offset as u16).min(max_x);
@@ -1243,7 +1240,9 @@ impl CredForm {
         Some((row, offset))
     }
 
-    fn title(&self) -> String {
+    /// Block title: distinguishes add vs edit mode. Public so the App's overlay
+    /// renderer can pass it to [`crate::tui::dialog::draw_dialog`].
+    pub fn title(&self) -> String {
         if self.editing {
             " edit credential ".into()
         } else {
@@ -1632,17 +1631,17 @@ mod tests {
                     String::new()
                 };
                 f.error = None;
-                terminal.draw(|fr| f.draw(fr, fr.area())).unwrap();
+                terminal.draw(|fr| f.draw_in_dialog(fr, fr.area())).unwrap();
             }
         }
         // Also with a validation error set.
         f.focus = Field::Name;
         f.error = Some(SaveError::MissingName);
-        terminal.draw(|fr| f.draw(fr, fr.area())).unwrap();
+        terminal.draw(|fr| f.draw_in_dialog(fr, fr.area())).unwrap();
         // And with a core error set.
         f.error = None;
         f.set_core_error("duplicate name".into());
-        terminal.draw(|fr| f.draw(fr, fr.area())).unwrap();
+        terminal.draw(|fr| f.draw_in_dialog(fr, fr.area())).unwrap();
     }
 
     // ---- auth chooser cycling ----
@@ -2260,20 +2259,20 @@ mod tests {
                         String::new()
                     };
                     f.error = None;
-                    terminal.draw(|fr| f.draw(fr, fr.area())).unwrap();
+                    terminal.draw(|fr| f.draw_in_dialog(fr, fr.area())).unwrap();
                 }
             }
             // Also exercise the Password row focus under Password choice.
             f.secret_kind = SecretChoice::Password;
             f.focus = CredField::Password;
-            terminal.draw(|fr| f.draw(fr, fr.area())).unwrap();
+            terminal.draw(|fr| f.draw_in_dialog(fr, fr.area())).unwrap();
             // And error / core_error lines.
             f.focus = CredField::Name;
             f.error = Some(CredSaveError::MissingName);
-            terminal.draw(|fr| f.draw(fr, fr.area())).unwrap();
+            terminal.draw(|fr| f.draw_in_dialog(fr, fr.area())).unwrap();
             f.error = None;
             f.set_core_error("store mode not decided".into());
-            terminal.draw(|fr| f.draw(fr, fr.area())).unwrap();
+            terminal.draw(|fr| f.draw_in_dialog(fr, fr.area())).unwrap();
         }
     }
 }

@@ -310,38 +310,50 @@ impl Launcher {
         }
     }
 
-    /// Render with the consolidated [`super::app::Status`] taking precedence over
-    /// this launcher's own local navigation hint. Priority:
-    /// 1. `app_status` message (red if error) — set by the loop after an action
-    ///    (save/delete/switch/cancel/error).
-    /// 2. `self.status` — a launcher-local navigation hint (e.g. "no host
-    ///    selected to delete").
-    /// 3. [`STATUS_LINE`] — the default key-binding hint.
+    /// Render the launcher into the shell's panel area (no outer border — the
+    /// shell supplies the brand/tab/footer bands around it). Splits `area` into
+    /// `[search(1), list(Fill), status(1)]`, renders the search row + ranked
+    /// list + status. Reuses `host_line` / `highlighted_name` /
+    /// `credential_label` / `frecency_tier`. The search row places the real
+    /// terminal cursor at the end of the query.
     ///
-    /// This is the launcher's integration point for the Task 20 status-bar
-    /// unification: the launcher keeps its own status line but yields it to the
-    /// consolidated channel when the loop has set one.
-    pub fn draw_with_status(
+    /// Task 6 scope: keep the current selection style (`bg(DarkGray)`) and the
+    /// `▍` search cursor glyph for now — Task 10 replaces them with the
+    /// theme's selected gutter + a real cursor. Just get the layout right.
+    pub fn draw_in_shell(
         &self,
         frame: &mut Frame,
         area: ratatui::layout::Rect,
         hosts: &[Host],
         frecency: &Frecency,
         credential_names: &CredentialNames,
-        app_status: &super::app::Status,
+        status: &super::app::Status,
     ) {
-        let [query_area, list_area, status_area] = Layout::vertical([
+        let [search_area, list_area, status_area] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Fill(1),
             Constraint::Length(1),
         ])
         .areas(area);
 
-        self.draw_query(frame, query_area);
+        // Search row: `❯ <query>` with the real terminal cursor at the end.
+        // The `▍` glyph is retained for Task 6; Task 10 swaps to a pure cursor.
+        let search_line = Line::from(vec![
+            Span::styled("❯ ", Style::new().dim()),
+            Span::raw(&self.query),
+            Span::styled("▍", Style::new().dim()),
+        ]);
+        frame.render_widget(Paragraph::new(search_line), search_area);
+        // Place the terminal cursor right after the query (2-cell `❯ ` prefix).
+        let cursor_x = search_area.x + 2 + self.query.chars().count() as u16;
+        let max_x = search_area.x + search_area.width.saturating_sub(1);
+        frame.set_cursor_position((cursor_x.min(max_x), search_area.y));
+
         self.draw_list(frame, list_area, hosts, frecency, credential_names);
 
-        let line = if let Some(msg) = &app_status.message {
-            let style = if app_status.is_error {
+        // Status row: app status (red on error) > launcher-local hint > default.
+        let line = if let Some(msg) = &status.message {
+            let style = if status.is_error {
                 Style::new().fg(Color::Red)
             } else {
                 Style::new()
@@ -360,17 +372,6 @@ impl Launcher {
             }
         };
         frame.render_widget(Paragraph::new(line), status_area);
-    }
-
-    /// Render the query input bar: `> <query>` with a cursor-style block.
-    fn draw_query(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
-        let line = Line::from(vec![
-            Span::styled("> ", Style::new().bold()),
-            Span::raw(&self.query),
-            // A trailing block character simulates a cursor at end-of-input.
-            Span::styled("▍", Style::new().dim()),
-        ]);
-        frame.render_widget(Paragraph::new(line), area);
     }
 
     /// Render the ranked host list with selection highlight and per-host fuzzy

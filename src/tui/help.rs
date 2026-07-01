@@ -37,7 +37,7 @@ fn help_lines() -> Vec<Line<'static>> {
     };
 
     vec![
-        section("Launcher (host picker)"),
+        section("Hosts tab"),
         binding("Enter", "connect to the selected host"),
         binding("Up / Down", "move selection (wraps)"),
         binding("Ctrl-N / Ctrl-P", "move selection (wraps)"),
@@ -46,11 +46,15 @@ fn help_lines() -> Vec<Line<'static>> {
         binding("Ctrl-A", "add a new host"),
         binding("Ctrl-E", "edit the selected host"),
         binding("Ctrl-D", "delete the selected host (confirm)"),
-        binding("c", "add a credential"),
-        binding("Shift-C", "edit the selected host's credential"),
-        binding("F2", "switch storage mode (keyring / vault / plaintext)"),
         binding("Esc", "clear query, or quit when query is empty"),
         binding("Ctrl-C", "quit"),
+        Line::from(""),
+        section("Tabs"),
+        binding(
+            "Tab / Shift-Tab",
+            "cycle tabs (Hosts / Credentials / Settings)",
+        ),
+        binding("Ctrl-1 / 2 / 3", "jump to a tab"),
         Line::from(""),
         section("Host & credential wizards"),
         binding("Tab", "next field"),
@@ -60,15 +64,10 @@ fn help_lines() -> Vec<Line<'static>> {
         binding("type", "edit the focused text field"),
         binding("Backspace", "edit the focused text field"),
         binding("Ctrl-S", "save (validates first)"),
-        binding("Esc / Ctrl-C", "cancel, return to launcher"),
-        Line::from(""),
-        section("Store mode view"),
-        binding("Up / Down", "move selection (keyring / vault / plaintext)"),
-        binding("Enter", "switch to the highlighted mode"),
-        binding("Esc / Ctrl-C", "back to launcher"),
+        binding("Esc / Ctrl-C", "cancel, return to the tab"),
         Line::from(""),
         section("Everywhere"),
-        binding("F1 / ?", "open this help overlay"),
+        binding("F1", "open / close this help overlay"),
         binding("Esc / q", "(in help) dismiss the overlay"),
         Line::from(""),
         Line::from(Span::styled(
@@ -113,10 +112,13 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         // Each surface has at least one binding documented.
-        assert!(joined.contains("connect to the selected host"), "launcher");
+        assert!(joined.contains("connect to the selected host"), "hosts tab");
         assert!(joined.contains("save (validates first)"), "wizards");
-        assert!(joined.contains("switch to the highlighted mode"), "store");
-        assert!(joined.contains("open this help overlay"), "F1 entry");
+        assert!(joined.contains("cycle tabs"), "tabs section");
+        assert!(
+            joined.contains("open / close this help overlay"),
+            "F1 entry"
+        );
         assert!(joined.contains("dismiss the overlay"), "dismiss hint");
     }
 }

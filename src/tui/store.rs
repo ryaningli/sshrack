@@ -17,6 +17,14 @@
 //! with a status when the daemon is down.
 //!
 //! [`confirm_popup`]: super::prompt::confirm_popup
+//
+// `dead_code`: the launcher `F2` entry that wired this view was removed by the
+// Task 6 App rewrite (single-char hotkey conflict fix). Task 8 re-homes the
+// view as the Settings tab's storage overlay; until then the whole module is
+// dormant except for `StoreView::new` (still called by the
+// `persist_store_switch_*` tests). Same pre-wired-TUI convention as
+// theme.rs / tab.rs.
+#![allow(dead_code)]
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use ratatui::{
