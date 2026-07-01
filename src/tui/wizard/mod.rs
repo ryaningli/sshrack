@@ -36,51 +36,52 @@ pub use host::HostForm;
 // Host wizard shared shape
 // ===========================================================================
 
-/// The selectable auth methods offered by the host wizard. This is the wizard's
-/// own input shape — distinct from core's [`Auth`] because the wizard works in
-/// *names* (a credential name the user picks from a chooser) while core stores
-/// *ids* (the loop resolves name→id before persisting). Inline password is
-/// intentionally absent (see the module docs).
+/// The selectable auth strategies offered by the host wizard. Two states only:
+/// reuse a named `[[credentials]]` entry, or carry an inline (host-own) config.
+/// This is the wizard's own input shape — distinct from core's [`Auth`] because
+/// the wizard works in *names* (a credential name the user picks) while core
+/// stores *ids* (the loop resolves name→id before persist). The inline secret
+/// kind is a separate [`SecretChoice`] row that appears only under Independent.
 ///
 /// [`Auth`]: sshrack_core::config::schema::Auth
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthChoice {
-    /// Inline user, no secret (rely on the ssh default / agent).
-    Default,
     /// Reuse a named `[[credentials]]` entry. `idx` indexes the credential
-    /// list the wizard was constructed with; the loop reads the name out of
-    /// the form and resolves it to an id at save time.
-    Credential { idx: usize },
-    /// Inline user + identity key path (entered as a text field).
-    InlineKey,
+    /// list the wizard was constructed with; the loop reads the name and
+    /// resolves it to an id at save time.
+    Reference { idx: usize },
+    /// Host-own auth: an inline user plus an optional secret (None / Password /
+    /// IdentityKey), chosen on the Secret row.
+    Independent,
 }
 
 impl AuthChoice {
-    /// The display order used by the chooser's `←`/`→` cycling. Mirrors the
-    /// sshrack CLI's interactive `prompt_auth` menu ordering.
-    const ORDER: &'static [AuthKind] =
-        &[AuthKind::Default, AuthKind::Credential, AuthKind::InlineKey];
+    /// Display order used by the auth chooser's `←`/`→` cycling. Independent
+    /// first: it is the zero-config default (a fresh host with no credential
+    /// yet defined should be addable without forcing a detour to the cred tab).
+    const ORDER: &'static [AuthKind] = &[AuthKind::Independent, AuthKind::Reference];
 
     /// Which slot in [`AuthChoice::ORDER`] this variant occupies.
     fn kind(&self) -> AuthKind {
         match self {
-            AuthChoice::Default => AuthKind::Default,
-            AuthChoice::Credential { .. } => AuthKind::Credential,
-            AuthChoice::InlineKey => AuthKind::InlineKey,
+            AuthChoice::Reference { .. } => AuthKind::Reference,
+            AuthChoice::Independent => AuthKind::Independent,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuthKind {
-    Default,
-    Credential,
-    InlineKey,
+    Independent,
+    Reference,
 }
 
 /// The focused field in the host form. `Tab`/`↑`/`↓` (and `Enter` to advance)
-/// move through these in declaration order; the last field's `Enter` triggers a
-/// save.
+/// move through the reachable ones in declaration order; the last reachable
+/// field's `Enter` triggers a save. `User`/`Secret`/`Identity`/`Password` are
+/// reachable only under [`AuthChoice::Independent`] (and `Identity`/`Password`
+/// further depend on [`SecretChoice`]); the form filters them at navigation
+/// time via [`HostForm::reachable_fields`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
     Name,
@@ -88,6 +89,9 @@ pub enum Field {
     Port,
     User,
     Auth,
+    Secret,
+    Identity,
+    Password,
 }
 
 impl Field {
@@ -98,29 +102,10 @@ impl Field {
         Field::Port,
         Field::User,
         Field::Auth,
+        Field::Secret,
+        Field::Identity,
+        Field::Password,
     ];
-
-    fn idx(self) -> usize {
-        Self::ORDER
-            .iter()
-            .position(|f| *f == self)
-            .expect("invariant: every Field variant is in ORDER")
-    }
-
-    fn next(self) -> Field {
-        let i = self.idx();
-        Self::ORDER[(i + 1) % Self::ORDER.len()]
-    }
-
-    fn prev(self) -> Field {
-        let i = self.idx();
-        Self::ORDER[(i + Self::ORDER.len() - 1) % Self::ORDER.len()]
-    }
-
-    /// True when this is the last field in the form (Enter here submits).
-    fn is_last(self) -> bool {
-        self.idx() == Self::ORDER.len() - 1
-    }
 
     /// Human label shown in the form. Capitalized so the add/edit forms read
     /// "Name" / "Host" / ... rather than lowercase.
@@ -131,6 +116,9 @@ impl Field {
             Field::Port => "Port",
             Field::User => "User",
             Field::Auth => "Auth",
+            Field::Secret => "Secret",
+            Field::Identity => "Identity",
+            Field::Password => "Password",
         }
     }
 }
@@ -352,9 +340,10 @@ pub(super) fn value_spans(value: &str, placeholder: Option<&str>) -> Vec<Span<'s
 }
 
 /// Column where the editable value begins within a rendered field row:
-/// `"▶ " (2) + right-aligned label + ": " (2)`. Host labels are padded to 5,
-/// credentials to 8. Used by each form's `draw` to place the terminal cursor.
-pub(super) const HOST_VALUE_COL: u16 = 2 + 5 + 2;
+/// `"▶ " (2) + right-aligned label + ": " (2)`. Host and credential labels are
+/// both padded to 8 (the longest host label is `Identity`/`Password` = 8).
+/// Used by each form's `draw` to place the terminal cursor.
+pub(super) const HOST_VALUE_COL: u16 = 2 + 8 + 2;
 pub(super) const CRED_VALUE_COL: u16 = 2 + 8 + 2;
 
 #[cfg(test)]
@@ -414,6 +403,9 @@ mod tests {
         assert_eq!(Field::Port.label(), "Port");
         assert_eq!(Field::User.label(), "User");
         assert_eq!(Field::Auth.label(), "Auth");
+        assert_eq!(Field::Secret.label(), "Secret");
+        assert_eq!(Field::Identity.label(), "Identity");
+        assert_eq!(Field::Password.label(), "Password");
     }
 
     #[test]

@@ -21,7 +21,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{Frame, Terminal, backend::CrosstermBackend};
-use sshrack_core::config::schema::SshrackConfig;
+use sshrack_core::config::schema::{Auth, SshrackConfig};
 use sshrack_core::error::SshrackError;
 use sshrack_core::frecency::Frecency;
 use std::path::PathBuf;
@@ -1296,7 +1296,7 @@ pub fn run_loop(
                     // add or apply-patch, write config, reload, close the wizard
                     // overlay. on_key's route_overlay stashed the form back on
                     // SaveHost (non-terminal), so the overlay is still open here.
-                    match persist_host_save(app) {
+                    match persist_host_save(app, &handle) {
                         Ok(()) => {
                             app.set_status("host saved".to_string());
                             app.close_host_wizard();
@@ -1498,7 +1498,7 @@ pub fn run_loop(
 /// preserving the original id (so the keyring entry is not orphaned). For a
 /// Credential auth choice, the referenced credential name is resolved to its
 /// stable [`Ulid`] here (the wizard only ever holds the name).
-fn persist_host_save(app: &mut App) -> Result<(), SshrackError> {
+fn persist_host_save(app: &mut App, handle: &TerminalHandle) -> Result<(), SshrackError> {
     // Take the form out of the overlay so we can borrow `app.config` for the
     // credential-name → id resolution without a borrow conflict. The form lives
     // inside `Overlay::HostWizard`; clone it out (the overlay keeps its copy so
@@ -1507,7 +1507,7 @@ fn persist_host_save(app: &mut App) -> Result<(), SshrackError> {
         return Ok(());
     };
 
-    // Resolve credential name → id (only when the user picked Credential).
+    // Resolve credential name → id (only when the user picked Reference).
     let resolved_credential = match form.selected_credential_name() {
         Some(name) => Some(
             app.config
@@ -1521,32 +1521,100 @@ fn persist_host_save(app: &mut App) -> Result<(), SshrackError> {
         None => None,
     };
 
-    let auth = form.build_auth(resolved_credential);
+    let mut auth = form.build_auth(resolved_credential);
     let name = form.name.trim().to_string();
     let host_addr = form.host_addr.trim().to_string();
     let port = form.parsed_port();
+
+    // The id that will own this host (and any keyring entry). Fresh for add,
+    // original for edit (so the keyring entry is not orphaned).
+    let target_id = if form.editing {
+        form.orig_id.ok_or(SshrackError::MissingRequiredField {
+            field: "orig_id (edit mode)",
+        })?
+    } else {
+        Ulid::new()
+    };
+
+    // ── Preserve an existing inline password on edit when the field was left
+    //    blank (mirror persist_cred_save's keep-existing-password branch). ────
+    if form.editing
+        && form.secret_kind == super::wizard::SecretChoice::Password
+        && form.password.is_empty()
+    {
+        if let Auth::Inline(body) = &auth {
+            if body.password.is_none() {
+                let orig =
+                    app.config
+                        .find_host_by_id(&target_id)
+                        .ok_or(SshrackError::HostNotFound {
+                            name: target_id.to_string(),
+                            hint: sshrack_core::error::DidYouMean::none(),
+                        })?;
+                if let Some(orig_body) = orig.auth.inline_body() {
+                    let mut kept = body.clone();
+                    kept.password = orig_body.password.clone();
+                    kept.keyring = orig_body.keyring;
+                    auth = Auth::inline(kept);
+                }
+            }
+        }
+    }
+
+    // ── Seal an inline plaintext password per the configured store mode ─────
+    // (mirror persist_cred_save). Only when there is a freshly collected
+    // plaintext password; a key / none body passes through unchanged. A Password
+    // choice with no store mode decided is a user-facing error, NOT a silent
+    // plaintext fallback. Vault unlock via TuiPassphrase (no-op unless vault
+    // mode); under SSHRACK_PASSPHRASE the env value shadows the popup.
+    if let Some(body) = auth.inline_body() {
+        if matches!(
+            body.password,
+            Some(sshrack_core::config::schema::Secret::Plain(_))
+        ) {
+            if app.config.store.is_none() {
+                return Err(SshrackError::StoreModeNotDecided);
+            }
+            use sshrack_core::id::OwnerKind;
+            use sshrack_core::secret::{OsKeyring, vault};
+            let passphrase_provider = TuiPassphrase::new(handle.clone());
+            let env_pw = vault::passphrase_from_env();
+            let vault_key = vault::ensure_unlocked_vault_key(
+                &app.config,
+                env_pw.as_ref(),
+                &passphrase_provider,
+            )?;
+            let backend = OsKeyring;
+            let sealed = vault::seal_body(
+                body.clone(),
+                OwnerKind::Host,
+                &target_id,
+                &app.config,
+                vault_key.as_ref(),
+                &backend,
+            )?;
+            auth = Auth::inline(sealed);
+        }
+    }
 
     let new_cfg = if form.editing {
         // Edit: preserve the original id (keyring-keyed). The form already holds
         // every field, so stamp the original id onto the freshly built host and
         // splice it in place of the original. A rename to another host's name
         // is rejected by validate_rename (excluding the current name).
-        let orig_id = form.orig_id.ok_or(SshrackError::MissingRequiredField {
-            field: "orig_id (edit mode)",
-        })?;
         let orig = app
             .config
-            .find_host_by_id(&orig_id)
+            .find_host_by_id(&target_id)
             .ok_or(SshrackError::HostNotFound {
-                name: orig_id.to_string(),
+                name: target_id.to_string(),
                 hint: sshrack_core::error::DidYouMean::none(),
             })?;
         if orig.name != name {
             sshrack_core::host::validate_rename(&app.config, &orig.name, &name)?;
         }
-        let edited = sshrack_core::host::finalize_body(orig_id, &name, &host_addr, port, auth);
+        let edited = sshrack_core::host::finalize_body(target_id, &name, &host_addr, port, auth);
         let mut next = app.config.clone();
-        if let Some(slot) = next.hosts.iter_mut().find(|h| h.id == orig_id) {
+        if let Some(slot) = next.hosts.iter_mut().find(|h| h.id == target_id) {
             *slot = edited;
         }
         next
@@ -1556,7 +1624,7 @@ fn persist_host_save(app: &mut App) -> Result<(), SshrackError> {
         // run it here so the error surfaces before the append (add_host itself
         // only checks forbidden chars).
         sshrack_core::host::validate_no_duplicate(&app.config, &name, false)?;
-        sshrack_core::host::add_host(&app.config, Ulid::new(), &name, &host_addr, port, auth)?
+        sshrack_core::host::add_host(&app.config, target_id, &name, &host_addr, port, auth)?
     };
 
     // Persist + reload (so the on-disk file is the source of truth and the
@@ -2293,7 +2361,7 @@ mod tests {
         w.user = "deploy".into();
         app.overlay = Some(Overlay::HostWizard(w));
 
-        persist_host_save(&mut app).expect("add save should succeed");
+        persist_host_save(&mut app, &dead_handle()).expect("add save should succeed");
 
         // Wizard is NOT auto-closed by persist (the loop does that); but the
         // config has been reloaded with the new host.
@@ -2332,7 +2400,7 @@ mod tests {
         w.name = "web-renamed".into();
         app.overlay = Some(Overlay::HostWizard(w));
 
-        persist_host_save(&mut app).expect("edit save should succeed");
+        persist_host_save(&mut app, &dead_handle()).expect("edit save should succeed");
 
         let reloaded = sshrack_core::config::store::load(&path).unwrap();
         assert_eq!(reloaded.hosts.len(), 1);
@@ -2367,7 +2435,7 @@ mod tests {
         w.host_addr = "h2".into();
         app.overlay = Some(Overlay::HostWizard(w));
 
-        let err = persist_host_save(&mut app).unwrap_err();
+        let err = persist_host_save(&mut app, &dead_handle()).unwrap_err();
         assert!(matches!(err, SshrackError::HostAlreadyExists { .. }));
         // The duplicate host was NOT written.
         let reloaded = sshrack_core::config::store::load(&path).unwrap();
@@ -2396,10 +2464,10 @@ mod tests {
         };
         w.name = "web".into();
         w.host_addr = "10.0.0.5".into();
-        w.auth_choice = super::super::wizard::AuthChoice::Credential { idx: 0 };
+        w.auth_choice = super::super::wizard::AuthChoice::Reference { idx: 0 };
         app.overlay = Some(Overlay::HostWizard(w));
 
-        persist_host_save(&mut app).unwrap();
+        persist_host_save(&mut app, &dead_handle()).unwrap();
 
         let reloaded = sshrack_core::config::store::load(&path).unwrap();
         let h = &reloaded.hosts[0];
@@ -2432,11 +2500,105 @@ mod tests {
         w.name = "web".into();
         w.host_addr = "10.0.0.5".into();
         w.credential_names = vec!["ghost".into()]; // not in config
-        w.auth_choice = super::super::wizard::AuthChoice::Credential { idx: 0 };
+        w.auth_choice = super::super::wizard::AuthChoice::Reference { idx: 0 };
         app.overlay = Some(Overlay::HostWizard(w));
 
-        let err = persist_host_save(&mut app).unwrap_err();
+        let err = persist_host_save(&mut app, &dead_handle()).unwrap_err();
         assert!(matches!(err, SshrackError::CredentialNotFound { .. }));
+    }
+
+    // ---- persist_host_save: Independent inline password seals per store mode ----
+    // Mirrors the cred wizard's seal tests. The plaintext no-leak test (under
+    // Keyring) pins the invariant: a host-own password must not live in the body
+    // when the store mode is keyring. The keyring backend is not reliably
+    // reachable in unit tests (needs a D-Bus / Secret Service daemon), so the
+    // keyring test is #[ignore]'d — exercise it via the Task 3 manual smoke.
+
+    #[test]
+    fn persist_host_save_independent_password_seals_under_plaintext() {
+        // Inline password under plaintext store: body carries Secret::Plain, no
+        // keyring marker. The plaintext no-leak invariant for the OTHER modes is
+        // pinned by the keyring test below; this test pins that plaintext truly
+        // round-trips through seal_body for a host-own password.
+        use super::super::wizard::{AuthChoice, SecretChoice};
+        use sshrack_core::config::schema::{Secret, SecretStore};
+        use zeroize::Zeroizing;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = SshrackConfig {
+            store: Some(SecretStore::Plaintext),
+            ..SshrackConfig::default()
+        };
+        sshrack_core::config::store::save(&path, &cfg).unwrap();
+        let mut app = App::new(cfg, Some(path.clone()), Frecency::default(), HashMap::new());
+
+        app.open_host_wizard_add();
+        let Overlay::HostWizard(mut w) = app.overlay.take().unwrap() else {
+            unreachable!("host wizard open");
+        };
+        w.name = "pw-host".into();
+        w.host_addr = "10.0.0.1".into();
+        w.auth_choice = AuthChoice::Independent;
+        w.secret_kind = SecretChoice::Password;
+        w.password = Zeroizing::new("hunter2".into());
+        app.overlay = Some(Overlay::HostWizard(w));
+
+        persist_host_save(&mut app, &dead_handle()).expect("seal + save succeeds");
+
+        let saved = app.config.find_host_by_name("pw-host").expect("host saved");
+        let body = saved.auth.inline_body().expect("inline body");
+        assert_eq!(body.secret_kind(), SecretKind::Password);
+        assert_eq!(
+            body.password.as_ref().and_then(Secret::as_plain),
+            Some("hunter2")
+        );
+        assert!(!body.keyring, "plaintext mode: no keyring marker");
+    }
+
+    #[test]
+    #[ignore = "needs a reachable OS keyring backend; exercise via the Task 3 manual smoke"]
+    fn persist_host_save_independent_password_seals_under_keyring() {
+        // Keyring store: body keeps only the keyring marker; the password is NOT
+        // in the body (it lives in the OS keyring, keyed by the host's ULID).
+        // This is the no-leak invariant: a host-own password must not appear as
+        // plaintext in config.toml under keyring mode.
+        use super::super::wizard::{AuthChoice, SecretChoice};
+        use sshrack_core::config::schema::SecretStore;
+        use zeroize::Zeroizing;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = SshrackConfig {
+            store: Some(SecretStore::Keyring),
+            ..SshrackConfig::default()
+        };
+        sshrack_core::config::store::save(&path, &cfg).unwrap();
+        let mut app = App::new(cfg, Some(path.clone()), Frecency::default(), HashMap::new());
+
+        app.open_host_wizard_add();
+        let Overlay::HostWizard(mut w) = app.overlay.take().unwrap() else {
+            unreachable!("host wizard open");
+        };
+        w.name = "kr-host".into();
+        w.host_addr = "10.0.0.1".into();
+        w.auth_choice = AuthChoice::Independent;
+        w.secret_kind = SecretChoice::Password;
+        w.password = Zeroizing::new("hunter2".into());
+        app.overlay = Some(Overlay::HostWizard(w));
+
+        persist_host_save(&mut app, &dead_handle()).expect("seal + save succeeds");
+
+        let saved = app.config.find_host_by_name("kr-host").expect("host saved");
+        let body = saved.auth.inline_body().expect("inline body");
+        assert!(
+            body.keyring,
+            "keyring mode: body must carry the keyring marker"
+        );
+        assert!(
+            body.password.is_none(),
+            "keyring mode: plaintext must NOT live in the body"
+        );
     }
 
     // ---- end-to-end add→save→launcher-reflects, driven via on_key + loop actions ----
@@ -2473,7 +2635,7 @@ mod tests {
         assert!(matches!(outcome, Outcome::SaveHost));
 
         // Loop actions.
-        persist_host_save(&mut app).expect("save");
+        persist_host_save(&mut app, &dead_handle()).expect("save");
         app.close_host_wizard();
         assert!(app.overlay().is_none(), "overlay closed back to launcher");
         // The launcher now sees the new host (re-ranked on close).
@@ -2524,7 +2686,7 @@ mod tests {
         let outcome = app.on_key(press(KeyCode::Char('s'), KeyModifiers::CONTROL));
         assert!(matches!(outcome, Outcome::SaveHost));
 
-        persist_host_save(&mut app).expect("save");
+        persist_host_save(&mut app, &dead_handle()).expect("save");
         app.close_host_wizard();
         assert_eq!(app.config().hosts.len(), 1);
         assert_eq!(app.config().hosts[0].port, 2200);
