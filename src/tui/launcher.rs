@@ -27,9 +27,9 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Layout},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListState, Paragraph},
+    widgets::{List, ListState, Paragraph},
 };
 use sshrack_core::config::schema::Host;
 use sshrack_core::frecency::Frecency;
@@ -37,6 +37,7 @@ use ulid::Ulid;
 
 use super::CredentialNames;
 use super::app::Outcome;
+use super::theme;
 
 /// A ranked host: its index into the source `&[Host]` slice plus the match
 /// score that placed it there.
@@ -315,11 +316,13 @@ impl Launcher {
     /// `[search(1), list(Fill), status(1)]`, renders the search row + ranked
     /// list + status. Reuses `host_line` / `highlighted_name` /
     /// `credential_label` / `frecency_tier`. The search row places the real
-    /// terminal cursor at the end of the query.
+    /// terminal cursor at the end of the query via `set_cursor_position`.
     ///
-    /// Task 6 scope: keep the current selection style (`bg(DarkGray)`) and the
-    /// `▍` search cursor glyph for now — Task 10 replaces them with the
-    /// theme's selected gutter + a real cursor. Just get the layout right.
+    /// Selection styling: the selected row carries `theme::selected_gutter()`
+    /// (a Cyan `▎`) as its first span and is rendered `BOLD`; every other row
+    /// is padded with a two-space prefix so the names align under the gutter.
+    /// There is no dark-background selection bar — the gutter + bold is the
+    /// whole signal, matching the Credentials and Settings panels.
     pub fn draw_in_shell(
         &self,
         frame: &mut Frame,
@@ -336,12 +339,11 @@ impl Launcher {
         ])
         .areas(area);
 
-        // Search row: `❯ <query>` with the real terminal cursor at the end.
-        // The `▍` glyph is retained for Task 6; Task 10 swaps to a pure cursor.
+        // Search row: `❯ <query>` with the real terminal cursor placed right
+        // after the query (no fake cursor glyph — the cursor is the terminal's).
         let search_line = Line::from(vec![
             Span::styled("❯ ", Style::new().dim()),
             Span::raw(&self.query),
-            Span::styled("▍", Style::new().dim()),
         ]);
         frame.render_widget(Paragraph::new(search_line), search_area);
         // Place the terminal cursor right after the query (2-cell `❯ ` prefix).
@@ -354,7 +356,7 @@ impl Launcher {
         // Status row: app status (red on error) > launcher-local hint > default.
         let line = if let Some(msg) = &status.message {
             let style = if status.is_error {
-                Style::new().fg(Color::Red)
+                Style::new().fg(theme::DANGER)
             } else {
                 Style::new()
             };
@@ -374,9 +376,9 @@ impl Launcher {
         frame.render_widget(Paragraph::new(line), status_area);
     }
 
-    /// Render the ranked host list with selection highlight and per-host fuzzy
-    /// match highlighting. Shows an empty-state line when there is nothing to
-    /// list.
+    /// Render the ranked host list with the selected-row gutter and per-host
+    /// fuzzy-match highlighting. Shows an empty-state line when there is
+    /// nothing to list. No outer border (the shell supplies the chrome).
     fn draw_list(
         &self,
         frame: &mut Frame,
@@ -385,44 +387,41 @@ impl Launcher {
         frecency: &Frecency,
         credential_names: &CredentialNames,
     ) {
-        let items: Vec<Line> = self
-            .ranked
-            .iter()
-            .map(|r| host_line(&hosts[r.host_idx], &self.query, frecency, credential_names))
-            .collect();
-
-        if items.is_empty() {
+        if self.ranked.is_empty() {
             let msg = if hosts.is_empty() {
                 "No hosts configured. Press ^a to add one (not yet implemented)."
             } else {
                 "No hosts match your query."
             };
-            let block = Block::new()
-                .borders(Borders::NONE)
-                .title(" sshrack — hosts ");
-            frame.render_widget(&block, area);
-            let [inner] = Layout::vertical([Constraint::Fill(1)]).areas(block.inner(area));
             frame.render_widget(
                 Paragraph::new(msg)
                     .style(Style::new().dim())
                     .alignment(Alignment::Center),
-                inner,
+                area,
             );
             return;
         }
 
-        let list = List::new(items)
-            .block(
-                Block::new()
-                    .borders(Borders::ALL)
-                    .title(" sshrack — hosts "),
-            )
-            .highlight_style(
-                Style::new()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol("▶ ");
+        // Bake the gutter into each item: the selected row carries
+        // `theme::selected_gutter()` (Cyan `▎`); every other row carries a
+        // two-space pad so names align. `highlight_style` then adds BOLD to
+        // the whole selected row — no dark-background selection bar.
+        let items: Vec<Line> = self
+            .ranked
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                host_line(
+                    &hosts[r.host_idx],
+                    &self.query,
+                    frecency,
+                    credential_names,
+                    i == self.selected,
+                )
+            })
+            .collect();
+
+        let list = List::new(items).highlight_style(Style::new().add_modifier(Modifier::BOLD));
 
         let mut state = ListState::default();
         state.select(Some(self.selected));
@@ -430,7 +429,8 @@ impl Launcher {
     }
 }
 
-/// Build the display line for one host: the name with fuzzy-matched chars
+/// Build the display line for one host: the selection gutter (or a two-space
+/// pad when not selected so names align), the name with fuzzy-matched chars
 /// highlighted, the address/port dimmed, the credential name (or inline user)
 /// dimmed, and the frecency tier on the right.
 fn host_line(
@@ -438,26 +438,34 @@ fn host_line(
     query: &str,
     frecency: &Frecency,
     credential_names: &CredentialNames,
+    selected: bool,
 ) -> Line<'static> {
     let name_spans = highlighted_name(&host.name, query);
     let addr = format!("  {}:{}", host.host, host.port);
     let cred = credential_label(host, credential_names);
     let tier = frecency_tier(frecency.score(&host.id));
 
-    let mut spans = name_spans;
+    let mut spans = Vec::with_capacity(name_spans.len() + 5);
+    // Selected row leads with the Cyan gutter mark; others pad to align.
+    spans.push(if selected {
+        theme::selected_gutter()
+    } else {
+        Span::raw("  ")
+    });
+    spans.extend(name_spans);
     spans.push(Span::styled(addr, Style::new().dim()));
     spans.push(Span::styled(format!("  ({cred})"), Style::new().dim()));
     spans.push(Span::styled(
         format!("  [{tier}]"),
-        Style::new().fg(Color::Cyan).dim(),
+        Style::new().fg(theme::ACCENT).dim(),
     ));
 
     Line::from(spans)
 }
 
 /// Render a host's name as a sequence of spans, with the fuzzy-matched
-/// characters (per nucleo) highlighted bold + accent. When the query is empty
-/// the whole name is one plain span.
+/// characters (per nucleo) highlighted bold + `theme::MATCH`. When the query
+/// is empty the whole name is one plain span.
 fn highlighted_name(name: &str, query: &str) -> Vec<Span<'static>> {
     if query.is_empty() {
         return vec![Span::raw(name.to_string())];
@@ -465,7 +473,7 @@ fn highlighted_name(name: &str, query: &str) -> Vec<Span<'static>> {
     let Some(matched) = match_indices(name, query) else {
         return vec![Span::raw(name.to_string())];
     };
-    let highlight = Style::new().add_modifier(Modifier::BOLD).fg(Color::Yellow);
+    let highlight = Style::new().add_modifier(Modifier::BOLD).fg(theme::MATCH);
     let mut spans = Vec::with_capacity(matched.len() + 1);
     let mut prev = 0usize;
     for idx in matched {
@@ -716,6 +724,7 @@ mod tests {
     // ---- view layer: Launcher state, on_key, render helpers ----
 
     use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+    use ratatui::{Terminal, backend::TestBackend};
     use std::collections::HashMap;
 
     /// A Press KeyEvent with the given code and modifiers.
@@ -723,8 +732,70 @@ mod tests {
         KeyEvent::new_with_kind(code, mods, KeyEventKind::Press)
     }
 
+    // ---- Task 10: visual-unification regression (gutter + real cursor) ----
+
+    /// Render the launcher inside the shell and assert it (a) does not panic,
+    /// (b) calls `set_cursor_position` on the search row (the real terminal
+    /// cursor — the fake cursor glyph must be gone), and (c) paints the
+    /// selected-row gutter `▎` (not a dark-background selection bar).
+    #[test]
+    fn draw_in_shell_renders_without_panic_sets_cursor_and_uses_gutter() {
+        let backend = TestBackend::new(100, 30);
+        let mut term = Terminal::new(backend).unwrap();
+        let hosts = vec![host(1, "web")];
+        let frecency = Frecency::default();
+        let mut p = Launcher::new(&hosts, &frecency);
+        p.query = "w".into();
+        p.recompute(&hosts, &frecency);
+
+        term.draw(|f| {
+            let area = crate::tui::shell::draw_shell(
+                f,
+                f.area(),
+                crate::tui::tab::Tab::Hosts,
+                &[("Enter", "connect"), ("^A", "add")],
+            );
+            p.draw_in_shell(
+                f,
+                area,
+                &hosts,
+                &frecency,
+                &empty_creds(),
+                &crate::tui::app::Status::empty(),
+            );
+        })
+        .unwrap();
+
+        // The fake cursor glyph must no longer be in the rendered buffer.
+        let view = buffer_view(term.backend().buffer());
+        assert!(
+            !view.contains('\u{258d}'),
+            "fake cursor glyph leaked: {view}"
+        );
+        // The selected row carries the Cyan gutter mark `▎`.
+        assert!(view.contains('▎'), "selected-row gutter missing: {view}");
+        // No dark-background selection: the selected host name is rendered with
+        // bold, not a dark background — assert the host name is present.
+        assert!(view.contains("web"), "host name missing: {view}");
+    }
+
     fn empty_creds() -> CredentialNames {
         HashMap::new()
+    }
+
+    /// A human-readable stringification of a ratatui `Buffer` (one line per
+    /// row) for substring assertions in render regression tests.
+    fn buffer_view(buf: &ratatui::buffer::Buffer) -> String {
+        let area = buf.area;
+        let mut out = String::with_capacity((area.width as usize + 1) * area.height as usize);
+        for row in 0..area.height {
+            for col in 0..area.width {
+                let cell = buf.cell((col, row));
+                out.push_str(cell.map(|c| c.symbol()).unwrap_or(" "));
+            }
+            out.push('\n');
+        }
+        out
     }
 
     #[test]

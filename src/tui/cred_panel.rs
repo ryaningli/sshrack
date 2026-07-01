@@ -26,14 +26,15 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Layout},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListState, Paragraph},
+    widgets::{List, ListState, Paragraph},
 };
 use sshrack_core::config::schema::{Credential, SecretKind};
 
 use super::app::{Outcome, Status};
 use super::panel::rank_by_name;
+use super::theme;
 
 /// The default status line shown beneath the credential list when no transient
 /// message is set. Mirrors the launcher's centralized STATUS_LINE.
@@ -163,8 +164,7 @@ impl CredPanel {
     /// `[search(1), list(Fill), status(1)]`, renders the search row + ranked
     /// list + status row. Mirrors
     /// [`Launcher::draw_in_shell`](super::launcher::Launcher::draw_in_shell):
-    /// same `bg(DarkGray)` selection + `▍` search-cursor glyph (Task 10 swaps
-    /// both to the theme's selected gutter + a pure cursor).
+    /// same `theme::selected_gutter()` selection + real terminal cursor.
     pub fn draw_in_shell(
         &self,
         frame: &mut Frame,
@@ -179,12 +179,11 @@ impl CredPanel {
         ])
         .areas(area);
 
-        // Search row: `❯ <query>` with the real terminal cursor at the end. The
-        // `▍` glyph is retained for now; Task 10 swaps to a pure cursor.
+        // Search row: `❯ <query>` with the real terminal cursor placed right
+        // after the query (no fake cursor glyph — the cursor is the terminal's).
         let search_line = Line::from(vec![
             Span::styled("❯ ", Style::new().dim()),
             Span::raw(&self.query),
-            Span::styled("▍", Style::new().dim()),
         ]);
         frame.render_widget(Paragraph::new(search_line), search_area);
         // Place the terminal cursor right after the query (2-cell `❯ ` prefix).
@@ -197,7 +196,7 @@ impl CredPanel {
         // Status row: app status (red on error) > default key-binding hint.
         let line = if let Some(msg) = &status.message {
             let style = if status.is_error {
-                Style::new().fg(Color::Red)
+                Style::new().fg(theme::DANGER)
             } else {
                 Style::new()
             };
@@ -211,48 +210,37 @@ impl CredPanel {
         frame.render_widget(Paragraph::new(line), status_area);
     }
 
-    /// Render the ranked credential list with selection highlight. Shows an
-    /// empty-state line when there is nothing to list. Mirrors the launcher's
-    /// `draw_list` shape.
+    /// Render the ranked credential list with the selected-row gutter. Shows
+    /// an empty-state line when there is nothing to list. Mirrors the
+    /// launcher's `draw_list` shape and selection styling exactly.
     fn draw_list(&self, frame: &mut Frame, area: ratatui::layout::Rect, creds: &[Credential]) {
-        let items: Vec<Line> = self
-            .ranked
-            .iter()
-            .map(|&idx| cred_row(&creds[idx]))
-            .collect();
-
-        if items.is_empty() {
+        if self.ranked.is_empty() {
             let msg = if creds.is_empty() {
                 "No credentials configured. Press ^a to add one."
             } else {
                 "No credentials match your query."
             };
-            let block = Block::new()
-                .borders(Borders::NONE)
-                .title(" sshrack — credentials ");
-            frame.render_widget(&block, area);
-            let [inner] = Layout::vertical([Constraint::Fill(1)]).areas(block.inner(area));
             frame.render_widget(
                 Paragraph::new(msg)
                     .style(Style::new().dim())
                     .alignment(Alignment::Center),
-                inner,
+                area,
             );
             return;
         }
 
-        let list = List::new(items)
-            .block(
-                Block::new()
-                    .borders(Borders::ALL)
-                    .title(" sshrack — credentials "),
-            )
-            .highlight_style(
-                Style::new()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol("▶ ");
+        // Bake the gutter into each item: the selected row carries
+        // `theme::selected_gutter()` (Cyan `▎`); every other row carries a
+        // two-space pad so names align. `highlight_style` adds BOLD to the
+        // whole selected row — no dark-background selection bar.
+        let items: Vec<Line> = self
+            .ranked
+            .iter()
+            .enumerate()
+            .map(|(i, &idx)| cred_row(&creds[idx], i == self.selected))
+            .collect();
+
+        let list = List::new(items).highlight_style(Style::new().add_modifier(Modifier::BOLD));
 
         let mut state = ListState::default();
         state.select(Some(self.selected));
@@ -275,17 +263,26 @@ pub fn rank_credentials(creds: &[Credential], query: &str) -> Vec<usize> {
     rank_by_name(&names, &scores, query)
 }
 
-/// Build the display line for one credential: the name, a dimmed secondary
-/// `user · kind`. `kind` ∈ password / identity / none; **no secret plaintext is
-/// ever read** — only [`CredentialBody::secret_kind`](SecretKind) is consulted.
-fn cred_row(cred: &Credential) -> Line<'static> {
+/// Build the display line for one credential: the selection gutter (or a
+/// two-space pad when not selected so names align), the name, a dimmed
+/// secondary `user · kind`. `kind` ∈ password / identity / none; **no secret
+/// plaintext is ever read** — only [`CredentialBody::secret_kind`](SecretKind)
+/// is consulted.
+fn cred_row(cred: &Credential, selected: bool) -> Line<'static> {
     let user = cred.body.user.clone();
     let kind = match cred.body.secret_kind() {
         SecretKind::Password | SecretKind::KeyringPassword => "password",
         SecretKind::Key => "identity",
         SecretKind::Default => "none",
     };
+    // Selected row leads with the Cyan gutter mark; others pad to align.
+    let gutter = if selected {
+        theme::selected_gutter()
+    } else {
+        Span::raw("  ")
+    };
     Line::from(vec![
+        gutter,
         Span::raw(cred.name.clone()),
         Span::raw("   "),
         Span::styled(format!("{user} · {kind}"), Style::new().dim()),
@@ -300,7 +297,23 @@ mod tests {
     //! terminal or event source is touched.
     use super::*;
     use crossterm::event::KeyEvent;
+    use ratatui::{Terminal, backend::TestBackend};
     use sshrack_core::config::schema::{Credential, CredentialBody};
+
+    /// A human-readable stringification of a ratatui `Buffer` (one line per
+    /// row) for substring assertions in render regression tests.
+    fn buffer_view(buf: &ratatui::buffer::Buffer) -> String {
+        let area = buf.area;
+        let mut out = String::with_capacity((area.width as usize + 1) * area.height as usize);
+        for row in 0..area.height {
+            for col in 0..area.width {
+                let cell = buf.cell((col, row));
+                out.push_str(cell.map(|c| c.symbol()).unwrap_or(" "));
+            }
+            out.push('\n');
+        }
+        out
+    }
 
     /// Build a default-only credential (user `u`, no secret) named `name`.
     fn cred(name: &str, user: &str) -> Credential {
@@ -482,17 +495,17 @@ mod tests {
 
         // Render each row and assert the secondary text contains the right kind
         // label AND never the plaintext password.
-        let pw_line = format!("{}", cred_row(&pw));
+        let pw_line = format!("{}", cred_row(&pw, false));
         assert!(pw_line.contains("password"), "pw_line: {pw_line}");
         assert!(!pw_line.contains("hunter2"), "plaintext leaked: {pw_line}");
 
-        let key_line = format!("{}", cred_row(&key));
+        let key_line = format!("{}", cred_row(&key, false));
         assert!(key_line.contains("identity"), "key_line: {key_line}");
 
-        let kr_line = format!("{}", cred_row(&kr));
+        let kr_line = format!("{}", cred_row(&kr, false));
         assert!(kr_line.contains("password"), "kr_line: {kr_line}");
 
-        let none_line = format!("{}", cred_row(&none));
+        let none_line = format!("{}", cred_row(&none, false));
         assert!(none_line.contains("none"), "none_line: {none_line}");
 
         // Touch Secret so the unused import stays meaningful in this test.
@@ -518,5 +531,40 @@ mod tests {
         p.on_key(key(KeyCode::Char('w')), &creds);
         assert_eq!(p.ranked.len(), 1);
         assert_eq!(creds[p.ranked[0]].name, "web");
+    }
+
+    // ---- Task 10: visual-unification regression (gutter + real cursor) ----
+
+    /// Render the credentials panel inside the shell and assert it (a) does
+    /// not panic, (b) drops the fake-cursor glyph (real terminal cursor
+    /// instead), and (c) paints the selected-row gutter `▎` — mirroring the
+    /// Hosts panel exactly.
+    #[test]
+    fn draw_in_shell_renders_without_panic_sets_cursor_and_uses_gutter() {
+        let backend = TestBackend::new(100, 30);
+        let mut term = Terminal::new(backend).unwrap();
+        let creds = vec![cred("ops", "u")];
+        let mut p = CredPanel::new();
+        p.query = "o".into();
+        p.recompute(&creds);
+
+        term.draw(|f| {
+            let area = crate::tui::shell::draw_shell(
+                f,
+                f.area(),
+                crate::tui::tab::Tab::Credentials,
+                &[("Enter", "edit"), ("^A", "add")],
+            );
+            p.draw_in_shell(f, area, &creds, &crate::tui::app::Status::empty());
+        })
+        .unwrap();
+
+        let view = buffer_view(term.backend().buffer());
+        assert!(
+            !view.contains('\u{258d}'),
+            "fake cursor glyph leaked: {view}"
+        );
+        assert!(view.contains('▎'), "selected-row gutter missing: {view}");
+        assert!(view.contains("ops"), "credential name missing: {view}");
     }
 }

@@ -26,12 +26,13 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{List, ListState},
 };
 
 use super::app::Outcome;
+use super::theme;
 
 /// The three storage modes the user can pick. Mirrors the CLI `StoreMode` but
 /// lives in the view layer (no dependency on the CLI args module).
@@ -154,23 +155,26 @@ impl StoreView {
     /// supplied by [`super::dialog::draw_dialog`]. The dialog supplies the outer
     /// border + title + footer hints, so this draws **no** outer `Block`; it
     /// only lays out the mode list (with the active one marked) and a status
-    /// line. Only writes to the frame; no stdout access.
+    /// line. Selection styling mirrors the Hosts/Credentials panels: the
+    /// selected row leads with `theme::selected_gutter()` (Cyan `▎`) and is
+    /// rendered BOLD. Only writes to the frame; no stdout access.
     pub fn draw_in_dialog(&self, frame: &mut Frame, body: Rect) {
         // Status line pinned to the bottom of the dialog body; the list fills
         // the rest. (The dialog's own footer holds the key-binding hints.)
         let [list_area, status_area] =
             Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(body);
 
+        // Bake the gutter into each item: the selected row carries
+        // `theme::selected_gutter()`; every other row carries a two-space pad
+        // so labels align. `highlight_style` adds BOLD to the whole selected
+        // row — no dark-background selection bar.
         let items: Vec<Line> = StoreModeChoice::ORDER
             .iter()
-            .map(|m| mode_line(*m, &self.active_label))
+            .enumerate()
+            .map(|(i, &m)| mode_line(m, &self.active_label, i == self.selected))
             .collect();
 
-        let list = List::new(items).highlight_style(
-            Style::new()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        );
+        let list = List::new(items).highlight_style(Style::new().add_modifier(Modifier::BOLD));
         let mut state = ListState::default();
         state.select(Some(self.selected));
         frame.render_stateful_widget(list, list_area, &mut state);
@@ -189,19 +193,27 @@ impl StoreView {
     }
 }
 
-/// Build the display line for one mode: the mode name (with `(active)` when it
-/// matches the snapshot), then the trade-off blurb dimmed.
-fn mode_line(mode: StoreModeChoice, active_label: &str) -> Line<'static> {
+/// Build the display line for one mode: the selection gutter (or a two-space
+/// pad when not selected so labels align), the mode name (with `(active)` when
+/// it matches the snapshot), then the trade-off blurb dimmed.
+fn mode_line(mode: StoreModeChoice, active_label: &str, selected: bool) -> Line<'static> {
     let active = mode.label() == active_label;
     let name_span = if active {
         Span::styled(
             format!("{} (active)", mode.label()),
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            theme::accent().add_modifier(Modifier::BOLD),
         )
     } else {
         Span::raw(mode.label())
     };
+    // Selected row leads with the Cyan gutter mark; others pad to align.
+    let gutter = if selected {
+        theme::selected_gutter()
+    } else {
+        Span::raw("  ")
+    };
     Line::from(vec![
+        gutter,
         name_span,
         Span::raw("\n"),
         Span::styled(mode.blurb(), Style::new().dim()),
