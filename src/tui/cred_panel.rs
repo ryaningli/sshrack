@@ -160,7 +160,7 @@ impl CredPanel {
     /// status footer). Splits `area` into `[search(1), list(Fill)]` and renders
     /// the search row + ranked list. Mirrors
     /// [`Launcher::draw_in_shell`](super::launcher::Launcher::draw_in_shell):
-    /// same `theme::selected_gutter()` selection + real terminal cursor.
+    /// same `theme::focus_marker()` selection + real terminal cursor.
     pub fn draw_in_shell(
         &self,
         frame: &mut Frame,
@@ -185,9 +185,11 @@ impl CredPanel {
         self.draw_list(frame, list_area, creds);
     }
 
-    /// Render the ranked credential list with the selected-row gutter. Shows
-    /// an empty-state line when there is nothing to list. Mirrors the
-    /// launcher's `draw_list` shape and selection styling exactly.
+    /// Render the ranked credential list with the selected-row focus marker and
+    /// column alignment. Shows an empty-state line when there is nothing to
+    /// list. Mirrors the launcher's `draw_list` shape and selection styling
+    /// exactly (Task 5 → Task 4 mirror): `▶ ` on the selected row, two spaces
+    /// elsewhere, BOLD on the whole selected row, no dark-background bar.
     fn draw_list(&self, frame: &mut Frame, area: ratatui::layout::Rect, creds: &[Credential]) {
         if self.ranked.is_empty() {
             let msg = if creds.is_empty() {
@@ -204,15 +206,33 @@ impl CredPanel {
             return;
         }
 
-        // Bake the gutter into each item: the selected row carries
-        // `theme::selected_gutter()` (Cyan `▎`); every other row carries a
-        // two-space pad so names align. `highlight_style` adds BOLD to the
-        // whole selected row — no dark-background selection bar.
+        // Adaptive column widths: the widest visible name / user, capped so a
+        // single very long value can't squeeze the kind column off the row.
+        let name_w = self
+            .ranked
+            .iter()
+            .map(|&i| creds[i].name.chars().count())
+            .max()
+            .unwrap_or(0)
+            .min(CRED_NAME_COL_CAP);
+        let user_w = self
+            .ranked
+            .iter()
+            .map(|&i| creds[i].body.user.chars().count())
+            .max()
+            .unwrap_or(0)
+            .min(CRED_USER_COL_CAP);
+
+        // Bake the marker into each item: the selected row carries
+        // `theme::focus_marker(true)` (Cyan `▶ `); every other row carries
+        // `theme::focus_marker(false)` (two spaces) so names align.
+        // `highlight_style` then adds BOLD to the whole selected row — no
+        // dark-background selection bar.
         let items: Vec<Line> = self
             .ranked
             .iter()
             .enumerate()
-            .map(|(i, &idx)| cred_row(&creds[idx], i == self.selected))
+            .map(|(i, &idx)| cred_row(&creds[idx], i == self.selected, name_w, user_w, area.width))
             .collect();
 
         let list = List::new(items).highlight_style(Style::new().add_modifier(Modifier::BOLD));
@@ -238,30 +258,56 @@ pub fn rank_credentials(creds: &[Credential], query: &str) -> Vec<usize> {
     rank_by_name(&names, &scores, query)
 }
 
-/// Build the display line for one credential: the selection gutter (or a
-/// two-space pad when not selected so names align), the name, a dimmed
-/// secondary `user · kind`. `kind` ∈ password / identity / none; **no secret
-/// plaintext is ever read** — only [`CredentialBody::secret_kind`](SecretKind)
-/// is consulted.
-fn cred_row(cred: &Credential, selected: bool) -> Line<'static> {
+/// Width cap for the adaptive name column. Names longer than this overflow
+/// gracefully into the gap rather than squeezing the user/kind columns.
+const CRED_NAME_COL_CAP: usize = 20;
+/// Width cap for the adaptive user column. Users longer than this overflow
+/// gracefully rather than squeezing the kind column off the row.
+const CRED_USER_COL_CAP: usize = 12;
+
+/// Build the display line for one credential: the focus marker (`▶ ` when
+/// selected, two spaces otherwise), the name padded to `name_w`, a dimmed
+/// `user` column padded to `user_w`, and `kind` right-aligned to `width`.
+/// `kind` ∈ password / identity / none; **no secret plaintext is ever read** —
+/// only [`CredentialBody::secret_kind`](SecretKind) is consulted.
+///
+/// `name_w`/`user_w` are the maxima across the visible rows (computed in
+/// [`CredPanel::draw_list`], capped at [`CRED_NAME_COL_CAP`] /
+/// [`CRED_USER_COL_CAP`]); `width` is the list area width, used to right-align
+/// the kind column. Mirrors the launcher's `host_line` marker + column pattern
+/// so both lists line up visually.
+fn cred_row(
+    cred: &Credential,
+    selected: bool,
+    name_w: usize,
+    user_w: usize,
+    width: u16,
+) -> Line<'static> {
     let user = cred.body.user.clone();
     let kind = match cred.body.secret_kind() {
         SecretKind::Password | SecretKind::KeyringPassword => "password",
         SecretKind::Key => "identity",
         SecretKind::Default => "none",
     };
-    // Selected row leads with the Cyan gutter mark; others pad to align.
-    let gutter = if selected {
-        theme::selected_gutter()
-    } else {
-        Span::raw("  ")
-    };
-    Line::from(vec![
-        gutter,
-        Span::raw(cred.name.clone()),
-        Span::raw("   "),
-        Span::styled(format!("{user} · {kind}"), Style::new().dim()),
-    ])
+    let mut spans = vec![theme::focus_marker(selected)];
+    // Name column (padded to name_w).
+    spans.push(Span::raw(cred.name.clone()));
+    spans.push(Span::raw(
+        " ".repeat(name_w.saturating_sub(cred.name.chars().count())),
+    ));
+    spans.push(Span::raw("  ")); // gap between name and user columns
+    // User column (dim, padded to user_w).
+    spans.push(Span::styled(user.clone(), Style::new().dim()));
+    spans.push(Span::raw(
+        " ".repeat(user_w.saturating_sub(user.chars().count())),
+    ));
+    // Kind column right-aligned to the list area's right edge.
+    let used = 2 + name_w + 2 + user_w;
+    let kind_block = format!("  {kind}"); // 2 leading spaces + label
+    let fill = (width as usize).saturating_sub(used + kind_block.chars().count());
+    spans.push(Span::raw(" ".repeat(fill)));
+    spans.push(Span::styled(kind_block, Style::new().dim()));
+    Line::from(spans)
 }
 
 #[cfg(test)]
@@ -469,18 +515,19 @@ mod tests {
         let none = mk("none", CredentialBody::new("u"));
 
         // Render each row and assert the secondary text contains the right kind
-        // label AND never the plaintext password.
-        let pw_line = format!("{}", cred_row(&pw, false));
+        // label AND never the plaintext password. Pass small column widths + a
+        // comfortable `width` so the right-aligned kind column still fits.
+        let pw_line = format!("{}", cred_row(&pw, false, 8, 4, 40));
         assert!(pw_line.contains("password"), "pw_line: {pw_line}");
         assert!(!pw_line.contains("hunter2"), "plaintext leaked: {pw_line}");
 
-        let key_line = format!("{}", cred_row(&key, false));
+        let key_line = format!("{}", cred_row(&key, false, 8, 4, 40));
         assert!(key_line.contains("identity"), "key_line: {key_line}");
 
-        let kr_line = format!("{}", cred_row(&kr, false));
+        let kr_line = format!("{}", cred_row(&kr, false, 8, 4, 40));
         assert!(kr_line.contains("password"), "kr_line: {kr_line}");
 
-        let none_line = format!("{}", cred_row(&none, false));
+        let none_line = format!("{}", cred_row(&none, false, 8, 4, 40));
         assert!(none_line.contains("none"), "none_line: {none_line}");
 
         // Touch Secret so the unused import stays meaningful in this test.
@@ -508,14 +555,14 @@ mod tests {
         assert_eq!(creds[p.ranked[0]].name, "web");
     }
 
-    // ---- Task 10: visual-unification regression (gutter + real cursor) ----
+    // ---- Task 10/5: visual-unification regression (focus marker + real cursor) ----
 
     /// Render the credentials panel inside the shell and assert it (a) does
     /// not panic, (b) drops the fake-cursor glyph (real terminal cursor
-    /// instead), and (c) paints the selected-row gutter `▎` — mirroring the
-    /// Hosts panel exactly.
+    /// instead), and (c) paints the selected-row focus marker `▶ ` — mirroring
+    /// the Hosts panel exactly (Task 4 → Task 5 mirror).
     #[test]
-    fn draw_in_shell_renders_without_panic_sets_cursor_and_uses_gutter() {
+    fn draw_in_shell_renders_without_panic_sets_cursor_and_uses_focus_marker() {
         let backend = TestBackend::new(100, 30);
         let mut term = Terminal::new(backend).unwrap();
         let creds = vec![cred("ops", "u")];
@@ -540,7 +587,25 @@ mod tests {
             !view.contains('\u{258d}'),
             "fake cursor glyph leaked: {view}"
         );
-        assert!(view.contains('▎'), "selected-row gutter missing: {view}");
+        // Selected row carries the focus marker `▶ `; the old `▎` gutter must
+        // be gone (replaced by the wizard-style arrow marker).
+        assert!(view.contains('▶'), "focus marker missing: {view}");
+        assert!(!view.contains('▎'), "old gutter leaked: {view}");
         assert!(view.contains("ops"), "credential name missing: {view}");
+    }
+
+    #[test]
+    fn cred_row_aligns_name_user_and_right_aligns_kind() {
+        // name "web-key", user "root", default secret → kind "none". Pass
+        // name_w=12 so the name column is padded with 5 trailing spaces, and a
+        // width big enough that the right-aligned kind fits.
+        let c = cred("web-key", "root");
+        let line = cred_row(&c, false, 12, 8, 50);
+        let s = format!("{line}");
+        // Name padded to 12: "web-key" + 5 spaces.
+        assert!(s.contains("web-key     "), "name not padded: {s}");
+        // Kind right-aligned (trailing), no plaintext.
+        assert!(s.contains("none"), "row text: {s}");
+        assert!(!s.contains("hunter2"));
     }
 }
