@@ -75,6 +75,85 @@ pub fn confirm_from_key(key: KeyCode) -> ConfirmAnswer {
     }
 }
 
+// wired by Task 3's store-pick popup; allow removed there.
+/// A store-mode selection made in the store-pick popup. The popup returns
+/// `Option<StorePick>` — `None` when the user cancelled. Distinct from
+/// `crate::tui::store::StoreModeChoice` (a `Mode::Store` view that returns
+/// `Outcome`) because this popup must return a selection synchronously.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum StorePick {
+    Keyring,
+    Vault,
+    Plaintext,
+}
+
+impl StorePick {
+    // wired by Task 3's store-pick popup; allow removed there.
+    /// Render + navigation order shown in the popup.
+    #[allow(dead_code)]
+    pub const ORDER: &'static [StorePick] =
+        &[StorePick::Keyring, StorePick::Vault, StorePick::Plaintext];
+
+    // wired by Task 3's store-pick popup; allow removed there.
+    /// The user-facing label.
+    #[allow(dead_code)]
+    pub fn label(self) -> &'static str {
+        match self {
+            StorePick::Keyring => "keyring",
+            StorePick::Vault => "vault",
+            StorePick::Plaintext => "plaintext",
+        }
+    }
+
+    // wired by Task 3's store-pick popup; allow removed there.
+    /// A one-line trade-off blurb shown beside the option in the popup.
+    #[allow(dead_code)]
+    pub fn blurb(self) -> &'static str {
+        match self {
+            StorePick::Keyring => "OS keyring (recommended); needs a Secret Service daemon",
+            StorePick::Vault => "master-passphrase encryption (portable across machines)",
+            StorePick::Plaintext => "stored in the clear — a security downgrade",
+        }
+    }
+}
+
+// wired by Task 3's store-pick popup; allow removed there.
+/// The decoded action for one key in the store-pick popup. Mirrors the shape of
+/// [`ConfirmAnswer`]: distinguishes "this key does something" from "ignore me".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum StorePickAction {
+    /// Move the cursor up (wraps).
+    Up,
+    /// Move the cursor down (wraps).
+    Down,
+    /// Enter: confirm the highlighted option.
+    Confirm,
+    /// Esc / Ctrl-C: cancel the popup.
+    Cancel,
+    /// Any other key: ignored.
+    Other,
+}
+
+// wired by Task 3's store-pick popup; allow removed there.
+/// Pure decision for the store-pick popup: which key yields which action. No
+/// I/O, so it is unit-testable without a terminal. `Ctrl-C` cancels regardless
+/// of the underlying char.
+#[allow(dead_code)]
+pub fn store_pick_action_from_key(key: KeyCode, mods: KeyModifiers) -> StorePickAction {
+    if mods == KeyModifiers::CONTROL && key == KeyCode::Char('c') {
+        return StorePickAction::Cancel;
+    }
+    match key {
+        KeyCode::Up => StorePickAction::Up,
+        KeyCode::Down => StorePickAction::Down,
+        KeyCode::Enter => StorePickAction::Confirm,
+        KeyCode::Esc => StorePickAction::Cancel,
+        _ => StorePickAction::Other,
+    }
+}
+
 /// Mask character shown for each typed password byte. The literal bullet keeps
 /// the field non-empty looking without leaking length precisely.
 #[allow(dead_code)]
@@ -402,5 +481,64 @@ mod tests {
         assert_ne!(ConfirmAnswer::Yes, ConfirmAnswer::No);
         assert_ne!(ConfirmAnswer::Yes, ConfirmAnswer::Pending);
         assert_ne!(ConfirmAnswer::No, ConfirmAnswer::Pending);
+    }
+
+    #[test]
+    fn store_pick_up_down_navigate() {
+        assert_eq!(
+            store_pick_action_from_key(KeyCode::Up, KeyModifiers::NONE),
+            StorePickAction::Up
+        );
+        assert_eq!(
+            store_pick_action_from_key(KeyCode::Down, KeyModifiers::NONE),
+            StorePickAction::Down
+        );
+    }
+
+    #[test]
+    fn store_pick_enter_confirms_esc_cancels() {
+        assert_eq!(
+            store_pick_action_from_key(KeyCode::Enter, KeyModifiers::NONE),
+            StorePickAction::Confirm
+        );
+        assert_eq!(
+            store_pick_action_from_key(KeyCode::Esc, KeyModifiers::NONE),
+            StorePickAction::Cancel
+        );
+    }
+
+    #[test]
+    fn store_pick_ctrl_c_cancels() {
+        assert_eq!(
+            store_pick_action_from_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            StorePickAction::Cancel
+        );
+    }
+
+    #[test]
+    fn store_pick_other_keys_are_other() {
+        assert_eq!(
+            store_pick_action_from_key(KeyCode::Char('a'), KeyModifiers::NONE),
+            StorePickAction::Other
+        );
+        assert_eq!(
+            store_pick_action_from_key(KeyCode::Tab, KeyModifiers::NONE),
+            StorePickAction::Other
+        );
+    }
+
+    #[test]
+    fn store_pick_order_and_labels_are_stable() {
+        assert_eq!(
+            StorePick::ORDER,
+            &[StorePick::Keyring, StorePick::Vault, StorePick::Plaintext]
+        );
+        assert_eq!(StorePick::Keyring.label(), "keyring");
+        assert_eq!(StorePick::Vault.label(), "vault");
+        assert_eq!(StorePick::Plaintext.label(), "plaintext");
+        // blurbs are non-empty one-liners (rendered beside each option).
+        for m in StorePick::ORDER {
+            assert!(!m.blurb().is_empty());
+        }
     }
 }
