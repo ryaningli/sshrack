@@ -27,6 +27,7 @@ pub mod app;
 pub mod connect;
 pub mod help;
 pub mod launcher;
+pub mod panel;
 pub mod popup;
 pub mod prompt;
 pub mod store;

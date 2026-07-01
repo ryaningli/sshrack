@@ -11,8 +11,8 @@
 //!
 //! Ranking contract:
 //! - **Empty query** — every host is returned, ordered by frecency score
-//!   descending with a name-ascending tiebreak (delegated to core's frecency
-//!   data via [`frecency::rank`] over all hosts with an empty query).
+//!   descending with a name-ascending tiebreak (via the shared
+//!   [`crate::tui::panel::rank_by_name`] helper over all hosts).
 //! - **Non-empty query** — hosts are fuzzy-matched against their `name` via
 //!   nucleo; non-matches are excluded. Matches are ordered by descending
 //!   nucleo match score, tie-broken by frecency score then name ascending.
@@ -32,7 +32,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListState, Paragraph},
 };
 use sshrack_core::config::schema::Host;
-use sshrack_core::frecency::{self, Frecency};
+use sshrack_core::frecency::Frecency;
 use ulid::Ulid;
 
 use super::CredentialNames;
@@ -57,67 +57,46 @@ pub struct RankedHost {
 ///
 /// Pure: no I/O, no printing, no env access. See the module docs for the full
 /// contract.
+///
+/// Delegates ordering to [`crate::tui::panel::rank_by_name`], the shared
+/// helper that the Credentials panel also uses, then re-attaches the nucleo
+/// match score (0 on the empty-query branch) that [`RankedHost::score`]
+/// carries for callers/tests.
 #[allow(dead_code)]
 pub fn rank_hosts(hosts: &[Host], frecency: &Frecency, query: &str) -> Vec<RankedHost> {
+    // Pair each host with its original slice index and its frecency score —
+    // the same score source the previous inlined comparator used
+    // (`frecency.score(&id)`). `rank_by_name` consumes parallel slices and
+    // returns display-ordered original indices.
+    let names: Vec<String> = hosts.iter().map(|h| h.name.clone()).collect();
+    let scores: Vec<f64> = hosts.iter().map(|h| frecency.score(&h.id)).collect();
+    let order = crate::tui::panel::rank_by_name(&names, &scores, query);
+
     if query.is_empty() {
-        // Delegate ordering to core's frecency rank (score-desc, name-asc),
-        // then map each ranked host back to its index in the source slice.
-        // Core's `rank` with an empty query matches every host, so every host
-        // is returned and the order is purely frecency-then-name. We pair each
-        // borrowed host with its original index up front so the reverse lookup
-        // is a cheap linear scan over the (small) ranked list, not a pointer
-        // identity search.
-        let indexed: Vec<(&Host, usize)> = hosts.iter().enumerate().map(|(i, h)| (h, i)).collect();
-        let refs: Vec<&Host> = indexed.iter().map(|(h, _)| *h).collect();
-        let ranked = frecency::rank(&refs, "", frecency);
-        ranked
+        // Empty-query branch reports score 0 (ordering is the signal).
+        order
             .into_iter()
-            .map(|r| RankedHost {
-                host_idx: indexed
-                    .iter()
-                    .find(|(h, _)| std::ptr::eq(*h, r.host))
-                    .map(|(_, i)| *i)
-                    .unwrap_or(0),
+            .map(|i| RankedHost {
+                host_idx: i,
                 score: 0,
             })
             .collect()
     } else {
+        // Re-attach the nucleo match score for each matched host. The pattern
+        // is deterministic, so re-scoring post-sort yields the same value as
+        // the pre-sort score `rank_by_name` used internally.
         let mut matcher = Matcher::new(Config::DEFAULT);
         let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
-        let mut scored: Vec<RankedHost> = hosts
-            .iter()
-            .enumerate()
-            .filter_map(|(i, h)| {
-                let score = pattern.score(Utf32Str::Ascii(h.name.as_bytes()), &mut matcher)?;
-                Some(RankedHost { host_idx: i, score })
+        order
+            .into_iter()
+            .map(|i| RankedHost {
+                host_idx: i,
+                score: pattern
+                    .score(Utf32Str::Ascii(hosts[i].name.as_bytes()), &mut matcher)
+                    .unwrap_or(0),
             })
-            .collect();
-        // Descending match score; tiebreak by frecency score descending, then
-        // name ascending, so recent/frequent and alphabetically-earlier hosts
-        // win ties.
-        scored.sort_by(|a, b| {
-            b.score
-                .cmp(&a.score)
-                .then_with(|| frecency_cmp(hosts, frecency, a.host_idx, b.host_idx))
-                .then_with(|| hosts[a.host_idx].name.cmp(&hosts[b.host_idx].name))
-        });
-        scored
+            .collect()
     }
-}
-
-/// Order tiebreak: higher frecency score first. Returns an `Ordering` usable
-/// directly in a `sort_by` closure (e.g. between elements `a` then `b`):
-/// `Less` means `a` should come before `b`, i.e. `a` has the higher score.
-fn frecency_cmp(
-    hosts: &[Host],
-    frecency: &Frecency,
-    a_idx: usize,
-    b_idx: usize,
-) -> std::cmp::Ordering {
-    let sa = frecency.score(&hosts[a_idx].id);
-    let sb = frecency.score(&hosts[b_idx].id);
-    // Descending: higher score first → compare b then a.
-    sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
 }
 
 // ---------------------------------------------------------------------------
