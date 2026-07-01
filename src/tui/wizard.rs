@@ -183,6 +183,33 @@ pub fn validate(form: &HostForm) -> Result<(), SaveError> {
     Ok(())
 }
 
+/// Build the value-area spans for one field row. Shared by [`HostForm`] and
+/// [`CredForm`] so both render the empty state identically.
+///
+/// When the value is empty and the row is focused, the cursor `▍` comes FIRST
+/// (at the input start), followed by the dim placeholder as a background hint —
+/// so backspace at an empty input is a natural no-op and the placeholder never
+/// looks like editable text the cursor is sitting inside. When the value is
+/// non-empty, the value renders raw with the cursor trailing it and the
+/// placeholder disappears.
+fn value_spans(value: &str, placeholder: Option<&str>, focused: bool) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    if value.is_empty() {
+        if focused {
+            spans.push(Span::styled("▍", Style::new().dim()));
+        }
+        if let Some(ph) = placeholder {
+            spans.push(Span::styled(ph.to_string(), Style::new().dim()));
+        }
+    } else {
+        spans.push(Span::raw(value.to_string()));
+        if focused {
+            spans.push(Span::styled("▍", Style::new().dim()));
+        }
+    }
+    spans
+}
+
 /// The host form's editable state. All fields are owned `String`s (cheap to
 /// mutate on each keystroke). The wizard constructs this either empty (add mode)
 /// or prefilled from an existing [`Host`] (edit mode).
@@ -629,20 +656,7 @@ impl HostForm {
         let (value_str, placeholder) = self.row_value_and_placeholder(field);
 
         let mut spans = vec![label_span];
-        if value_str.is_empty() {
-            spans.push(Span::styled(
-                placeholder.unwrap_or_default().to_string(),
-                Style::new().dim(),
-            ));
-            if focused {
-                spans.push(Span::styled("▍", Style::new().dim()));
-            }
-        } else {
-            spans.push(Span::raw(value_str));
-            if focused {
-                spans.push(Span::styled("▍", Style::new().dim()));
-            }
-        }
+        spans.extend(value_spans(&value_str, placeholder, focused));
         Line::from(spans).alignment(Alignment::Left)
     }
 
@@ -1198,20 +1212,7 @@ impl CredForm {
         let (value_str, placeholder) = self.row_value_and_placeholder(field);
 
         let mut spans = vec![label_span];
-        if value_str.is_empty() {
-            spans.push(Span::styled(
-                placeholder.unwrap_or_default().to_string(),
-                Style::new().dim(),
-            ));
-            if focused {
-                spans.push(Span::styled("▍", Style::new().dim()));
-            }
-        } else {
-            spans.push(Span::raw(value_str));
-            if focused {
-                spans.push(Span::styled("▍", Style::new().dim()));
-            }
-        }
+        spans.extend(value_spans(&value_str, placeholder, focused));
         Line::from(spans).alignment(Alignment::Left)
     }
 
@@ -1258,6 +1259,45 @@ mod tests {
 
     fn press(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new_with_kind(code, mods, KeyEventKind::Press)
+    }
+
+    // ---- value_spans: empty-state cursor sits BEFORE the placeholder ----
+
+    #[test]
+    fn value_spans_empty_focused_puts_cursor_before_placeholder() {
+        let spans = value_spans("", Some("e.g. web-prod"), true);
+        assert_eq!(spans.len(), 2, "focused empty: cursor + placeholder");
+        assert_eq!(&*spans[0].content, "▍", "cursor first (at the input start)");
+        assert_eq!(
+            &*spans[1].content, "e.g. web-prod",
+            "placeholder second (background)"
+        );
+    }
+
+    #[test]
+    fn value_spans_empty_unfocused_has_no_cursor() {
+        let spans = value_spans("", Some("e.g. web-prod"), false);
+        assert_eq!(
+            spans.len(),
+            1,
+            "unfocused empty: placeholder only, no cursor"
+        );
+        assert_eq!(&*spans[0].content, "e.g. web-prod");
+    }
+
+    #[test]
+    fn value_spans_non_empty_puts_cursor_after_value_and_no_placeholder() {
+        let spans = value_spans("typed", Some("e.g. web-prod"), true);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(&*spans[0].content, "typed");
+        assert_eq!(&*spans[1].content, "▍");
+    }
+
+    #[test]
+    fn value_spans_empty_with_no_placeholder_focused_is_cursor_only() {
+        let spans = value_spans("", None, true);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(&*spans[0].content, "▍");
     }
 
     fn blank_form() -> HostForm {
