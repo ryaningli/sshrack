@@ -626,10 +626,23 @@ impl App {
     /// Apply the entry-routing decision (derived from `cli.cmd` in
     /// [`super::entry_mode_from_cmd`]) before the first frame. Called once from
     /// [`super::run`] after the config is loaded and before the alternate
-    /// screen is entered. A missing edit target (name not in the config) falls
-    /// back to the launcher rather than erroring — the user lands in the host
-    /// list and can fix the typo, mirroring how the in-TUI edit path degrades.
+    /// screen is entered.
+    ///
+    /// **Tab first, then overlay** (Task 11 routing contract): the shell's
+    /// `active_tab` is set to [`EntryMode::target_tab`] BEFORE the overlay opens
+    /// so the panel behind the wizard already matches user intent (e.g.
+    /// `sshrack cred add` lands on the Credentials tab, not the Hosts tab). For
+    /// a named edit, the matching panel selection is also moved onto that name
+    /// so the cursor is on it when the overlay closes. A missing edit target
+    /// (name not in the config) falls back to the panel on that tab rather than
+    /// erroring — the user lands in the list with a status hint and can fix the
+    /// typo, mirroring how the in-TUI edit path degrades.
+    ///
+    /// [`EntryMode::target_tab`]: super::EntryMode::target_tab
     pub fn apply_entry_mode(&mut self, mode: super::EntryMode) {
+        // Tab first: every entry mode carries its target tab. Set it before
+        // opening any overlay so the panel behind the wizard is already right.
+        self.active_tab = mode.target_tab();
         match mode {
             super::EntryMode::Launcher => {}
             super::EntryMode::HostWizard { edit_name: None } => self.open_host_wizard_add(),
@@ -638,6 +651,8 @@ impl App {
             } => {
                 if !self.open_host_wizard_edit_by_name(&name) {
                     self.status = Status::error(format!("host '{name}' not found"));
+                } else {
+                    self.select_host_by_name(&name);
                 }
             }
             super::EntryMode::CredWizard { edit_name: None } => self.open_cred_wizard_add(),
@@ -646,8 +661,40 @@ impl App {
             } => {
                 if !self.open_cred_wizard_edit(&name) {
                     self.status = Status::error(format!("credential '{name}' not found"));
+                } else {
+                    self.select_cred_by_name(&name);
                 }
             }
+        }
+    }
+
+    /// Best-effort move the launcher selection onto the host named `name`, so
+    /// the cursor is on it when an entry-routed edit overlay closes. Finds the
+    /// host's index in the current ranking and sets `selected`; a missing name
+    /// leaves the selection untouched (the wizard still opened).
+    fn select_host_by_name(&mut self, name: &str) {
+        if let Some(idx) = self.launcher.ranked.iter().position(|r| {
+            self.config
+                .hosts
+                .get(r.host_idx)
+                .is_some_and(|h| h.name == name)
+        }) {
+            self.launcher.selected = idx;
+        }
+    }
+
+    /// Best-effort move the credential panel selection onto the credential named
+    /// `name`, so the cursor is on it when an entry-routed edit overlay closes.
+    /// Finds the credential's index in the current ranking and sets `selected`;
+    /// a missing name leaves the selection untouched.
+    fn select_cred_by_name(&mut self, name: &str) {
+        if let Some(idx) = self.cred_panel.ranked.iter().position(|i| {
+            self.config
+                .credentials
+                .get(*i)
+                .is_some_and(|c| c.name == name)
+        }) {
+            self.cred_panel.selected = idx;
         }
     }
 
@@ -3663,5 +3710,133 @@ mod tests {
         };
         app.set_config(cfg);
         assert_eq!(app.current_store_mode_label(), "plaintext");
+    }
+
+    /// An app seeded with one host named `name`. Used by the entry-routing
+    /// tests so `apply_entry_mode` has a target to land on / edit.
+    fn app_with_named_host(name: &str) -> App {
+        app_with_host(name)
+    }
+
+    /// An app seeded with one named credential. Used by the entry-routing
+    /// tests that target the Credentials tab.
+    fn app_with_named_cred(name: &str) -> App {
+        use sshrack_core::config::schema::Credential;
+        let cfg = SshrackConfig {
+            credentials: vec![Credential {
+                id: Ulid::new(),
+                name: name.into(),
+                body: CredentialBody::new("deploy"),
+            }],
+            ..SshrackConfig::default()
+        };
+        App::new(cfg, None, Frecency::default(), HashMap::new())
+    }
+
+    #[test]
+    fn host_add_entry_lands_on_hosts_tab_with_overlay() {
+        let mut app = app_with_named_host("web");
+        app.apply_entry_mode(super::super::EntryMode::HostWizard { edit_name: None });
+        assert_eq!(app.active_tab(), super::super::tab::Tab::Hosts);
+        assert!(
+            matches!(app.overlay(), Some(Overlay::HostWizard(_))),
+            "host add entry should open the HostWizard overlay"
+        );
+    }
+
+    #[test]
+    fn host_edit_entry_lands_on_hosts_tab_with_edit_overlay_and_selection() {
+        let mut app = app_with_named_host("web");
+        app.apply_entry_mode(super::super::EntryMode::HostWizard {
+            edit_name: Some("web".into()),
+        });
+        assert_eq!(app.active_tab(), super::super::tab::Tab::Hosts);
+        // Selection landed on the named host (assert before borrowing overlay).
+        assert_eq!(app.launcher.selected, 0);
+        // Edit overlay is a HostWizard in edit mode (form.editing == true).
+        let Some(Overlay::HostWizard(form)) = app.overlay() else {
+            panic!("host edit entry should open the HostWizard overlay");
+        };
+        assert!(
+            form.editing,
+            "edit entry should prefill the form in edit mode"
+        );
+    }
+
+    #[test]
+    fn host_edit_entry_missing_name_lands_on_hosts_tab_no_overlay_with_status() {
+        let mut app = app_with_named_host("web");
+        app.apply_entry_mode(super::super::EntryMode::HostWizard {
+            edit_name: Some("ghost".into()),
+        });
+        assert_eq!(app.active_tab(), super::super::tab::Tab::Hosts);
+        assert!(
+            app.overlay().is_none(),
+            "missing edit target should not open an overlay"
+        );
+        assert!(
+            app.status().is_error,
+            "missing target should set an error status"
+        );
+    }
+
+    #[test]
+    fn cred_add_entry_lands_on_credentials_tab_with_overlay() {
+        let mut app = app_with_named_cred("ops");
+        app.apply_entry_mode(super::super::EntryMode::CredWizard { edit_name: None });
+        assert_eq!(
+            app.active_tab(),
+            super::super::tab::Tab::Credentials,
+            "`cred add` must land on the Credentials tab"
+        );
+        assert!(
+            matches!(app.overlay(), Some(Overlay::CredWizard(_))),
+            "cred add entry should open the CredWizard overlay"
+        );
+    }
+
+    #[test]
+    fn cred_edit_entry_lands_on_credentials_tab_with_edit_overlay_and_selection() {
+        let mut app = app_with_named_cred("ops");
+        app.apply_entry_mode(super::super::EntryMode::CredWizard {
+            edit_name: Some("ops".into()),
+        });
+        assert_eq!(app.active_tab(), super::super::tab::Tab::Credentials);
+        // Selection landed on the named credential (assert before borrowing
+        // overlay — both are shared borrows of `app`, but cred_panel() is
+        // &mut, so do it while no &ref is alive).
+        assert_eq!(app.cred_panel().selected, 0);
+        let Some(Overlay::CredWizard(form)) = app.overlay() else {
+            panic!("cred edit entry should open the CredWizard overlay");
+        };
+        assert!(
+            form.editing,
+            "cred edit entry should prefill the form in edit mode"
+        );
+    }
+
+    #[test]
+    fn cred_edit_entry_missing_name_lands_on_credentials_tab_no_overlay_with_status() {
+        let mut app = app_with_named_cred("ops");
+        app.apply_entry_mode(super::super::EntryMode::CredWizard {
+            edit_name: Some("ghost".into()),
+        });
+        assert_eq!(app.active_tab(), super::super::tab::Tab::Credentials);
+        assert!(
+            app.overlay().is_none(),
+            "missing edit target should not open an overlay"
+        );
+        assert!(
+            app.status().is_error,
+            "missing target should set an error status"
+        );
+    }
+
+    #[test]
+    fn bare_entry_lands_on_hosts_tab_no_overlay() {
+        let mut app = app_with_named_host("web");
+        app.apply_entry_mode(super::super::EntryMode::Launcher);
+        assert_eq!(app.active_tab(), super::super::tab::Tab::Hosts);
+        assert!(app.overlay().is_none(), "bare entry should open no overlay");
     }
 }

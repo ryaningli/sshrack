@@ -129,20 +129,38 @@ pub fn run(cli: &Cli) -> Result<Option<ConnectRequest>, SshrackError> {
 
 /// Which view the TUI should open first, derived from the subcommand that
 /// routed it here. `route_is_tui` already filtered to bare / empty-add /
-/// empty-edit, so this only needs to distinguish those.
+/// empty-edit, so this only needs to distinguish those. Each variant also
+/// carries the tab the shell should land on so [`App::apply_entry_mode`] can
+/// set `active_tab` before opening the overlay (Task 11 routing contract).
 ///
-/// - `None` (bare `sshrack`) → launcher.
-/// - `host add` (empty) → host add wizard; `host edit <name>` (empty) → host
-///   edit wizard.
-/// - `cred add` (empty) → cred add wizard; `cred edit <name>` (empty) → cred
-///   edit wizard.
+/// - `None` (bare `sshrack`) → Hosts tab, no overlay.
+/// - `host add` (empty) → Hosts tab + host add wizard; `host edit <name>`
+///   (empty) → Hosts tab + host edit wizard.
+/// - `cred add` (empty) → Credentials tab + cred add wizard; `cred edit <name>`
+///   (empty) → Credentials tab + cred edit wizard.
 pub(super) enum EntryMode {
     /// Bare `sshrack` — open the host launcher.
     Launcher,
-    /// Empty `host add` (add wizard) or `host edit <name>` (edit wizard).
+    /// Empty `host add` (add wizard) or `host edit <name>` (edit wizard). Lands
+    /// on the Hosts tab.
     HostWizard { edit_name: Option<String> },
-    /// Empty `cred add` (add wizard) or `cred edit <name>` (edit wizard).
+    /// Empty `cred add` (add wizard) or `cred edit <name>` (edit wizard). Lands
+    /// on the Credentials tab.
     CredWizard { edit_name: Option<String> },
+}
+
+impl EntryMode {
+    /// The shell tab this entry mode should land on. Read by
+    /// [`App::apply_entry_mode`] before the overlay opens, so the panel behind
+    /// the overlay already matches the user's intent (e.g. `sshrack cred add`
+    /// does not flash the Hosts tab).
+    pub(super) fn target_tab(&self) -> tab::Tab {
+        use tab::Tab;
+        match self {
+            EntryMode::Launcher | EntryMode::HostWizard { .. } => Tab::Hosts,
+            EntryMode::CredWizard { .. } => Tab::Credentials,
+        }
+    }
 }
 
 /// Map the parsed CLI command to an [`EntryMode`]. Only the
@@ -176,13 +194,17 @@ fn entry_mode_from_cmd(cmd: Option<&Command>) -> EntryMode {
 #[cfg(test)]
 mod tests {
     //! Decision-table tests for [`entry_mode_from_cmd`]: each `route_is_tui`-
-    //! true shape maps to the wizard that matches user intent.
+    //! true shape maps to the wizard that matches user intent AND carries the
+    //! tab the shell should land on (Task 11 routing contract).
     use super::*;
     use crate::cli::args::{Command, CredAction, HostAction};
+    use crate::tui::tab::Tab;
 
     #[test]
     fn bare_maps_to_launcher() {
-        assert!(matches!(entry_mode_from_cmd(None), EntryMode::Launcher));
+        let mode = entry_mode_from_cmd(None);
+        assert!(matches!(mode, EntryMode::Launcher));
+        assert_eq!(mode.target_tab(), Tab::Hosts, "bare lands on Hosts tab");
     }
 
     #[test]
@@ -198,10 +220,9 @@ mod tests {
                 force: false,
             },
         };
-        assert!(matches!(
-            entry_mode_from_cmd(Some(&cmd)),
-            EntryMode::HostWizard { edit_name: None }
-        ));
+        let mode = entry_mode_from_cmd(Some(&cmd));
+        assert!(matches!(mode, EntryMode::HostWizard { edit_name: None }));
+        assert_eq!(mode.target_tab(), Tab::Hosts);
     }
 
     #[test]
@@ -220,10 +241,12 @@ mod tests {
                 clear_credential: false,
             },
         };
+        let mode = entry_mode_from_cmd(Some(&cmd));
         assert!(matches!(
-            entry_mode_from_cmd(Some(&cmd)),
+            &mode,
             EntryMode::HostWizard { edit_name: Some(n) } if n == "web"
         ));
+        assert_eq!(mode.target_tab(), Tab::Hosts);
     }
 
     #[test]
@@ -236,10 +259,13 @@ mod tests {
                 force: false,
             },
         };
-        assert!(matches!(
-            entry_mode_from_cmd(Some(&cmd)),
-            EntryMode::CredWizard { edit_name: None }
-        ));
+        let mode = entry_mode_from_cmd(Some(&cmd));
+        assert!(matches!(mode, EntryMode::CredWizard { edit_name: None }));
+        assert_eq!(
+            mode.target_tab(),
+            Tab::Credentials,
+            "`cred add` lands on Credentials tab"
+        );
     }
 
     #[test]
@@ -253,9 +279,11 @@ mod tests {
                 rename: None,
             },
         };
+        let mode = entry_mode_from_cmd(Some(&cmd));
         assert!(matches!(
-            entry_mode_from_cmd(Some(&cmd)),
+            &mode,
             EntryMode::CredWizard { edit_name: Some(n) } if n == "ops"
         ));
+        assert_eq!(mode.target_tab(), Tab::Credentials);
     }
 }
