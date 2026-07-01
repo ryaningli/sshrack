@@ -48,8 +48,8 @@ use super::shared::{EnvPassphrase, fail, load_config, save_config, unlock_vault_
 
 /// The single tunable vault runtime field exposed by `store config`: the
 /// master-key cache TTL in seconds (`0` disables caching). KDF cost params
-/// (`m`/`t`/`p`) are intentionally NOT here — changing them alters the derived
-/// key and requires re-encryption, which is `rekey`'s job.
+/// (`m`/`t`/`p`) are excluded — changing them alters the derived key and
+/// requires re-encryption, which is `rekey`'s job.
 const CACHE_TTL_FIELD: &str = "cache-ttl-secs";
 
 /// Dispatch for the `Store` arm of the CLI.

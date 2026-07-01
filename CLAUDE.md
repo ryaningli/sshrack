@@ -171,9 +171,12 @@ Do not block on clippy or formatting while the actual issue is still unresolved.
 
 Both `Host` and `Credential` carry a **first-class, immutable `id: Ulid`** (generated at construction via `id::new_id()`). The id feeds three things: keyring keying, frecency keying, and cross-object references. The `name` is a human-readable, mutable, unique handle (renamable).
 
-- **Reference by id.** `host.auth` references a credential by its ULID (`Auth::Ref { credential: Ulid }`), not by name. **Renaming a credential never dangles a host reference.** For human readability, `host ls`/`show` reverse-resolve id→name; on `add`/`edit` the user specifies a credential by name and the CLI resolves it to an id before persisting.
+- **Reference by id.** A host authenticates one of two ways:
+  - **Reference** — `Auth::Ref { credential: Ulid }` points at a `[[credentials]]` entry by its ULID, not by name. **Renaming a credential never dangles a host reference.** For human readability, `host ls`/`show` reverse-resolve id→name; on `add`/`edit` the user specifies a credential by name and the CLI/wizard resolves it to an id before persisting.
+  - **Independent** — `Auth::Inline { body: CredentialBody }` carries a host-own user plus an optional secret of kind None / Password / IdentityKey. The host owns its secret directly, so it works without a detour to the credential tab; the password variant is keyring-keyed by the host's ULID (`OwnerKind::Host`), so the same rename-safe and delete/`cp`/`--force` cleanup rules apply as for credentials.
+- Both surfaces expose the full chooser: the **TUI** host wizard cycles Auth between Reference and Independent (and, under Independent, Secret between None/Password/IdentityKey); the **CLI** exposes both via `--credential` (Reference) and `--user` / `--identity` (Independent). Inline **None** and **IdentityKey** hosts can be created either way; an inline **password** is TUI-only (passwords never enter argv — see CLI Contract).
 - A `format_version` field (currently `1`) is included for future migrations.
-- `CredentialBody` (user + optional secret) carries no id — the id lives on the owner.
+- `CredentialBody` (user + optional secret) carries no id — the id lives on the owner (the credential, or the host when inline).
 
 ## CLI Contract
 
@@ -193,7 +196,7 @@ The CLI (`src/cli/`) is **always non-interactive** — it never prompts. Anythin
 1. **clap derive parses everything** — no hand-written parse/dispatch.
 2. **Patch commands touch only the named fields** — supplying a flag must not pop an interactive menu for an unspecified field (the patch-vs-wizard line is enforced by `route_is_tui`).
 3. **Fail-fast validation precedes network IO** — duplicate / not-found / reserved-word checks, and connection-path local checks (credential existence via `credential::resolve`), run *before* any network IO. (There is no interaction to precede — the CLI does not prompt.)
-4. **Passwords never enter argv** — a password credential cannot be created from the CLI; use the TUI for that.
+4. **Passwords never enter argv** — neither a credential password nor an inline (host-own) password can be created from the CLI; use the TUI for that. The CLI can still create Independent-None and Independent-IdentityKey hosts via `--user` / `--identity`.
 
 ## Storage & Security
 

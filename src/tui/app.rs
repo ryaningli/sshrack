@@ -1494,10 +1494,19 @@ pub fn run_loop(
 /// config-write failures surface as [`SshrackError`] so the loop can show them
 /// in the wizard's error line.
 ///
-/// Add mode: `host::add_host` with a fresh id. Edit mode: `host::apply_patch`
-/// preserving the original id (so the keyring entry is not orphaned). For a
-/// Credential auth choice, the referenced credential name is resolved to its
-/// stable [`Ulid`] here (the wizard only ever holds the name).
+/// Add mode: `host::add_host` with a fresh id. Edit mode: `host::finalize_body`
+/// preserving the original id (so a keyring entry keyed by that id is not
+/// orphaned). For a [`Reference`][crate::tui::wizard::AuthChoice::Reference]
+/// auth choice, the picked credential name is resolved to its stable [`Ulid`]
+/// here (the wizard only ever holds the name). For an
+/// [`Independent`][crate::tui::wizard::AuthChoice::Independent] auth choice
+/// whose secret is a password, the inline password is sealed per the configured
+/// store mode (keyring / vault / plaintext) here — mirroring `persist_cred_save` —
+/// so the host owns its own secret without a detour to the credential tab.
+///
+/// Keyring lifecycle: an inline password is keyed by the host's ULID
+/// (`OwnerKind::Host`); on edit the old entry is cleaned up, and on delete /
+/// `host cp` / `host add --force` the same id-keyed cleanup runs.
 fn persist_host_save(app: &mut App, handle: &TerminalHandle) -> Result<(), SshrackError> {
     // Take the form out of the overlay so we can borrow `app.config` for the
     // credential-name → id resolution without a borrow conflict. The form lives

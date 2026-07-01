@@ -1239,7 +1239,7 @@ mod tests {
     }
 
     #[test]
-    fn new_edit_inline_key_round_trips_to_independent_identitykey() {
+    fn new_edit_identitykey_round_trips_to_independent_identitykey() {
         let host = Host {
             id: Ulid::new(),
             name: "gw".into(),
