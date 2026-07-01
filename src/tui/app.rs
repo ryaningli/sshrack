@@ -1091,7 +1091,7 @@ impl App {
     pub fn draw(&self, frame: &mut Frame) {
         let area = frame.area();
         let footer = self.footer_hints();
-        let panel_area = draw_shell(frame, area, self.active_tab, &footer);
+        let panel_area = draw_shell(frame, area, self.active_tab, &footer, &self.status);
         match self.active_tab {
             Tab::Hosts => self.launcher.draw_in_shell(
                 frame,
@@ -1099,19 +1099,15 @@ impl App {
                 &self.config.hosts,
                 &self.frecency,
                 &self.credential_names,
-                &self.status,
             ),
-            Tab::Credentials => self.cred_panel.draw_in_shell(
-                frame,
-                panel_area,
-                &self.config.credentials,
-                &self.status,
-            ),
+            Tab::Credentials => {
+                self.cred_panel
+                    .draw_in_shell(frame, panel_area, &self.config.credentials)
+            }
             Tab::Settings => self.settings_panel.draw_in_shell(
                 frame,
                 panel_area,
                 self.current_store_mode_label(),
-                &self.status,
             ),
         }
         if let Some(ov) = &self.overlay {

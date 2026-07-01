@@ -39,6 +39,11 @@ use super::CredentialNames;
 use super::app::Outcome;
 use super::theme;
 
+// NOTE: the launcher no longer carries a status row or a `status` field — the
+// shell footer (band 3) is the single status surface. `^a`/`^e`/Enter-no-host
+// feedback now flows through `App::status` (set by the App-layer routing that
+// intercepts those keys before they reach the launcher).
+
 /// A ranked host: its index into the source `&[Host]` slice plus the match
 /// score that placed it there.
 ///
@@ -105,11 +110,6 @@ pub fn rank_hosts(hosts: &[Host], frecency: &Frecency, query: &str) -> Vec<Ranke
 // View layer: Launcher state, render, and pure key handling.
 // ---------------------------------------------------------------------------
 
-/// The status line shown beneath the host list. Centralized so the launcher
-/// and any future view stay in sync.
-const STATUS_LINE: &str =
-    "Enter connect  ·  ^a add  ·  ^e edit  ·  ^d del  ·  F1 help  ·  Esc quit";
-
 /// A frecency tier label for display. Mirrors core's 4-tier decay so the user
 /// sees a meaningful bucket, not a raw float.
 fn frecency_tier(score: f64) -> &'static str {
@@ -125,8 +125,8 @@ fn frecency_tier(score: f64) -> &'static str {
 }
 
 /// Interactive launcher state: the live query, the cursor into the ranked
-/// list, the (recomputed on each keystroke) ranked list, a transient status
-/// message, and the pending-connect intent set by Enter.
+/// list, the (recomputed on each keystroke) ranked list, and the
+/// pending-connect intent set by Enter.
 ///
 /// The launcher holds **no host data of its own** — it carries only indices
 /// into the `&[Host]` slice owned by [`super::app::App`]. This keeps the view
@@ -146,9 +146,6 @@ pub struct Launcher {
     /// The ranked host list, recomputed by [`Launcher::recompute`] on every
     /// query change. Empty when there are no hosts or no matches.
     pub ranked: Vec<RankedHost>,
-    /// A transient one-line message (e.g. a deferred-action notice). Cleared
-    /// on the next query/edit keystroke. `None` shows the default status line.
-    pub status: Option<String>,
     /// Set by `on_key` when the user presses Enter on a host. The event loop
     /// reads this (clearing it on cancel), then runs connect orchestration.
     /// `on_key` performs NO I/O, so this is the pure bridge to the loop.
@@ -165,7 +162,6 @@ impl Launcher {
             query: String::new(),
             selected: 0,
             ranked,
-            status: None,
             pending_connect: None,
         }
     }
@@ -210,8 +206,8 @@ impl Launcher {
         self.ranked.get(self.selected).map(|r| &hosts[r.host_idx])
     }
 
-    /// Pure key decision: inspect `key`, mutate query/selection/status, and
-    /// return what the loop should do next. Performs **no I/O**.
+    /// Pure key decision: inspect `key`, mutate query/selection, and return
+    /// what the loop should do next. Performs **no I/O**.
     ///
     /// Bindings:
     /// - printable char → append to query, recompute, clamp
@@ -222,11 +218,16 @@ impl Launcher {
     /// - `Enter` → set [`Launcher::pending_connect`] and return
     ///   [`Outcome::ConnectRequested`] (pure intent; the loop runs the
     ///   I/O-heavy connect orchestration). When no host is under the cursor,
-    ///   sets a "no host selected" status and returns [`Outcome::Continue`].
-    /// - `^a` / `^e` → set a "not yet implemented" status (the App-level
-    ///   `on_key` intercepts these to open the wizard before reaching here, so
-    ///   these branches are fallbacks); `^d` and `F1`/`?` are intercepted at the
-    ///   App level too (delete intent / help overlay)
+    ///   returns [`Outcome::Continue`] (the App layer surfaces the "no host
+    ///   selected" status via its own `status` channel).
+    /// - `^a` / `^e` → [`Outcome::Continue`] (the App-level `on_key` intercepts
+    ///   these to open the wizard before reaching here, so these are
+    ///   fallbacks); `^d` and `F1`/`?` are intercepted at the App level too
+    ///   (delete intent / help overlay).
+    ///
+    /// The launcher no longer carries a `status` field: the shell footer is
+    /// the single status surface, and deferred-action feedback flows through
+    /// `App::status` (set by App-layer routing).
     pub fn on_key(&mut self, key: KeyEvent, hosts: &[Host], frecency: &Frecency) -> Outcome {
         // Only react to Press events; Release/Repeat are ignored (crossterm
         // emits them on some platforms).
@@ -250,7 +251,6 @@ impl Launcher {
                 } else {
                     self.query.clear();
                     self.recompute(hosts, frecency);
-                    self.status = None;
                     Outcome::Continue
                 }
             }
@@ -265,16 +265,12 @@ impl Launcher {
                         self.pending_connect = Some(h.id);
                         Outcome::ConnectRequested
                     }
-                    None => {
-                        self.status = Some("no host selected".into());
-                        Outcome::Continue
-                    }
+                    None => Outcome::Continue,
                 }
             }
             KeyCode::Backspace => {
                 self.query.pop();
                 self.recompute(hosts, frecency);
-                self.status = None;
                 Outcome::Continue
             }
             KeyCode::Down if !ctrl => {
@@ -293,19 +289,13 @@ impl Launcher {
                 self.move_selection(-1);
                 Outcome::Continue
             }
-            // Deferred views (Tasks 16/19/20): set a status notice, no wizard.
-            KeyCode::Char('a') if ctrl => {
-                self.status = Some("add host — not yet implemented".into());
-                Outcome::Continue
-            }
-            KeyCode::Char('e') if ctrl => {
-                self.status = Some("edit host — not yet implemented".into());
-                Outcome::Continue
-            }
+            // Deferred views: App-layer routing intercepts ^a/^e to open the
+            // wizard; reaching here is a fallback that simply continues.
+            KeyCode::Char('a') if ctrl => Outcome::Continue,
+            KeyCode::Char('e') if ctrl => Outcome::Continue,
             KeyCode::Char(c) if !ctrl => {
                 self.query.push(c);
                 self.recompute(hosts, frecency);
-                self.status = None;
                 Outcome::Continue
             }
             _ => Outcome::Continue,
@@ -313,9 +303,9 @@ impl Launcher {
     }
 
     /// Render the launcher into the shell's panel area (no outer border — the
-    /// shell supplies the brand/tab/footer bands around it). Splits `area` into
-    /// `[search(1), list(Fill), status(1)]`, renders the search row + ranked
-    /// list + status. Reuses `host_line` / `highlighted_name` /
+    /// shell supplies the brand/tab/footer bands around it, including the
+    /// status footer). Splits `area` into `[search(1), list(Fill)]` and renders
+    /// the search row + ranked list. Reuses `host_line` / `highlighted_name` /
     /// `credential_label` / `frecency_tier`. The search row places the real
     /// terminal cursor at the end of the query via `set_cursor_position`.
     ///
@@ -331,14 +321,9 @@ impl Launcher {
         hosts: &[Host],
         frecency: &Frecency,
         credential_names: &CredentialNames,
-        status: &super::app::Status,
     ) {
-        let [search_area, list_area, status_area] = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Fill(1),
-            Constraint::Length(1),
-        ])
-        .areas(area);
+        let [search_area, list_area] =
+            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(area);
 
         // Search row: `❯ <query>` with the real terminal cursor placed right
         // after the query (no fake cursor glyph — the cursor is the terminal's).
@@ -353,28 +338,6 @@ impl Launcher {
         frame.set_cursor_position((cursor_x.min(max_x), search_area.y));
 
         self.draw_list(frame, list_area, hosts, frecency, credential_names);
-
-        // Status row: app status (red on error) > launcher-local hint > default.
-        let line = if let Some(msg) = &status.message {
-            let style = if status.is_error {
-                Style::new().fg(theme::DANGER)
-            } else {
-                Style::new()
-            };
-            Line::from(vec![
-                Span::styled("status: ", Style::new().dim()),
-                Span::styled(msg.clone(), style),
-            ])
-        } else {
-            match &self.status {
-                Some(msg) => Line::from(vec![
-                    Span::styled("status: ", Style::new().dim()),
-                    Span::raw(msg.clone()),
-                ]),
-                None => Line::from(STATUS_LINE).style(Style::new().dim()),
-            }
-        };
-        frame.render_widget(Paragraph::new(line), status_area);
     }
 
     /// Render the ranked host list with the selected-row gutter and per-host
@@ -755,15 +718,9 @@ mod tests {
                 f.area(),
                 crate::tui::tab::Tab::Hosts,
                 &[("Enter", "connect"), ("^A", "add")],
-            );
-            p.draw_in_shell(
-                f,
-                area,
-                &hosts,
-                &frecency,
-                &empty_creds(),
                 &crate::tui::app::Status::empty(),
             );
+            p.draw_in_shell(f, area, &hosts, &frecency, &empty_creds());
         })
         .unwrap();
 
@@ -778,6 +735,48 @@ mod tests {
         // No dark-background selection: the selected host name is rendered with
         // bold, not a dark background — assert the host name is present.
         assert!(view.contains("web"), "host name missing: {view}");
+    }
+
+    /// Regression for the "two identical hint lines" bug (Task 3): the panel no
+    /// longer emits its own status/hint row — only the shell footer (band 3)
+    /// carries hints. Render the launcher with an empty status and assert the
+    /// hint text appears exactly once in the buffer (it lives only in the shell
+    /// footer), not duplicated by a per-panel status row.
+    #[test]
+    fn draw_in_shell_does_not_emit_a_second_hint_row() {
+        let backend = TestBackend::new(100, 30);
+        let mut term = Terminal::new(backend).unwrap();
+        let hosts = vec![host(1, "web")];
+        let frecency = Frecency::default();
+        let p = Launcher::new(&hosts, &frecency);
+
+        term.draw(|f| {
+            let area = crate::tui::shell::draw_shell(
+                f,
+                f.area(),
+                crate::tui::tab::Tab::Hosts,
+                &[("Enter", "connect"), ("F1", "help")],
+                &crate::tui::app::Status::empty(),
+            );
+            p.draw_in_shell(f, area, &hosts, &frecency, &empty_creds());
+        })
+        .unwrap();
+
+        let view = buffer_view(term.backend().buffer());
+        // The hint "connect" should appear exactly once — in the shell footer.
+        // The `STATUS_LINE` duplication (a second `connect` from the panel's own
+        // status row) must be gone.
+        let occurrences = view.matches("connect").count();
+        assert_eq!(
+            occurrences, 1,
+            "hint should appear only in the shell footer, found {occurrences} times:\n{view}"
+        );
+        // The launcher's own STATUS_LINE text ("^a add", "Esc quit", ...) must
+        // not appear anywhere — that was the per-panel status row's content.
+        assert!(
+            !view.contains("Esc quit"),
+            "panel status line leaked into the render:\n{view}"
+        );
     }
 
     fn empty_creds() -> CredentialNames {
@@ -940,24 +939,25 @@ mod tests {
     }
 
     #[test]
-    fn on_key_enter_with_no_host_sets_status_and_continues() {
-        // Enter with an empty host list cannot select anything: stay Continue,
-        // set a status, and do NOT set a pending_connect.
+    fn on_key_enter_with_no_host_continues_without_pending_connect() {
+        // Enter with an empty host list cannot select anything: stay Continue
+        // and do NOT set a pending_connect. The launcher no longer carries a
+        // status field; the "no host selected" feedback now flows through
+        // App::status (the App-layer primary_action path).
         let hosts: Vec<Host> = vec![];
         let fr = Frecency::default();
         let mut launcher = Launcher::new(&hosts, &fr);
         let outcome = launcher.on_key(key(KeyCode::Enter, KeyModifiers::NONE), &hosts, &fr);
         assert!(matches!(outcome, Outcome::Continue));
         assert!(launcher.pending_connect.is_none());
-        assert_eq!(launcher.status.as_deref(), Some("no host selected"));
     }
 
     #[test]
-    fn on_key_ctrl_a_e_set_not_yet_implemented_status() {
-        // `^d` and `F1` are now handled at the App level (delete intent / help
-        // overlay), so the launcher only falls back to a "not yet implemented"
-        // status for `^a` and `^e` (the App layer normally intercepts these too,
-        // but the launcher keeps the fallback). Drive the launcher directly.
+    fn on_key_ctrl_a_e_continue_as_app_layer_intercepts() {
+        // `^a` and `^e` are intercepted by the App-layer routing to open the
+        // host wizard before reaching the launcher; the launcher's fallback is
+        // simply Continue (no status field — feedback flows through App::status).
+        // Drive the launcher directly to pin the fallback behavior.
         let hosts = vec![host(1, "web")];
         let fr = Frecency::default();
         for k in [
@@ -969,14 +969,6 @@ mod tests {
             assert!(
                 matches!(outcome, Outcome::Continue),
                 "deferred key must not quit"
-            );
-            assert!(
-                launcher
-                    .status
-                    .as_deref()
-                    .unwrap_or("")
-                    .contains("not yet implemented"),
-                "deferred key should set a not-yet-implemented status"
             );
         }
     }
