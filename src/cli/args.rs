@@ -206,22 +206,31 @@ pub enum Command {
 pub enum HostAction {
     /// Add a host. All required fields must come from flags (missing `--host`
     /// errors); the interactive wizard lives in the TUI.
+    ///
+    /// Two auth modes: **Reference** (`--credential <name>`, reusing a
+    /// `[[credentials]]` entry) or **Independent** (`--user`/`--identity`,
+    /// self-contained). With no auth flag the host is Independent with the
+    /// default user `root`. A password cannot be set here — passwords never
+    /// enter argv; use the TUI for a password host.
     Add {
         /// Host name to add (or overwrite when --force is set). Required.
         name: Option<String>,
         /// Remote hostname or IP. Required.
         #[arg(long)]
         host: Option<String>,
-        /// Login user (defaults to `root`).
+        /// Login user for independent auth (defaults to `root` when no auth
+        /// flag is given). Ignored when `--credential` is set.
         #[arg(long)]
         user: Option<String>,
         /// SSH port (defaults to `22`).
         #[arg(long)]
         port: Option<u16>,
-        /// Path to a private key file.
+        /// Path to a private key for independent auth. Ignored when
+        /// `--credential` is set.
         #[arg(long)]
         identity: Option<PathBuf>,
-        /// Reference a [[credentials]] entry by name instead of inline user/key.
+        /// Reference a [[credentials]] entry by name (Reference mode, mutually
+        /// exclusive with the independent flags `--user`/`--identity`).
         /// Resolved from name to id by the CLI layer, not by clap.
         #[arg(long)]
         credential: Option<String>,
@@ -254,26 +263,31 @@ pub enum HostAction {
 
     /// Edit an existing host's fields. Patch-only: only flagged fields change.
     /// With no flags, prints "no changes". The full edit wizard lives in the TUI.
+    ///
+    /// Auth-mode switches: `--credential <name>` switches to **Reference** mode;
+    /// `--clear-credential` drops a reference and reverts to **Independent**
+    /// auth (default user `root`). `--user`/`--identity` only patch an existing
+    /// Independent host (a Reference host is left untouched by them).
     Edit {
         /// Host name to edit. Required.
         name: Option<String>,
         /// New remote hostname or IP.
         #[arg(long)]
         host: Option<String>,
-        /// New login user.
+        /// New login user (Independent hosts only; ignored on a Reference host).
         #[arg(long)]
         user: Option<String>,
         /// New SSH port.
         #[arg(long)]
         port: Option<u16>,
-        /// New identity file path.
+        /// New identity file path (Independent hosts only).
         #[arg(long)]
         identity: Option<PathBuf>,
         /// Rename the host to this new name.
         #[arg(long)]
         rename: Option<String>,
-        /// Switch auth to a credential reference (sets `Auth::Ref`). Mutually
-        /// exclusive with --clear-credential.
+        /// Switch to Reference auth, pointing at this [[credentials]] entry by
+        /// name (sets `Auth::Ref`). Mutually exclusive with --clear-credential.
         #[arg(long, conflicts_with = "clear_credential")]
         credential: Option<String>,
         /// Remove the identity file (set key_path to none).
@@ -282,7 +296,8 @@ pub enum HostAction {
         /// Remove the stored password.
         #[arg(long)]
         clear_password: bool,
-        /// Drop any credential reference, falling back to inline default user.
+        /// Drop the credential reference, reverting to Independent auth (user
+        /// defaults to `root`, or the value of `--user` if given).
         #[arg(long)]
         clear_credential: bool,
     },
