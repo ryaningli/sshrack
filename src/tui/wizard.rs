@@ -888,7 +888,7 @@ pub fn validate_cred(form: &CredForm) -> Result<(), CredSaveError> {
 /// masked (`•`) and never placed in errors or logs. The wizard builds this
 /// either empty (add mode) or prefilled from an existing [`Credential`] (edit
 /// mode).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CredForm {
     /// Editable credential name.
     pub name: String,
@@ -919,6 +919,28 @@ pub struct CredForm {
     /// it onto the patched credential (preserving the keyring entry). `None` in
     /// add mode.
     pub orig_id: Option<Ulid>,
+}
+
+impl std::fmt::Debug for CredForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact the password so `format!("{:?}", form)` / `dbg!(form)` can
+        // never leak the plaintext to logs or error messages. `Zeroizing<Z>`
+        // derives `Debug` by delegating to `Z`, so the derived impl would
+        // otherwise print it. Mirrors the redacting Debug on `config::Secret`.
+        // `identity` holds a key file *path*, not key material, so it is safe.
+        f.debug_struct("CredForm")
+            .field("name", &self.name)
+            .field("user", &self.user)
+            .field("identity", &self.identity)
+            .field("secret_kind", &self.secret_kind)
+            .field("password", &"<redacted>")
+            .field("focus", &self.focus)
+            .field("error", &self.error)
+            .field("core_error", &self.core_error)
+            .field("editing", &self.editing)
+            .field("orig_id", &self.orig_id)
+            .finish()
+    }
 }
 
 impl CredForm {
