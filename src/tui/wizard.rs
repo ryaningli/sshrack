@@ -26,13 +26,14 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Layout},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
 };
 use ulid::Ulid;
 
 use super::app::Outcome;
+use super::theme;
 use sshrack_core::config::schema::{Auth, Credential, CredentialBody, Host};
 use sshrack_core::host::validate_name_chars;
 use zeroize::Zeroizing;
@@ -602,14 +603,14 @@ impl HostForm {
 
         let error_line = if let Some(msg) = &self.core_error {
             Line::from(vec![
-                Span::styled("  ! ", Style::new().fg(Color::Red).bold()),
-                Span::styled(msg.clone(), Style::new().fg(Color::Red)),
+                Span::styled("  ! ", Style::new().fg(theme::DANGER).bold()),
+                Span::styled(msg.clone(), Style::new().fg(theme::DANGER)),
             ])
         } else {
             match self.error {
                 Some(e) => Line::from(vec![
-                    Span::styled("  ! ", Style::new().fg(Color::Red).bold()),
-                    Span::styled(e.message(), Style::new().fg(Color::Red)),
+                    Span::styled("  ! ", Style::new().fg(theme::DANGER).bold()),
+                    Span::styled(e.message(), Style::new().fg(theme::DANGER)),
                 ]),
                 None => Line::raw(""),
             }
@@ -675,7 +676,7 @@ impl HostForm {
         let label_span = Span::styled(
             format!("{cursor}{label:>5}: "),
             if focused {
-                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                theme::accent().add_modifier(Modifier::BOLD)
             } else {
                 Style::new().dim()
             },
@@ -1192,14 +1193,14 @@ impl CredForm {
 
         let error_line = if let Some(msg) = &self.core_error {
             Line::from(vec![
-                Span::styled("  ! ", Style::new().fg(Color::Red).bold()),
-                Span::styled(msg.clone(), Style::new().fg(Color::Red)),
+                Span::styled("  ! ", Style::new().fg(theme::DANGER).bold()),
+                Span::styled(msg.clone(), Style::new().fg(theme::DANGER)),
             ])
         } else {
             match self.error {
                 Some(e) => Line::from(vec![
-                    Span::styled("  ! ", Style::new().fg(Color::Red).bold()),
-                    Span::styled(e.message(), Style::new().fg(Color::Red)),
+                    Span::styled("  ! ", Style::new().fg(theme::DANGER).bold()),
+                    Span::styled(e.message(), Style::new().fg(theme::DANGER)),
                 ]),
                 None => Line::raw(""),
             }
@@ -1257,7 +1258,7 @@ impl CredForm {
         let label_span = Span::styled(
             format!("{cursor}{label:>8}: "),
             if focused {
-                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                theme::accent().add_modifier(Modifier::BOLD)
             } else {
                 Style::new().dim()
             },
@@ -1597,51 +1598,80 @@ mod tests {
         assert!(matches!(o, Outcome::Continue));
     }
 
-    // ---- render smoke: draw() must not panic for any focus / auth state ----
+    // ---- render smoke: draw_in_dialog must not panic for any focus / auth state ----
 
     #[test]
-    fn draw_renders_without_panic_across_focus_and_auth_states() {
-        // A render smoke: drive the form through every focus field and every
-        // auth kind (including Credential with and without names), drawing each
-        // into a TestBackend. Catches row-render / placeholder / chooser
-        // formatting panics the on_key tests never touch.
+    fn draw_in_dialog_renders_without_panic_across_focus_and_auth_states() {
+        // A render smoke through the real Dialog chrome: drive the form through
+        // every focus field × every auth kind (Default / two Credential indices /
+        // InlineKey), plus a validation error and a core error. Routing through
+        // `draw_dialog` (not a bare full-screen rect) exercises the cursor
+        // offset math against a body rect that is offset from (0,0) by the
+        // dialog's centered border — the real path the App's overlay renderer
+        // takes. Catches row-render / placeholder / chooser formatting panics
+        // the on_key tests never touch.
+        use crate::tui::dialog::draw_dialog;
         use ratatui::{Terminal, backend::TestBackend};
-        let mut f = complete_form();
-        f.credential_names = vec!["ops".into(), "team".into()];
-        let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
-        for field in [
-            Field::Name,
-            Field::Host,
-            Field::Port,
-            Field::User,
-            Field::Auth,
-        ] {
-            f.focus = field;
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        for focus in Field::ORDER {
             for auth in [
                 AuthChoice::Default,
                 AuthChoice::Credential { idx: 0 },
                 AuthChoice::Credential { idx: 1 },
                 AuthChoice::InlineKey,
             ] {
-                let is_inline_key = matches!(auth, AuthChoice::InlineKey);
-                f.auth_choice = auth;
-                f.inline_key = if is_inline_key {
-                    "/k/path".into()
+                let mut f = complete_form();
+                f.credential_names = vec!["ops".into(), "team".into()];
+                f.focus = *focus;
+                f.auth_choice = auth.clone();
+                f.inline_key = if matches!(auth, AuthChoice::InlineKey) {
+                    String::from("/k/path")
                 } else {
                     String::new()
                 };
                 f.error = None;
-                terminal.draw(|fr| f.draw_in_dialog(fr, fr.area())).unwrap();
+                terminal
+                    .draw(|fr| {
+                        let body = draw_dialog(
+                            fr,
+                            &f.title(),
+                            0,
+                            &[("Tab", "field"), ("^S", "save"), ("Esc", "cancel")],
+                        );
+                        f.draw_in_dialog(fr, body);
+                    })
+                    .unwrap();
             }
         }
-        // Also with a validation error set.
+        // Validation error row renders in DANGER across the body.
+        let mut f = complete_form();
         f.focus = Field::Name;
         f.error = Some(SaveError::MissingName);
-        terminal.draw(|fr| f.draw_in_dialog(fr, fr.area())).unwrap();
-        // And with a core error set.
+        terminal
+            .draw(|fr| {
+                let body = draw_dialog(
+                    fr,
+                    &f.title(),
+                    0,
+                    &[("Tab", "field"), ("^S", "save"), ("Esc", "cancel")],
+                );
+                f.draw_in_dialog(fr, body);
+            })
+            .unwrap();
+        // Core-level error row renders in DANGER across the body.
         f.error = None;
         f.set_core_error("duplicate name".into());
-        terminal.draw(|fr| f.draw_in_dialog(fr, fr.area())).unwrap();
+        terminal
+            .draw(|fr| {
+                let body = draw_dialog(
+                    fr,
+                    &f.title(),
+                    0,
+                    &[("Tab", "field"), ("^S", "save"), ("Esc", "cancel")],
+                );
+                f.draw_in_dialog(fr, body);
+            })
+            .unwrap();
     }
 
     // ---- auth chooser cycling ----
@@ -2231,10 +2261,16 @@ mod tests {
         // ---- render smoke ----
 
         #[test]
-        fn cred_draw_renders_without_panic_across_focus_and_secret_states() {
+        fn cred_draw_in_dialog_renders_without_panic_across_focus_and_secret_states() {
+            // Mirrors the host variant: drive every focus field × every secret
+            // kind through the real Dialog chrome so the cursor-offset math
+            // (body.x + CRED_VALUE_COL + offset, body.y + focus_row) is exercised
+            // against a body rect offset from (0,0). Also covers the
+            // Password-only focus, a validation error, and a core error row.
+            use crate::tui::dialog::draw_dialog;
             use ratatui::{Terminal, backend::TestBackend};
             let mut f = complete_cred_form();
-            let mut terminal = Terminal::new(TestBackend::new(64, 16)).unwrap();
+            let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
             for field in [
                 CredField::Name,
                 CredField::User,
@@ -2259,20 +2295,60 @@ mod tests {
                         String::new()
                     };
                     f.error = None;
-                    terminal.draw(|fr| f.draw_in_dialog(fr, fr.area())).unwrap();
+                    terminal
+                        .draw(|fr| {
+                            let body = draw_dialog(
+                                fr,
+                                &f.title(),
+                                0,
+                                &[("Tab", "field"), ("^S", "save"), ("Esc", "cancel")],
+                            );
+                            f.draw_in_dialog(fr, body);
+                        })
+                        .unwrap();
                 }
             }
             // Also exercise the Password row focus under Password choice.
             f.secret_kind = SecretChoice::Password;
             f.focus = CredField::Password;
-            terminal.draw(|fr| f.draw_in_dialog(fr, fr.area())).unwrap();
+            terminal
+                .draw(|fr| {
+                    let body = draw_dialog(
+                        fr,
+                        &f.title(),
+                        0,
+                        &[("Tab", "field"), ("^S", "save"), ("Esc", "cancel")],
+                    );
+                    f.draw_in_dialog(fr, body);
+                })
+                .unwrap();
             // And error / core_error lines.
             f.focus = CredField::Name;
             f.error = Some(CredSaveError::MissingName);
-            terminal.draw(|fr| f.draw_in_dialog(fr, fr.area())).unwrap();
+            terminal
+                .draw(|fr| {
+                    let body = draw_dialog(
+                        fr,
+                        &f.title(),
+                        0,
+                        &[("Tab", "field"), ("^S", "save"), ("Esc", "cancel")],
+                    );
+                    f.draw_in_dialog(fr, body);
+                })
+                .unwrap();
             f.error = None;
             f.set_core_error("store mode not decided".into());
-            terminal.draw(|fr| f.draw_in_dialog(fr, fr.area())).unwrap();
+            terminal
+                .draw(|fr| {
+                    let body = draw_dialog(
+                        fr,
+                        &f.title(),
+                        0,
+                        &[("Tab", "field"), ("^S", "save"), ("Esc", "cancel")],
+                    );
+                    f.draw_in_dialog(fr, body);
+                })
+                .unwrap();
         }
     }
 }
