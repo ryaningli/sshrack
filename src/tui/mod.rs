@@ -32,6 +32,7 @@ pub mod launcher;
 pub mod panel;
 pub mod popup;
 pub mod prompt;
+pub mod settings;
 pub mod shell;
 pub mod store;
 pub mod tab;

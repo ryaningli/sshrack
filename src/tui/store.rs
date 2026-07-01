@@ -1,5 +1,6 @@
 //! Store mode switch view: lets the user change the password storage mode
-//! (keyring / vault / plaintext) interactively.
+//! (keyring / vault / plaintext) interactively, rendered as the Settings tab's
+//! store-picker overlay.
 //!
 //! A thin view over the *same* core switch paths `cli::cmd::store` uses. The
 //! view holds only its cursor and a transient status string; [`StoreView::on_key`]
@@ -16,23 +17,18 @@
 //! reachable Secret Service: the loop probes [`OsKeyring::available`] and aborts
 //! with a status when the daemon is down.
 //!
+//! Rendering goes into a dialog body supplied by [`super::dialog::draw_dialog`]
+//! (the Settings tab opens this as `Overlay::StorePicker`).
+//!
 //! [`confirm_popup`]: super::prompt::confirm_popup
-//
-// `dead_code`: the launcher `F2` entry that wired this view was removed by the
-// Task 6 App rewrite (single-char hotkey conflict fix). Task 8 re-homes the
-// view as the Settings tab's storage overlay; until then the whole module is
-// dormant except for `StoreView::new` (still called by the
-// `persist_store_switch_*` tests). Same pre-wired-TUI convention as
-// theme.rs / tab.rs.
-#![allow(dead_code)]
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Layout},
+    layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListState, Paragraph},
+    widgets::{List, ListState},
 };
 
 use super::app::Outcome;
@@ -154,18 +150,16 @@ impl StoreView {
         }
     }
 
-    /// Render the store view: a bordered list of the three modes (with the
-    /// active one marked), each with its trade-off blurb, plus a status line.
-    /// Only writes to the frame; no stdout access.
-    pub fn draw(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
-        let block = Block::new()
-            .borders(Borders::ALL)
-            .title(" sshrack — store mode ");
-        frame.render_widget(&block, area);
-        let [inner] = Layout::vertical([Constraint::Fill(1)]).areas(block.inner(area));
-
+    /// Render the store view's three-mode list into a dialog `body` rect
+    /// supplied by [`super::dialog::draw_dialog`]. The dialog supplies the outer
+    /// border + title + footer hints, so this draws **no** outer `Block`; it
+    /// only lays out the mode list (with the active one marked) and a status
+    /// line. Only writes to the frame; no stdout access.
+    pub fn draw_in_dialog(&self, frame: &mut Frame, body: Rect) {
+        // Status line pinned to the bottom of the dialog body; the list fills
+        // the rest. (The dialog's own footer holds the key-binding hints.)
         let [list_area, status_area] =
-            Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(inner);
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(body);
 
         let items: Vec<Line> = StoreModeChoice::ORDER
             .iter()
@@ -181,16 +175,17 @@ impl StoreView {
         state.select(Some(self.selected));
         frame.render_stateful_widget(list, list_area, &mut state);
 
+        // The transient status (success/failure from the last switch attempt).
+        // When None the dialog's footer hints already explain the keys, so this
+        // line stays empty rather than duplicating the hint.
         let line = match &self.status {
             Some(msg) => Line::from(vec![
                 Span::styled("status: ", Style::new().dim()),
                 Span::raw(msg),
             ]),
-            None => {
-                Line::from("Up/Down select  ·  Enter switch  ·  Esc back").style(Style::new().dim())
-            }
+            None => Line::from(""),
         };
-        frame.render_widget(Paragraph::new(line).alignment(Alignment::Left), status_area);
+        frame.render_widget(ratatui::widgets::Paragraph::new(line), status_area);
     }
 }
 

@@ -35,6 +35,7 @@ use super::dialog::draw_dialog;
 use super::help::draw_help;
 use super::launcher::Launcher;
 use super::prompt::TuiPassphrase;
+use super::settings::SettingsPanel;
 use super::shell::draw_shell;
 use super::store::StoreView;
 use super::tab::{Tab, TabKey, tab_key_decision};
@@ -136,9 +137,12 @@ impl Drop for TerminalGuard {
 ///
 /// Later tasks grow this enum (EditHost, AddHost, AddCred, RemoveHost, ...).
 //
-// `dead_code`: the SwitchTo{Keyring,Vault,Plaintext} variants are constructed
-// by the Settings tab's store overlay (Task 8); until then they are unused in
-// the non-test build. Same pre-wired-TUI convention as theme.rs / tab.rs.
+// `dead_code`: SwitchTab(Tab)/OpenOverlay(Overlay) carry their payload for
+// test assertions (`matches!(outcome, Outcome::SwitchTab(Tab::Settings))`)
+// and as self-documenting intent — the loop pattern-matches them with `_`
+// because the state mutation already happened in `on_key`. The carry is read
+// in tests but not in the non-test build, so the field-level allow is the
+// established pre-wired-TUI convention (theme.rs / tab.rs).
 #[allow(dead_code, clippy::large_enum_variant)]
 pub enum Outcome {
     /// User asked to quit; the loop returns `None` (no connect).
@@ -245,12 +249,12 @@ pub enum Outcome {
 /// variants keeps the form state alive across keystrokes without a separate
 /// `Option<HostForm>` field.
 //
-// `dead_code`: StorePicker/DeleteHost are constructed by the Settings tab
-// (Task 8) and the delete-confirm popup path respectively; until then they
-// are unused. `large_enum_variant`: the wizard variants carry full forms
+// `dead_code`: DeleteHost/DeleteCred are constructed by the delete-confirm
+// popup path (Task 9 wires the overlay-driven variant); until then they are
+// matched only in `draw_overlay`/`route_overlay` and never constructed in the
+// non-test build. `large_enum_variant`: the wizard variants carry full forms
 // while Help/StorePicker/DeleteHost are near-ZSTs — the enum is box-free by
-// intent (a single live overlay, cloned only on OpenOverlay). Both are the
-// pre-wired-TUI convention; revisit when Task 8 lands.
+// intent (a single live overlay, cloned only on OpenOverlay).
 #[allow(dead_code, clippy::large_enum_variant)]
 #[derive(Clone)]
 pub enum Overlay {
@@ -354,10 +358,9 @@ pub struct App {
     /// The credential panel (the Credentials tab: query + selection + ranked
     /// list). Public so the loop can read `pending_delete_cred`.
     cred_panel: CredPanel,
-    /// The settings panel. `None` until Task 8 fills it; the Settings tab
-    /// renders a placeholder until then.
-    #[allow(dead_code)]
-    settings_panel: Option<SettingsPanel>,
+    /// The settings panel (the Settings tab: one row for the storage mode).
+    /// Owns its cursor + the OpenStorePicker intent on Enter.
+    settings_panel: SettingsPanel,
     /// The store-mode switch view, used by the Settings tab. Present only while
     /// a [`Overlay::StorePicker`] flow or its Task 8 successor is active; kept
     /// on `App` so its state survives across the loop's popup-driven switch.
@@ -406,7 +409,7 @@ impl App {
             overlay: None,
             launcher,
             cred_panel,
-            settings_panel: None,
+            settings_panel: SettingsPanel::new(),
             store_view: None,
             status: Status::empty(),
             pending_connect: None,
@@ -582,9 +585,8 @@ impl App {
     }
 
     /// The human-readable label for the currently active storage mode, or
-    /// `"undecided"` when `cfg.store` is `None`. Used by the store view to mark
-    /// the `(active)` row.
-    #[allow(dead_code)]
+    /// `"undecided"` when `cfg.store` is `None`. Used by the settings panel and
+    /// the store view to mark the `(active)` row.
     fn current_store_mode_label(&self) -> &'static str {
         use sshrack_core::config::schema::SecretStore;
         match &self.config.store {
@@ -596,11 +598,22 @@ impl App {
     }
 
     /// Open the store-mode switch view, snapshotting the active mode for the
-    /// `(active)` marker. Used by the Settings tab (Task 8) and the legacy
-    /// store-pick recovery path.
-    #[allow(dead_code)]
+    /// `(active)` marker. Used by the Settings tab and the legacy store-pick
+    /// recovery path.
     pub fn open_store_view(&mut self) {
         self.store_view = Some(StoreView::new(Some(self.current_store_mode_label())));
+    }
+
+    /// Open the store-mode picker as the `StorePicker` overlay (the Settings
+    /// tab's Enter action). Builds a fresh [`StoreView`] snapshotting the active
+    /// mode, stashes it on `self.store_view`, sets the overlay, and returns the
+    /// `OpenOverlay` intent so the loop re-renders. The picker's cursor + switch
+    /// intents are driven by [`App::route_overlay`] delegating to the stashed
+    /// view's `on_key`.
+    fn open_store_picker(&mut self) -> Outcome {
+        self.open_store_view();
+        self.overlay = Some(Overlay::StorePicker);
+        Outcome::OpenOverlay(Overlay::StorePicker)
     }
 
     /// Leave the store view. The host ranking is unaffected by a mode switch,
@@ -702,12 +715,12 @@ impl App {
     ///    mid-wizard).
     /// 2. **Overlay** — when an overlay is open it owns the key. Help dismisses
     ///    on `F1`/`Esc`/`q`; a wizard's `on_key` returns `SaveHost`/`SaveCred`/
-    ///    `Cancel`/`Continue`; StorePicker/DeleteHost close on `Esc`.
+    ///    `Cancel`/`Continue`; the store picker delegates to the stashed
+    ///    `StoreView::on_key` (Up/Down/Enter/Esc); DeleteHost/DeleteCred close
+    ///    on `Esc`.
     /// 3. **Panel/tab** — when no overlay is open: `tab_key_decision` switches
     ///    tabs (Tab / Shift-Tab / Ctrl-1/2/3), then `Ctrl-A/E/D` + `Enter` +
-    ///    `Esc`, then the active panel consumes printable chars / arrows. For
-    ///    Task 6 only the Hosts branch is real; Credentials/Settings render a
-    ///    placeholder and their `Ctrl-A/E`/`Enter` are no-ops until Tasks 7–8.
+    ///    `Esc`, then the active panel consumes printable chars / arrows.
     pub fn on_key(&mut self, key: KeyEvent) -> Outcome {
         use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 
@@ -779,11 +792,30 @@ impl App {
                 out
             }
             Overlay::StorePicker => {
-                if key.kind == KeyEventKind::Press && key.code == KeyCode::Esc {
+                // Delegate to the stashed store view's on_key (Up/Down move the
+                // cursor; Enter signals SwitchTo{Keyring,Vault,Plaintext}; Esc
+                // signals Cancel). on_key is pure — the loop runs the I/O-heavy
+                // migration + persist on the switch outcomes. Cancel / switch
+                // outcomes are terminal for the overlay (the view is dropped /
+                // closed by the loop); Continue keeps the picker open.
+                let Some(view) = self.store_view.as_mut() else {
+                    // Defensive: open_store_picker always stashes the view. If it
+                    // is missing, close the overlay rather than panic.
                     return Outcome::CloseOverlay;
+                };
+                let out = view.on_key(key);
+                let terminal = matches!(
+                    out,
+                    Outcome::SwitchToKeyring
+                        | Outcome::SwitchToVault
+                        | Outcome::SwitchToPlaintext
+                        | Outcome::Cancel
+                        | Outcome::CloseOverlay
+                );
+                if !terminal {
+                    self.overlay = Some(Overlay::StorePicker);
                 }
-                self.overlay = Some(Overlay::StorePicker);
-                Outcome::Continue
+                out
             }
             Overlay::DeleteHost => {
                 if key.kind == KeyEventKind::Press && key.code == KeyCode::Esc {
@@ -962,7 +994,8 @@ impl App {
     /// The tab-specific primary action on Enter. Hosts delegates to the
     /// launcher's `on_key` (which sets `pending_connect` and returns
     /// `ConnectRequested`); Credentials opens the edit wizard for the selected
-    /// credential (Enter = edit on this tab); Settings is Task 8.
+    /// credential (Enter = edit on this tab); Settings opens the store-mode
+    /// picker overlay.
     fn primary_action(&mut self) -> Outcome {
         match self.active_tab {
             Tab::Hosts => {
@@ -973,13 +1006,14 @@ impl App {
                 out
             }
             Tab::Credentials => self.open_edit_overlay(),
-            Tab::Settings => Outcome::Continue,
+            Tab::Settings => self.open_store_picker(),
         }
     }
 
     /// Forward a panel-level key to the active panel. Hosts → the launcher's
     /// `on_key` (query/selection); Credentials → the cred panel's `on_key`;
-    /// Settings consumes nothing yet.
+    /// Settings → the settings panel's `on_key` (Up/Down/Enter only — printable
+    /// chars are ignored, Settings has no query).
     fn route_active_panel_key(&mut self, key: KeyEvent) -> Outcome {
         match self.active_tab {
             Tab::Hosts => {
@@ -992,7 +1026,7 @@ impl App {
                 out
             }
             Tab::Credentials => self.cred_panel.on_key(key, &self.config.credentials),
-            Tab::Settings => Outcome::Continue,
+            Tab::Settings => self.settings_panel.on_key(key),
         }
     }
 
@@ -1046,7 +1080,12 @@ impl App {
                 &self.config.credentials,
                 &self.status,
             ),
-            Tab::Settings => self.draw_placeholder(frame, panel_area, "Settings"),
+            Tab::Settings => self.settings_panel.draw_in_shell(
+                frame,
+                panel_area,
+                self.current_store_mode_label(),
+                &self.status,
+            ),
         }
         if let Some(ov) = &self.overlay {
             self.draw_overlay(frame, ov);
@@ -1081,8 +1120,9 @@ impl App {
 
     /// Render the active overlay on top of the shell. Wizards draw their field
     /// rows into the body rect [`draw_dialog`] hands them; Help is the static
-    /// keymap reference; StorePicker/DeleteHost render an empty dialog for now
-    /// (Task 8 / the loop's popup path fill them).
+    /// keymap reference; StorePicker draws the three-mode list into the dialog
+    /// body via [`StoreView::draw_in_dialog`]; DeleteHost/DeleteCred render an
+    /// empty dialog (the loop drives their confirm popups).
     fn draw_overlay(&self, frame: &mut Frame, ov: &Overlay) {
         match ov {
             Overlay::Help => draw_help(frame, frame.area()),
@@ -1104,23 +1144,22 @@ impl App {
                 );
                 form.draw_in_dialog(frame, body);
             }
-            Overlay::StorePicker | Overlay::DeleteHost | Overlay::DeleteCred => {
+            Overlay::StorePicker => {
+                let body = draw_dialog(
+                    frame,
+                    " storage mode ",
+                    0,
+                    &[("↑↓", "select"), ("Enter", "switch"), ("Esc", "cancel")],
+                );
+                self.store_view
+                    .as_ref()
+                    .expect("invariant: store_view stashed while StorePicker overlay is open")
+                    .draw_in_dialog(frame, body);
+            }
+            Overlay::DeleteHost | Overlay::DeleteCred => {
                 let _ = draw_dialog(frame, "…", 0, &[("Esc", "cancel")]);
             }
         }
-    }
-
-    /// Render a centered dim "coming soon" placeholder for the not-yet-built
-    /// Credentials/Settings tabs. Tasks 7/8 replace this.
-    fn draw_placeholder(&self, frame: &mut Frame, area: ratatui::layout::Rect, name: &str) {
-        let line = ratatui::text::Line::from(ratatui::text::Span::styled(
-            format!("{name} tab — coming soon"),
-            ratatui::style::Style::new().dim(),
-        ));
-        frame.render_widget(
-            ratatui::widgets::Paragraph::new(line).alignment(ratatui::layout::Alignment::Center),
-            area,
-        );
     }
 }
 
@@ -1131,12 +1170,6 @@ fn enter_press() -> KeyEvent {
     use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
     KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Press)
 }
-
-// Placeholder panel for the Settings tab. Task 8 (settings.rs) replaces this
-// with a real module; until then the tab renders the "coming soon" placeholder
-// and its key bindings are no-ops.
-/// Placeholder until Task 8 (settings.rs) replaces it.
-pub struct SettingsPanel;
 
 /// Blocking event loop. Renders `app`, polls crossterm for key events, and
 /// dispatches each key through [`App::on_key`]. Returns `Some(req)` when the
@@ -3537,5 +3570,98 @@ mod tests {
 
         let err = persist_cred_delete(&mut app, "ghost").unwrap_err();
         assert!(matches!(err, SshrackError::CredentialNotFound { .. }));
+    }
+
+    // ---- Settings panel routing (Task 8) ----
+    // Drive App::on_key directly to pin: Ctrl-3 lands on Settings, Enter opens
+    // the StorePicker overlay (and stashes a store_view), arrow keys are no-ops,
+    // and Esc inside the picker returns Cancel + clears the overlay.
+
+    #[test]
+    fn ctrl_3_switches_to_settings_tab() {
+        let mut app = app_with_host("web");
+        let outcome = app.on_key(press(KeyCode::Char('3'), KeyModifiers::CONTROL));
+        assert!(matches!(outcome, Outcome::SwitchTab(Tab::Settings)));
+        assert_eq!(app.active_tab(), Tab::Settings);
+    }
+
+    #[test]
+    fn settings_enter_opens_store_picker_overlay() {
+        let mut app = app_with_host("web");
+        app.on_key(press(KeyCode::Char('3'), KeyModifiers::CONTROL)); // -> Settings
+        let outcome = app.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            outcome,
+            Outcome::OpenOverlay(Overlay::StorePicker)
+        ));
+        assert!(
+            matches!(app.overlay(), Some(Overlay::StorePicker)),
+            "StorePicker overlay should be open"
+        );
+        // open_store_picker stashes a view so draw_overlay + route_overlay can
+        // drive it across keystrokes.
+        assert!(
+            app.store_view.is_some(),
+            "store_view must be stashed while the picker is open"
+        );
+    }
+
+    #[test]
+    fn settings_arrows_are_noops() {
+        let mut app = app_with_host("web");
+        app.on_key(press(KeyCode::Char('3'), KeyModifiers::CONTROL)); // -> Settings
+        let outcome = app.on_key(press(KeyCode::Down, KeyModifiers::NONE));
+        assert!(matches!(outcome, Outcome::Continue));
+        // No overlay opened.
+        assert!(app.overlay().is_none());
+    }
+
+    #[test]
+    fn store_picker_esc_returns_cancel_and_drops_overlay() {
+        // Open the picker, then Esc: store_view::on_key signals Cancel, which
+        // is terminal for the overlay → route_overlay drops it. The loop's
+        // Cancel arm clears the overlay + re-renders; here we pin the pure half
+        // (the outcome + the overlay state after on_key).
+        let mut app = app_with_host("web");
+        app.on_key(press(KeyCode::Char('3'), KeyModifiers::CONTROL)); // -> Settings
+        app.on_key(press(KeyCode::Enter, KeyModifiers::NONE)); // open picker
+        assert!(matches!(app.overlay(), Some(Overlay::StorePicker)));
+        let outcome = app.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            matches!(outcome, Outcome::Cancel),
+            "Esc in the picker must signal Cancel"
+        );
+        assert!(
+            app.overlay().is_none(),
+            "Cancel must drop the StorePicker overlay"
+        );
+    }
+
+    #[test]
+    fn store_picker_down_then_enter_signals_switch_to_vault() {
+        // Cursor starts on keyring (index 0); Down → vault; Enter signals
+        // SwitchToVault. The loop's SwitchToVault arm runs the I/O; here we pin
+        // the pure routing through the stashed store_view.
+        let mut app = app_with_host("web");
+        app.on_key(press(KeyCode::Char('3'), KeyModifiers::CONTROL)); // -> Settings
+        app.on_key(press(KeyCode::Enter, KeyModifiers::NONE)); // open picker
+        app.on_key(press(KeyCode::Down, KeyModifiers::NONE)); // -> vault
+        let outcome = app.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(outcome, Outcome::SwitchToVault));
+    }
+
+    #[test]
+    fn current_store_mode_label_reflects_configured_mode() {
+        // Sanity: the label the settings panel renders comes from the config's
+        // store field. Undecided → "undecided".
+        let mut app = app_with_host("web");
+        assert_eq!(app.current_store_mode_label(), "undecided");
+
+        let cfg = SshrackConfig {
+            store: Some(SecretStore::Plaintext),
+            ..SshrackConfig::default()
+        };
+        app.set_config(cfg);
+        assert_eq!(app.current_store_mode_label(), "plaintext");
     }
 }
