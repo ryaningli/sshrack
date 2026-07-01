@@ -50,7 +50,6 @@ use super::popup;
 /// decision" ([`ConfirmAnswer::Yes`]/[`ConfirmAnswer::No`]) from "keep waiting"
 /// ([`ConfirmAnswer::Pending`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum ConfirmAnswer {
     /// User confirmed (y/Y).
     Yes,
@@ -66,7 +65,6 @@ pub enum ConfirmAnswer {
 /// - `y`/`Y` → [`ConfirmAnswer::Yes`]
 /// - `n`/`N`/`Esc` → [`ConfirmAnswer::No`] (Esc is a cancel = decline)
 /// - anything else → [`ConfirmAnswer::Pending`]
-#[allow(dead_code)]
 pub fn confirm_from_key(key: KeyCode) -> ConfirmAnswer {
     match key {
         KeyCode::Char('y') | KeyCode::Char('Y') => ConfirmAnswer::Yes,
@@ -77,8 +75,9 @@ pub fn confirm_from_key(key: KeyCode) -> ConfirmAnswer {
 
 /// A store-mode selection made in the store-pick popup. The popup returns
 /// `Option<StorePick>` — `None` when the user cancelled. Distinct from
-/// `crate::tui::store::StoreModeChoice` (a `Mode::Store` view that returns
-/// `Outcome`) because this popup must return a selection synchronously.
+/// `crate::tui::store::StoreModeChoice` (the `Overlay::StorePicker` dialog
+/// view that returns `Outcome`) because this popup must return a selection
+/// synchronously.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorePick {
     Keyring,
@@ -144,7 +143,6 @@ pub fn store_pick_action_from_key(key: KeyCode, mods: KeyModifiers) -> StorePick
 
 /// Mask character shown for each typed password byte. The literal bullet keeps
 /// the field non-empty looking without leaking length precisely.
-#[allow(dead_code)]
 const MASK: &str = "•";
 
 /// Upgrade a weak terminal handle to the owning `Rc<RefCell<Tui>>` so the
@@ -161,7 +159,6 @@ fn upgrade_terminal(handle: &TerminalHandle) -> Result<Rc<RefCell<Tui>>, Sshrack
 /// wrapped in [`Zeroizing`] so it is wiped on drop. `Enter` submits; `Esc` or
 /// `Ctrl-C` cancels ([`SshrackError::Interrupted`]). The popup re-renders on
 /// every keystroke so masking tracks input live.
-#[allow(dead_code)]
 pub fn prompt_password(terminal: &mut Tui, title: &str) -> Result<Zeroizing<String>, SshrackError> {
     // Zeroizing wrapper so the typed passphrase bytes are wiped on drop on
     // EVERY path — including cancel (Esc/Ctrl-C), where the buffer would
@@ -193,7 +190,6 @@ pub fn prompt_password(terminal: &mut Tui, title: &str) -> Result<Zeroizing<Stri
 /// Read a new passphrase twice via masked popups, looping until the two entries
 /// match. A mismatch re-prompts from scratch. Cancel (`Esc`/`Ctrl-C`) at any
 /// point yields [`SshrackError::Interrupted`].
-#[allow(dead_code)]
 pub fn prompt_password_confirm(
     terminal: &mut Tui,
     title: &str,
@@ -232,7 +228,6 @@ pub fn prompt_password_confirm(
 /// Render `text` in a popup and read keys until [`confirm_from_key`] resolves.
 /// Returns `Ok(true)` on Yes, `Ok(false)` on No/Esc, `Err(Interrupted)` on
 /// `Ctrl-C`.
-#[allow(dead_code)]
 pub fn confirm_popup(terminal: &mut Tui, text: &str) -> Result<bool, SshrackError> {
     loop {
         let lines = text
@@ -350,7 +345,6 @@ fn render_password_popup(terminal: &mut Tui, title: &str, buffer: &str, mismatch
 /// Construct via [`TuiPassphrase::new`] *while the guard is alive* and pass it
 /// to [`sshrack_core::secret::vault::ensure_unlocked_vault_key`] (or any other
 /// core API that consumes a `&dyn PassphraseProvider`).
-#[allow(dead_code)]
 pub struct TuiPassphrase {
     terminal: TerminalHandle,
 }
@@ -358,7 +352,6 @@ pub struct TuiPassphrase {
 impl TuiPassphrase {
     /// Build a provider that drives popups on `terminal` (a weak handle cloned
     /// from the live [`crate::tui::app::TerminalGuard`]).
-    #[allow(dead_code)]
     pub fn new(terminal: TerminalHandle) -> Self {
         Self { terminal }
     }
@@ -402,7 +395,6 @@ impl PassphraseProvider for TuiPassphrase {
 /// `run_host_key_flow`, then inspect the flag; when it is `true`, return
 /// `Err(SshrackError::Interrupted)` from the caller so the cancel surfaces as
 /// "cancelled", not as a host-key rejection.
-#[allow(dead_code)]
 pub fn host_key_confirm(
     terminal: TerminalHandle,
 ) -> (

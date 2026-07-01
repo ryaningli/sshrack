@@ -32,7 +32,7 @@ use super::CredentialNames;
 use super::connect::connect_host;
 use super::cred_panel::CredPanel;
 use super::dialog::draw_dialog;
-use super::help::draw_help;
+use super::help::draw_help_dialog;
 use super::launcher::Launcher;
 use super::prompt::TuiPassphrase;
 use super::settings::SettingsPanel;
@@ -118,7 +118,6 @@ impl TerminalGuard {
     /// reentrancy seam: popups upgrade it and `borrow_mut()` the terminal
     /// inside their own draw loop — the loop must NOT hold a `RefMut` at that
     /// point (see the type-level reentrancy contract).
-    #[allow(dead_code)]
     pub fn handle(&self) -> TerminalHandle {
         Rc::downgrade(&self.terminal)
     }
@@ -137,13 +136,14 @@ impl Drop for TerminalGuard {
 ///
 /// Later tasks grow this enum (EditHost, AddHost, AddCred, RemoveHost, ...).
 //
-// `dead_code`: SwitchTab(Tab)/OpenOverlay(Overlay) carry their payload for
-// test assertions (`matches!(outcome, Outcome::SwitchTab(Tab::Settings))`)
-// and as self-documenting intent — the loop pattern-matches them with `_`
-// because the state mutation already happened in `on_key`. The carry is read
-// in tests but not in the non-test build, so the field-level allow is the
-// established pre-wired-TUI convention (theme.rs / tab.rs).
-#[allow(dead_code, clippy::large_enum_variant)]
+// `SwitchTab(Tab)` / `OpenOverlay(Overlay)` carry their payload for test
+// assertions (`matches!(outcome, Outcome::SwitchTab(Tab::Settings))`) and as
+// self-documenting intent — the loop pattern-matches them with `_` because the
+// state mutation already happened in `on_key`. `large_enum_variant`: the
+// `ConnectRequested` variant carries a `Ulid` (small), but clippy sizes the
+// whole enum by its largest variant; the wizard-carrying `Overlay` enum below
+// is the real offender, and the allow here keeps the two enums consistent.
+#[allow(clippy::large_enum_variant)]
 pub enum Outcome {
     /// User asked to quit; the loop returns `None` (no connect).
     Quit,
@@ -228,11 +228,20 @@ pub enum Outcome {
     /// [`credential::delete_credential_with_secret`]: sshrack_core::credential::delete_credential_with_secret
     DeleteCred,
     /// Pure intent: switch the active tab (Tab / Shift-Tab / Ctrl-1/2/3).
-    /// `on_key` already set `active_tab`; the loop just re-renders.
+    /// `on_key` already set `active_tab`; the loop just re-renders. The carried
+    /// `Tab` is matched by tests via `matches!(out, Outcome::SwitchTab(Tab::…))`
+    /// to assert *which* tab was routed to; `matches!` only structurally inspects
+    /// the value (does not read the field), so clippy flags the payload as dead.
+    /// Kept because the structural-match observability is the whole point.
+    #[allow(dead_code)]
     SwitchTab(Tab),
     /// Pure intent: open an overlay. `on_key` already stashed the overlay on
-    /// `App::overlay`; the loop just re-renders. The variant carries the overlay
-    /// so the loop can distinguish "a real overlay opened" from `Continue`.
+    /// `App::overlay`; the loop just re-renders. The carried `Overlay` is matched
+    /// by tests via `matches!(out, Outcome::OpenOverlay(Overlay::…))` to assert
+    /// *which* overlay opened; `matches!` only structurally inspects it (does not
+    /// read the field), so clippy flags the payload as dead. Kept because the
+    /// structural-match observability is the whole point.
+    #[allow(dead_code)]
     OpenOverlay(Overlay),
     /// Pure intent: close the current overlay (Esc / Ctrl-C inside one). The
     /// loop clears `App::overlay` and surfaces a default status.
@@ -249,13 +258,10 @@ pub enum Outcome {
 /// variants keeps the form state alive across keystrokes without a separate
 /// `Option<HostForm>` field.
 //
-// `dead_code`: DeleteHost/DeleteCred are constructed by the delete-confirm
-// popup path (Task 9 wires the overlay-driven variant); until then they are
-// matched only in `draw_overlay`/`route_overlay` and never constructed in the
-// non-test build. `large_enum_variant`: the wizard variants carry full forms
-// while Help/StorePicker/DeleteHost are near-ZSTs — the enum is box-free by
-// intent (a single live overlay, cloned only on OpenOverlay).
-#[allow(dead_code, clippy::large_enum_variant)]
+// `large_enum_variant`: the wizard variants carry full forms while
+// Help/StorePicker/DeleteHost are near-ZSTs — the enum is box-free by intent
+// (a single live overlay, cloned only on OpenOverlay).
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub enum Overlay {
     /// The Help keymap reference (F1). Static text — no carried state.
@@ -268,13 +274,6 @@ pub enum Overlay {
     /// Storage-mode picker (opened from Settings). Task 8 drives the cursor +
     /// switch intents; for Task 6 Esc closes it.
     StorePicker,
-    /// Delete-current-row confirm (driven via [`TuiPassphrase::confirm`] in the
-    /// loop). Carries no state: the host id lives on `App::pending_delete`.
-    DeleteHost,
-    /// Delete-current-credential-row confirm (driven via
-    /// [`TuiPassphrase::confirm`] in the loop). Carries no state: the credential
-    /// name lives on `App::pending_delete_cred`.
-    DeleteCred,
 }
 
 /// The consolidated status-bar message: a transient one-liner the user reads as
@@ -435,30 +434,24 @@ impl App {
         &mut self.frecency
     }
 
-    /// Borrow the launcher mutably. Exposed for tests that drive the launcher
-    /// state machine directly and for the loop's `pending_connect` read.
-    #[allow(dead_code)]
-    pub fn launcher(&mut self) -> &mut Launcher {
-        &mut self.launcher
-    }
-
-    /// The active shell tab. Exposed for tests asserting tab routing.
-    #[allow(dead_code)]
+    /// The active shell tab. Test accessor for assertions on tab routing; the
+    /// production loop reads `self.active_tab` directly.
+    #[cfg(test)]
     pub fn active_tab(&self) -> Tab {
         self.active_tab
     }
 
-    /// The current overlay, if any. Exposed for tests asserting overlay
-    /// routing (`matches!(app.overlay(), Some(Overlay::HostWizard(_)))`).
-    #[allow(dead_code)]
+    /// The current overlay, if any. Test accessor for assertions on overlay
+    /// routing (`matches!(app.overlay(), Some(Overlay::HostWizard(_)))`); the
+    /// production loop reads the overlay field directly.
+    #[cfg(test)]
     pub fn overlay(&self) -> Option<&Overlay> {
         self.overlay.as_ref()
     }
 
-    /// Borrow the active host wizard, if a [`Overlay::HostWizard`] is open. The
-    /// loop uses this to read the form fields when fulfilling a
-    /// [`Outcome::SaveHost`] intent.
-    #[allow(dead_code)]
+    /// Borrow the active host wizard, if a [`Overlay::HostWizard`] is open. Test
+    /// accessor: the production loop reads the overlay field directly.
+    #[cfg(test)]
     pub fn wizard(&self) -> Option<&HostForm> {
         match &self.overlay {
             Some(Overlay::HostWizard(f)) => Some(f),
@@ -466,8 +459,9 @@ impl App {
         }
     }
 
-    /// Borrow the active cred wizard, if a [`Overlay::CredWizard`] is open.
-    #[allow(dead_code)]
+    /// Borrow the active cred wizard, if a [`Overlay::CredWizard`] is open. Test
+    /// accessor: the production loop reads the overlay field directly.
+    #[cfg(test)]
     pub fn cred_wizard(&self) -> Option<&CredForm> {
         match &self.overlay {
             Some(Overlay::CredWizard(f)) => Some(f),
@@ -864,20 +858,6 @@ impl App {
                 }
                 out
             }
-            Overlay::DeleteHost => {
-                if key.kind == KeyEventKind::Press && key.code == KeyCode::Esc {
-                    return Outcome::CloseOverlay;
-                }
-                self.overlay = Some(Overlay::DeleteHost);
-                Outcome::Continue
-            }
-            Overlay::DeleteCred => {
-                if key.kind == KeyEventKind::Press && key.code == KeyCode::Esc {
-                    return Outcome::CloseOverlay;
-                }
-                self.overlay = Some(Overlay::DeleteCred);
-                Outcome::Continue
-            }
         }
     }
 
@@ -1172,7 +1152,7 @@ impl App {
     /// empty dialog (the loop drives their confirm popups).
     fn draw_overlay(&self, frame: &mut Frame, ov: &Overlay) {
         match ov {
-            Overlay::Help => draw_help(frame, frame.area()),
+            Overlay::Help => draw_help_dialog(frame),
             Overlay::HostWizard(form) => {
                 let body = draw_dialog(
                     frame,
@@ -1202,9 +1182,6 @@ impl App {
                     .as_ref()
                     .expect("invariant: store_view stashed while StorePicker overlay is open")
                     .draw_in_dialog(frame, body);
-            }
-            Overlay::DeleteHost | Overlay::DeleteCred => {
-                let _ = draw_dialog(frame, "…", 0, &[("Esc", "cancel")]);
             }
         }
     }
@@ -1812,7 +1789,7 @@ fn recover_store_mode_and_retry_cred_save(
     };
     match persist_store_switch(app, target, handle)? {
         true => {
-            // Mode switched + persisted; retry the save. Any error propagates
+            // Store mode switched + persisted; retry the save. Any error propagates
             // (fulfill_save_cred surfaces it in the wizard's core-error line).
             persist_cred_save(app, handle).map(|_| true)
         }
@@ -3173,13 +3150,6 @@ mod tests {
     }
 
     #[test]
-    fn f1_opens_help_overlay() {
-        let mut app = app_with_host("web");
-        let out = app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
-        assert!(matches!(out, Outcome::OpenOverlay(Overlay::Help)));
-    }
-
-    #[test]
     fn esc_inside_overlay_closes_it_and_does_not_touch_query() {
         let mut app = app_with_host("web");
         app.on_key(press(KeyCode::Char('a'), KeyModifiers::CONTROL)); // open host wizard
@@ -3194,11 +3164,16 @@ mod tests {
     // ===============================================================
 
     #[test]
-    fn f1_in_launcher_opens_help_overlay() {
+    fn f1_in_launcher_opens_help_overlay_then_esc_closes_it() {
         let mut app = app_with_host("web");
+        // F1 opens the Help overlay; both the outcome and the stashed overlay agree.
         let outcome = app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
         assert!(matches!(outcome, Outcome::OpenOverlay(Overlay::Help)));
         assert!(matches!(app.overlay(), Some(Overlay::Help)));
+        // Esc closes it and clears the overlay.
+        let after = app.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(after, Outcome::CloseOverlay));
+        assert!(app.overlay().is_none());
     }
 
     #[test]

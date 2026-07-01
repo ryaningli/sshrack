@@ -20,11 +20,6 @@ use crate::tui::{tab, tab::Tab, theme};
 /// Render the brand + tab bar (band 1) and the hotkey footer (band 3), and
 /// return the band-2 `Rect` for the active panel to draw into. `footer` is a
 /// slice of `(key, label)` pairs joined by ` · ` with keys accented.
-///
-/// `#[allow(dead_code)]`: the keystone App rewrite (Task 9) is the first
-/// production caller; unit tests already exercise this path. Same pre-wired
-/// convention as `theme.rs` / `tab.rs`.
-#[allow(dead_code)]
 pub fn draw_shell(frame: &mut Frame, area: Rect, active: Tab, footer: &[(&str, &str)]) -> Rect {
     let [top, middle, bottom] = Layout::vertical([
         Constraint::Length(1),
@@ -39,7 +34,7 @@ pub fn draw_shell(frame: &mut Frame, area: Rect, active: Tab, footer: &[(&str, &
         .map(|t| Line::from(t.label()))
         .collect();
     let tabs_index = active.idx();
-    let brand_len: u16 = 7; // "sshrack"
+    let brand_len: u16 = theme::BRAND.chars().count() as u16;
     let help_text = "F1 help";
     let tabs_area = Rect {
         x: top.x + brand_len + 2,

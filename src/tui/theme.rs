@@ -7,43 +7,42 @@ use ratatui::{
     text::Span,
 };
 
-// These tokens are the theme's public surface; later tasks (shell renderer,
-// panels, status bar) consume them. `#[allow(dead_code)]` is the codebase's
-// established convention for pre-declared-but-not-yet-wired TUI surface (see
-// popup.rs / prompt.rs / launcher.rs); it tolerates the dual build where the
-// unit tests already reference the items while production callers land later.
+// These tokens are the theme's public surface; the shell renderer, panels,
+// wizards, and status bar all consume them.
 /// The single accent color: active tab, selected-row gutter, brand, links.
-#[allow(dead_code)]
 pub const ACCENT: Color = Color::Cyan;
 /// Fuzzy-match highlight color.
-#[allow(dead_code)]
 pub const MATCH: Color = Color::Yellow;
 /// Errors, delete confirm, downgrade warning.
-#[allow(dead_code)]
 pub const DANGER: Color = Color::Red;
 /// Transient success messages.
+///
+/// Reserved for a transient success indicator; no production caller renders it
+/// yet (the success path currently reuses the status-line message). Kept so the
+/// palette stays complete and documented rather than sprinkling a literal
+/// `Color::Green` later.
 #[allow(dead_code)]
 pub const OK: Color = Color::Green;
 
+/// The brand word rendered in the shell's top band. Centralized so the shell's
+/// `brand_len` arithmetic (derived from `BRAND.chars().count()`) and the accented
+/// span never drift apart.
+pub const BRAND: &str = "sshrack";
+
 /// Accent style (fg only). Callers add modifiers as needed.
-#[allow(dead_code)]
 pub fn accent() -> Style {
     Style::new().fg(ACCENT)
 }
 
 /// The leading gutter mark for the selected list row.
-#[allow(dead_code)]
 pub fn selected_gutter() -> Span<'static> {
     Span::styled("▎", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD))
 }
 
-/// The brand word `sshrack`, accented + bold.
-#[allow(dead_code)]
+/// The brand word `sshrack`, accented + bold. Uses [`BRAND`] so the literal
+/// lives in exactly one place.
 pub fn brand_span() -> Span<'static> {
-    Span::styled(
-        "sshrack",
-        Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
-    )
+    Span::styled(BRAND, Style::new().fg(ACCENT).add_modifier(Modifier::BOLD))
 }
 
 #[cfg(test)]

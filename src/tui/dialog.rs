@@ -2,12 +2,6 @@
 //! and its own hotkey footer. The shell stays visible behind it (no dark
 //! scrim — terminals can't do translucency). The caller fills the returned
 //! body rect.
-//!
-//! Foundation module: the wizards (host/cred add-edit) and the store-picker
-//! overlay (Tasks 6/8/9) are the first production callers; unit tests already
-//! exercise this path, so items carry `#[allow(dead_code)]` until the keystone
-//! App rewrite wires them in — same pre-wired convention as `theme.rs` /
-//! `tab.rs` / `shell.rs`.
 
 use ratatui::{
     Frame,
@@ -30,7 +24,6 @@ const MAX_H: u16 = 24;
 /// (`w-4` / `h-4`) so it never touches the screen edge, and centered. When the
 /// screen is smaller than 6 cells on either axis the screen is returned as-is
 /// (we can't center meaningfully and a zero-size rect would panic downstream).
-#[allow(dead_code)]
 pub fn dialog_area(screen: Rect) -> Rect {
     let w = MAX_W.min(screen.width.saturating_sub(4));
     let h = MAX_H.min(screen.height.saturating_sub(4));
@@ -64,7 +57,6 @@ pub fn dialog_area(screen: Rect) -> Rect {
 ///
 /// Footer `hints` are `(key, label)` pairs joined by ` · `, with keys in the
 /// accent color + bold and labels dimmed.
-#[allow(dead_code)]
 pub fn draw_dialog(
     frame: &mut Frame,
     title: &str,

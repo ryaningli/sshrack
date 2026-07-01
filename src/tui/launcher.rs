@@ -46,11 +46,13 @@ use super::theme;
 /// for the empty-query frecency-only branch (where ordering, not score, is the
 /// useful signal).
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct RankedHost {
     /// Index into the `&[Host]` slice passed to [`rank_hosts`].
     pub host_idx: usize,
-    /// nucleo match score (0 on the empty-query branch).
+    /// nucleo match score (0 on the empty-query branch). Read only by tests
+    /// (production callers key off `host_idx` and the list order); kept so the
+    /// score survives ranking and is assertable.
+    #[allow(dead_code)]
     pub score: u32,
 }
 
@@ -63,7 +65,6 @@ pub struct RankedHost {
 /// helper that the Credentials panel also uses, then re-attaches the nucleo
 /// match score (0 on the empty-query branch) that [`RankedHost::score`]
 /// carries for callers/tests.
-#[allow(dead_code)]
 pub fn rank_hosts(hosts: &[Host], frecency: &Frecency, query: &str) -> Vec<RankedHost> {
     // Pair each host with its original slice index and its frecency score —
     // the same score source the previous inlined comparator used

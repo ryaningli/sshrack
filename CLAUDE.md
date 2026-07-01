@@ -36,15 +36,22 @@ sshrack/
 │   │   ├── args.rs             #     clap derive (Cli/Command/HostAction/CredAction/StoreAction)
 │   │   ├── table.rs            #     text table rendering for ls/show
 │   │   └── mod.rs              #     cmd handlers (connect/scp/host/cred/store) + run()
-│   ├── tui/                    #   INTERACTIVE ratatui shell
-│   │   ├── launcher.rs         #     frecency-tiered host list + nucleo fuzzy filter + key bindings
-│   │   ├── wizard.rs           #     host add/edit + credential add/edit wizards
-│   │   ├── store.rs            #     store-mode switch view (keyring/vault/plaintext)
+│   ├── tui/                    #   INTERACTIVE ratatui shell (three-band shell + tabs + overlays)
+│   │   ├── shell.rs            #     three-band renderer (brand+tabs / panel area / hotkey footer)
+│   │   ├── tab.rs              #     Tab enum (Hosts/Credentials/Settings) + tab_key_decision
+│   │   ├── panel.rs            #     shared rank_by_name helper (frecency + nucleo fuzzy)
+│   │   ├── launcher.rs         #     Hosts panel: frecency-tiered host list + fuzzy filter + search box
+│   │   ├── cred_panel.rs       #     Credentials panel (same shape, no secrets rendered)
+│   │   ├── settings.rs         #     Settings panel: storage-mode row + picker overlay driver
+│   │   ├── dialog.rs           #     overlay chrome (titled border + hotkey footer → body Rect)
+│   │   ├── wizard.rs           #     host add/edit + credential add/edit wizards (draw_in_dialog)
+│   │   ├── store.rs            #     store-mode switch view (keyring/vault/plaintext) in a dialog
 │   │   ├── connect.rs          #     ConnectRequest orchestration + delayed exec handoff
 │   │   ├── prompt.rs           #     TUI PassphraseProvider impl (crossterm-based)
-│   │   ├── popup.rs            #     delete/confirm popups
-│   │   ├── help.rs             #     F1 help overlay
-│   │   ├── app.rs              #     top-level App loop + consolidated status bar
+│   │   ├── popup.rs            #     centered popup renderer (used by prompt.rs confirm dialogs)
+│   │   ├── theme.rs            #     design tokens (accent, gutter, brand) — the single color surface
+│   │   ├── help.rs             #     F1 help dialog (draw_help_dialog + keymap reference)
+│   │   ├── app.rs              #     top-level App: active_tab + Overlay routing, Outcome loop, status bar
 │   │   └── mod.rs              #     TerminalGuard + run() entry
 │   └── shared/
 │       ├── format.rs           #     --format json|text output shapes (locked contract)
@@ -84,16 +91,17 @@ A flagged field is **always** a CLI patch, never a wizard — `host edit x --por
 
 | Key | Action |
 |---|---|
+| `Tab` / `Shift-Tab` | cycle tab (Hosts / Credentials / Settings) |
+| `Ctrl-1` / `2` / `3` | jump to Hosts / Credentials / Settings |
+| type | filter the active panel's search box (`⌫` deletes; bare letters/digits never act as hotkeys — they reach the query) |
 | `↑`/`↓` or `^n`/`^p` | move selection |
-| type | fuzzy-filter query (`⌫` delete, `^a`/`^e` home/end) |
-| `Enter` | connect to selected host |
-| `c` | add credential (`^c` cancels a popup/wizard) |
-| `Shift-C` | store-mode switch view |
-| `^a` (launcher) / `^e` (launcher) | add host / edit host |
-| `^d` | delete selected host (confirm popup) |
-| `F1` or `?` | help overlay |
-| `F2` | store-mode switch view |
-| `Esc` | cancel popup / close overlay / quit (twice from launcher) |
+| `Enter` | Hosts: connect · Credentials: edit · Settings: edit the storage-mode row |
+| `^a` / `^e` / `^d` | add / edit / delete (current tab; delete opens a confirm) |
+| `F1` | help overlay (also closes it) |
+| `Esc` | clear query / close overlay / quit (from launcher) |
+| `^c` | quit |
+
+The single-char conflict fix: bare `c`, `?`, and `1`/`2`/`3` always reach the active panel's search box (never act as hotkeys). The old `c` add-credential, `Shift-C`/`F2` store-mode switch, and `?` help bindings are gone — use `Ctrl-A`/`Ctrl-S`/`F1` instead.
 
 ### Invariants
 
@@ -229,7 +237,15 @@ sshrack is an orchestration layer over the system OpenSSH. Do **not** introduce 
 
 ## TUI (delivered)
 
-The interactive shell (`src/tui/`) is delivered: launcher (frecency-tiered host list + nucleo fuzzy filter), host add/edit wizard, credential add/edit wizard, store-mode switch view (keyring/vault/plaintext), delete-confirm popups, connect orchestration with delayed exec (the terminal is restored before `ssh` inherits it), F1 help overlay, and a consolidated status bar. It is reached by a bare `sshrack`, or by `host`/`cred` `add`/`edit` with no content flags.
+The interactive shell (`src/tui/`) is delivered as a **three-band shell + tabs + overlays**:
+
+- **Shell (`shell.rs`):** a top band (brand word + tab bar), a middle band (the active panel's area), and a bottom hotkey footer. `draw_shell` returns the middle `Rect` for the panel to render into.
+- **Tabs (`tab.rs` + `Tab` enum):** Hosts / Credentials / Settings, default Hosts. `Tab`/`Shift-Tab` cycle, `Ctrl-1`/`2`/`3` jump. The active tab is the only routing state (`App::active_tab`); the old full-screen `Mode` enum is gone.
+- **Panels:** Hosts panel (`launcher.rs`, frecency-tiered host list + nucleo fuzzy filter + search box), Credentials panel (`cred_panel.rs`, same shape, no secrets rendered), Settings panel (`settings.rs`, storage-mode row).
+- **Overlays (`Overlay` enum, at most one open at a time):** host add/edit wizard, credential add/edit wizard, store-mode picker, and the F1 help reference are all **dialogs** (`dialog.rs` chrome: titled bordered area + hotkey footer, no dark scrim) layered on top of the shell — not full-screen modes. `Esc`/`Ctrl-C` inside an overlay closes it; the shell keeps rendering behind it.
+- **Event routing (`app.rs`):** `on_key` returns a pure-intent `Outcome` (`SwitchTab` / `OpenOverlay` / `CloseOverlay` / `SaveHost` / `DeleteHost` / `ConnectRequested` / `Quit` / …); the loop applies the I/O (persist, keyring cleanup, confirm popups via `TuiPassphrase`, connect orchestration with delayed exec — the terminal is restored before `ssh` inherits it). A consolidated status bar surfaces feedback after every action.
+
+It is reached by a bare `sshrack`, or by `host`/`cred` `add`/`edit` with no content flags. CLI entry (`host add`, `cred add`, etc.) routes straight to the matching tab + overlay.
 
 ## Later phase (still deferred)
 

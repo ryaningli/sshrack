@@ -14,16 +14,13 @@ use ratatui::{
 
 /// The fixed size of a popup. Centralized so password and confirm popups share
 /// the same footprint.
-#[allow(dead_code)]
 const POPUP_WIDTH: u16 = 60;
-#[allow(dead_code)]
 const POPUP_HEIGHT: u16 = 20;
 
 /// Standard ratatui centered-rect recipe. Returns a rect of `POPUP_WIDTH` x
 /// `POPUP_HEIGHT` centered inside `r`. Pure (no I/O), so the geometry is
 /// unit-testable. When the terminal is too small, returns `r` clamped so we
 /// still render top-left aligned instead of panicking on a zero-size rect.
-#[allow(dead_code)]
 pub fn centered_rect(r: Rect) -> Rect {
     let popup = Rect::new(0, 0, POPUP_WIDTH, POPUP_HEIGHT);
     if r.width < popup.width || r.height < popup.height {
@@ -49,7 +46,6 @@ pub fn centered_rect(r: Rect) -> Rect {
 /// Render a clear-backed bordered popup titled `title`, then render `body`
 /// inside it. The caller drives input by reading keys separately; this fn only
 /// paints the chrome + body widget.
-#[allow(dead_code)]
 pub fn render_popup<W: Widget>(frame: &mut Frame, title: &str, body: W) {
     let area = centered_rect(frame.area());
     // Clear the background so previous frame content doesn't bleed through.

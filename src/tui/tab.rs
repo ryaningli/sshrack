@@ -3,15 +3,10 @@
 //! The contract: ONLY `Tab` / `Shift-Tab` / `Ctrl-1/2/3` switch tabs. Every
 //! printable char returns [`TabKey::None`] so it reaches the panel search box —
 //! this is the fix for the single-character hotkey conflict.
-//!
-//! Foundation module: these types land before the keystone App rewrite (Task 9)
-//! wires them in, so items are `#[allow(dead_code)]` until the shell consumes
-//! them — same pattern as `theme.rs`.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 /// The three shell tabs. Default is [`Tab::Hosts`].
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Hosts,
@@ -20,10 +15,8 @@ pub enum Tab {
 }
 
 /// Stable left-to-right tab order used by [`Tab::next`] / [`Tab::prev`].
-#[allow(dead_code)]
 pub const TAB_ORDER: &[Tab] = &[Tab::Hosts, Tab::Credentials, Tab::Settings];
 
-#[allow(dead_code)]
 impl Tab {
     /// Cycle to the next tab, wrapping past [`Tab::Settings`] back to
     /// [`Tab::Hosts`].
@@ -56,7 +49,6 @@ impl Tab {
 /// Whether a panel-level key switches tabs. Produced by
 /// [`tab_key_decision`]; consumed by the panel event loop to decide tab switch
 /// vs. forward-to-search.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabKey {
     /// Jump directly to a tab (`Ctrl-1/2/3`).
@@ -73,7 +65,6 @@ pub enum TabKey {
 /// other key (including bare digits and letters) returns [`TabKey::None`] so
 /// it flows into the panel search box. Only `Press` events are honored; `Release`
 /// and `Repeat` are `None`.
-#[allow(dead_code)]
 pub fn tab_key_decision(key: KeyEvent) -> TabKey {
     if key.kind != KeyEventKind::Press {
         return TabKey::None;

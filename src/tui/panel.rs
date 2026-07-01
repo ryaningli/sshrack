@@ -18,7 +18,6 @@ use nucleo_matcher::{
 /// Pure: no I/O, no printing, no env access. `scores.len()` must equal
 /// `names.len()`; the caller is responsible for pairing them (each entry's
 /// score sits at the same index as its name).
-#[allow(dead_code)]
 pub fn rank_by_name(names: &[String], scores: &[f64], query: &str) -> Vec<usize> {
     if query.is_empty() {
         let mut idx: Vec<usize> = (0..names.len()).collect();

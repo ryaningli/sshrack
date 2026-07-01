@@ -1020,7 +1020,7 @@ impl CredForm {
     /// Pure key decision: mutate form state and return an [`Outcome`]. Performs
     /// **no I/O** — the loop runs persist only when this signals
     /// [`Outcome::SaveCred`]. The `App` routes the cred wizard's intent by the
-    /// active [`super::app::Mode`] (`CredWizard`), so it never collides with
+    /// active [`super::app::Overlay`] (`CredWizard`), so it never collides with
     /// the host wizard's [`Outcome::SaveHost`].
     ///
     /// Bindings mirror [`HostForm::on_key`]:
