@@ -30,6 +30,7 @@ pub mod launcher;
 pub mod popup;
 pub mod prompt;
 pub mod store;
+pub mod theme;
 pub mod wizard;
 
 pub use app::{App, TerminalGuard, run_loop};
