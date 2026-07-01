@@ -186,29 +186,26 @@ pub fn validate(form: &HostForm) -> Result<(), SaveError> {
 /// Build the value-area spans for one field row. Shared by [`HostForm`] and
 /// [`CredForm`] so both render the empty state identically.
 ///
-/// When the value is empty and the row is focused, the cursor `▍` comes FIRST
-/// (at the input start), followed by the dim placeholder as a background hint —
-/// so backspace at an empty input is a natural no-op and the placeholder never
-/// looks like editable text the cursor is sitting inside. When the value is
-/// non-empty, the value renders raw with the cursor trailing it and the
-/// placeholder disappears.
-fn value_spans(value: &str, placeholder: Option<&str>, focused: bool) -> Vec<Span<'static>> {
-    let mut spans: Vec<Span<'static>> = Vec::new();
+/// No cursor glyph is drawn here — the real terminal cursor is placed by each
+/// form's `draw` via `Frame::set_cursor_position`, so an empty focused field
+/// shows just the dim placeholder with the terminal cursor landing on its
+/// first char (mirrors sshelf). A non-empty value renders raw; the placeholder
+/// disappears.
+fn value_spans(value: &str, placeholder: Option<&str>) -> Vec<Span<'static>> {
     if value.is_empty() {
-        if focused {
-            spans.push(Span::styled("▍", Style::new().dim()));
-        }
-        if let Some(ph) = placeholder {
-            spans.push(Span::styled(ph.to_string(), Style::new().dim()));
-        }
+        placeholder
+            .map(|ph| vec![Span::styled(ph.to_string(), Style::new().dim())])
+            .unwrap_or_default()
     } else {
-        spans.push(Span::raw(value.to_string()));
-        if focused {
-            spans.push(Span::styled("▍", Style::new().dim()));
-        }
+        vec![Span::raw(value.to_string())]
     }
-    spans
 }
+
+/// Column where the editable value begins within a rendered field row:
+/// `"▶ " (2) + right-aligned label + ": " (2)`. Host labels are padded to 5,
+/// credentials to 8. Used by each form's `draw` to place the terminal cursor.
+const HOST_VALUE_COL: u16 = 2 + 5 + 2;
+const CRED_VALUE_COL: u16 = 2 + 8 + 2;
 
 /// The host form's editable state. All fields are owned `String`s (cheap to
 /// mutate on each keystroke). The wizard constructs this either empty (add mode)
@@ -627,6 +624,38 @@ impl HostForm {
             "  Tab/up-down next  ·  ^s save  ·  Esc cancel"
         };
         frame.render_widget(Paragraph::new(hint).style(Style::new().dim()), hint_area);
+
+        // Place the real terminal cursor on the focused text field (no drawn
+        // glyph — the terminal highlights the char under the cursor, landing on
+        // the placeholder's first char when the field is empty). Chooser fields
+        // (Default/Credential auth) return None and get no cursor.
+        if let Some((row, offset)) = self.cursor_target() {
+            let max_x = fields_area.x + fields_area.width.saturating_sub(1);
+            let x = (fields_area.x + HOST_VALUE_COL + offset as u16).min(max_x);
+            let y = fields_area.y + row as u16;
+            frame.set_cursor_position((x, y));
+        }
+    }
+
+    /// The `(row, value_offset)` where the terminal cursor should sit for the
+    /// focused field, or `None` when the focused field is a chooser (Default /
+    /// Credential auth) with no text cursor. `row` is the index into the
+    /// rendered rows ([`Field::ORDER`]); `offset` is the char count already
+    /// typed. Pure; [`HostForm::draw`] consumes it to call
+    /// `Frame::set_cursor_position`.
+    fn cursor_target(&self) -> Option<(usize, usize)> {
+        let row = self.focus.idx();
+        let offset = match self.focus {
+            Field::Name => self.name.chars().count(),
+            Field::Host => self.host_addr.chars().count(),
+            Field::Port => self.port.chars().count(),
+            Field::User => self.user.chars().count(),
+            Field::Auth => match self.auth_choice {
+                AuthChoice::InlineKey => self.inline_key.chars().count(),
+                AuthChoice::Default | AuthChoice::Credential { .. } => return None,
+            },
+        };
+        Some((row, offset))
     }
 
     /// Block title: distinguishes add vs edit mode.
@@ -656,7 +685,7 @@ impl HostForm {
         let (value_str, placeholder) = self.row_value_and_placeholder(field);
 
         let mut spans = vec![label_span];
-        spans.extend(value_spans(&value_str, placeholder, focused));
+        spans.extend(value_spans(&value_str, placeholder));
         Line::from(spans).alignment(Alignment::Left)
     }
 
@@ -1186,6 +1215,32 @@ impl CredForm {
             "  Tab/up-down next  ·  ^s save  ·  Esc cancel"
         };
         frame.render_widget(Paragraph::new(hint).style(Style::new().dim()), hint_area);
+
+        // Place the real terminal cursor on the focused text field (no drawn
+        // glyph — see HostForm::draw). SecretKind is a chooser (no cursor).
+        if let Some((row, offset)) = self.cursor_target() {
+            let max_x = fields_area.x + fields_area.width.saturating_sub(1);
+            let x = (fields_area.x + CRED_VALUE_COL + offset as u16).min(max_x);
+            let y = fields_area.y + row as u16;
+            frame.set_cursor_position((x, y));
+        }
+    }
+
+    /// The `(row, value_offset)` where the terminal cursor should sit for the
+    /// focused field, or `None` for the SecretKind chooser. `row` is the index
+    /// into the reachable rendered rows; `offset` is the char count already
+    /// typed (the masked password counts its chars). Pure; [`CredForm::draw`]
+    /// consumes it to call `Frame::set_cursor_position`.
+    fn cursor_target(&self) -> Option<(usize, usize)> {
+        let row = self.focus_idx();
+        let offset = match self.focus {
+            CredField::Name => self.name.chars().count(),
+            CredField::User => self.user.chars().count(),
+            CredField::Identity => self.identity.chars().count(),
+            CredField::Password => self.password.chars().count(),
+            CredField::SecretKind => return None,
+        };
+        Some((row, offset))
     }
 
     fn title(&self) -> String {
@@ -1212,7 +1267,7 @@ impl CredForm {
         let (value_str, placeholder) = self.row_value_and_placeholder(field);
 
         let mut spans = vec![label_span];
-        spans.extend(value_spans(&value_str, placeholder, focused));
+        spans.extend(value_spans(&value_str, placeholder));
         Line::from(spans).alignment(Alignment::Left)
     }
 
@@ -1264,40 +1319,97 @@ mod tests {
     // ---- value_spans: empty-state cursor sits BEFORE the placeholder ----
 
     #[test]
-    fn value_spans_empty_focused_puts_cursor_before_placeholder() {
-        let spans = value_spans("", Some("e.g. web-prod"), true);
-        assert_eq!(spans.len(), 2, "focused empty: cursor + placeholder");
-        assert_eq!(&*spans[0].content, "▍", "cursor first (at the input start)");
-        assert_eq!(
-            &*spans[1].content, "e.g. web-prod",
-            "placeholder second (background)"
-        );
-    }
-
-    #[test]
-    fn value_spans_empty_unfocused_has_no_cursor() {
-        let spans = value_spans("", Some("e.g. web-prod"), false);
-        assert_eq!(
-            spans.len(),
-            1,
-            "unfocused empty: placeholder only, no cursor"
-        );
+    fn value_spans_empty_shows_only_placeholder_no_glyph() {
+        let spans = value_spans("", Some("e.g. web-prod"));
+        assert_eq!(spans.len(), 1, "empty: placeholder only, no drawn cursor");
         assert_eq!(&*spans[0].content, "e.g. web-prod");
     }
 
     #[test]
-    fn value_spans_non_empty_puts_cursor_after_value_and_no_placeholder() {
-        let spans = value_spans("typed", Some("e.g. web-prod"), true);
-        assert_eq!(spans.len(), 2);
+    fn value_spans_non_empty_shows_only_value() {
+        let spans = value_spans("typed", Some("e.g. web-prod"));
+        assert_eq!(spans.len(), 1);
         assert_eq!(&*spans[0].content, "typed");
-        assert_eq!(&*spans[1].content, "▍");
     }
 
     #[test]
-    fn value_spans_empty_with_no_placeholder_focused_is_cursor_only() {
-        let spans = value_spans("", None, true);
+    fn value_spans_empty_with_no_placeholder_is_empty() {
+        let spans = value_spans("", None);
+        assert!(spans.is_empty());
+    }
+
+    #[test]
+    fn value_spans_non_empty_ignores_placeholder() {
+        let spans = value_spans("x", Some("e.g. web-prod"));
         assert_eq!(spans.len(), 1);
-        assert_eq!(&*spans[0].content, "▍");
+        assert_eq!(&*spans[0].content, "x");
+    }
+
+    // ---- cursor_target: where the terminal cursor sits on the focused field ----
+
+    #[test]
+    fn host_cursor_target_name_empty_is_row_zero_offset_zero() {
+        let mut f = blank_form();
+        f.focus = Field::Name;
+        assert_eq!(f.cursor_target(), Some((0, 0)));
+    }
+
+    #[test]
+    fn host_cursor_target_host_with_typed_value_offsets_by_char_count() {
+        let mut f = blank_form();
+        f.focus = Field::Host;
+        f.host_addr = "10.0.0.5".into();
+        assert_eq!(f.cursor_target(), Some((1, 8)));
+    }
+
+    #[test]
+    fn host_cursor_target_auth_default_is_none_chooser() {
+        let mut f = blank_form();
+        f.focus = Field::Auth;
+        f.auth_choice = AuthChoice::Default;
+        assert_eq!(f.cursor_target(), None);
+    }
+
+    #[test]
+    fn host_cursor_target_auth_credential_is_none_chooser() {
+        let mut f = blank_form();
+        f.credential_names = vec!["ops".into()];
+        f.focus = Field::Auth;
+        f.auth_choice = AuthChoice::Credential { idx: 0 };
+        assert_eq!(f.cursor_target(), None);
+    }
+
+    #[test]
+    fn host_cursor_target_auth_inline_key_offsets_path() {
+        let mut f = blank_form();
+        f.focus = Field::Auth;
+        f.auth_choice = AuthChoice::InlineKey;
+        f.inline_key = "/k/id".into();
+        assert_eq!(f.cursor_target(), Some((4, 5)));
+    }
+
+    #[test]
+    fn cred_cursor_target_name_empty_is_row_zero_offset_zero() {
+        let mut f = CredForm::new_add();
+        f.focus = CredField::Name;
+        assert_eq!(f.cursor_target(), Some((0, 0)));
+    }
+
+    #[test]
+    fn cred_cursor_target_password_offsets_by_masked_len() {
+        let mut f = CredForm::new_add();
+        f.secret_kind = SecretChoice::Password;
+        f.focus = CredField::Password;
+        f.password = Zeroizing::new(String::from("secret1"));
+        // Password is the 5th reachable field when secret_kind == Password.
+        assert_eq!(f.cursor_target(), Some((4, 7)));
+    }
+
+    #[test]
+    fn cred_cursor_target_secret_kind_is_none_chooser() {
+        let mut f = CredForm::new_add();
+        f.focus = CredField::SecretKind;
+        assert_eq!(f.cursor_target(), None);
     }
 
     fn blank_form() -> HostForm {
