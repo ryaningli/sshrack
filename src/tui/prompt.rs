@@ -75,13 +75,11 @@ pub fn confirm_from_key(key: KeyCode) -> ConfirmAnswer {
     }
 }
 
-// wired by Task 3's store-pick popup; allow removed there.
 /// A store-mode selection made in the store-pick popup. The popup returns
 /// `Option<StorePick>` — `None` when the user cancelled. Distinct from
 /// `crate::tui::store::StoreModeChoice` (a `Mode::Store` view that returns
 /// `Outcome`) because this popup must return a selection synchronously.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum StorePick {
     Keyring,
     Vault,
@@ -89,15 +87,11 @@ pub enum StorePick {
 }
 
 impl StorePick {
-    // wired by Task 3's store-pick popup; allow removed there.
     /// Render + navigation order shown in the popup.
-    #[allow(dead_code)]
     pub const ORDER: &'static [StorePick] =
         &[StorePick::Keyring, StorePick::Vault, StorePick::Plaintext];
 
-    // wired by Task 3's store-pick popup; allow removed there.
     /// The user-facing label.
-    #[allow(dead_code)]
     pub fn label(self) -> &'static str {
         match self {
             StorePick::Keyring => "keyring",
@@ -106,9 +100,7 @@ impl StorePick {
         }
     }
 
-    // wired by Task 3's store-pick popup; allow removed there.
     /// A one-line trade-off blurb shown beside the option in the popup.
-    #[allow(dead_code)]
     pub fn blurb(self) -> &'static str {
         match self {
             StorePick::Keyring => "OS keyring (recommended); needs a Secret Service daemon",
@@ -118,11 +110,9 @@ impl StorePick {
     }
 }
 
-// wired by Task 3's store-pick popup; allow removed there.
 /// The decoded action for one key in the store-pick popup. Mirrors the shape of
 /// [`ConfirmAnswer`]: distinguishes "this key does something" from "ignore me".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum StorePickAction {
     /// Move the cursor up (wraps).
     Up,
@@ -136,11 +126,9 @@ pub enum StorePickAction {
     Other,
 }
 
-// wired by Task 3's store-pick popup; allow removed there.
 /// Pure decision for the store-pick popup: which key yields which action. No
 /// I/O, so it is unit-testable without a terminal. `Ctrl-C` cancels regardless
 /// of the underlying char.
-#[allow(dead_code)]
 pub fn store_pick_action_from_key(key: KeyCode, mods: KeyModifiers) -> StorePickAction {
     if mods == KeyModifiers::CONTROL && key == KeyCode::Char('c') {
         return StorePickAction::Cancel;
@@ -439,6 +427,63 @@ pub fn host_key_confirm(
         }
     };
     (closure, flag)
+}
+
+/// Drive the store-mode pick popup on the terminal behind `handle`. Returns
+/// `Ok(Some(pick))` when the user chose a mode, `Ok(None)` when they cancelled
+/// (Esc / Ctrl-C), or `Err(Interrupted)` when the terminal guard is already
+/// gone (a popup after `tui::run` returned — treated as a silent cancel, never
+/// a panic). Used by the SaveCred recovery path so the user can choose a store
+/// mode without leaving the credential wizard.
+pub fn prompt_store_pick(handle: &TerminalHandle) -> Result<Option<StorePick>, SshrackError> {
+    let rc = upgrade_terminal(handle)?;
+    store_pick_popup(&mut rc.borrow_mut())
+}
+
+/// Render the three store modes with a cursor marker and read keys until the
+/// user confirms or cancels. Mirrors [`confirm_popup`]'s render/poll/read loop.
+fn store_pick_popup(terminal: &mut Tui) -> Result<Option<StorePick>, SshrackError> {
+    let mut cursor: usize = 0;
+    let len = StorePick::ORDER.len();
+    loop {
+        let mut lines: Vec<Line> = StorePick::ORDER
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                let marker = if i == cursor { "▶ " } else { "  " };
+                Line::from(format!("{marker}{} — {}", m.label(), m.blurb()))
+            })
+            .collect();
+        lines.push(Line::from(""));
+        lines.push(
+            Line::from("[↑/↓] select   [Enter] confirm   [Esc] cancel")
+                .style(ratatui::style::Style::new().dim()),
+        );
+        let body =
+            ratatui::widgets::Paragraph::new(lines).alignment(ratatui::layout::Alignment::Left);
+        terminal
+            .draw(|f| popup::render_popup(f, "Choose store mode", body))
+            .map_err(SshrackError::from_prompt_io)?;
+
+        if !event::poll(std::time::Duration::from_millis(250))
+            .map_err(SshrackError::from_prompt_io)?
+        {
+            continue;
+        }
+        let Event::Key(key) = event::read().map_err(SshrackError::from_prompt_io)? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        match store_pick_action_from_key(key.code, key.modifiers) {
+            StorePickAction::Up => cursor = (cursor + len - 1) % len,
+            StorePickAction::Down => cursor = (cursor + 1) % len,
+            StorePickAction::Confirm => return Ok(StorePick::ORDER.get(cursor).copied()),
+            StorePickAction::Cancel => return Ok(None),
+            StorePickAction::Other => {}
+        }
+    }
 }
 
 #[cfg(test)]

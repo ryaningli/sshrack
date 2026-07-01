@@ -948,32 +948,9 @@ pub fn run_loop(
                 }
                 Outcome::SaveCred => {
                     // The cred wizard signaled save after its pure validate()
-                    // passed. Persist: build the body, seal any password per
-                    // the configured store mode via core, add or splice-in-
-                    // place preserving the original id, write config, reload,
-                    // close the wizard.
-                    match persist_cred_save(app, &handle) {
-                        Ok(()) => {
-                            app.set_status("credential saved".to_string());
-                            app.close_cred_wizard();
-                        }
-                        Err(SshrackError::Interrupted) => {
-                            // User cancelled a vault-unlock popup (Esc/Ctrl-C).
-                            // Stay in the wizard; surface a status so they know
-                            // why nothing was saved.
-                            if let Some(w) = app.cred_wizard.as_mut() {
-                                w.set_core_error("vault unlock cancelled".into());
-                            }
-                        }
-                        Err(e) => {
-                            // Persist failed (duplicate name, store mode
-                            // undecided, write error). Surface in the wizard's
-                            // core-error line and stay so the user can fix it.
-                            if let Some(w) = app.cred_wizard.as_mut() {
-                                w.set_core_error(e.to_string());
-                            }
-                        }
-                    }
+                    // passed. Persist + recover from a store-undecided state in
+                    // place (popup + switch + retry) without leaving the wizard.
+                    fulfill_save_cred(app, &handle);
                 }
                 Outcome::Cancel => {
                     // A view's Esc / Ctrl-C: discard the active view and return
@@ -1341,6 +1318,95 @@ fn persist_cred_save(app: &mut App, handle: &TerminalHandle) -> Result<(), Sshra
         app.set_config(new_cfg);
     }
     Ok(())
+}
+
+/// Map the popup's selection onto the loop's switch target.
+fn map_store_pick(pick: super::prompt::StorePick) -> StoreSwitchTarget {
+    match pick {
+        super::prompt::StorePick::Keyring => StoreSwitchTarget::Keyring,
+        super::prompt::StorePick::Vault => StoreSwitchTarget::Vault,
+        super::prompt::StorePick::Plaintext => StoreSwitchTarget::Plaintext,
+    }
+}
+
+/// Recover from a `StoreModeNotDecided` save: drive the store-pick popup, run
+/// the switch via [`persist_store_switch`], then retry the cred save. Returns
+/// `Ok(true)` when the retry succeeded; `Ok(false)` when the user cancelled the
+/// popup or the switch was refused (reason already in the wizard's core-error
+/// line); `Err` propagates a real failure so [`fulfill_save_cred`] can surface
+/// it. Called only from [`fulfill_save_cred`].
+fn recover_store_mode_and_retry_cred_save(
+    app: &mut App,
+    handle: &TerminalHandle,
+) -> Result<bool, SshrackError> {
+    let pick = super::prompt::prompt_store_pick(handle)?;
+    let Some(target) = pick.map(map_store_pick) else {
+        // User cancelled the popup. Stay in the wizard with a clear reason.
+        if let Some(w) = app.cred_wizard.as_mut() {
+            w.set_core_error("store selection cancelled".into());
+        }
+        return Ok(false);
+    };
+    match persist_store_switch(app, target, handle)? {
+        true => {
+            // Mode switched + persisted; retry the save. Any error propagates
+            // (fulfill_save_cred surfaces it in the wizard's core-error line).
+            persist_cred_save(app, handle).map(|_| true)
+        }
+        false => {
+            // Switch refused (keyring daemon down, plaintext declined, ...).
+            if let Some(w) = app.cred_wizard.as_mut() {
+                w.set_core_error(
+                    "could not switch store mode (unavailable or declined); \
+                     try Shift-C / F2 in the launcher"
+                        .into(),
+                );
+            }
+            Ok(false)
+        }
+    }
+}
+
+/// Handle an [`Outcome::SaveCred`] intent end-to-end: persist the cred, and on
+/// `StoreModeNotDecided` recover in place via a store-pick popup + switch +
+/// retry instead of erroring out of the wizard. All outcomes surface through
+/// the wizard's core-error line or a launcher status + wizard close.
+fn fulfill_save_cred(app: &mut App, handle: &TerminalHandle) {
+    match persist_cred_save(app, handle) {
+        Ok(()) => {
+            app.set_status("credential saved".to_string());
+            app.close_cred_wizard();
+        }
+        Err(SshrackError::StoreModeNotDecided) => {
+            match recover_store_mode_and_retry_cred_save(app, handle) {
+                Ok(true) => {
+                    app.set_status("credential saved".to_string());
+                    app.close_cred_wizard();
+                }
+                Ok(false) => {} // cancelled or switch refused; reason already in core-error.
+                Err(SshrackError::Interrupted) => {
+                    if let Some(w) = app.cred_wizard.as_mut() {
+                        w.set_core_error("cancelled".into());
+                    }
+                }
+                Err(e) => {
+                    if let Some(w) = app.cred_wizard.as_mut() {
+                        w.set_core_error(e.to_string());
+                    }
+                }
+            }
+        }
+        Err(SshrackError::Interrupted) => {
+            if let Some(w) = app.cred_wizard.as_mut() {
+                w.set_core_error("vault unlock cancelled".into());
+            }
+        }
+        Err(e) => {
+            if let Some(w) = app.cred_wizard.as_mut() {
+                w.set_core_error(e.to_string());
+            }
+        }
+    }
 }
 
 /// Which target mode a [`Outcome::SwitchToKeyring`]/[`Outcome::SwitchToVault`]/
@@ -2121,6 +2187,51 @@ mod tests {
             "undecided store mode must error, not silently pick plaintext: {err}"
         );
         // Nothing was written.
+        let reloaded = sshrack_core::config::store::load(&path).unwrap();
+        assert!(reloaded.credentials.is_empty());
+    }
+
+    #[test]
+    fn fulfill_save_cred_undecided_with_dead_handle_stays_in_wizard_with_cancel_msg() {
+        // SaveCred on a Password cred with store undecided would normally error
+        // out (persist_cred_save returns StoreModeNotDecided). fulfill_save_cred
+        // must catch that, try the store-pick popup, and — when the popup cannot
+        // render (dead handle, as in tests) — surface a cancel message and KEEP
+        // the wizard open (no panic, no silent drop, no close). Mirrors how
+        // cred_add_password_with_store_mode_undecided_errors_not_silent_plaintext
+        // builds the App + cred form.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        sshrack_core::config::store::save(&path, &SshrackConfig::default()).unwrap();
+        let cfg = sshrack_core::config::store::load(&path).unwrap();
+        let mut app = App::new(cfg, Some(path.clone()), Frecency::default(), HashMap::new());
+        // store undecided by construction: SshrackConfig::default().store is None.
+        assert!(app.config.store.is_none());
+
+        app.open_cred_wizard_add();
+        let w = app.cred_wizard.as_mut().unwrap();
+        w.name = "ops".into();
+        w.user = "deploy".into();
+        w.secret_kind = super::super::wizard::SecretChoice::Password;
+        *w.password = "hunter2".into();
+
+        fulfill_save_cred(&mut app, &dead_handle());
+
+        // The wizard stayed open (popup upgrade failed → Interrupted → cancel).
+        assert!(
+            app.cred_wizard.is_some(),
+            "stayed in wizard on popup cancel"
+        );
+        let msg = app
+            .cred_wizard
+            .as_ref()
+            .and_then(|w| w.core_error.as_deref())
+            .unwrap_or_default();
+        assert!(
+            msg.to_lowercase().contains("cancel"),
+            "recovery should surface a cancel message, got: {msg}"
+        );
+        // And nothing was written.
         let reloaded = sshrack_core::config::store::load(&path).unwrap();
         assert!(reloaded.credentials.is_empty());
     }
