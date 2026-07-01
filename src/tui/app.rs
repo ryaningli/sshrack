@@ -30,6 +30,7 @@ use ulid::Ulid;
 use super::ConnectRequest;
 use super::CredentialNames;
 use super::connect::connect_host;
+use super::cred_panel::CredPanel;
 use super::dialog::draw_dialog;
 use super::help::draw_help;
 use super::launcher::Launcher;
@@ -212,6 +213,16 @@ pub enum Outcome {
     ///
     /// [`host::delete_host_with_secret`]: sshrack_core::host::delete_host_with_secret
     DeleteHost,
+    /// Pure intent: the user pressed `^d` on the selected credential. The
+    /// credential panel's selection points at the target; `on_key` itself does
+    /// NO I/O. The event loop drives a "Remove <name>? (y/n)" confirm popup via
+    /// [`TuiPassphrase::confirm`]; on Yes it calls
+    /// [`credential::delete_credential_with_secret`] (remove + keyring cleanup
+    /// so no secret is orphaned), persists, reloads, and returns to the panel
+    /// with a "removed <name>" status. No / Esc cancels.
+    ///
+    /// [`credential::delete_credential_with_secret`]: sshrack_core::credential::delete_credential_with_secret
+    DeleteCred,
     /// Pure intent: switch the active tab (Tab / Shift-Tab / Ctrl-1/2/3).
     /// `on_key` already set `active_tab`; the loop just re-renders.
     SwitchTab(Tab),
@@ -256,6 +267,10 @@ pub enum Overlay {
     /// Delete-current-row confirm (driven via [`TuiPassphrase::confirm`] in the
     /// loop). Carries no state: the host id lives on `App::pending_delete`.
     DeleteHost,
+    /// Delete-current-credential-row confirm (driven via
+    /// [`TuiPassphrase::confirm`] in the loop). Carries no state: the credential
+    /// name lives on `App::pending_delete_cred`.
+    DeleteCred,
 }
 
 /// The consolidated status-bar message: a transient one-liner the user reads as
@@ -336,10 +351,9 @@ pub struct App {
     /// list). Public so the existing tests can drive its state machine directly
     /// and the loop can read `pending_connect`.
     pub launcher: Launcher,
-    /// The credential panel. `None` until Task 7 fills it; the Credentials tab
-    /// renders a placeholder until then.
-    #[allow(dead_code)]
-    cred_panel: Option<CredPanel>,
+    /// The credential panel (the Credentials tab: query + selection + ranked
+    /// list). Public so the loop can read `pending_delete_cred`.
+    cred_panel: CredPanel,
     /// The settings panel. `None` until Task 8 fills it; the Settings tab
     /// renders a placeholder until then.
     #[allow(dead_code)]
@@ -360,6 +374,12 @@ pub struct App {
     /// the I/O-heavy delete. `on_key` does NO I/O, so this is the pure bridge
     /// to the loop.
     pending_delete: Option<Ulid>,
+    /// Set by `on_key` when the user presses `^d` on a credential. The loop
+    /// reads (clearing it on cancel), drives the confirm popup, and runs the
+    /// I/O-heavy delete via `credential::delete_credential_with_secret`. The
+    /// credential's name is captured here (not its id) because the core delete
+    /// fn is name-keyed and the panel's cursor already resolved to a name.
+    pending_delete_cred: Option<String>,
 }
 
 impl App {
@@ -374,6 +394,8 @@ impl App {
         credential_names: CredentialNames,
     ) -> Self {
         let launcher = Launcher::new(&config.hosts, &frecency);
+        let mut cred_panel = CredPanel::new();
+        cred_panel.recompute(&config.credentials);
         Self {
             should_quit: false,
             config,
@@ -383,12 +405,13 @@ impl App {
             active_tab: Tab::Hosts,
             overlay: None,
             launcher,
-            cred_panel: None,
+            cred_panel,
             settings_panel: None,
             store_view: None,
             status: Status::empty(),
             pending_connect: None,
             pending_delete: None,
+            pending_delete_cred: None,
         }
     }
 
@@ -500,7 +523,16 @@ impl App {
     pub fn close_host_wizard(&mut self) {
         self.overlay = None;
         // Re-rank so the launcher reflects the (possibly) updated host list.
+        self.recompute_panels();
+    }
+
+    /// Re-rank both panels (Hosts by frecency, Credentials alphabetically) from
+    /// the current config. Called after every config reload / cancel so the
+    /// visible tab reflects any change. Centralized so a new panel never gets
+    /// forgotten on a reload path.
+    fn recompute_panels(&mut self) {
         self.launcher.recompute(&self.config.hosts, &self.frecency);
+        self.cred_panel.recompute(&self.config.credentials);
     }
 
     /// Open the credential wizard overlay in add mode with a blank form.
@@ -521,20 +553,20 @@ impl App {
     }
 
     /// Leave the cred wizard overlay and return to the launcher. Used by the
-    /// loop after a save or a cancel. The host ranking is unchanged (crediting
-    /// does not move hosts), but re-running `recompute` is cheap and keeps the
-    /// launcher in sync if a credential rename affected a host's display label.
+    /// loop after a save or a cancel. Re-ranks both panels: the host ranking
+    /// reflects any inline-user change, and the credential panel reflects the
+    /// added/edited credential.
     pub fn close_cred_wizard(&mut self) {
         self.overlay = None;
-        self.launcher.recompute(&self.config.hosts, &self.frecency);
+        self.recompute_panels();
     }
 
     /// Close whatever overlay is open. The loop calls this after a save, a
-    /// cancel, or a switch intent resolved. Re-ranks the launcher so the
-    /// Hosts tab reflects any config change.
+    /// cancel, or a switch intent resolved. Re-ranks both panels so any tab
+    /// reflects a config change.
     pub fn close_overlay(&mut self) {
         self.overlay = None;
-        self.launcher.recompute(&self.config.hosts, &self.frecency);
+        self.recompute_panels();
     }
 
     /// Open the host wizard overlay in edit mode, prefilled from the host named
@@ -572,10 +604,10 @@ impl App {
     }
 
     /// Leave the store view. The host ranking is unaffected by a mode switch,
-    /// but re-running `recompute` is cheap and keeps the launcher in sync.
+    /// but re-running `recompute` is cheap and keeps both panels in sync.
     pub fn close_store_view(&mut self) {
         self.store_view = None;
-        self.launcher.recompute(&self.config.hosts, &self.frecency);
+        self.recompute_panels();
     }
 
     /// Apply the entry-routing decision (derived from `cli.cmd` in
@@ -643,6 +675,21 @@ impl App {
     #[cfg(test)]
     pub fn pending_delete(&self) -> Option<Ulid> {
         self.pending_delete
+    }
+
+    /// The pending-delete credential name set by `^d` on the credential panel.
+    /// The loop reads (and clears) this to drive the delete confirm popup.
+    /// Exposed for tests that drive the delete intent directly.
+    #[cfg(test)]
+    pub fn pending_delete_cred(&self) -> Option<&str> {
+        self.pending_delete_cred.as_deref()
+    }
+
+    /// Borrow the credential panel mutably. Exposed for tests that drive the
+    /// panel state machine directly.
+    #[cfg(test)]
+    pub fn cred_panel(&mut self) -> &mut CredPanel {
+        &mut self.cred_panel
     }
 
     /// Pure: decide what should happen next for a given key. Performs **no**
@@ -745,6 +792,13 @@ impl App {
                 self.overlay = Some(Overlay::DeleteHost);
                 Outcome::Continue
             }
+            Overlay::DeleteCred => {
+                if key.kind == KeyEventKind::Press && key.code == KeyCode::Esc {
+                    return Outcome::CloseOverlay;
+                }
+                self.overlay = Some(Overlay::DeleteCred);
+                Outcome::Continue
+            }
         }
     }
 
@@ -807,7 +861,7 @@ impl App {
     }
 
     /// Open the add overlay for the active tab. Hosts opens the host wizard;
-    /// Credentials/Settings are Task 7/8.
+    /// Credentials opens the cred wizard; Settings is Task 8.
     fn open_add_overlay(&mut self) -> Outcome {
         match self.active_tab {
             Tab::Hosts => {
@@ -821,13 +875,18 @@ impl App {
                 self.overlay = Some(ov.clone());
                 Outcome::OpenOverlay(ov)
             }
-            Tab::Credentials | Tab::Settings => Outcome::Continue,
+            Tab::Credentials => {
+                let ov = Overlay::CredWizard(CredForm::new_add());
+                self.overlay = Some(ov.clone());
+                Outcome::OpenOverlay(ov)
+            }
+            Tab::Settings => Outcome::Continue,
         }
     }
 
     /// Open the edit overlay for the active tab, prefilled from the selected
-    /// row. Hosts edits the host under the launcher cursor; Credentials/Settings
-    /// are Task 7/8.
+    /// row. Hosts edits the host under the launcher cursor; Credentials edits
+    /// the credential under the cred panel cursor; Settings is Task 8.
     fn open_edit_overlay(&mut self) -> Outcome {
         match self.active_tab {
             Tab::Hosts => {
@@ -845,13 +904,33 @@ impl App {
                     Outcome::Continue
                 }
             }
-            Tab::Credentials | Tab::Settings => Outcome::Continue,
+            Tab::Credentials => {
+                // Resolve the cursor → the credential's name, then open the
+                // edit wizard prefilled from it. The name lookup is done from
+                // the config (not the panel) so a missing credential surfaces
+                // cleanly rather than indexing nothing.
+                let Some(name) = self
+                    .cred_panel
+                    .selected_credential(&self.config.credentials)
+                    .map(|c| c.name.clone())
+                else {
+                    self.status = Status::error("no credential selected to edit".to_string());
+                    return Outcome::Continue;
+                };
+                self.open_cred_wizard_edit(&name);
+                match self.overlay.clone() {
+                    Some(ov) => Outcome::OpenOverlay(ov),
+                    None => Outcome::Continue,
+                }
+            }
+            Tab::Settings => Outcome::Continue,
         }
     }
 
     /// Begin a delete on the selected row. Hosts sets `pending_delete` and
     /// returns [`Outcome::DeleteHost`] (the loop drives the confirm popup);
-    /// Credentials/Settings are Task 7/8.
+    /// Credentials sets `pending_delete_cred` and returns
+    /// [`Outcome::DeleteCred`]; Settings is Task 8.
     fn begin_delete(&mut self) -> Outcome {
         match self.active_tab {
             Tab::Hosts => match self.launcher.selected_host(&self.config.hosts) {
@@ -864,13 +943,26 @@ impl App {
                     Outcome::Continue
                 }
             },
-            Tab::Credentials | Tab::Settings => Outcome::Continue,
+            Tab::Credentials => {
+                let Some(name) = self
+                    .cred_panel
+                    .selected_credential(&self.config.credentials)
+                    .map(|c| c.name.clone())
+                else {
+                    self.status = Status::error("no credential selected to delete".to_string());
+                    return Outcome::Continue;
+                };
+                self.pending_delete_cred = Some(name);
+                Outcome::DeleteCred
+            }
+            Tab::Settings => Outcome::Continue,
         }
     }
 
     /// The tab-specific primary action on Enter. Hosts delegates to the
     /// launcher's `on_key` (which sets `pending_connect` and returns
-    /// `ConnectRequested`); Credentials/Settings are Task 7/8.
+    /// `ConnectRequested`); Credentials opens the edit wizard for the selected
+    /// credential (Enter = edit on this tab); Settings is Task 8.
     fn primary_action(&mut self) -> Outcome {
         match self.active_tab {
             Tab::Hosts => {
@@ -880,12 +972,14 @@ impl App {
                 self.pending_connect = self.launcher.pending_connect;
                 out
             }
-            Tab::Credentials | Tab::Settings => Outcome::Continue,
+            Tab::Credentials => self.open_edit_overlay(),
+            Tab::Settings => Outcome::Continue,
         }
     }
 
     /// Forward a panel-level key to the active panel. Hosts → the launcher's
-    /// `on_key` (query/selection); Credentials/Settings consume nothing yet.
+    /// `on_key` (query/selection); Credentials → the cred panel's `on_key`;
+    /// Settings consumes nothing yet.
     fn route_active_panel_key(&mut self, key: KeyEvent) -> Outcome {
         match self.active_tab {
             Tab::Hosts => {
@@ -897,28 +991,36 @@ impl App {
                 }
                 out
             }
-            Tab::Credentials | Tab::Settings => Outcome::Continue,
+            Tab::Credentials => self.cred_panel.on_key(key, &self.config.credentials),
+            Tab::Settings => Outcome::Continue,
         }
     }
 
     /// The active panel's query string (for Esc-clears-query). Hosts → the
-    /// launcher query; the placeholder tabs have an empty "query".
+    /// launcher query; Credentials → the cred panel query; Settings has an
+    /// empty "query".
     fn active_panel_query(&self) -> &str {
         match self.active_tab {
             Tab::Hosts => &self.launcher.query,
-            Tab::Credentials | Tab::Settings => "",
+            Tab::Credentials => &self.cred_panel.query,
+            Tab::Settings => "",
         }
     }
 
     /// Clear the active panel's query (Esc on a non-empty query). Hosts clears
-    /// the launcher query and re-ranks.
+    /// the launcher query and re-ranks; Credentials clears the cred panel query
+    /// and re-ranks.
     fn clear_active_panel_query(&mut self) {
         match self.active_tab {
             Tab::Hosts => {
                 self.launcher.query.clear();
                 self.launcher.recompute(&self.config.hosts, &self.frecency);
             }
-            Tab::Credentials | Tab::Settings => {}
+            Tab::Credentials => {
+                self.cred_panel.query.clear();
+                self.cred_panel.recompute(&self.config.credentials);
+            }
+            Tab::Settings => {}
         }
     }
 
@@ -938,7 +1040,12 @@ impl App {
                 &self.credential_names,
                 &self.status,
             ),
-            Tab::Credentials => self.draw_placeholder(frame, panel_area, "Credentials"),
+            Tab::Credentials => self.cred_panel.draw_in_shell(
+                frame,
+                panel_area,
+                &self.config.credentials,
+                &self.status,
+            ),
             Tab::Settings => self.draw_placeholder(frame, panel_area, "Settings"),
         }
         if let Some(ov) = &self.overlay {
@@ -997,7 +1104,7 @@ impl App {
                 );
                 form.draw_in_dialog(frame, body);
             }
-            Overlay::StorePicker | Overlay::DeleteHost => {
+            Overlay::StorePicker | Overlay::DeleteHost | Overlay::DeleteCred => {
                 let _ = draw_dialog(frame, "…", 0, &[("Esc", "cancel")]);
             }
         }
@@ -1025,11 +1132,9 @@ fn enter_press() -> KeyEvent {
     KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Press)
 }
 
-// Placeholder panels for the Credentials/Settings tabs. Task 7 (cred_panel.rs)
-// and Task 8 (settings.rs) replace these with real modules; until then the tabs
-// render the "coming soon" placeholder and their key bindings are no-ops.
-/// Placeholder until Task 7 (cred_panel.rs) replaces it.
-pub struct CredPanel;
+// Placeholder panel for the Settings tab. Task 8 (settings.rs) replaces this
+// with a real module; until then the tab renders the "coming soon" placeholder
+// and its key bindings are no-ops.
 /// Placeholder until Task 8 (settings.rs) replaces it.
 pub struct SettingsPanel;
 
@@ -1277,6 +1382,40 @@ pub fn run_loop(
                         }
                     }
                 }
+                Outcome::DeleteCred => {
+                    // Pure intent: ^d on a credential set pending_delete_cred.
+                    // Drive the confirm popup, then (on Yes) core delete +
+                    // keyring cleanup + persist + reload. A cancel (Esc/Ctrl-C
+                    // in the popup) surfaces as Interrupted → "cancelled"
+                    // status, NOT an exit.
+                    let Some(name) = app.pending_delete_cred.take() else {
+                        continue;
+                    };
+                    let provider = TuiPassphrase::new(handle.clone());
+                    let prompt = format!("Remove credential '{name}'?");
+                    match provider.confirm(&prompt) {
+                        Ok(true) => match persist_cred_delete(app, &name) {
+                            Ok(()) => {
+                                app.overlay = None;
+                                app.set_status(format!("removed '{name}'"));
+                            }
+                            Err(e) => {
+                                app.set_status_error(format!("delete failed: {e}"));
+                            }
+                        },
+                        Ok(false) => {
+                            app.overlay = None;
+                            app.set_status("delete cancelled".to_string());
+                        }
+                        Err(SshrackError::Interrupted) => {
+                            app.overlay = None;
+                            app.set_status("delete cancelled".to_string());
+                        }
+                        Err(e) => {
+                            app.set_status_error(format!("delete failed: {e}"));
+                        }
+                    }
+                }
             }
         }
 
@@ -1398,8 +1537,44 @@ fn persist_host_delete(app: &mut App, name: &str) -> Result<(), SshrackError> {
         app.set_config(new_cfg);
     }
     // Re-rank so the launcher reflects the (shorter) host list and the
-    // selection clamps back into range.
-    app.launcher.recompute(&app.config.hosts, &app.frecency);
+    // selection clamps back into range. The credential panel is unaffected by a
+    // host delete but re-running recompute is cheap and keeps both panels in
+    // sync if a future change ties them together.
+    app.recompute_panels();
+    Ok(())
+}
+
+/// Fulfill a [`Outcome::DeleteCred`] intent (after the user confirmed the
+/// popup): call [`credential::delete_credential_with_secret`] — which removes
+/// the credential and best-effort forgets its keyring entry when the body was
+/// keyring-marked (so no orphaned secret is left behind) — then persist +
+/// reload + re-rank the credential panel. Mirrors the CLI's `cred rm` sequence.
+///
+/// `name` is the credential's name at confirm time (the caller captured it
+/// before deleting). An absent credential surfaces as
+/// [`SshrackError::CredentialNotFound`] (defensive: the panel only hands out
+/// names from the loaded config, but a concurrent edit could race — the error
+/// is clearer than a silent no-op).
+///
+/// [`credential::delete_credential_with_secret`]: sshrack_core::credential::delete_credential_with_secret
+fn persist_cred_delete(app: &mut App, name: &str) -> Result<(), SshrackError> {
+    use sshrack_core::credential;
+    use sshrack_core::secret::OsKeyring;
+
+    let backend = OsKeyring;
+    let new_cfg = credential::delete_credential_with_secret(&app.config, name, &backend)?;
+    if let Some(path) = app.config_path() {
+        sshrack_core::config::store::save(path, &new_cfg)?;
+        let reloaded = sshrack_core::config::store::load(path)?;
+        app.set_config(reloaded);
+    } else {
+        app.set_config(new_cfg);
+    }
+    // Re-rank so the credential panel reflects the (shorter) list and the
+    // selection clamps back into range. The host panel is re-ranked too so a
+    // host whose auth referenced the deleted credential (now dangling) keeps a
+    // coherent display label.
+    app.recompute_panels();
     Ok(())
 }
 
@@ -3140,5 +3315,227 @@ mod tests {
         // This borrow_mut panics because `_outer` is still live — exactly the
         // "already borrowed" the user saw on every popup before the fix.
         let _ = upgraded.borrow_mut();
+    }
+
+    // ---- Credentials panel routing (Task 7) ----
+    // These drive App::on_key directly to pin the new panel routing: tab
+    // switching to Credentials, Ctrl-A/E/D/Enter, query/arrows, and the
+    // delete-confirm → persist_cred_delete round-trip. No terminal is touched.
+    // (`Credential` and `CredentialBody` are already in scope from the earlier
+    // `use` statements at the top of `mod tests`.)
+
+    /// A one-credential app. Enough to exercise the Credentials panel without a
+    /// config file.
+    fn app_with_credential(name: &str, user: &str) -> App {
+        let cred = Credential {
+            id: Ulid::new(),
+            name: name.into(),
+            body: CredentialBody::new(user),
+        };
+        let cfg = SshrackConfig {
+            credentials: vec![cred],
+            ..SshrackConfig::default()
+        };
+        App::new(cfg, None, Frecency::default(), HashMap::new())
+    }
+
+    #[test]
+    fn ctrl_2_switches_to_credentials_tab() {
+        let mut app = app_with_credential("ops", "deploy");
+        assert_eq!(app.active_tab(), Tab::Hosts);
+        let outcome = app.on_key(press(KeyCode::Char('2'), KeyModifiers::CONTROL));
+        assert!(matches!(outcome, Outcome::SwitchTab(Tab::Credentials)));
+        assert_eq!(app.active_tab(), Tab::Credentials);
+    }
+
+    #[test]
+    fn credentials_printable_enters_query_not_hotkey() {
+        // On the Credentials tab a plain char enters the panel query (no
+        // single-char hotkeys).
+        let mut app = app_with_credential("ops", "deploy");
+        app.on_key(press(KeyCode::Char('2'), KeyModifiers::CONTROL)); // switch
+        let outcome = app.on_key(press(KeyCode::Char('o'), KeyModifiers::NONE));
+        assert!(matches!(outcome, Outcome::Continue));
+        assert_eq!(app.cred_panel().query, "o");
+    }
+
+    #[test]
+    fn credentials_ctrl_a_opens_cred_wizard_add() {
+        let mut app = app_with_credential("ops", "deploy");
+        app.on_key(press(KeyCode::Char('2'), KeyModifiers::CONTROL)); // → Credentials
+        let outcome = app.on_key(press(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert!(matches!(
+            outcome,
+            Outcome::OpenOverlay(Overlay::CredWizard(_))
+        ));
+        let w = app.cred_wizard().expect("cred wizard open");
+        assert!(!w.editing, "add mode must be non-editing");
+        assert!(w.name.is_empty(), "add form must start blank");
+    }
+
+    #[test]
+    fn credentials_ctrl_e_opens_cred_wizard_edit_prefilled() {
+        let mut app = app_with_credential("ops", "deploy");
+        app.on_key(press(KeyCode::Char('2'), KeyModifiers::CONTROL)); // → Credentials
+        let outcome = app.on_key(press(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert!(matches!(
+            outcome,
+            Outcome::OpenOverlay(Overlay::CredWizard(_))
+        ));
+        let w = app.cred_wizard().expect("cred wizard open");
+        assert!(w.editing, "edit mode must be editing");
+        assert_eq!(w.name, "ops", "edit form must be prefilled with the name");
+        assert_eq!(w.user, "deploy");
+    }
+
+    #[test]
+    fn credentials_enter_opens_cred_wizard_edit() {
+        // Enter on the Credentials tab = edit the selected credential (primary
+        // action). Same outcome as Ctrl-E here.
+        let mut app = app_with_credential("ops", "deploy");
+        app.on_key(press(KeyCode::Char('2'), KeyModifiers::CONTROL)); // → Credentials
+        let outcome = app.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            outcome,
+            Outcome::OpenOverlay(Overlay::CredWizard(_))
+        ));
+        let w = app.cred_wizard().expect("cred wizard open");
+        assert!(w.editing);
+        assert_eq!(w.name, "ops");
+    }
+
+    #[test]
+    fn credentials_ctrl_e_with_no_selection_sets_status() {
+        // No credentials → no selection → status hint, no overlay.
+        let cfg = SshrackConfig::default();
+        let mut app = App::new(cfg, None, Frecency::default(), HashMap::new());
+        app.on_key(press(KeyCode::Char('2'), KeyModifiers::CONTROL)); // → Credentials
+        let outcome = app.on_key(press(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert!(matches!(outcome, Outcome::Continue));
+        assert!(app.overlay().is_none());
+        assert_eq!(
+            app.status().message.as_deref(),
+            Some("no credential selected to edit")
+        );
+    }
+
+    #[test]
+    fn credentials_ctrl_d_sets_pending_delete_cred_and_emits_delete_cred() {
+        // Ctrl-D on a credential captures its name and returns the DeleteCred
+        // intent (pure; the loop drives the confirm popup). The captured name
+        // is the credential under the cursor.
+        let mut app = app_with_credential("ops", "deploy");
+        app.on_key(press(KeyCode::Char('2'), KeyModifiers::CONTROL)); // → Credentials
+        let outcome = app.on_key(press(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert!(matches!(outcome, Outcome::DeleteCred));
+        assert_eq!(app.pending_delete_cred(), Some("ops"));
+    }
+
+    #[test]
+    fn credentials_ctrl_d_with_no_selection_sets_status() {
+        let cfg = SshrackConfig::default();
+        let mut app = App::new(cfg, None, Frecency::default(), HashMap::new());
+        app.on_key(press(KeyCode::Char('2'), KeyModifiers::CONTROL)); // → Credentials
+        let outcome = app.on_key(press(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert!(matches!(outcome, Outcome::Continue));
+        assert!(app.pending_delete_cred().is_none());
+        assert_eq!(
+            app.status().message.as_deref(),
+            Some("no credential selected to delete")
+        );
+    }
+
+    #[test]
+    fn credentials_esc_clears_query_then_second_esc_is_handled() {
+        // On the Credentials tab: typing then Esc clears the query (Continue);
+        // the second Esc (empty query) signals Quit at the App layer.
+        let mut app = app_with_credential("ops", "deploy");
+        app.on_key(press(KeyCode::Char('2'), KeyModifiers::CONTROL)); // → Credentials
+        app.on_key(press(KeyCode::Char('o'), KeyModifiers::NONE));
+        assert_eq!(app.cred_panel().query, "o");
+        let first = app.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(first, Outcome::Continue));
+        assert!(app.cred_panel().query.is_empty());
+        let second = app.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(second, Outcome::Quit));
+    }
+
+    #[test]
+    fn persist_cred_save_reranks_cred_panel_after_reload() {
+        // After a cred save the on-disk config is reloaded and the cred panel
+        // must reflect the new credential. Drive the loop's save half directly
+        // (persist path), then assert the panel sees the new credential.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        sshrack_core::config::store::save(&path, &SshrackConfig::default()).unwrap();
+        let cfg = sshrack_core::config::store::load(&path).unwrap();
+        // Provide a live (never-upgraded) weak handle so the vault unlock path
+        // stays a no-op (no plaintext password in this body).
+        let rc = Rc::new(RefCell::new(stdout_tui()));
+        let handle: TerminalHandle = Rc::downgrade(&rc);
+
+        let mut app = App::new(cfg, Some(path.clone()), Frecency::default(), HashMap::new());
+        // Open the add wizard and fill the form with a default-only body.
+        app.open_cred_wizard_add();
+        let Overlay::CredWizard(mut w) = app.overlay.take().unwrap() else {
+            unreachable!("cred wizard open");
+        };
+        w.name = "ops".into();
+        w.user = "deploy".into();
+        // secret_kind stays None → no password to seal → no vault unlock needed.
+        app.overlay = Some(Overlay::CredWizard(w));
+
+        // The save path under test: persist + reload + close_cred_wizard (which
+        // re-ranks the cred panel).
+        persist_cred_save(&mut app, &handle).expect("cred save should succeed");
+        app.close_cred_wizard();
+
+        // The cred panel now ranks the new credential.
+        assert_eq!(app.config().credentials.len(), 1);
+        assert_eq!(app.cred_panel().ranked.len(), 1);
+        assert_eq!(app.config().credentials[0].name, "ops");
+    }
+
+    #[test]
+    fn persist_cred_delete_removes_credential_and_reranks_panel() {
+        // The loop's delete half: after confirm, persist_cred_delete removes
+        // the credential, persists, reloads, and re-ranks the cred panel so it
+        // reflects the shorter list.
+        use sshrack_core::config::schema::Credential;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = SshrackConfig {
+            credentials: vec![Credential {
+                id: Ulid::new(),
+                name: "ops".into(),
+                body: CredentialBody::new("deploy"),
+            }],
+            ..SshrackConfig::default()
+        };
+        sshrack_core::config::store::save(&path, &cfg).unwrap();
+        let mut app = App::new(cfg, Some(path.clone()), Frecency::default(), HashMap::new());
+
+        persist_cred_delete(&mut app, "ops").expect("cred delete should succeed");
+
+        let reloaded = sshrack_core::config::store::load(&path).unwrap();
+        assert!(reloaded.credentials.is_empty());
+        assert!(
+            app.cred_panel().ranked.is_empty(),
+            "cred panel must re-rank to empty after the only credential is deleted"
+        );
+    }
+
+    #[test]
+    fn persist_cred_delete_unknown_credential_errors() {
+        // Deleting a name not in the config surfaces CredentialNotFound rather
+        // than silently no-op'ing.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        sshrack_core::config::store::save(&path, &SshrackConfig::default()).unwrap();
+        let cfg = sshrack_core::config::store::load(&path).unwrap();
+        let mut app = App::new(cfg, Some(path), Frecency::default(), HashMap::new());
+
+        let err = persist_cred_delete(&mut app, "ghost").unwrap_err();
+        assert!(matches!(err, SshrackError::CredentialNotFound { .. }));
     }
 }

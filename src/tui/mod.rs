@@ -25,6 +25,7 @@ use ulid::Ulid;
 
 pub mod app;
 pub mod connect;
+pub mod cred_panel;
 pub mod dialog;
 pub mod help;
 pub mod launcher;
