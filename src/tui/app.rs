@@ -192,8 +192,9 @@ pub enum Outcome {
     /// [`vault::enable`] (the same core fn the CLI's `store use vault` uses) to
     /// derive a fresh key, write the verifier, and migrate every existing
     /// password into vault mode, and persists the config. A cancel inside the
-    /// passphrase popup surfaces as [`SshrackError::Interrupted`] → "cancelled"
-    /// status; other errors surface in the view's status line.
+    /// passphrase popup surfaces as [`SshrackError::Interrupted`] → stay in the
+    /// view with NO status write (the popup dismissing is the feedback); other
+    /// errors surface in the view's status line.
     ///
     /// [`vault::enable`]: sshrack_core::secret::vault::enable
     SwitchToVault,
@@ -1030,6 +1031,15 @@ impl App {
                     .launcher
                     .on_key(enter_press(), &self.config.hosts, &self.frecency);
                 self.pending_connect = self.launcher.pending_connect;
+                // When Enter hit no host (empty list / filtered out), the
+                // launcher returns Continue with pending_connect still None.
+                // Surface that as a status so the single footer gives feedback
+                // instead of silently no-op'ing. (Restores the hint lost when
+                // Launcher::status was removed; the Credentials tab's edit path
+                // already sets its own status.)
+                if matches!(out, Outcome::Continue) && self.pending_connect.is_none() {
+                    self.status = Status::info("no host selected".to_string());
+                }
                 out
             }
             Tab::Credentials => self.open_edit_overlay(),
@@ -1268,8 +1278,8 @@ pub fn run_loop(
                         Ok(req) => return Some(req),
                         Err(SshrackError::Interrupted) => {
                             // User cancelled a popup (Esc/Ctrl-C). Return to the
-                            // launcher, NOT an exit.
-                            app.set_status("connect cancelled".to_string());
+                            // launcher, NOT an exit. No status write — the popup
+                            // dismissing is the feedback.
                         }
                         Err(e) => {
                             // A real error (vault unlock fail, host-key reject,
@@ -1311,16 +1321,14 @@ pub fn run_loop(
                 Outcome::Cancel => {
                     // A wizard's Esc / Ctrl-C: on_key's route_overlay already
                     // dropped the form (terminal outcome) and left the overlay
-                    // clear. Surface a status and re-rank the launcher so the
-                    // Hosts tab reflects any state.
-                    app.set_status("cancelled".to_string());
+                    // clear. No status write — the overlay closing is the
+                    // feedback; re-rank so the Hosts tab reflects any state.
                     app.close_overlay();
                 }
                 Outcome::CloseOverlay => {
                     // Esc / Ctrl-C inside a non-wizard overlay (Help /
-                    // StorePicker / DeleteHost). on_key already cleared it; just
-                    // surface a status.
-                    app.set_status("cancelled".to_string());
+                    // StorePicker / DeleteHost). on_key already cleared it; the
+                    // overlay closing is the feedback, so no status write.
                 }
                 Outcome::SwitchTab(_) | Outcome::OpenOverlay(_) | Outcome::Continue => {
                     // Pure state changes already applied inside on_key; the next
@@ -1339,10 +1347,8 @@ pub fn run_loop(
                         }
                         Err(SshrackError::Interrupted) => {
                             // User cancelled a vault-unlock popup (vault→keyring
-                            // needs the source key). Stay in the store view.
-                            if let Some(v) = app.store_view.as_mut() {
-                                v.status = Some("cancelled".into());
-                            }
+                            // needs the source key). Stay in the store view. No
+                            // status write — the popup dismissing is the feedback.
                         }
                         Err(e) => {
                             if let Some(v) = app.store_view.as_mut() {
@@ -1360,10 +1366,9 @@ pub fn run_loop(
                         }
                         Ok(false) => {}
                         Err(SshrackError::Interrupted) => {
-                            // User cancelled the passphrase popup. Stay in the view.
-                            if let Some(v) = app.store_view.as_mut() {
-                                v.status = Some("cancelled".into());
-                            }
+                            // User cancelled the passphrase popup. Stay in the
+                            // view. No status write — the popup dismissing is the
+                            // feedback.
                         }
                         Err(e) => {
                             if let Some(v) = app.store_view.as_mut() {
@@ -1383,9 +1388,8 @@ pub fn run_loop(
                         Err(SshrackError::Interrupted) => {
                             // User cancelled the confirm popup (or a vault-unlock
                             // popup, when leaving vault). Stay in the store view.
-                            if let Some(v) = app.store_view.as_mut() {
-                                v.status = Some("cancelled".into());
-                            }
+                            // No status write — the popup dismissing is the
+                            // feedback.
                         }
                         Err(e) => {
                             if let Some(v) = app.store_view.as_mut() {
@@ -1397,8 +1401,9 @@ pub fn run_loop(
                 Outcome::DeleteHost => {
                     // Pure intent: ^d on a host set pending_delete. Drive the
                     // confirm popup, then (on Yes) core delete + keyring cleanup
-                    // + persist + reload. A cancel (Esc/Ctrl-C in the popup)
-                    // surfaces as Interrupted → "cancelled" status, NOT an exit.
+                    // + persist + reload. A cancel (Esc/Ctrl-C in the popup, or
+                    // a No) closes the overlay with NO status write — the popup
+                    // dismissing is the feedback — and is NOT an exit.
                     let Some(host_id) = app.pending_delete.take() else {
                         continue;
                     };
@@ -1423,12 +1428,14 @@ pub fn run_loop(
                             }
                         },
                         Ok(false) => {
+                            // User declined (No). The confirm popup closing is
+                            // the feedback; no status write.
                             app.overlay = None;
-                            app.set_status("delete cancelled".to_string());
                         }
                         Err(SshrackError::Interrupted) => {
+                            // User cancelled the popup (Esc/Ctrl-C). No status
+                            // write — the popup dismissing is the feedback.
                             app.overlay = None;
-                            app.set_status("delete cancelled".to_string());
                         }
                         Err(e) => {
                             app.set_status_error(format!("delete failed: {e}"));
@@ -1439,8 +1446,9 @@ pub fn run_loop(
                     // Pure intent: ^d on a credential set pending_delete_cred.
                     // Drive the confirm popup, then (on Yes) core delete +
                     // keyring cleanup + persist + reload. A cancel (Esc/Ctrl-C
-                    // in the popup) surfaces as Interrupted → "cancelled"
-                    // status, NOT an exit.
+                    // in the popup, or a No) closes the overlay with NO status
+                    // write — the popup dismissing is the feedback — and is NOT
+                    // an exit.
                     let Some(name) = app.pending_delete_cred.take() else {
                         continue;
                     };
@@ -1457,12 +1465,14 @@ pub fn run_loop(
                             }
                         },
                         Ok(false) => {
+                            // User declined (No). The confirm popup closing is
+                            // the feedback; no status write.
                             app.overlay = None;
-                            app.set_status("delete cancelled".to_string());
                         }
                         Err(SshrackError::Interrupted) => {
+                            // User cancelled the popup (Esc/Ctrl-C). No status
+                            // write — the popup dismissing is the feedback.
                             app.overlay = None;
-                            app.set_status("delete cancelled".to_string());
                         }
                         Err(e) => {
                             app.set_status_error(format!("delete failed: {e}"));
@@ -2122,6 +2132,29 @@ mod tests {
         assert!(matches!(outcome, Outcome::ConnectRequested));
         assert!(!app.should_quit, "Enter must not set should_quit");
         assert_eq!(app.launcher.pending_connect, Some(expected_id));
+    }
+
+    #[test]
+    fn enter_with_no_host_surfaces_no_host_selected_status() {
+        // When Enter hits no host (empty host list), primary_action must surface
+        // a "no host selected" status so the single footer gives feedback
+        // instead of silently no-op'ing. Restores the hint lost when
+        // Launcher::status was removed; mirrors the Credentials edit path.
+        let cfg = SshrackConfig::default();
+        let mut app = App::new(cfg, None, Frecency::default(), HashMap::new());
+        assert!(app.config().hosts.is_empty());
+        let outcome = app.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(outcome, Outcome::Continue));
+        assert!(
+            app.launcher.pending_connect.is_none(),
+            "no host → no pending_connect"
+        );
+        assert_eq!(
+            app.status().message.as_deref(),
+            Some("no host selected"),
+            "Enter on no host must surface a status, not silently no-op"
+        );
+        assert!(!app.status().is_error, "the hint is informational, not red");
     }
 
     #[test]

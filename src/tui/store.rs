@@ -156,7 +156,7 @@ impl StoreView {
     /// border + title + footer hints, so this draws **no** outer `Block`; it
     /// only lays out the mode list (with the active one marked) and a status
     /// line. Selection styling mirrors the Hosts/Credentials panels: the
-    /// selected row leads with `theme::selected_gutter()` (Cyan `▎`) and is
+    /// selected row leads with `theme::focus_marker(true)` (Cyan `▶ `) and is
     /// rendered BOLD. Only writes to the frame; no stdout access.
     pub fn draw_in_dialog(&self, frame: &mut Frame, body: Rect) {
         // Status line pinned to the bottom of the dialog body; the list fills
@@ -164,10 +164,11 @@ impl StoreView {
         let [list_area, status_area] =
             Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(body);
 
-        // Bake the gutter into each item: the selected row carries
-        // `theme::selected_gutter()`; every other row carries a two-space pad
-        // so labels align. `highlight_style` adds BOLD to the whole selected
-        // row — no dark-background selection bar.
+        // Bake the focus marker into each item via `theme::focus_marker`: the
+        // selected row carries `▶ ` (accented + bold), every other row carries
+        // a two-space pad. Both are 2 cells wide, so labels align regardless of
+        // which row is selected (no selected-row left-shift). `highlight_style`
+        // adds BOLD to the whole selected row — no dark-background selection bar.
         let items: Vec<Line> = StoreModeChoice::ORDER
             .iter()
             .enumerate()
@@ -193,9 +194,10 @@ impl StoreView {
     }
 }
 
-/// Build the display line for one mode: the selection gutter (or a two-space
-/// pad when not selected so labels align), the mode name (with `(active)` when
-/// it matches the snapshot), then the trade-off blurb dimmed.
+/// Build the display line for one mode: the focus marker (`▶ ` when selected,
+/// two spaces otherwise — both 2 cells wide so labels align), the mode name
+/// (with `(active)` when it matches the snapshot), then the trade-off blurb
+/// dimmed.
 fn mode_line(mode: StoreModeChoice, active_label: &str, selected: bool) -> Line<'static> {
     let active = mode.label() == active_label;
     let name_span = if active {
@@ -206,14 +208,11 @@ fn mode_line(mode: StoreModeChoice, active_label: &str, selected: bool) -> Line<
     } else {
         Span::raw(mode.label())
     };
-    // Selected row leads with the Cyan gutter mark; others pad to align.
-    let gutter = if selected {
-        theme::selected_gutter()
-    } else {
-        Span::raw("  ")
-    };
+    // `theme::focus_marker` yields the accented `▶ ` for the selected row and
+    // a two-space pad for the others, so every label starts at the same column.
+    let marker = theme::focus_marker(selected);
     Line::from(vec![
-        gutter,
+        marker,
         name_span,
         Span::raw("\n"),
         Span::styled(mode.blurb(), Style::new().dim()),

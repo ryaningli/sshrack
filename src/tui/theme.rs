@@ -9,7 +9,7 @@ use ratatui::{
 
 // These tokens are the theme's public surface; the shell renderer, panels,
 // wizards, and status bar all consume them.
-/// The single accent color: active tab, selected-row gutter, brand, links.
+/// The single accent color: active tab, selection marker, brand, links.
 pub const ACCENT: Color = Color::Cyan;
 /// Fuzzy-match highlight color.
 pub const MATCH: Color = Color::Yellow;
@@ -34,17 +34,11 @@ pub fn accent() -> Style {
     Style::new().fg(ACCENT)
 }
 
-/// The leading gutter mark for the selected list row.
-pub fn selected_gutter() -> Span<'static> {
-    Span::styled("▎", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD))
-}
-
 /// The selection marker shared by list rows and form fields: `▶ ` accented +
 /// bold when focused/selected, two spaces when not. Both forms are 2 cells
 /// wide, so every row's content starts at the same column regardless of which
 /// row is selected (no selected-row left-shift). Mirrors the wizard's
 /// focused-field marker.
-#[allow(dead_code)]
 pub fn focus_marker(focused: bool) -> Span<'static> {
     if focused {
         Span::styled("▶ ", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD))
@@ -73,12 +67,6 @@ mod tests {
         assert_eq!(MATCH, Color::Yellow);
         assert_eq!(DANGER, Color::Red);
         assert_eq!(OK, Color::Green);
-    }
-
-    #[test]
-    fn selected_gutter_is_accented_bar() {
-        let span = selected_gutter();
-        assert_eq!(span.content.as_ref(), "▎");
     }
 
     #[test]

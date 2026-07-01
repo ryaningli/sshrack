@@ -109,9 +109,9 @@ pub fn connect_host(
     // accepts is appended to known_hosts; a changed key is rejected by ssh at
     // connect time (core never classifies "changed", only "present"). A cancel
     // inside the popup (Ctrl-C/Esc) flips the shared flag; we re-surface that
-    // as Interrupted so run_loop shows "connect cancelled", NOT the
-    // HostKeyNotConfirmed "connect failed" message (Finding #4: the popup
-    // cancel used to be flattened to a host-key rejection).
+    // as Interrupted so run_loop returns the user to the launcher (no status
+    // write), NOT the HostKeyNotConfirmed "connect failed" message (Finding #4:
+    // the popup cancel used to be flattened to a host-key rejection).
     let host_str = resolved_host.host.as_str();
     let (confirm, interrupted) = host_key_confirm(handle);
     hostkey::run_host_key_flow(host_str, port, confirm)?;

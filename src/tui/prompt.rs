@@ -383,7 +383,8 @@ impl PassphraseProvider for TuiPassphrase {
 /// flips the shared [`Cell`] so the caller ([`super::connect::connect_host`])
 /// can re-surface the cancel as `Interrupted` afterwards. This keeps the
 /// connect-cancel UX consistent with the vault-unlock popup: a cancel inside
-/// the host-key popup shows "connect cancelled", NOT "connect failed".
+/// the host-key popup returns the user to the launcher (no status write), NOT
+/// a "connect failed" error.
 ///
 /// `terminal` is a weak handle captured by move; the closure is `FnOnce`
 /// because `run_host_key_flow` consumes it. If the guard is gone by the time
@@ -393,8 +394,8 @@ impl PassphraseProvider for TuiPassphrase {
 ///
 /// Returns `(closure, interrupted_flag)`: pass the closure to
 /// `run_host_key_flow`, then inspect the flag; when it is `true`, return
-/// `Err(SshrackError::Interrupted)` from the caller so the cancel surfaces as
-/// "cancelled", not as a host-key rejection.
+/// `Err(SshrackError::Interrupted)` from the caller so the cancel returns the
+/// user to the launcher (no status write), not as a host-key rejection.
 pub fn host_key_confirm(
     terminal: TerminalHandle,
 ) -> (
