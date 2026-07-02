@@ -8,12 +8,14 @@
 use std::collections::HashMap;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::{Terminal, backend::CrosstermBackend};
 use sshrack_core::config::schema::{Auth, Credential, CredentialBody, Host, SshrackConfig};
 use sshrack_core::frecency::Frecency;
 use ulid::Ulid;
 
 use crate::tui::TerminalHandle;
 use crate::tui::app::App;
+use crate::tui::term::Tui;
 
 /// A one-host `App` with no frecency and no named credentials. Enough to drive
 /// the launcher's quit/navigation branches without a config file.
@@ -74,4 +76,13 @@ pub(crate) fn press(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
 /// terminal (the popup path then treats it as a silent cancel).
 pub(crate) fn dead_handle() -> TerminalHandle {
     std::rc::Weak::new()
+}
+
+/// Build a `Tui` backed by real stdout. Construction alone (without raw mode /
+/// alternate screen) is enough to exercise the RefCell borrow mechanics — that
+/// is what the borrow-regression and rerank tests target, not rendering. Shared
+/// here so both the `app` and `persist` test modules can reach it.
+pub(crate) fn stdout_tui() -> Tui {
+    let backend = CrosstermBackend::new(std::io::stdout());
+    Terminal::new(backend).expect("terminal init for borrow test")
 }
