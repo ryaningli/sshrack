@@ -36,13 +36,15 @@ pub mod settings;
 pub mod shell;
 pub mod store;
 pub mod tab;
+pub mod term;
 pub mod theme;
 pub mod wizard;
 
 #[cfg(test)]
 mod test_support;
 
-pub use app::{App, TerminalGuard, run_loop};
+pub use app::{App, run_loop};
+pub use term::{TerminalGuard, TerminalHandle, Tui};
 
 /// Reverse lookup from a credential ULID to its display name, built once at
 /// startup from the loaded config. Lets the launcher show `Auth::Ref` targets

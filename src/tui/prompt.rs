@@ -41,8 +41,8 @@ use sshrack_core::error::SshrackError;
 use sshrack_core::secret::PassphraseProvider;
 use zeroize::Zeroizing;
 
-use super::app::{TerminalHandle, Tui};
 use super::popup;
+use super::{TerminalHandle, Tui};
 
 /// The yes/no answer derived from a single key in a confirm popup.
 ///

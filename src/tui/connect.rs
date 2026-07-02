@@ -46,8 +46,8 @@ use sshrack_core::hostkey;
 use sshrack_core::secret::vault;
 
 use super::ConnectRequest;
+use super::TerminalHandle;
 use super::app::App;
-use super::app::TerminalHandle;
 use super::prompt::{TuiPassphrase, host_key_confirm};
 
 /// Run all pre-exec side effects for connecting to `host_id` and return the

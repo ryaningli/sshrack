@@ -12,9 +12,8 @@ use sshrack_core::config::schema::{Auth, Credential, CredentialBody, Host, Sshra
 use sshrack_core::frecency::Frecency;
 use ulid::Ulid;
 
-use crate::tui::app::{App, TerminalHandle};
-// `TerminalHandle` still lives in app.rs at this point in the plan. Task 2
-// (term extraction) will rewrite this path to `crate::tui::term::TerminalHandle`.
+use crate::tui::TerminalHandle;
+use crate::tui::app::App;
 
 /// A one-host `App` with no frecency and no named credentials. Enough to drive
 /// the launcher's quit/navigation branches without a config file.
