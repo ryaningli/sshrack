@@ -515,6 +515,10 @@ impl App {
         }
 
         // Layer 3 — panel/tab layer (no overlay).
+        // Auto-clear stale panel status on the next panel key: the status is a
+        // transient per-action hint, not a persistent banner. A new status set
+        // during this keypress (e.g. an error) replaces the clear below.
+        self.status = Status::empty();
         self.route_panel(key)
     }
 
@@ -816,7 +820,7 @@ impl App {
     pub fn draw(&self, frame: &mut Frame) {
         let area = frame.area();
         let footer = self.footer_hints();
-        let panel_area = draw_shell(frame, area, self.active_tab, &footer, &self.status);
+        let panel_area = draw_shell(frame, area, self.active_tab, &footer);
         match self.active_tab {
             Tab::Hosts => self.launcher.draw_in_shell(
                 frame,
@@ -824,15 +828,19 @@ impl App {
                 &self.config.hosts,
                 &self.frecency,
                 &self.config.credentials,
+                &self.status,
             ),
-            Tab::Credentials => {
-                self.cred_panel
-                    .draw_in_shell(frame, panel_area, &self.config.credentials)
-            }
+            Tab::Credentials => self.cred_panel.draw_in_shell(
+                frame,
+                panel_area,
+                &self.config.credentials,
+                &self.status,
+            ),
             Tab::Settings => self.settings_panel.draw_in_shell(
                 frame,
                 panel_area,
                 self.current_store_mode_label(),
+                &self.status,
             ),
         }
         if let Some(ov) = &self.overlay {

@@ -22,8 +22,9 @@ use ratatui::{
     widgets::Paragraph,
 };
 
-use super::Outcome;
+use super::parts;
 use super::theme;
+use super::{Outcome, Status};
 
 /// The Settings panel state. Today it holds a single row (the storage-mode
 /// entry), so `selected` is always `0`; the field exists so future rows land
@@ -65,19 +66,31 @@ impl SettingsPanel {
     }
 
     /// Render the panel into the shell's panel area (no outer border — the
-    /// shell supplies the brand/tab/footer bands around it, including the
-    /// status footer). Splits `area` into `[row(2), spacer(Fill)]` and renders
-    /// the single storage-mode row. There is no search row for Settings and no
-    /// per-panel status row (the shell footer is the single status surface).
+    /// shell supplies the brand/tab/footer bands around it; the footer is
+    /// hotkey-only now). Splits `area` into `[row(2), spacer(Fill), status(1)]`
+    /// and renders the single storage-mode row plus the status row at the
+    /// bottom (shared with the other panels via `parts::draw_status_row`).
+    /// There is no search row for Settings.
     ///
     /// `current_mode` is the human-readable label for the active store mode
     /// (`"keyring"` / `"vault"` / `"plaintext"` / `"undecided"`), used to tint
     /// the value red when no mode is chosen yet.
-    pub fn draw_in_shell(&self, frame: &mut Frame, area: Rect, current_mode: &str) {
-        // No search row for Settings: a 2-row band for the single entry and a
-        // fill spacer. The status footer lives in the shell (band 3).
-        let [row_area, _] =
-            Layout::vertical([Constraint::Length(2), Constraint::Fill(1)]).areas(area);
+    pub fn draw_in_shell(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        current_mode: &str,
+        status: &Status,
+    ) {
+        // No search row for Settings: a 2-row band for the single entry, a fill
+        // spacer, and the status row at the bottom (shared with the other
+        // panels). The shell footer is hotkey-only.
+        let [row_area, _, status_area] = Layout::vertical([
+            Constraint::Length(2),
+            Constraint::Fill(1),
+            Constraint::Length(1),
+        ])
+        .areas(area);
 
         let value_span = if current_mode == "undecided" {
             Span::styled(format!("{current_mode} ▸"), Style::new().fg(theme::DANGER))
@@ -96,6 +109,7 @@ impl SettingsPanel {
             value_span,
         ]);
         frame.render_widget(Paragraph::new(row), row_area);
+        parts::draw_status_row(frame, status_area, status);
     }
 }
 

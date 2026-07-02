@@ -16,24 +16,16 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Tabs},
 };
 
-use crate::tui::Status;
 use crate::tui::{tab, tab::Tab, theme};
 
 /// Render the brand + tab bar (band 1), the bordered middle band (band 2, whose
-/// inner `Rect` is returned for the active panel to draw into), and the status
-/// footer (band 3) — the **single** status surface. Band 3 shows the status
-/// message when [`Status::message`] is `Some` (red on [`Status::is_error`],
-/// else normal), preceded by a dim `"status: "` label; otherwise it shows the
-/// hotkey hints (`footer` is a slice of `(key, label)` pairs joined by ` · `
-/// with keys accented). Centralizing band 3 here is what removes the per-panel
-/// status row that previously duplicated the hotkey hint.
-pub fn draw_shell(
-    frame: &mut Frame,
-    area: Rect,
-    active: Tab,
-    footer: &[(&str, &str)],
-    status: &Status,
-) -> Rect {
+/// inner `Rect` is returned for the active panel to draw into), and the hotkey
+/// footer on the bottom (always hints — status renders at the bottom of each
+/// panel's own area). Brand on the left, the [`Tabs`] bar next to it running to
+/// near the right edge; band 3 is a dot-separated `(key, label)` row where keys
+/// take the accent color. The `F1` help hint lives in the footer (passed in by
+/// the caller), not the header.
+pub fn draw_shell(frame: &mut Frame, area: Rect, active: Tab, footer: &[(&str, &str)]) -> Rect {
     let [top, middle, bottom] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Fill(1),
@@ -78,34 +70,19 @@ pub fn draw_shell(
     let panel_area = panel_block.inner(middle);
     frame.render_widget(panel_block, middle);
 
-    // ── Band 3: status message when present, else the hotkey hints ──────────
-    // The footer is the single status surface: a set status message takes
-    // precedence (red on error), otherwise the `(key, label)` hint pairs show.
-    let line = if let Some(msg) = &status.message {
-        let style = if status.is_error {
-            Style::new().fg(theme::DANGER)
-        } else {
-            Style::new()
-        };
-        Line::from(vec![
-            Span::styled("status: ", Style::new().dim()),
-            Span::styled(msg.clone(), style),
-        ])
-    } else {
-        let mut spans: Vec<Span> = Vec::new();
-        for (i, (k, label)) in footer.iter().enumerate() {
-            if i > 0 {
-                spans.push(Span::styled(" · ", Style::new().dim()));
-            }
-            spans.push(Span::styled(
-                *k,
-                theme::accent().add_modifier(Modifier::BOLD),
-            ));
-            spans.push(Span::styled(format!(" {label}"), Style::new().dim()));
+    // ── Band 3: hotkey hints (always). Status lives in each panel now. ──────
+    let mut spans: Vec<Span> = Vec::new();
+    for (i, (k, label)) in footer.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", Style::new().dim()));
         }
-        Line::from(spans)
-    };
-    frame.render_widget(Paragraph::new(line), bottom);
+        spans.push(Span::styled(
+            *k,
+            theme::accent().add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(format!(" {label}"), Style::new().dim()));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), bottom);
 
     panel_area
 }
@@ -119,7 +96,6 @@ mod tests {
     fn draw_shell_returns_inner_panel_area_and_never_panics() {
         let backend = TestBackend::new(100, 30);
         let mut term = Terminal::new(backend).unwrap();
-        let status = Status::empty();
         for active in [Tab::Hosts, Tab::Credentials, Tab::Settings] {
             let mut got = Rect::default();
             term.draw(|f| {
@@ -128,7 +104,6 @@ mod tests {
                     f.area(),
                     active,
                     &[("Enter", "connect"), ("^A", "add"), ("F1", "help")],
-                    &status,
                 );
             })
             .unwrap();
@@ -146,9 +121,8 @@ mod tests {
     fn draw_shell_clamps_on_tiny_terminal() {
         let backend = TestBackend::new(20, 3);
         let mut term = Terminal::new(backend).unwrap();
-        let status = Status::empty();
         term.draw(|f| {
-            let _ = draw_shell(f, f.area(), Tab::Hosts, &[], &status);
+            let _ = draw_shell(f, f.area(), Tab::Hosts, &[]);
         })
         .unwrap();
     }
@@ -157,7 +131,6 @@ mod tests {
     fn draw_shell_borders_middle_and_drops_f1_help() {
         let backend = TestBackend::new(60, 12);
         let mut term = Terminal::new(backend).unwrap();
-        let status = Status::empty();
         let mut got = Rect::default();
         term.draw(|f| {
             got = draw_shell(
@@ -165,7 +138,6 @@ mod tests {
                 f.area(),
                 Tab::Hosts,
                 &[("Enter", "connect"), ("F1", "help")],
-                &status,
             );
         })
         .unwrap();
@@ -203,21 +175,16 @@ mod tests {
         );
     }
 
-    /// The footer (band 3) is the single status surface: with an empty status it
-    /// renders the hotkey hints; with a status message it renders that message
-    /// (preceded by a dim `status: ` label) and the hints disappear. This is the
-    /// contract that lets the panels drop their own status row without losing
-    /// either feedback or hints.
+    /// Band 3 is now hotkey-hints-only: the status no longer feeds the shell,
+    /// so the hints always render regardless of any panel status. (Status
+    /// rendering is covered by the panel tests + `parts::draw_status_row`.)
     #[test]
-    fn draw_shell_footer_shows_hints_when_empty_and_message_when_set() {
+    fn draw_shell_footer_always_shows_hints() {
         let backend = TestBackend::new(80, 12);
         let mut term = Terminal::new(backend).unwrap();
         let hints = [("Enter", "connect"), ("F1", "help")];
-
-        // Empty status → hints render in band 3 (the bottom row).
-        let empty = Status::empty();
         term.draw(|f| {
-            let _ = draw_shell(f, f.area(), Tab::Hosts, &hints, &empty);
+            let _ = draw_shell(f, f.area(), Tab::Hosts, &hints);
         })
         .unwrap();
         let bottom_row: String = (0..term.backend().buffer().area.width)
@@ -232,36 +199,7 @@ mod tests {
         let bottom_trim = bottom_row.trim().to_string();
         assert!(
             bottom_trim.contains("Enter") && bottom_trim.contains("connect"),
-            "empty status should show the hotkey hints in band 3, got: {bottom_trim:?}"
-        );
-        assert!(
-            !bottom_trim.contains("status:"),
-            "empty status should not show a status label, got: {bottom_trim:?}"
-        );
-
-        // Set status → the message renders in band 3, and the hints are gone.
-        let msg = Status::info("host saved");
-        term.draw(|f| {
-            let _ = draw_shell(f, f.area(), Tab::Hosts, &hints, &msg);
-        })
-        .unwrap();
-        let bottom_row: String = (0..term.backend().buffer().area.width)
-            .map(|col| {
-                term.backend()
-                    .buffer()
-                    .cell((col, term.backend().buffer().area.height - 1))
-                    .map(|c| c.symbol().to_string())
-                    .unwrap_or_else(|| " ".to_string())
-            })
-            .collect();
-        let bottom_trim = bottom_row.trim().to_string();
-        assert!(
-            bottom_trim.contains("status:") && bottom_trim.contains("host saved"),
-            "set status should render the message in band 3, got: {bottom_trim:?}"
-        );
-        assert!(
-            !bottom_trim.contains("connect"),
-            "set status should suppress the hotkey hints, got: {bottom_trim:?}"
+            "footer must always show the hotkey hints, got: {bottom_trim:?}"
         );
     }
 }

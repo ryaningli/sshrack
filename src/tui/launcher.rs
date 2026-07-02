@@ -35,13 +35,9 @@ use sshrack_core::config::schema::{Auth, Credential, Host};
 use sshrack_core::frecency::Frecency;
 use ulid::Ulid;
 
-use super::intent::Outcome;
+use super::intent::{Outcome, Status};
+use super::parts;
 use super::theme;
-
-// NOTE: the launcher no longer carries a status row or a `status` field — the
-// shell footer (band 3) is the single status surface. `^a`/`^e`/Enter-no-host
-// feedback now flows through `App::status` (set by the App-layer routing that
-// intercepts those keys before they reach the launcher).
 
 /// A ranked host: its index into the source `&[Host]` slice plus the match
 /// score that placed it there.
@@ -321,23 +317,29 @@ impl Launcher {
         hosts: &[Host],
         frecency: &Frecency,
         credentials: &[Credential],
+        status: &Status,
     ) {
-        let [search_area, list_area] =
-            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(area);
+        let [search_area, list_area, status_area] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Fill(1),
+            Constraint::Length(1),
+        ])
+        .areas(area);
 
         // Search row: `❯ <query>` with the real terminal cursor placed right
         // after the query (no fake cursor glyph — the cursor is the terminal's).
+        // (Task 5 replaces this inline row with a boxed input.)
         let search_line = Line::from(vec![
             Span::styled("❯ ", Style::new().dim()),
             Span::raw(&self.query),
         ]);
         frame.render_widget(Paragraph::new(search_line), search_area);
-        // Place the terminal cursor right after the query (2-cell `❯ ` prefix).
         let cursor_x = search_area.x + 2 + self.query.chars().count() as u16;
         let max_x = search_area.x + search_area.width.saturating_sub(1);
         frame.set_cursor_position((cursor_x.min(max_x), search_area.y));
 
         self.draw_list(frame, list_area, hosts, frecency, credentials);
+        parts::draw_status_row(frame, status_area, status);
     }
 
     /// Render the ranked host list with the selected-row marker and per-host
@@ -833,9 +835,15 @@ mod tests {
                 f.area(),
                 crate::tui::tab::Tab::Hosts,
                 &[("Enter", "connect"), ("^A", "add")],
+            );
+            p.draw_in_shell(
+                f,
+                area,
+                &hosts,
+                &frecency,
+                &empty_creds(),
                 &crate::tui::intent::Status::empty(),
             );
-            p.draw_in_shell(f, area, &hosts, &frecency, &empty_creds());
         })
         .unwrap();
 
@@ -875,9 +883,15 @@ mod tests {
                 f.area(),
                 crate::tui::tab::Tab::Hosts,
                 &[("Enter", "connect"), ("F1", "help")],
+            );
+            p.draw_in_shell(
+                f,
+                area,
+                &hosts,
+                &frecency,
+                &empty_creds(),
                 &crate::tui::intent::Status::empty(),
             );
-            p.draw_in_shell(f, area, &hosts, &frecency, &empty_creds());
         })
         .unwrap();
 

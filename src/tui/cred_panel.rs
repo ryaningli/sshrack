@@ -32,8 +32,9 @@ use ratatui::{
 };
 use sshrack_core::config::schema::{Credential, SecretKind};
 
-use super::intent::Outcome;
+use super::intent::{Outcome, Status};
 use super::panel::rank_by_name;
+use super::parts;
 use super::theme;
 
 /// Interactive credential panel state: the live query, the cursor into the
@@ -156,9 +157,10 @@ impl CredPanel {
     }
 
     /// Render the panel into the shell's panel area (no outer border — the
-    /// shell supplies the brand/tab/footer bands around it, including the
-    /// status footer). Splits `area` into `[search(1), list(Fill)]` and renders
-    /// the search row + ranked list. Mirrors
+    /// shell supplies the brand/tab/footer bands around it; the footer is
+    /// hotkey-only now). Splits `area` into `[search(1), list(Fill),
+    /// status(1)]` and renders the search row + ranked list + the shared
+    /// status row at the bottom. Mirrors
     /// [`Launcher::draw_in_shell`](super::launcher::Launcher::draw_in_shell):
     /// same `theme::focus_marker()` selection + real terminal cursor.
     pub fn draw_in_shell(
@@ -166,9 +168,14 @@ impl CredPanel {
         frame: &mut Frame,
         area: ratatui::layout::Rect,
         creds: &[Credential],
+        status: &Status,
     ) {
-        let [search_area, list_area] =
-            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(area);
+        let [search_area, list_area, status_area] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Fill(1),
+            Constraint::Length(1),
+        ])
+        .areas(area);
 
         // Search row: `❯ <query>` with the real terminal cursor placed right
         // after the query (no fake cursor glyph — the cursor is the terminal's).
@@ -183,6 +190,7 @@ impl CredPanel {
         frame.set_cursor_position((cursor_x.min(max_x), search_area.y));
 
         self.draw_list(frame, list_area, creds);
+        parts::draw_status_row(frame, status_area, status);
     }
 
     /// Render the ranked credential list with the selected-row focus marker and
@@ -576,9 +584,8 @@ mod tests {
                 f.area(),
                 crate::tui::tab::Tab::Credentials,
                 &[("Enter", "edit"), ("^A", "add")],
-                &crate::tui::intent::Status::empty(),
             );
-            p.draw_in_shell(f, area, &creds);
+            p.draw_in_shell(f, area, &creds, &crate::tui::intent::Status::empty());
         })
         .unwrap();
 
