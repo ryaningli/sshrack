@@ -166,14 +166,29 @@ pub fn prompt_password(terminal: &mut Tui, title: &str) -> Result<Zeroizing<Stri
     // we move the inner String into a fresh Zeroizing so the wipe still runs
     // when the caller drops the returned value.
     let mut buffer = Zeroizing::new(String::new());
+    // A transient rejection banner (empty passphrase). Held across the next
+    // render so the user actually sees it, then cleared on the first edit.
+    let mut flash: Option<&'static str> = None;
     loop {
-        render_password_popup(terminal, title, buffer.as_str(), None);
+        render_password_popup(terminal, title, buffer.as_str(), flash);
         match read_decision_key()? {
-            KeyDecision::Char(ch) => buffer.push(ch),
+            KeyDecision::Char(ch) => {
+                buffer.push(ch);
+                flash = None;
+            }
             KeyDecision::Backspace => {
                 buffer.pop();
+                flash = None;
             }
             KeyDecision::Submit => {
+                if buffer.is_empty() {
+                    // Reject an empty passphrase: keep the buffer, raise the
+                    // banner so the next render explains the rejection, and
+                    // loop (do NOT return). The banner stays visible until the
+                    // user starts typing.
+                    flash = Some(EMPTY_PASSPHRASE_FLASH);
+                    continue;
+                }
                 // Move the inner String out so this Zeroizing does not double-
                 // hold it; the returned Zeroizing owns the wipe from here.
                 // `&mut *buffer` goes through DerefMut to the inner String
@@ -188,8 +203,9 @@ pub fn prompt_password(terminal: &mut Tui, title: &str) -> Result<Zeroizing<Stri
 }
 
 /// Read a new passphrase twice via masked popups, looping until the two entries
-/// match. A mismatch re-prompts from scratch. Cancel (`Esc`/`Ctrl-C`) at any
-/// point yields [`SshrackError::Interrupted`].
+/// match. A mismatch re-prompts from scratch. Empty entries are rejected
+/// inline by [`prompt_password`]. Cancel (`Esc`/`Ctrl-C`) at any point yields
+/// [`SshrackError::Interrupted`].
 pub fn prompt_password_confirm(
     terminal: &mut Tui,
     title: &str,
@@ -215,7 +231,12 @@ pub fn prompt_password_confirm(
                     // Mismatch: flash a hint and restart the whole flow. The
                     // second buffer drops here (Zeroizing wipes it) before the
                     // next iteration builds a fresh one.
-                    render_password_popup(terminal, "Mismatch — try again", "", Some(true));
+                    render_password_popup(
+                        terminal,
+                        "Mismatch — try again",
+                        "",
+                        Some("Mismatch — try again"),
+                    );
                     break;
                 }
                 KeyDecision::Cancel => return Err(SshrackError::Interrupted),
@@ -318,21 +339,30 @@ fn read_decision_key() -> Result<KeyDecision, SshrackError> {
     }
 }
 
-/// Render the password popup. `buffer` is masked with [`MASK`]; `mismatch`
-/// non-None tints the title to signal a failed confirmation. Draw errors are
-/// tolerated (best-effort render); a transient failure is retried on the next
-/// keystroke loop iteration.
-fn render_password_popup(terminal: &mut Tui, title: &str, buffer: &str, mismatch: Option<bool>) {
+/// The title the password popup shows this frame: the rejection banner when
+/// one is active, otherwise the caller's title. Extracted as pure so the
+/// empty-passphrase banner logic is unit-testable without a terminal.
+fn popup_title<'a>(title: &'a str, flash: Option<&'a str>) -> &'a str {
+    flash.unwrap_or(title)
+}
+
+/// Banner shown when the user submits an empty passphrase. Kept as a named
+/// constant so the rejection copy is pinned by a test, not buried in a string
+/// literal inside the input loop.
+const EMPTY_PASSPHRASE_FLASH: &str = "Passphrase must not be empty";
+
+/// Render the password popup. `buffer` is masked with [`MASK`]; `flash`, when
+/// set, overrides `title` for this frame to signal a rejected submission (an
+/// empty passphrase, or a confirmation mismatch) so the user sees why their
+/// Enter did not proceed. Draw errors are tolerated (best-effort render); a
+/// transient failure is retried on the next keystroke loop iteration.
+fn render_password_popup(terminal: &mut Tui, title: &str, buffer: &str, flash: Option<&str>) {
     let masked: String = std::iter::repeat_n(MASK, buffer.chars().count()).collect();
     let mut lines = vec![Line::from(masked.as_str()).bold()];
     lines.push(Line::from(""));
     lines.push(Line::from("[Enter] confirm   [Esc] cancel").style(Style::new().dim()));
     let body = Paragraph::new(lines).alignment(Alignment::Left);
-    let title = if mismatch == Some(true) {
-        "Mismatch — try again"
-    } else {
-        title
-    };
+    let title = popup_title(title, flash);
     let _ = terminal.draw(|f| {
         popup::render_popup(f, title, body);
     });
@@ -584,5 +614,31 @@ mod tests {
         for m in StorePick::ORDER {
             assert!(!m.blurb().is_empty());
         }
+    }
+
+    // ---- password popup title / empty-passphrase rejection banner ----
+
+    #[test]
+    fn popup_title_falls_back_to_caller_title_when_no_flash() {
+        assert_eq!(popup_title("New passphrase", None), "New passphrase");
+    }
+
+    #[test]
+    fn popup_title_uses_flash_banner_when_set() {
+        assert_eq!(
+            popup_title("New passphrase", Some(EMPTY_PASSPHRASE_FLASH)),
+            "Passphrase must not be empty"
+        );
+        assert_eq!(
+            popup_title("Confirm passphrase", Some("Mismatch — try again")),
+            "Mismatch — try again"
+        );
+    }
+
+    #[test]
+    fn empty_passphrase_flash_copy_is_stable() {
+        // Pin the exact rejection copy so a typo here is caught by tests, not
+        // at runtime. The input loops raise this banner on an empty Submit.
+        assert_eq!(EMPTY_PASSPHRASE_FLASH, "Passphrase must not be empty");
     }
 }
