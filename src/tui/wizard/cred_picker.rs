@@ -44,6 +44,11 @@ pub struct CredPicker {
     pub ranked: Vec<usize>,
 }
 
+/// How many credential rows the picker list renders. The popup is
+/// `popup::POPUP_HEIGHT` (20) tall; subtract the border (2) and the query row
+/// (1) plus a small margin. Bump in lockstep if `POPUP_HEIGHT` changes.
+const PICKER_VISIBLE_ROWS: usize = 16;
+
 impl CredPicker {
     /// Fresh picker over `names`: empty query, cursor at the top, every name
     /// ranked (name order, since scores are all zero). Clones `names` so the
@@ -136,7 +141,7 @@ impl CredPicker {
                 Style::new().dim(),
             ))];
         }
-        let visible = 16usize; // popup inner height ≈ 18; leave 1 for the query row + margin
+        let visible = PICKER_VISIBLE_ROWS;
         let half = visible / 2;
         let start = self.selected.saturating_sub(half);
         let end = (start + visible).min(self.ranked.len());
@@ -285,6 +290,21 @@ mod tests {
         let mut p = CredPicker::new(&[]); // no credentials at all
         let out = p.on_key(press(KeyCode::Enter));
         assert!(matches!(out, PickerOutcome::Pending));
+    }
+
+    #[test]
+    fn enter_on_no_match_query_is_pending() {
+        // Credentials exist, but the query matches none: ranked empties,
+        // selected_idx() is None, so Enter stays Pending (no selection, no panic).
+        let mut p = CredPicker::new(&["web-prod".into(), "db-staging".into()]);
+        for c in "zzz".chars() {
+            let _ = p.on_key(press(KeyCode::Char(c)));
+        }
+        assert!(p.ranked.is_empty(), "no name matches 'zzz'");
+        assert!(matches!(
+            p.on_key(press(KeyCode::Enter)),
+            PickerOutcome::Pending
+        ));
     }
 
     // ---- Esc / Ctrl-C cancel; other keys are pending ----

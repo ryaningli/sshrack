@@ -396,6 +396,7 @@ impl HostForm {
         // hold on `cred_picker`; on Pending the still-open picker goes back.
         // Selected writes the chosen credential index back and closes; Cancel
         // just closes.
+        // Swallows every key while open, incl Ctrl-S — close (Esc/Enter) before ^s can save.
         if let Some(mut picker) = self.cred_picker.take() {
             match picker.on_key(key) {
                 PickerOutcome::Selected { idx } => {
