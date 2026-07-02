@@ -1,8 +1,8 @@
 //! The three shell tabs and the pure decision of whether a key switches tabs.
 //!
-//! The contract: ONLY `Tab` / `Shift-Tab` / `Ctrl-1/2/3` switch tabs. Every
-//! printable char returns [`TabKey::None`] so it reaches the panel search box —
-//! this is the fix for the single-character hotkey conflict.
+//! The contract: ONLY `Tab` / `Shift-Tab` switch tabs. Every printable char
+//! returns [`TabKey::None`] so it reaches the panel search box — this is the
+//! fix for the single-character hotkey conflict.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
@@ -51,8 +51,6 @@ impl Tab {
 /// vs. forward-to-search.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabKey {
-    /// Jump directly to a tab (`Ctrl-1/2/3`).
-    To(Tab),
     /// Cycle by `delta` (`Tab` = +1, `BackTab` = -1).
     Cycle(i32),
     /// Not a tab key — let the panel handle it (printable chars land here).
@@ -61,21 +59,17 @@ pub enum TabKey {
 
 /// Pure decision of whether a key event should switch tabs.
 ///
-/// Only `Tab`, `Shift-Tab` (`BackTab`), and `Ctrl-1/2/3` switch tabs; every
-/// other key (including bare digits and letters) returns [`TabKey::None`] so
-/// it flows into the panel search box. Only `Press` events are honored; `Release`
-/// and `Repeat` are `None`.
+/// Only `Tab` and `Shift-Tab` (`BackTab`) switch tabs; every other key
+/// (including bare digits and letters) returns [`TabKey::None`] so it flows
+/// into the panel search box. Only `Press` events are honored; `Release` and
+/// `Repeat` are `None`.
 pub fn tab_key_decision(key: KeyEvent) -> TabKey {
     if key.kind != KeyEventKind::Press {
         return TabKey::None;
     }
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
         KeyCode::Tab if key.modifiers == KeyModifiers::NONE => TabKey::Cycle(1),
         KeyCode::BackTab => TabKey::Cycle(-1),
-        KeyCode::Char('1') if ctrl => TabKey::To(Tab::Hosts),
-        KeyCode::Char('2') if ctrl => TabKey::To(Tab::Credentials),
-        KeyCode::Char('3') if ctrl => TabKey::To(Tab::Settings),
         _ => TabKey::None,
     }
 }
@@ -94,22 +88,6 @@ mod tests {
         assert!(matches!(
             tab_key_decision(press(KeyCode::BackTab, KeyModifiers::NONE)),
             TabKey::Cycle(-1)
-        ));
-    }
-
-    #[test]
-    fn ctrl_digits_jump_to_tabs() {
-        assert!(matches!(
-            tab_key_decision(press(KeyCode::Char('1'), KeyModifiers::CONTROL)),
-            TabKey::To(Tab::Hosts)
-        ));
-        assert!(matches!(
-            tab_key_decision(press(KeyCode::Char('2'), KeyModifiers::CONTROL)),
-            TabKey::To(Tab::Credentials)
-        ));
-        assert!(matches!(
-            tab_key_decision(press(KeyCode::Char('3'), KeyModifiers::CONTROL)),
-            TabKey::To(Tab::Settings)
         ));
     }
 

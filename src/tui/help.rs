@@ -41,7 +41,6 @@ fn help_lines() -> Vec<Line<'static>> {
             "Tab / Shift-Tab",
             "cycle tabs (Hosts / Credentials / Settings)",
         ),
-        binding("Ctrl-1 / 2 / 3", "jump to Hosts / Credentials / Settings"),
         binding("type", "filter the active panel's search box"),
         binding("Up / Down", "move selection (wraps)"),
         binding("Ctrl-N / Ctrl-P", "move selection (wraps)"),
@@ -101,7 +100,6 @@ mod tests {
             .join("\n");
         // Every surface has at least one binding documented.
         assert!(joined.contains("cycle tabs"), "tabs section");
-        assert!(joined.contains("jump to Hosts"), "ctrl-digit jump");
         assert!(
             joined.contains("connect to the selected host"),
             "hosts panel"
@@ -149,19 +147,6 @@ mod tests {
         assert!(
             !joined.contains("\n  c             "),
             "bare c add-credential binding removed"
-        );
-    }
-
-    #[test]
-    fn help_lines_document_ctrl_digit_tab_jumps() {
-        let joined: String = help_lines()
-            .iter()
-            .map(|l| l.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            joined.contains("Ctrl-1 / 2 / 3"),
-            "ctrl-digit tab jump binding"
         );
     }
 }

@@ -71,6 +71,15 @@ pub(crate) fn press(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
     KeyEvent::new_with_kind(code, mods, KeyEventKind::Press)
 }
 
+/// Cycle the app from the default Hosts tab to the Settings tab by pressing
+/// `Tab` twice (Hosts → Credentials → Settings). The direct Ctrl-digit tab
+/// jumps were removed; this is the shared setup step the Settings-panel tests
+/// use to reach the Settings tab now.
+pub(crate) fn switch_to_settings(app: &mut App) {
+    app.on_key(press(KeyCode::Tab, KeyModifiers::NONE)); // → Credentials
+    app.on_key(press(KeyCode::Tab, KeyModifiers::NONE)); // → Settings
+}
+
 /// A dead weak terminal handle — `Weak::upgrade` returns `None`. Used by tests
 /// that exercise a save/delete path through a `TerminalHandle` without a live
 /// terminal (the popup path then treats it as a silent cancel).

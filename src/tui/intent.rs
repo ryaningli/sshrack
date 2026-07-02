@@ -107,7 +107,7 @@ pub enum Outcome {
     ///
     /// [`credential::delete_credential_with_secret`]: sshrack_core::credential::delete_credential_with_secret
     DeleteCred,
-    /// Pure intent: switch the active tab (Tab / Shift-Tab / Ctrl-1/2/3).
+    /// Pure intent: switch the active tab (Tab / Shift-Tab).
     /// `on_key` already set `active_tab`; the loop just re-renders. The carried
     /// `Tab` is matched by tests via `matches!(out, Outcome::SwitchTab(Tab::…))`
     /// to assert *which* tab was routed to; `matches!` only structurally inspects

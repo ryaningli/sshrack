@@ -97,7 +97,6 @@ A flagged field is **always** a CLI patch, never a wizard — `host edit x --por
 | Key | Action |
 |---|---|
 | `Tab` / `Shift-Tab` | cycle tab (Hosts / Credentials / Settings) |
-| `Ctrl-1` / `2` / `3` | jump to Hosts / Credentials / Settings |
 | type | filter the active panel's search box (`⌫` deletes; bare letters/digits never act as hotkeys — they reach the query) |
 | `↑`/`↓` or `^n`/`^p` | move selection |
 | `Enter` | Hosts: connect · Credentials: edit · Settings: edit the storage-mode row |
@@ -248,7 +247,7 @@ sshrack is an orchestration layer over the system OpenSSH. Do **not** introduce 
 The interactive shell (`src/tui/`) is delivered as a **three-band shell + tabs + overlays**:
 
 - **Shell (`shell.rs`):** a top band (brand word + tab bar), a middle band (the active panel's area), and a bottom hotkey footer. `draw_shell` returns the middle `Rect` for the panel to render into.
-- **Tabs (`tab.rs` + `Tab` enum):** Hosts / Credentials / Settings, default Hosts. `Tab`/`Shift-Tab` cycle, `Ctrl-1`/`2`/`3` jump. The active tab is the only routing state (`App::active_tab`); the old full-screen `Mode` enum is gone.
+- **Tabs (`tab.rs` + `Tab` enum):** Hosts / Credentials / Settings, default Hosts. `Tab`/`Shift-Tab` cycle. The active tab is the only routing state (`App::active_tab`); the old full-screen `Mode` enum is gone.
 - **Panels:** Hosts panel (`launcher.rs`, frecency-tiered host list + nucleo fuzzy filter + search box), Credentials panel (`cred_panel.rs`, same shape, no secrets rendered), Settings panel (`settings.rs`, storage-mode row).
 - **Overlays (`Overlay` enum, at most one open at a time):** host add/edit wizard, credential add/edit wizard, store-mode picker, and the F1 help reference are all **dialogs** (`dialog.rs` chrome: titled bordered area + hotkey footer, no dark scrim) layered on top of the shell — not full-screen modes. `Esc`/`Ctrl-C` inside an overlay closes it; the shell keeps rendering behind it.
 - **Host wizard auth:** the Auth row cycles `Independent ↔ Reference` with `←`/`→`. Under Reference a dedicated **Credential** row appears; `Enter` there opens a fuzzy credential-picker overlay (type to filter, `↑`/`↓` to move, `Enter` to select, `Esc` to cancel) — replacing the old in-place `Shift-←/→` cycle so a host can reuse a credential even when dozens exist. Under Independent the `Secret` row cycles `None / Password / IdentityKey` as before.

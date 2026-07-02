@@ -56,7 +56,7 @@ pub struct App {
     /// launcher can show `Auth::Ref` targets by name without re-scanning.
     credential_names: CredentialNames,
     /// The active shell tab. Drives which panel fills the middle band and
-    /// which footer hints show. Switched by Tab / Shift-Tab / Ctrl-1/2/3.
+    /// which footer hints show. Switched by Tab / Shift-Tab.
     active_tab: Tab,
     /// The overlay layered on top of the shell, if any. At most one at a time.
     /// The wizard forms live inside their variants so their state survives
@@ -480,8 +480,8 @@ impl App {
     ///    `StoreView::on_key` (Up/Down/Enter/Esc); DeleteHost/DeleteCred close
     ///    on `Esc`.
     /// 3. **Panel/tab** — when no overlay is open: `tab_key_decision` switches
-    ///    tabs (Tab / Shift-Tab / Ctrl-1/2/3), then `Ctrl-A/E/D` + `Enter` +
-    ///    `Esc`, then the active panel consumes printable chars / arrows.
+    ///    tabs (Tab / Shift-Tab), then `Ctrl-A/E/D` + `Enter` + `Esc`, then
+    ///    the active panel consumes printable chars / arrows.
     pub fn on_key(&mut self, key: KeyEvent) -> Outcome {
         use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 
@@ -583,7 +583,7 @@ impl App {
 
     /// Layer 3: route a key to the active panel/tab. No overlay is open when
     /// this runs (the caller checked). Tab switching is decided first so a
-    /// `Tab`/`Ctrl-1/2/3` never reaches a panel's search box.
+    /// `Tab`/`BackTab` never reaches a panel's search box.
     fn route_panel(&mut self, key: KeyEvent) -> Outcome {
         use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -591,12 +591,8 @@ impl App {
             return Outcome::Continue;
         }
 
-        // Tab switching first (Tab / BackTab / Ctrl-1/2/3).
+        // Tab switching first (Tab / BackTab).
         match tab_key_decision(key) {
-            TabKey::To(t) => {
-                self.active_tab = t;
-                return Outcome::SwitchTab(t);
-            }
             TabKey::Cycle(d) => {
                 let new = if d > 0 {
                     self.active_tab.next()
@@ -922,6 +918,7 @@ mod tests {
     use crate::tui::persist::{persist_cred_save, persist_host_save};
     use crate::tui::test_support::{
         app_with_credential, app_with_host, app_with_named_cred, dead_handle, press,
+        switch_to_settings,
     };
     use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
     use sshrack_core::config::schema::{Auth, CredentialBody, Host, SshrackConfig};
@@ -1445,15 +1442,21 @@ mod tests {
     // ===============================================================
 
     #[test]
-    fn ctrl_digits_and_tab_switch_tab() {
+    fn tab_cycles_across_tabs_at_app_level() {
+        // With the Ctrl-digit jumps gone, Tab is the only tab switcher. Pin it
+        // at the App level: Hosts → Credentials → Settings → Hosts.
         let mut app = app_with_host("web");
         assert!(matches!(
-            app.on_key(press(KeyCode::Char('2'), KeyModifiers::CONTROL)),
+            app.on_key(press(KeyCode::Tab, KeyModifiers::NONE)),
             Outcome::SwitchTab(Tab::Credentials)
         ));
         assert!(matches!(
             app.on_key(press(KeyCode::Tab, KeyModifiers::NONE)),
             Outcome::SwitchTab(Tab::Settings)
+        ));
+        assert!(matches!(
+            app.on_key(press(KeyCode::Tab, KeyModifiers::NONE)),
+            Outcome::SwitchTab(Tab::Hosts)
         ));
     }
 
@@ -1628,10 +1631,10 @@ mod tests {
     // `use` statements at the top of `mod tests`.)
 
     #[test]
-    fn ctrl_2_switches_to_credentials_tab() {
+    fn tab_switches_to_credentials_tab() {
         let mut app = app_with_credential("ops", "deploy");
         assert_eq!(app.active_tab(), Tab::Hosts);
-        let outcome = app.on_key(press(KeyCode::Char('2'), KeyModifiers::CONTROL));
+        let outcome = app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
         assert!(matches!(outcome, Outcome::SwitchTab(Tab::Credentials)));
         assert_eq!(app.active_tab(), Tab::Credentials);
     }
@@ -1641,7 +1644,7 @@ mod tests {
         // On the Credentials tab a plain char enters the panel query (no
         // single-char hotkeys).
         let mut app = app_with_credential("ops", "deploy");
-        app.on_key(press(KeyCode::Char('2'), KeyModifiers::CONTROL)); // switch
+        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE)); // switch to Credentials
         let outcome = app.on_key(press(KeyCode::Char('o'), KeyModifiers::NONE));
         assert!(matches!(outcome, Outcome::Continue));
         assert_eq!(app.cred_panel().query, "o");
@@ -1650,7 +1653,7 @@ mod tests {
     #[test]
     fn credentials_ctrl_a_opens_cred_wizard_add() {
         let mut app = app_with_credential("ops", "deploy");
-        app.on_key(press(KeyCode::Char('2'), KeyModifiers::CONTROL)); // → Credentials
+        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE)); // → Credentials
         let outcome = app.on_key(press(KeyCode::Char('a'), KeyModifiers::CONTROL));
         assert!(matches!(
             outcome,
@@ -1664,7 +1667,7 @@ mod tests {
     #[test]
     fn credentials_ctrl_e_opens_cred_wizard_edit_prefilled() {
         let mut app = app_with_credential("ops", "deploy");
-        app.on_key(press(KeyCode::Char('2'), KeyModifiers::CONTROL)); // → Credentials
+        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE)); // → Credentials
         let outcome = app.on_key(press(KeyCode::Char('e'), KeyModifiers::CONTROL));
         assert!(matches!(
             outcome,
@@ -1681,7 +1684,7 @@ mod tests {
         // Enter on the Credentials tab = edit the selected credential (primary
         // action). Same outcome as Ctrl-E here.
         let mut app = app_with_credential("ops", "deploy");
-        app.on_key(press(KeyCode::Char('2'), KeyModifiers::CONTROL)); // → Credentials
+        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE)); // → Credentials
         let outcome = app.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(
             outcome,
@@ -1697,7 +1700,7 @@ mod tests {
         // No credentials → no selection → status hint, no overlay.
         let cfg = SshrackConfig::default();
         let mut app = App::new(cfg, None, Frecency::default(), HashMap::new());
-        app.on_key(press(KeyCode::Char('2'), KeyModifiers::CONTROL)); // → Credentials
+        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE)); // → Credentials
         let outcome = app.on_key(press(KeyCode::Char('e'), KeyModifiers::CONTROL));
         assert!(matches!(outcome, Outcome::Continue));
         assert!(app.overlay().is_none());
@@ -1713,7 +1716,7 @@ mod tests {
         // intent (pure; the loop drives the confirm popup). The captured name
         // is the credential under the cursor.
         let mut app = app_with_credential("ops", "deploy");
-        app.on_key(press(KeyCode::Char('2'), KeyModifiers::CONTROL)); // → Credentials
+        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE)); // → Credentials
         let outcome = app.on_key(press(KeyCode::Char('d'), KeyModifiers::CONTROL));
         assert!(matches!(outcome, Outcome::DeleteCred));
         assert_eq!(app.pending_delete_cred(), Some("ops"));
@@ -1723,7 +1726,7 @@ mod tests {
     fn credentials_ctrl_d_with_no_selection_sets_status() {
         let cfg = SshrackConfig::default();
         let mut app = App::new(cfg, None, Frecency::default(), HashMap::new());
-        app.on_key(press(KeyCode::Char('2'), KeyModifiers::CONTROL)); // → Credentials
+        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE)); // → Credentials
         let outcome = app.on_key(press(KeyCode::Char('d'), KeyModifiers::CONTROL));
         assert!(matches!(outcome, Outcome::Continue));
         assert!(app.pending_delete_cred().is_none());
@@ -1738,7 +1741,7 @@ mod tests {
         // On the Credentials tab: typing then Esc clears the query (Continue);
         // the second Esc (empty query) signals Quit at the App layer.
         let mut app = app_with_credential("ops", "deploy");
-        app.on_key(press(KeyCode::Char('2'), KeyModifiers::CONTROL)); // → Credentials
+        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE)); // → Credentials
         app.on_key(press(KeyCode::Char('o'), KeyModifiers::NONE));
         assert_eq!(app.cred_panel().query, "o");
         let first = app.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
@@ -1749,22 +1752,14 @@ mod tests {
     }
 
     // ---- Settings panel routing (Task 8) ----
-    // Drive App::on_key directly to pin: Ctrl-3 lands on Settings, Enter opens
+    // Drive App::on_key directly to pin: Tab Tab lands on Settings, Enter opens
     // the StorePicker overlay (and stashes a store_view), arrow keys are no-ops,
     // and Esc inside the picker returns Cancel + clears the overlay.
 
     #[test]
-    fn ctrl_3_switches_to_settings_tab() {
-        let mut app = app_with_host("web");
-        let outcome = app.on_key(press(KeyCode::Char('3'), KeyModifiers::CONTROL));
-        assert!(matches!(outcome, Outcome::SwitchTab(Tab::Settings)));
-        assert_eq!(app.active_tab(), Tab::Settings);
-    }
-
-    #[test]
     fn settings_enter_opens_store_picker_overlay() {
         let mut app = app_with_host("web");
-        app.on_key(press(KeyCode::Char('3'), KeyModifiers::CONTROL)); // -> Settings
+        switch_to_settings(&mut app);
         let outcome = app.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(
             outcome,
@@ -1785,7 +1780,7 @@ mod tests {
     #[test]
     fn settings_arrows_are_noops() {
         let mut app = app_with_host("web");
-        app.on_key(press(KeyCode::Char('3'), KeyModifiers::CONTROL)); // -> Settings
+        switch_to_settings(&mut app);
         let outcome = app.on_key(press(KeyCode::Down, KeyModifiers::NONE));
         assert!(matches!(outcome, Outcome::Continue));
         // No overlay opened.
@@ -1799,7 +1794,7 @@ mod tests {
         // Cancel arm clears the overlay + re-renders; here we pin the pure half
         // (the outcome + the overlay state after on_key).
         let mut app = app_with_host("web");
-        app.on_key(press(KeyCode::Char('3'), KeyModifiers::CONTROL)); // -> Settings
+        switch_to_settings(&mut app);
         app.on_key(press(KeyCode::Enter, KeyModifiers::NONE)); // open picker
         assert!(matches!(app.overlay(), Some(Overlay::StorePicker)));
         let outcome = app.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
@@ -1819,7 +1814,7 @@ mod tests {
         // SwitchToVault. The loop's SwitchToVault arm runs the I/O; here we pin
         // the pure routing through the stashed store_view.
         let mut app = app_with_host("web");
-        app.on_key(press(KeyCode::Char('3'), KeyModifiers::CONTROL)); // -> Settings
+        switch_to_settings(&mut app);
         app.on_key(press(KeyCode::Enter, KeyModifiers::NONE)); // open picker
         app.on_key(press(KeyCode::Down, KeyModifiers::NONE)); // -> vault
         let outcome = app.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
