@@ -32,7 +32,7 @@ use ratatui::{
 };
 use sshrack_core::config::schema::{Credential, SecretKind};
 
-use super::app::Outcome;
+use super::intent::Outcome;
 use super::panel::rank_by_name;
 use super::theme;
 
@@ -576,7 +576,7 @@ mod tests {
                 f.area(),
                 crate::tui::tab::Tab::Credentials,
                 &[("Enter", "edit"), ("^A", "add")],
-                &crate::tui::app::Status::empty(),
+                &crate::tui::intent::Status::empty(),
             );
             p.draw_in_shell(f, area, &creds);
         })

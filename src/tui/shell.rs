@@ -16,7 +16,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Tabs},
 };
 
-use crate::tui::app::Status;
+use crate::tui::Status;
 use crate::tui::{tab, tab::Tab, theme};
 
 /// Render the brand + tab bar (band 1), the bordered middle band (band 2, whose

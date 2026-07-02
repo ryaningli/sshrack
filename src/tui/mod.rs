@@ -28,6 +28,7 @@ pub mod connect;
 pub mod cred_panel;
 pub mod dialog;
 pub mod help;
+pub mod intent;
 pub mod launcher;
 pub mod panel;
 pub mod popup;
@@ -44,6 +45,7 @@ pub mod wizard;
 mod test_support;
 
 pub use app::{App, run_loop};
+pub use intent::{Outcome, Overlay, Status};
 pub use term::{TerminalGuard, TerminalHandle, Tui};
 
 /// Reverse lookup from a credential ULID to its display name, built once at

@@ -23,7 +23,7 @@ use ratatui::{
 use ulid::Ulid;
 use zeroize::Zeroizing;
 
-use super::super::app::Outcome;
+use super::super::intent::Outcome;
 use super::super::theme;
 use super::{
     AuthChoice, AuthKind, Field, HOST_VALUE_COL, SaveError, SecretChoice, validate, value_spans,

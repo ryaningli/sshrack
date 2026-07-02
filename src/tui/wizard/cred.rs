@@ -18,7 +18,7 @@ use ratatui::{
 use ulid::Ulid;
 use zeroize::Zeroizing;
 
-use super::super::app::Outcome;
+use super::super::intent::Outcome;
 use super::super::theme;
 use super::{CRED_VALUE_COL, CredField, CredSaveError, SecretChoice, validate_cred, value_spans};
 use sshrack_core::config::schema::{Credential, CredentialBody};
@@ -182,7 +182,7 @@ impl CredForm {
     /// Pure key decision: mutate form state and return an [`Outcome`]. Performs
     /// **no I/O** — the loop runs persist only when this signals
     /// [`Outcome::SaveCred`]. The `App` routes the cred wizard's intent by the
-    /// active [`super::super::app::Overlay`] (`CredWizard`), so it never collides with
+    /// active [`super::super::intent::Overlay`] (`CredWizard`), so it never collides with
     /// the host wizard's [`Outcome::SaveHost`].
     ///
     /// Bindings mirror [`super::HostForm::on_key`]:

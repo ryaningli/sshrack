@@ -18,9 +18,9 @@
 //! via `super::wizard::{...}` — the paths stay identical to the pre-split
 //! single-file layout.
 //!
-//! [`Outcome`]: super::app::Outcome
-//! [`Outcome::SaveHost`]: super::app::Outcome::SaveHost
-//! [`Outcome::SaveCred`]: super::app::Outcome::SaveCred
+//! [`Outcome`]: super::intent::Outcome
+//! [`Outcome::SaveHost`]: super::intent::Outcome::SaveHost
+//! [`Outcome::SaveCred`]: super::intent::Outcome::SaveCred
 
 use ratatui::style::Style;
 use ratatui::text::Span;

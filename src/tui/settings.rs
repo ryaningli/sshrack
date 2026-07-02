@@ -22,7 +22,7 @@ use ratatui::{
     widgets::Paragraph,
 };
 
-use super::app::Outcome;
+use super::Outcome;
 use super::theme;
 
 /// The Settings panel state. Today it holds a single row (the storage-mode
@@ -59,7 +59,7 @@ impl SettingsPanel {
         match key.code {
             // With a single row Up/Down have nowhere to go; ignore gracefully.
             KeyCode::Up | KeyCode::Down => Outcome::Continue,
-            KeyCode::Enter => Outcome::OpenOverlay(super::app::Overlay::StorePicker),
+            KeyCode::Enter => Outcome::OpenOverlay(super::Overlay::StorePicker),
             _ => Outcome::Continue,
         }
     }
@@ -123,7 +123,7 @@ mod tests {
         let out = p.on_key(key(KeyCode::Enter));
         assert!(matches!(
             out,
-            Outcome::OpenOverlay(super::super::app::Overlay::StorePicker)
+            Outcome::OpenOverlay(super::super::Overlay::StorePicker)
         ));
     }
 

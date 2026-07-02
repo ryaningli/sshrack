@@ -31,7 +31,7 @@ use ratatui::{
     widgets::{List, ListState},
 };
 
-use super::app::Outcome;
+use super::intent::Outcome;
 use super::theme;
 
 /// The three storage modes the user can pick. Mirrors the CLI `StoreMode` but

@@ -35,7 +35,7 @@ use sshrack_core::config::schema::{Auth, Credential, Host};
 use sshrack_core::frecency::Frecency;
 use ulid::Ulid;
 
-use super::app::Outcome;
+use super::intent::Outcome;
 use super::theme;
 
 // NOTE: the launcher no longer carries a status row or a `status` field — the
@@ -833,7 +833,7 @@ mod tests {
                 f.area(),
                 crate::tui::tab::Tab::Hosts,
                 &[("Enter", "connect"), ("^A", "add")],
-                &crate::tui::app::Status::empty(),
+                &crate::tui::intent::Status::empty(),
             );
             p.draw_in_shell(f, area, &hosts, &frecency, &empty_creds());
         })
@@ -875,7 +875,7 @@ mod tests {
                 f.area(),
                 crate::tui::tab::Tab::Hosts,
                 &[("Enter", "connect"), ("F1", "help")],
-                &crate::tui::app::Status::empty(),
+                &crate::tui::intent::Status::empty(),
             );
             p.draw_in_shell(f, area, &hosts, &frecency, &empty_creds());
         })
