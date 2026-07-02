@@ -63,7 +63,7 @@ use super::prompt::{TuiPassphrase, host_key_confirm};
 /// 5. Build argv via [`connect::ssh::build`] (no overrides, no remote command).
 /// 6. Record + save frecency **before** returning (a hung ssh never loses it).
 ///
-/// `main` runs [`connect::launch`] after the [`super::app::TerminalGuard`]
+/// `main` runs [`connect::launch`] after the [`super::term::TerminalGuard`]
 /// drops, so ssh inherits a normal terminal.
 ///
 /// `data_dir` is the frecency data dir (from `config::path::default_data_dir`).

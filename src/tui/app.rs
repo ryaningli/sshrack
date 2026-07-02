@@ -1,9 +1,12 @@
-//! TUI application state and key handling.
+//! The TUI state machine: [`App`] and its pure key-routing logic.
 //!
-//! The loop is the only place with side effects. [`App::on_key`] is pure (no
-//! I/O): it inspects a [`KeyEvent`] and returns an [`Outcome`] describing what
-//! the loop should do next. This keeps key logic unit-testable without a
-//! terminal or event source.
+//! [`App::on_key`] inspects a [`crossterm::event::KeyEvent`] and returns an
+//! [`Outcome`][super::intent::Outcome] describing what should happen next — it
+//! performs NO I/O, so the key logic is unit-testable without a terminal or
+//! event source. Side effects (persist, connect, terminal ownership) live in
+//! sibling modules: [`super::run_loop`] drives the loop, [`super::persist`]
+//! holds the disk-writing functions, and [`super::term`] owns the RAII terminal
+//! guard. [`App::draw`] renders the current state into a frame.
 
 use crossterm::event::KeyEvent;
 use ratatui::Frame;

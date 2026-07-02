@@ -51,8 +51,13 @@ sshrack/
 │   │   ├── popup.rs            #     centered popup renderer (used by prompt.rs confirm dialogs)
 │   │   ├── theme.rs            #     design tokens (accent, gutter, brand) — the single color surface
 │   │   ├── help.rs             #     F1 help dialog (draw_help_dialog + keymap reference)
-│   │   ├── app.rs              #     top-level App: active_tab + Overlay routing, Outcome loop, status bar
-│   │   └── mod.rs              #     TerminalGuard + run() entry
+│   │   ├── app.rs              #     App state machine + on_key (pure) + draw
+│   │   ├── intent.rs           #     pure intent/state types: Outcome / Overlay / Status
+│   │   ├── term.rs             #     RAII terminal ownership: TerminalGuard / TerminalHandle / Tui
+│   │   ├── persist.rs          #     persist_* side-effects (host/cred CRUD, store switch) called by the loop
+│   │   ├── run_loop.rs         #     blocking event loop: poll keys → on_key → dispatch Outcome
+│   │   ├── test_support.rs     #     #[cfg(test)] shared App/press helpers for app/persist/run_loop tests
+│   │   └── mod.rs              #     re-exports + run() entry
 │   └── shared/
 │       ├── format.rs           #     --format json|text output shapes (locked contract)
 │       ├── exit_code.rs        #     stable exit codes
@@ -246,7 +251,7 @@ The interactive shell (`src/tui/`) is delivered as a **three-band shell + tabs +
 - **Tabs (`tab.rs` + `Tab` enum):** Hosts / Credentials / Settings, default Hosts. `Tab`/`Shift-Tab` cycle, `Ctrl-1`/`2`/`3` jump. The active tab is the only routing state (`App::active_tab`); the old full-screen `Mode` enum is gone.
 - **Panels:** Hosts panel (`launcher.rs`, frecency-tiered host list + nucleo fuzzy filter + search box), Credentials panel (`cred_panel.rs`, same shape, no secrets rendered), Settings panel (`settings.rs`, storage-mode row).
 - **Overlays (`Overlay` enum, at most one open at a time):** host add/edit wizard, credential add/edit wizard, store-mode picker, and the F1 help reference are all **dialogs** (`dialog.rs` chrome: titled bordered area + hotkey footer, no dark scrim) layered on top of the shell — not full-screen modes. `Esc`/`Ctrl-C` inside an overlay closes it; the shell keeps rendering behind it.
-- **Event routing (`app.rs`):** `on_key` returns a pure-intent `Outcome` (`SwitchTab` / `OpenOverlay` / `CloseOverlay` / `SaveHost` / `DeleteHost` / `ConnectRequested` / `Quit` / …); the loop applies the I/O (persist, keyring cleanup, confirm popups via `TuiPassphrase`, connect orchestration with delayed exec — the terminal is restored before `ssh` inherits it). A consolidated status bar surfaces feedback after every action.
+- **Event routing (split across `app`/`intent`/`persist`/`run_loop`/`term`):** `App::on_key` (in `app.rs`) returns a pure-intent `Outcome` (`SwitchTab` / `OpenOverlay` / `CloseOverlay` / `SaveHost` / `DeleteHost` / `ConnectRequested` / `Quit` / …) declared in `intent.rs`; `run_loop.rs` drives the blocking loop and applies the I/O via the free functions in `persist.rs` (host/cred CRUD, keyring cleanup, store switch) and `connect::connect_host` (confirm popups via `TuiPassphrase`, connect orchestration with delayed exec — the terminal owned by `term.rs`'s `TerminalGuard` is restored before `ssh` inherits it). A consolidated status bar surfaces feedback after every action.
 
 It is reached by a bare `sshrack`, or by `host`/`cred` `add`/`edit` with no content flags. CLI entry (`host add`, `cred add`, etc.) routes straight to the matching tab + overlay.
 

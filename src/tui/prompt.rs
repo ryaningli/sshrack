@@ -9,8 +9,8 @@
 //! rendering a ratatui popup needs `&mut Tui`. We solve this without changing
 //! the core trait and without `unsafe` by sharing the terminal behind an
 //! `Rc<RefCell<Tui>>` whose only strong ref lives in
-//! [`crate::tui::app::TerminalGuard`]. The prompt layer holds a *weak* handle
-//! ([`crate::tui::app::TerminalHandle`] = `Weak<RefCell<Tui>>`) cloned from the
+//! [`crate::tui::term::TerminalGuard`]. The prompt layer holds a *weak* handle
+//! ([`crate::tui::term::TerminalHandle`] = `Weak<RefCell<Tui>>`) cloned from the
 //! guard; [`TuiPassphrase`] stores it and its `&self` methods [`upgrade`] it at
 //! call time, then `borrow_mut()` the terminal to drive a popup. Because the
 //! handle is weak, a `TuiPassphrase` (or host-key closure) that outlives the
@@ -335,7 +335,7 @@ fn render_password_popup(terminal: &mut Tui, title: &str, buffer: &str, mismatch
 }
 
 /// [`PassphraseProvider`] for the TUI. Holds a weak handle to the terminal
-/// (cloned from [`crate::tui::app::TerminalGuard::handle`]); its `&self`
+/// (cloned from [`crate::tui::term::TerminalGuard::handle`]); its `&self`
 /// methods [`upgrade`](std::rc::Weak::upgrade) the handle and `borrow_mut()`
 /// the terminal to drive a popup. If the guard has already dropped, the
 /// `upgrade` returns `None` and the call surfaces as
@@ -351,7 +351,7 @@ pub struct TuiPassphrase {
 
 impl TuiPassphrase {
     /// Build a provider that drives popups on `terminal` (a weak handle cloned
-    /// from the live [`crate::tui::app::TerminalGuard`]).
+    /// from the live [`crate::tui::term::TerminalGuard`]).
     pub fn new(terminal: TerminalHandle) -> Self {
         Self { terminal }
     }
