@@ -240,7 +240,9 @@ pub fn confirm_popup(terminal: &mut Tui, text: &str) -> Result<bool, SshrackErro
             .collect::<Vec<_>>();
         let body = Paragraph::new(lines).alignment(Alignment::Left);
         terminal
-            .draw(|f| popup::render_popup(f, "Confirm", body))
+            .draw(|f| {
+                popup::render_popup(f, "Confirm", body);
+            })
             .map_err(SshrackError::from_prompt_io)?;
 
         if !event::poll(std::time::Duration::from_millis(250))
@@ -331,7 +333,9 @@ fn render_password_popup(terminal: &mut Tui, title: &str, buffer: &str, mismatch
     } else {
         title
     };
-    let _ = terminal.draw(|f| popup::render_popup(f, title, body));
+    let _ = terminal.draw(|f| {
+        popup::render_popup(f, title, body);
+    });
 }
 
 /// [`PassphraseProvider`] for the TUI. Holds a weak handle to the terminal
@@ -455,7 +459,9 @@ fn store_pick_popup(terminal: &mut Tui) -> Result<Option<StorePick>, SshrackErro
         let body =
             ratatui::widgets::Paragraph::new(lines).alignment(ratatui::layout::Alignment::Left);
         terminal
-            .draw(|f| popup::render_popup(f, "Choose store mode", body))
+            .draw(|f| {
+                popup::render_popup(f, "Choose store mode", body);
+            })
             .map_err(SshrackError::from_prompt_io)?;
 
         if !event::poll(std::time::Duration::from_millis(250))

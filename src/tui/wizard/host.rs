@@ -593,6 +593,13 @@ impl HostForm {
             let y = fields_area.y + row as u16;
             frame.set_cursor_position((x, y));
         }
+
+        // If the credential picker is open, paint it over the wizard. Drawn last
+        // so it sits on top, and after the wizard's own cursor placement so the
+        // picker's query-box cursor wins.
+        if let Some(picker) = &self.cred_picker {
+            picker.draw_overlay(frame);
+        }
     }
 
     /// The `(row, value_offset)` where the terminal cursor should sit for the

@@ -44,9 +44,10 @@ pub fn centered_rect(r: Rect) -> Rect {
 }
 
 /// Render a clear-backed bordered popup titled `title`, then render `body`
-/// inside it. The caller drives input by reading keys separately; this fn only
-/// paints the chrome + body widget.
-pub fn render_popup<W: Widget>(frame: &mut Frame, title: &str, body: W) {
+/// inside it, and return the inner content rect (so callers that need to place
+/// a terminal cursor — e.g. the credential picker's query box — know where the
+/// content area landed). Callers that ignore the return value are unaffected.
+pub fn render_popup<W: Widget>(frame: &mut Frame, title: &str, body: W) -> Rect {
     let area = centered_rect(frame.area());
     // Clear the background so previous frame content doesn't bleed through.
     frame.render_widget(Clear, area);
@@ -56,6 +57,7 @@ pub fn render_popup<W: Widget>(frame: &mut Frame, title: &str, body: W) {
     frame.render_widget(&block, area);
     let [content] = Layout::vertical([Constraint::Fill(1)]).areas(block.inner(area));
     frame.render_widget(body, content);
+    content
 }
 
 #[cfg(test)]
@@ -91,5 +93,23 @@ mod tests {
         let exact = Rect::new(0, 0, POPUP_WIDTH, POPUP_HEIGHT);
         let popup = centered_rect(exact);
         assert_eq!(popup, exact);
+    }
+
+    #[test]
+    fn render_popup_returns_inner_content_rect() {
+        use ratatui::{Terminal, backend::TestBackend, widgets::Paragraph};
+        let backend = TestBackend::new(100, 40);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut captured = None;
+        let _ = term.draw(|f| {
+            captured = Some(render_popup(f, "Title", Paragraph::new("body")));
+        });
+        let rect = captured.unwrap();
+        let screen = Rect::new(0, 0, 100, 40);
+        let popup = centered_rect(screen);
+        assert!(rect.x >= popup.x);
+        assert!(rect.x + rect.width <= popup.x + popup.width);
+        assert!(rect.y >= popup.y);
+        assert!(rect.y + rect.height <= popup.y + popup.height);
     }
 }
