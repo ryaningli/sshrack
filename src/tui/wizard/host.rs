@@ -197,7 +197,9 @@ impl HostForm {
         }
     }
 
-    /// Advance the auth chooser by `delta` (signed), wrapping. Pure.
+    /// Advance the auth chooser by `delta` (signed), wrapping. Pure. Does not
+    /// move focus — a toggle leaves the caller on the Auth row, so the user
+    /// drives any further navigation (Tab to Credential, etc.) themselves.
     fn cycle_auth(&mut self, delta: i32) {
         let cur_kind = self.auth_choice.kind();
         let order = AuthChoice::ORDER;
@@ -223,23 +225,22 @@ impl HostForm {
                 AuthChoice::Reference { idx }
             }
         };
-        // Converge focus so toggling auth lands on the new mode's signature
-        // field: Reference → Credential, Independent (from Credential) → User.
-        // Name/Host/Port are common to both modes, so editing them is never
-        // interrupted by an auth toggle; Auth itself also converges to
-        // Credential on the Reference side (the test helper relies on this).
-        match next_kind {
-            AuthKind::Reference => {
-                if !matches!(self.focus, Field::Name | Field::Host | Field::Port) {
-                    self.focus = Field::Credential;
-                }
-            }
-            AuthKind::Independent => {
-                if self.focus == Field::Credential {
-                    self.focus = Field::User;
-                }
-            }
+    }
+
+    /// Advance the credential chooser by `delta` (signed), wrapping around the
+    /// credential list. No-op when there are no credentials or the form is not
+    /// in the Reference branch. Pure; the loop never reaches this under
+    /// Independent (the Credential row is unreachable there).
+    fn cycle_credential(&mut self, delta: i32) {
+        let AuthChoice::Reference { idx } = self.auth_choice else {
+            return;
+        };
+        let n = self.credential_names.len();
+        if n == 0 {
+            return;
         }
+        let next = (idx as i32 + delta).rem_euclid(n as i32) as usize;
+        self.auth_choice = AuthChoice::Reference { idx: next };
     }
 
     /// The currently-selected credential name, if Reference and idx in range.
@@ -456,6 +457,18 @@ impl HostForm {
                 self.error = None;
                 Outcome::Continue
             }
+            // Credential row: ←/→ cycle the chosen credential inline
+            // (Reference); Enter opens the fuzzy picker when there are many.
+            KeyCode::Left if self.focus == Field::Credential => {
+                self.cycle_credential(-1);
+                self.error = None;
+                Outcome::Continue
+            }
+            KeyCode::Right if self.focus == Field::Credential => {
+                self.cycle_credential(1);
+                self.error = None;
+                Outcome::Continue
+            }
             // Secret row: ←/→ cycle None / Password / IdentityKey (Independent).
             KeyCode::Left if self.focus == Field::Secret => {
                 self.secret_kind = self.secret_kind.prev();
@@ -580,7 +593,9 @@ impl HostForm {
             Field::Auth => {
                 "  <- -> cycle Independent/Reference  ·  Tab next  ·  ^s save  ·  Esc cancel"
             }
-            Field::Credential => "  Enter pick credential  ·  Esc cancel  ·  ^s save",
+            Field::Credential => {
+                "  <- -> cycle  ·  Enter pick credential  ·  ^s save  ·  Esc cancel"
+            }
             Field::Secret => "  <- -> cycle None/Password/IdentityKey  ·  ^s save  ·  Esc cancel",
             _ => "  Tab/up-down next  ·  ^s save  ·  Esc cancel",
         };
@@ -662,7 +677,7 @@ impl HostForm {
             ),
             Field::Host => (
                 self.host_addr.clone(),
-                Some("e.g. 10.0.0.5 or host.example.com"),
+                Some("e.g. 192.168.1.1 or host.example.com"),
             ),
             Field::Port => {
                 let v = self.port.clone();
@@ -701,7 +716,7 @@ impl HostForm {
                 let ph = if self.credential_names.is_empty() {
                     Some("no credentials defined — add one with the cred wizard")
                 } else {
-                    Some("Enter to pick")
+                    Some("<- -> cycle  ·  Enter pick")
                 };
                 (v, ph)
             }
@@ -1092,9 +1107,9 @@ mod tests {
         assert_eq!(f.auth_choice, AuthChoice::Independent);
         f.on_key(press(KeyCode::Right, KeyModifiers::NONE));
         assert!(matches!(f.auth_choice, AuthChoice::Reference { .. }));
-        // cycle_auth converged focus to Credential; reset to Auth to test the
-        // wrap-around cycle (Right on the Credential row does not cycle auth).
-        f.focus = Field::Auth;
+        // A toggle leaves focus on Auth (no auto-jump), so a second Right wraps
+        // Reference -> Independent right away.
+        assert_eq!(f.focus, Field::Auth);
         f.on_key(press(KeyCode::Right, KeyModifiers::NONE));
         assert_eq!(f.auth_choice, AuthChoice::Independent);
     }
@@ -1120,19 +1135,16 @@ mod tests {
 
     fn ref_form(names: &[&str]) -> HostForm {
         // A Reference-form host: switch Auth to Reference so the Credential row
-        // is reachable. Focus starts on Credential.
+        // is reachable, then focus it. cycle_auth no longer auto-jumps, so the
+        // focus move onto the Credential row is explicit.
         let mut f = HostForm::new_add(names.iter().map(|s| s.to_string()).collect());
         f.name = "h".into();
         f.host_addr = "10.0.0.5".into();
-        // Cycle Auth Independent -> Reference, then focus the Credential row.
         f.focus = Field::Auth;
         let _ = f.on_key(press(KeyCode::Right, KeyModifiers::NONE));
         assert!(matches!(f.auth_choice, AuthChoice::Reference { .. }));
-        assert_eq!(
-            f.focus,
-            Field::Credential,
-            "cycle_auth converged focus to Credential"
-        );
+        assert_eq!(f.focus, Field::Auth, "toggle leaves focus on Auth");
+        f.focus = Field::Credential;
         f
     }
 
@@ -1212,6 +1224,56 @@ mod tests {
             !f.reachable_fields().contains(&Field::Credential),
             "Independent+IdentityKey"
         );
+    }
+
+    // ---- row_value_and_placeholder: example copy ----
+
+    #[test]
+    fn host_address_placeholder_uses_a_private_range_example() {
+        let f = blank_form();
+        let (_, ph) = f.row_value_and_placeholder(Field::Host);
+        assert_eq!(ph, Some("e.g. 192.168.1.1 or host.example.com"));
+    }
+
+    // ---- credential row inline cycling (Reference branch) ----
+
+    #[test]
+    fn right_arrow_on_credential_row_cycles_forward_and_wraps() {
+        let mut f = ref_form(&["alpha", "beta", "gamma"]);
+        assert_eq!(f.selected_credential_name(), Some("alpha"));
+        f.on_key(press(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(f.selected_credential_name(), Some("beta"));
+        f.on_key(press(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(f.selected_credential_name(), Some("gamma"));
+        f.on_key(press(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(f.selected_credential_name(), Some("alpha"), "wraps around");
+    }
+
+    #[test]
+    fn left_arrow_on_credential_row_cycles_backward_and_wraps() {
+        let mut f = ref_form(&["alpha", "beta"]);
+        assert_eq!(f.selected_credential_name(), Some("alpha"));
+        f.on_key(press(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(f.selected_credential_name(), Some("beta"), "wraps backward");
+    }
+
+    #[test]
+    fn credential_row_cycling_is_noop_with_no_credentials() {
+        let mut f = ref_form(&[]);
+        // No credentials → cycle stays at idx 0 and never panics.
+        f.on_key(press(KeyCode::Right, KeyModifiers::NONE));
+        assert!(matches!(f.auth_choice, AuthChoice::Reference { idx: 0 }));
+    }
+
+    #[test]
+    fn credential_row_left_right_do_not_fire_off_credential_row() {
+        // On the Name row, Left/Right are inert — they neither cycle the
+        // credential nor move focus.
+        let mut f = ref_form(&["alpha", "beta", "gamma"]);
+        f.focus = Field::Name;
+        f.on_key(press(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(f.selected_credential_name(), Some("alpha"), "idx unchanged");
+        assert_eq!(f.focus, Field::Name);
     }
 
     // ---- secret chooser cycling ----
