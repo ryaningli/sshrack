@@ -220,9 +220,10 @@ impl Launcher {
     ///   fallbacks); `^d` and `F1`/`?` are intercepted at the App level too
     ///   (delete intent / help overlay).
     ///
-    /// The launcher no longer carries a `status` field: the shell footer is
-    /// the single status surface, and deferred-action feedback flows through
-    /// `App::status` (set by App-layer routing).
+    /// The launcher no longer carries a `status` field: deferred-action
+    /// feedback flows through `App::status` (set by App-layer routing), which
+    /// each panel renders as its own bottom status row (the shell footer is
+    /// hotkey-only now).
     pub fn on_key(&mut self, key: KeyEvent, hosts: &[Host], frecency: &Frecency) -> Outcome {
         // Only react to Press events; Release/Repeat are ignored (crossterm
         // emits them on some platforms).
@@ -298,11 +299,13 @@ impl Launcher {
     }
 
     /// Render the launcher into the shell's panel area (no outer border — the
-    /// shell supplies the brand/tab/footer bands around it, including the
-    /// status footer). Splits `area` into `[search(1), list(Fill)]` and renders
-    /// the search row + ranked list. Reuses `host_line` / `highlighted_name` /
-    /// `host_user` / `frecency_tier`. The search row places the real terminal
-    /// cursor at the end of the query via `set_cursor_position`.
+    /// shell supplies the brand/tab/footer bands around it; the footer is
+    /// hotkey-only now). Splits `area` into `[search(Length 1), list(Fill),
+    /// status(Length 1)]` and renders the search row + ranked list + the
+    /// shared status row at the bottom via `parts::draw_status_row`. Reuses
+    /// `host_line` / `highlighted_name` / `host_user` / `frecency_tier`. The
+    /// search row places the real terminal cursor at the end of the query via
+    /// `set_cursor_position`.
     ///
     /// Selection styling: the selected row carries `theme::focus_marker(true)`
     /// (a Cyan `▶ `) as its first span and is rendered `BOLD`; every other row
