@@ -60,16 +60,28 @@ pub const PASSPHRASE_ENV: &str = "SSHRACK_PASSPHRASE";
 /// [`unlock_with_passphrase`] (read) and [`enable`] (write).
 pub(crate) const VERIFIER_PLAINTEXT: &[u8] = b"sshrack-vault-v1";
 
-/// Read the passphrase from the environment, wrapped in [`Zeroizing`] so it
-/// is wiped on drop rather than lingering as a bare `String` through the derive
-/// phase. Returns `None` when the variable is unset or empty.
+/// Map a raw `SSHRACK_PASSPHRASE` value (unset → `None`) to the passphrase the
+/// vault layer consumes. **Empty is treated as unset** so an accidentally-empty
+/// `SSHRACK_PASSPHRASE=` cannot enable an empty master passphrase (Argon2id
+/// would otherwise accept it). Wraps the value in [`Zeroizing`] so it is wiped
+/// on drop rather than lingering as a bare `String` through the derive phase.
+///
+/// Pure (the env read lives in [`passphrase_from_env`]); tests inject the raw
+/// value here instead of touching `std::env`, which the project forbids in
+/// tests.
+fn passphrase_from(raw: Option<String>) -> Option<Zeroizing<String>> {
+    raw.filter(|s| !s.is_empty()).map(Zeroizing::new)
+}
+
+/// Read the master passphrase from `SSHRACK_PASSPHRASE`. Returns `None` when
+/// the variable is unset or empty (see [`passphrase_from`]).
 ///
 /// Used by the production caller (the connect path), which then passes the
 /// value into [`unlock`] / [`ensure_unlocked_vault_key`] as the
 /// `env_passphrase` parameter. Tests inject the value directly instead of
 /// calling this — they never mutate `std::env`.
 pub fn passphrase_from_env() -> Option<Zeroizing<String>> {
-    std::env::var(PASSPHRASE_ENV).ok().map(Zeroizing::new)
+    passphrase_from(std::env::var(PASSPHRASE_ENV).ok())
 }
 
 /// Derive the master key from `passphrase`, verify it against `meta.verifier`
@@ -356,6 +368,27 @@ mod tests {
         let verifier = crypto::encrypt(VERIFIER_PLAINTEXT, &key).unwrap();
         meta.verifier = Some(verifier);
         meta
+    }
+
+    // ---- passphrase_from ----
+
+    #[test]
+    fn passphrase_from_treats_empty_as_unset() {
+        // An accidentally-empty SSHRACK_PASSPHRASE= must not enable an empty
+        // master passphrase (Argon2id would otherwise accept it). It collapses
+        // to None — same as unset — so callers fall through to their "no
+        // passphrase" branch (the CLI errors "set SSHRACK_PASSPHRASE …").
+        assert!(passphrase_from(None).is_none(), "unset must be None");
+        assert!(
+            passphrase_from(Some(String::new())).is_none(),
+            "empty must be None"
+        );
+    }
+
+    #[test]
+    fn passphrase_from_keeps_non_empty_value() {
+        let pw = passphrase_from(Some("hunter2".to_string())).expect("non-empty value");
+        assert_eq!(pw.as_str(), "hunter2");
     }
 
     // ---- unlock_with_passphrase ----
