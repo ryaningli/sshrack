@@ -39,6 +39,9 @@ pub mod tab;
 pub mod theme;
 pub mod wizard;
 
+#[cfg(test)]
+mod test_support;
+
 pub use app::{App, TerminalGuard, run_loop};
 
 /// Reverse lookup from a credential ULID to its display name, built once at

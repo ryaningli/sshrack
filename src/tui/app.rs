@@ -2098,33 +2098,13 @@ mod tests {
     //! terminal, no event source) to pin both the behavior and the purity.
 
     use super::*;
+    use crate::tui::test_support::{
+        app_with_credential, app_with_host, app_with_named_cred, dead_handle, press,
+    };
     use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
     use sshrack_core::config::schema::{Auth, CredentialBody, Host, SshrackConfig};
     use std::collections::HashMap;
     use ulid::Ulid;
-
-    /// A one-host app with no frecency and no named credentials. Enough to
-    /// drive the launcher's quit/navigation branches without a config file.
-    fn app_with_host(name: &str) -> App {
-        let host = Host {
-            id: Ulid::new(),
-            name: name.into(),
-            host: "h".into(),
-            port: 22,
-            auth: Auth::inline(CredentialBody::new("u")),
-        };
-        let cfg = SshrackConfig {
-            hosts: vec![host],
-            ..SshrackConfig::default()
-        };
-        App::new(cfg, None, Frecency::default(), HashMap::new())
-    }
-
-    fn press(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
-        // crossterm distinguishes Press/Release/Repeat; the app only acts on
-        // Press, so tests construct Press keys to exercise the binding.
-        KeyEvent::new_with_kind(code, mods, KeyEventKind::Press)
-    }
 
     #[test]
     fn esc_with_empty_query_yields_quit() {
@@ -2730,14 +2710,6 @@ mod tests {
     // ===============================================================
 
     use sshrack_core::config::schema::{Credential, SecretKind, SecretStore};
-
-    /// A `TerminalHandle` whose [`Weak::upgrade`] always returns `None`. Used
-    /// in tests that exercise the plaintext store-mode path (no vault unlock
-    /// popup, so the handle is never upgraded). Vault-mode tests would need a
-    /// live terminal; the plaintext path is the unit-testable surface here.
-    fn dead_handle() -> TerminalHandle {
-        std::rc::Weak::new()
-    }
 
     #[test]
     fn cred_add_none_kind_persists_user_only_credential() {
@@ -3579,21 +3551,6 @@ mod tests {
     // (`Credential` and `CredentialBody` are already in scope from the earlier
     // `use` statements at the top of `mod tests`.)
 
-    /// A one-credential app. Enough to exercise the Credentials panel without a
-    /// config file.
-    fn app_with_credential(name: &str, user: &str) -> App {
-        let cred = Credential {
-            id: Ulid::new(),
-            name: name.into(),
-            body: CredentialBody::new(user),
-        };
-        let cfg = SshrackConfig {
-            credentials: vec![cred],
-            ..SshrackConfig::default()
-        };
-        App::new(cfg, None, Frecency::default(), HashMap::new())
-    }
-
     #[test]
     fn ctrl_2_switches_to_credentials_tab() {
         let mut app = app_with_credential("ops", "deploy");
@@ -3887,30 +3844,9 @@ mod tests {
         assert_eq!(app.current_store_mode_label(), "plaintext");
     }
 
-    /// An app seeded with one host named `name`. Used by the entry-routing
-    /// tests so `apply_entry_mode` has a target to land on / edit.
-    fn app_with_named_host(name: &str) -> App {
-        app_with_host(name)
-    }
-
-    /// An app seeded with one named credential. Used by the entry-routing
-    /// tests that target the Credentials tab.
-    fn app_with_named_cred(name: &str) -> App {
-        use sshrack_core::config::schema::Credential;
-        let cfg = SshrackConfig {
-            credentials: vec![Credential {
-                id: Ulid::new(),
-                name: name.into(),
-                body: CredentialBody::new("deploy"),
-            }],
-            ..SshrackConfig::default()
-        };
-        App::new(cfg, None, Frecency::default(), HashMap::new())
-    }
-
     #[test]
     fn host_add_entry_lands_on_hosts_tab_with_overlay() {
-        let mut app = app_with_named_host("web");
+        let mut app = app_with_host("web");
         app.apply_entry_mode(super::super::EntryMode::HostWizard { edit_name: None });
         assert_eq!(app.active_tab(), super::super::tab::Tab::Hosts);
         assert!(
@@ -3921,7 +3857,7 @@ mod tests {
 
     #[test]
     fn host_edit_entry_lands_on_hosts_tab_with_edit_overlay_and_selection() {
-        let mut app = app_with_named_host("web");
+        let mut app = app_with_host("web");
         app.apply_entry_mode(super::super::EntryMode::HostWizard {
             edit_name: Some("web".into()),
         });
@@ -3940,7 +3876,7 @@ mod tests {
 
     #[test]
     fn host_edit_entry_missing_name_lands_on_hosts_tab_no_overlay_with_status() {
-        let mut app = app_with_named_host("web");
+        let mut app = app_with_host("web");
         app.apply_entry_mode(super::super::EntryMode::HostWizard {
             edit_name: Some("ghost".into()),
         });
@@ -4009,7 +3945,7 @@ mod tests {
 
     #[test]
     fn bare_entry_lands_on_hosts_tab_no_overlay() {
-        let mut app = app_with_named_host("web");
+        let mut app = app_with_host("web");
         app.apply_entry_mode(super::super::EntryMode::Launcher);
         assert_eq!(app.active_tab(), super::super::tab::Tab::Hosts);
         assert!(app.overlay().is_none(), "bare entry should open no overlay");
