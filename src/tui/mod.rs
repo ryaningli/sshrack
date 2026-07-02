@@ -18,9 +18,11 @@ use std::collections::HashMap;
 use crate::cli::Cli;
 use crate::cli::args::{Command, CredAction, HostAction};
 use sshrack_core::config::path as config_path;
+use sshrack_core::config::schema::SecretStore;
 use sshrack_core::config::store as config_store;
 use sshrack_core::error::SshrackError;
 use sshrack_core::frecency;
+use sshrack_core::secret::{OsKeyring, SecretBackend};
 use ulid::Ulid;
 
 pub mod app;
@@ -73,6 +75,17 @@ pub struct ConnectRequest {
     pub source: sshrack_core::credential::PasswordSource,
 }
 
+/// The default store mode to apply when a freshly-loaded config has not chosen
+/// one yet (`store` is `None`). Returns `Keyring` when the OS keyring is
+/// available, so a desktop user lands in the safest mode with zero prompts;
+/// returns `None` when the keyring is absent (headless / no D-Bus), leaving the
+/// config undecided so the existing first-password-save prompt handles it.
+///
+/// Pure: the caller performs the keyring probe and passes the boolean.
+fn auto_default_store_mode(undecided: bool, keyring_available: bool) -> Option<SecretStore> {
+    (undecided && keyring_available).then_some(SecretStore::Keyring)
+}
+
 /// TUI entry point. Returns `Ok(None)` when the user quits without connecting,
 /// `Ok(Some(req))` when the TUI wants `main` to exec ssh after terminal
 /// restore, or `Err` if terminal setup failed.
@@ -89,11 +102,25 @@ pub fn run(cli: &Cli) -> Result<Option<ConnectRequest>, SshrackError> {
     // Load core data before touching the terminal: a load error should reach
     // the user on their normal terminal, not the alternate screen.
     let config_path = config_path::resolve(cli.config.as_deref());
-    let cfg = config_path
+    let mut cfg = config_path
         .as_ref()
         .map(|p| config_store::load(p))
         .transpose()?
         .unwrap_or_default();
+
+    // Auto-default the store mode: if the loaded config is undecided and the
+    // OS keyring is available, adopt keyring silently so a desktop user never
+    // sees the store-undecided state. When the keyring is absent the config
+    // stays undecided and the first password save will prompt (existing path).
+    // Best-effort persist: a write failure is non-fatal — the in-memory mode
+    // is correct for this session and the next credential/host save rewrites
+    // the whole config anyway.
+    if let Some(mode) = auto_default_store_mode(cfg.store.is_none(), OsKeyring.available()) {
+        cfg.store = Some(mode);
+        if let Some(p) = config_path.as_ref() {
+            let _ = config_store::save(p, &cfg);
+        }
+    }
 
     // Best-effort frecency load: a missing/corrupt file is an empty table,
     // never a reason to strand the user.
@@ -295,5 +322,27 @@ mod tests {
             EntryMode::CredWizard { edit_name: Some(n) } if n == "ops"
         ));
         assert_eq!(mode.target_tab(), Tab::Credentials);
+    }
+
+    #[test]
+    fn auto_default_picks_keyring_when_undecided_and_available() {
+        assert_eq!(
+            auto_default_store_mode(true, true),
+            Some(SecretStore::Keyring)
+        );
+    }
+
+    #[test]
+    fn auto_default_never_overrides_a_decided_config() {
+        // A user who explicitly chose plaintext or vault must not be silently
+        // flipped to keyring on the next launch.
+        assert_eq!(auto_default_store_mode(false, true), None);
+    }
+
+    #[test]
+    fn auto_default_none_when_keyring_absent() {
+        // Headless / no D-Bus: stay undecided so the first password save
+        // triggers the existing store-pick prompt.
+        assert_eq!(auto_default_store_mode(true, false), None);
     }
 }
