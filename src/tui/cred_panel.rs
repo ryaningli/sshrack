@@ -158,11 +158,14 @@ impl CredPanel {
 
     /// Render the panel into the shell's panel area (no outer border — the
     /// shell supplies the brand/tab/footer bands around it; the footer is
-    /// hotkey-only now). Splits `area` into `[search(1), list(Fill),
-    /// status(1)]` and renders the search row + ranked list + the shared
-    /// status row at the bottom. Mirrors
+    /// hotkey-only now). Splits `area` into `[boxed search (3), list (Fill),
+    /// status (1)]`: the search row is a bordered box (`parts::draw_search_box`)
+    /// showing `❯ <query>` on the left with the real terminal cursor right
+    /// after the query and a right-aligned `matched/total` count; the ranked
+    /// list fills the middle; the shared status row is rendered at the bottom.
+    /// Mirrors
     /// [`Launcher::draw_in_shell`](super::launcher::Launcher::draw_in_shell):
-    /// same `theme::focus_marker()` selection + real terminal cursor.
+    /// same `theme::focus_marker()` selection + boxed search input.
     pub fn draw_in_shell(
         &self,
         frame: &mut Frame,
@@ -170,24 +173,20 @@ impl CredPanel {
         creds: &[Credential],
         status: &Status,
     ) {
-        let [search_area, list_area, status_area] = Layout::vertical([
-            Constraint::Length(1),
+        let [search_band, list_area, status_area] = Layout::vertical([
+            Constraint::Length(3),
             Constraint::Fill(1),
             Constraint::Length(1),
         ])
         .areas(area);
 
-        // Search row: `❯ <query>` with the real terminal cursor placed right
-        // after the query (no fake cursor glyph — the cursor is the terminal's).
-        let search_line = Line::from(vec![
-            Span::styled("❯ ", Style::new().dim()),
-            Span::raw(&self.query),
-        ]);
-        frame.render_widget(Paragraph::new(search_line), search_area);
-        // Place the terminal cursor right after the query (2-cell `❯ ` prefix).
-        let cursor_x = search_area.x + 2 + self.query.chars().count() as u16;
-        let max_x = search_area.x + search_area.width.saturating_sub(1);
-        frame.set_cursor_position((cursor_x.min(max_x), search_area.y));
+        parts::draw_search_box(
+            frame,
+            search_band,
+            &self.query,
+            self.ranked.len(),
+            creds.len(),
+        );
 
         self.draw_list(frame, list_area, creds);
         parts::draw_status_row(frame, status_area, status);

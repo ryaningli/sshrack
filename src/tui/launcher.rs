@@ -300,12 +300,13 @@ impl Launcher {
 
     /// Render the launcher into the shell's panel area (no outer border — the
     /// shell supplies the brand/tab/footer bands around it; the footer is
-    /// hotkey-only now). Splits `area` into `[search(Length 1), list(Fill),
-    /// status(Length 1)]` and renders the search row + ranked list + the
-    /// shared status row at the bottom via `parts::draw_status_row`. Reuses
-    /// `host_line` / `highlighted_name` / `host_user` / `frecency_tier`. The
-    /// search row places the real terminal cursor at the end of the query via
-    /// `set_cursor_position`.
+    /// hotkey-only now). Splits `area` into `[boxed search (3), list (Fill),
+    /// status (1)]`: the search row is a bordered box (`parts::draw_search_box`)
+    /// showing `❯ <query>` on the left with the real terminal cursor right
+    /// after the query and a right-aligned `matched/total` count; the ranked
+    /// list fills the middle; the shared status row is rendered at the bottom
+    /// via `parts::draw_status_row`. Reuses `host_line` / `highlighted_name` /
+    /// `host_user` / `frecency_tier`.
     ///
     /// Selection styling: the selected row carries `theme::focus_marker(true)`
     /// (a Cyan `▶ `) as its first span and is rendered `BOLD`; every other row
@@ -322,24 +323,20 @@ impl Launcher {
         credentials: &[Credential],
         status: &Status,
     ) {
-        let [search_area, list_area, status_area] = Layout::vertical([
-            Constraint::Length(1),
+        let [search_band, list_area, status_area] = Layout::vertical([
+            Constraint::Length(3),
             Constraint::Fill(1),
             Constraint::Length(1),
         ])
         .areas(area);
 
-        // Search row: `❯ <query>` with the real terminal cursor placed right
-        // after the query (no fake cursor glyph — the cursor is the terminal's).
-        // (Task 5 replaces this inline row with a boxed input.)
-        let search_line = Line::from(vec![
-            Span::styled("❯ ", Style::new().dim()),
-            Span::raw(&self.query),
-        ]);
-        frame.render_widget(Paragraph::new(search_line), search_area);
-        let cursor_x = search_area.x + 2 + self.query.chars().count() as u16;
-        let max_x = search_area.x + search_area.width.saturating_sub(1);
-        frame.set_cursor_position((cursor_x.min(max_x), search_area.y));
+        parts::draw_search_box(
+            frame,
+            search_band,
+            &self.query,
+            self.ranked.len(),
+            hosts.len(),
+        );
 
         self.draw_list(frame, list_area, hosts, frecency, credentials);
         parts::draw_status_row(frame, status_area, status);

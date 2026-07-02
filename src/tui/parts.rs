@@ -6,10 +6,10 @@
 
 use ratatui::{
     Frame,
-    layout::Rect,
+    layout::{Alignment, Constraint, Layout, Rect},
     style::Style,
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Block, Borders, Padding, Paragraph},
 };
 
 use super::intent::Status;
@@ -24,6 +24,52 @@ pub fn vertical_center(area: Rect, h: u16) -> Rect {
         height: h,
         ..area
     }
+}
+
+/// `matched/total` — always this form, even when unfiltered (then
+/// `matched == total`, e.g. `50/50`). Extracted so the count format is pure and
+/// unit-testable independent of rendering.
+pub fn count_label(matched: usize, total: usize) -> String {
+    format!("{matched}/{total}")
+}
+
+/// Render the search input as a bordered box: `❯ <query>` on the left, the
+/// [`count_label`] right-aligned, both inside a 3-row bordered band (top border,
+/// one content row, bottom border). The terminal cursor is placed right after
+/// the query. `matched` is the filtered (post-query) list length, `total` the
+/// full list length. Callers give this a `Length(3)` band.
+pub fn draw_search_box(frame: &mut Frame, area: Rect, query: &str, matched: usize, total: usize) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().dim())
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let label = count_label(matched, total);
+    let label_w = label.chars().count() as u16;
+    let [prompt_area, count_area] =
+        Layout::horizontal([Constraint::Fill(1), Constraint::Length(label_w)]).areas(inner);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("❯ ", Style::new().dim()),
+            Span::raw(query),
+        ])),
+        prompt_area,
+    );
+    frame.render_widget(
+        Paragraph::new(label)
+            .alignment(Alignment::Right)
+            .style(Style::new().dim()),
+        count_area,
+    );
+
+    // The terminal cursor sits right after the 2-cell `❯ ` prefix, inside the
+    // box's content row. `inner` is already inset by border + padding.
+    let cursor_x = inner.x + 2 + query.chars().count() as u16;
+    let max_x = inner.x + inner.width.saturating_sub(1);
+    frame.set_cursor_position((cursor_x.min(max_x), inner.y));
 }
 
 /// Render the consolidated status as the bottom row of a panel's area: a dim
@@ -46,4 +92,27 @@ pub fn draw_status_row(frame: &mut Frame, area: Rect, status: &Status) {
         None => Line::from(vec![Span::styled("› ", Style::new().dim())]),
     };
     frame.render_widget(Paragraph::new(line), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn count_label_is_matched_slash_total_for_filtered_query() {
+        // A filtered query shows the matched count over the total.
+        assert_eq!(count_label(12, 50), "12/50");
+    }
+
+    #[test]
+    fn count_label_shows_full_count_when_unfiltered() {
+        // Unfiltered: matched == total, still the same `{matched}/{total}` form.
+        assert_eq!(count_label(50, 50), "50/50");
+    }
+
+    #[test]
+    fn count_label_shows_zero_when_nothing_matches() {
+        // A query that matches nothing still shows 0 over the total.
+        assert_eq!(count_label(0, 3), "0/3");
+    }
 }
