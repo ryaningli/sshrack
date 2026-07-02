@@ -33,6 +33,7 @@ pub mod help;
 pub mod intent;
 pub mod launcher;
 pub mod panel;
+pub mod parts;
 pub mod persist;
 pub mod popup;
 pub mod prompt;

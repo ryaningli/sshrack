@@ -201,7 +201,7 @@ impl CredPanel {
                 Paragraph::new(msg)
                     .style(Style::new().dim())
                     .alignment(Alignment::Center),
-                area,
+                super::parts::vertical_center(area, 1),
             );
             return;
         }

@@ -353,7 +353,7 @@ impl Launcher {
     ) {
         if self.ranked.is_empty() {
             let msg = if hosts.is_empty() {
-                "No hosts configured. Press ^a to add one (not yet implemented)."
+                "No hosts configured. Press ^a to add one."
             } else {
                 "No hosts match your query."
             };
@@ -361,7 +361,7 @@ impl Launcher {
                 Paragraph::new(msg)
                     .style(Style::new().dim())
                     .alignment(Alignment::Center),
-                area,
+                super::parts::vertical_center(area, 1),
             );
             return;
         }
