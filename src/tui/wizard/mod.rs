@@ -27,9 +27,14 @@ use ratatui::text::Span;
 use sshrack_core::host::validate_name_chars;
 
 pub mod cred;
+pub mod cred_picker;
 pub mod host;
 
 pub use cred::CredForm;
+// Re-export sits ahead of its first consumer (task 2: host wizard wiring).
+// Remove the allow once task 2 imports these via `super::wizard::CredPicker`.
+#[allow(unused_imports)]
+pub use cred_picker::{CredPicker, PickerOutcome};
 pub use host::HostForm;
 
 // ===========================================================================
