@@ -83,10 +83,7 @@ pub fn tab_key_decision(key: KeyEvent) -> TabKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn press(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
-        KeyEvent::new_with_kind(code, mods, KeyEventKind::Press)
-    }
+    use crate::tui::test_support::press;
 
     #[test]
     fn tab_cycles_forward_backtab_cycles_backward() {
