@@ -26,7 +26,8 @@ use zeroize::Zeroizing;
 use super::super::intent::Outcome;
 use super::super::theme;
 use super::{
-    AuthChoice, AuthKind, Field, HOST_VALUE_COL, SaveError, SecretChoice, validate, value_spans,
+    AuthChoice, AuthKind, CredPicker, Field, HOST_VALUE_COL, PickerOutcome, SaveError,
+    SecretChoice, validate, value_spans,
 };
 use sshrack_core::config::schema::{Auth, CredentialBody, Host};
 
@@ -76,6 +77,10 @@ pub struct HostForm {
     /// The credential names offered by the Reference chooser, in order. The
     /// wizard never resolves these to ids itself — the loop does, at save time.
     pub credential_names: Vec<String>,
+    /// Open fuzzy credential picker (Reference branch). `None` when closed.
+    /// When open, `on_key` routes every key into the picker before the form,
+    /// and `draw_in_dialog` paints the picker overlay over the wizard.
+    pub cred_picker: Option<CredPicker>,
 }
 
 impl std::fmt::Debug for HostForm {
@@ -96,6 +101,7 @@ impl std::fmt::Debug for HostForm {
             .field("core_error", &self.core_error)
             .field("editing", &self.editing)
             .field("orig_id", &self.orig_id)
+            .field("cred_picker", &self.cred_picker)
             .field("credential_names", &self.credential_names)
             .finish()
     }
@@ -120,6 +126,7 @@ impl HostForm {
             editing: false,
             orig_id: None,
             credential_names,
+            cred_picker: None,
         }
     }
 
@@ -186,6 +193,7 @@ impl HostForm {
             editing: true,
             orig_id: Some(host.id),
             credential_names,
+            cred_picker: None,
         }
     }
 
@@ -215,21 +223,23 @@ impl HostForm {
                 AuthChoice::Reference { idx }
             }
         };
-    }
-
-    /// Cycle the credential index within the Reference chooser by `delta`
-    /// (signed), wrapping. No-op when there are no credentials.
-    fn cycle_credential(&mut self, delta: i32) {
-        let n = self.credential_names.len();
-        if n == 0 {
-            return;
+        // Converge focus so toggling auth lands on the new mode's signature
+        // field: Reference → Credential, Independent (from Credential) → User.
+        // Name/Host/Port are common to both modes, so editing them is never
+        // interrupted by an auth toggle; Auth itself also converges to
+        // Credential on the Reference side (the test helper relies on this).
+        match next_kind {
+            AuthKind::Reference => {
+                if !matches!(self.focus, Field::Name | Field::Host | Field::Port) {
+                    self.focus = Field::Credential;
+                }
+            }
+            AuthKind::Independent => {
+                if self.focus == Field::Credential {
+                    self.focus = Field::User;
+                }
+            }
         }
-        let cur = match self.auth_choice {
-            AuthChoice::Reference { idx } => idx,
-            _ => 0,
-        };
-        let next = (cur as i32 + delta).rem_euclid(n as i32) as usize;
-        self.auth_choice = AuthChoice::Reference { idx: next };
     }
 
     /// The currently-selected credential name, if Reference and idx in range.
@@ -303,21 +313,27 @@ impl HostForm {
     }
 
     /// The ordered list of fields the user can navigate to. Reference shows only
-    /// Name/Host/Port/Auth (the user comes from the credential). Independent
-    /// always shows User/Auth/Secret, plus Identity (IdentityKey) or Password
-    /// (Password) — never both, never neither's secret-specific row.
+    /// Name/Host/Port/Auth/Credential (the user comes from the credential).
+    /// Independent always shows User/Auth/Secret, plus Identity (IdentityKey) or
+    /// Password (Password) — never both, never neither's secret-specific row.
+    /// Credential is Reference-only and must be blacklisted in every Independent
+    /// arm (the Independent branch filters with `!matches!`, so omitting it would
+    /// let the Credential row leak through).
     fn reachable_fields(&self) -> Vec<Field> {
         Field::ORDER
             .iter()
             .copied()
             .filter(|f| match self.auth_choice {
-                AuthChoice::Reference { .. } => {
-                    matches!(f, Field::Name | Field::Host | Field::Port | Field::Auth)
-                }
+                AuthChoice::Reference { .. } => matches!(
+                    f,
+                    Field::Name | Field::Host | Field::Port | Field::Auth | Field::Credential
+                ),
                 AuthChoice::Independent => match self.secret_kind {
-                    SecretChoice::None => !matches!(f, Field::Identity | Field::Password),
-                    SecretChoice::IdentityKey => *f != Field::Password,
-                    SecretChoice::Password => *f != Field::Identity,
+                    SecretChoice::None => {
+                        !matches!(f, Field::Credential | Field::Identity | Field::Password)
+                    }
+                    SecretChoice::IdentityKey => !matches!(f, Field::Credential | Field::Password),
+                    SecretChoice::Password => !matches!(f, Field::Credential | Field::Identity),
                 },
             })
             .collect()
@@ -357,9 +373,13 @@ impl HostForm {
     ///   attempt save (validate then signal [`Outcome::SaveHost`]); on
     ///   validation error set `error` and move focus to the bad field.
     /// - `Ctrl-S` → attempt save from any field.
-    /// - `←`/`→` on the auth row → cycle Independent / Reference. `Shift-←`/
-    ///   `Shift-→` on the auth row → cycle the credential list (Reference only).
+    /// - `←`/`→` on the auth row → cycle Independent / Reference.
     /// - `←`/`→` on the secret row → cycle None / Password / IdentityKey.
+    /// - `Enter` on the Credential row → open the fuzzy credential picker
+    ///   (Reference only). While the picker is open it is modal: every key
+    ///   routes into it, `Enter` writes the chosen index back to
+    ///   `AuthChoice::Reference { idx }`, `Esc`/`Ctrl-C` close without changing
+    ///   the selection.
     /// - `Esc` / `Ctrl-C` → cancel back to the launcher.
     ///
     /// [`validate`]: super::validate
@@ -369,8 +389,26 @@ impl HostForm {
         }
         // Any keystroke clears a stale core-level error.
         self.core_error = None;
+
+        // An open credential picker is modal: route every key into it before
+        // the form. `take()` so we can write back to `cred_picker` /
+        // `auth_choice` without fighting the borrow the picker would otherwise
+        // hold on `cred_picker`; on Pending the still-open picker goes back.
+        // Selected writes the chosen credential index back and closes; Cancel
+        // just closes.
+        if let Some(mut picker) = self.cred_picker.take() {
+            match picker.on_key(key) {
+                PickerOutcome::Selected { idx } => {
+                    self.auth_choice = AuthChoice::Reference { idx };
+                }
+                PickerOutcome::Cancel => {}
+                PickerOutcome::Pending => self.cred_picker = Some(picker),
+            }
+            self.error = None;
+            return Outcome::Continue;
+        }
+
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let ctrl_c_only = key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c');
 
         if ctrl_c_only {
@@ -389,6 +427,16 @@ impl HostForm {
                 Outcome::Continue
             }
             KeyCode::Enter => {
+                // The Credential row is a trigger: Enter opens the fuzzy picker
+                // (only when there is at least one credential to pick). It never
+                // advances focus or saves from here.
+                if self.focus == Field::Credential {
+                    if !self.credential_names.is_empty() {
+                        self.cred_picker = Some(CredPicker::new(&self.credential_names));
+                    }
+                    self.error = None;
+                    return Outcome::Continue;
+                }
                 if self.is_last_reachable(self.focus) {
                     self.attempt_save()
                 } else {
@@ -396,29 +444,14 @@ impl HostForm {
                     Outcome::Continue
                 }
             }
-            // Auth row: ←/→ cycle Independent/Reference; Shift-←/→ cycle the
-            // credential list (only meaningful under Reference).
-            KeyCode::Left if self.focus == Field::Auth && !shift => {
+            // Auth row: ←/→ cycle Independent/Reference.
+            KeyCode::Left if self.focus == Field::Auth => {
                 self.cycle_auth(-1);
                 self.error = None;
                 Outcome::Continue
             }
-            KeyCode::Right if self.focus == Field::Auth && !shift => {
+            KeyCode::Right if self.focus == Field::Auth => {
                 self.cycle_auth(1);
-                self.error = None;
-                Outcome::Continue
-            }
-            KeyCode::Left if self.focus == Field::Auth && shift => {
-                if matches!(self.auth_choice, AuthChoice::Reference { .. }) {
-                    self.cycle_credential(-1);
-                }
-                self.error = None;
-                Outcome::Continue
-            }
-            KeyCode::Right if self.focus == Field::Auth && shift => {
-                if matches!(self.auth_choice, AuthChoice::Reference { .. }) {
-                    self.cycle_credential(1);
-                }
                 self.error = None;
                 Outcome::Continue
             }
@@ -459,8 +492,9 @@ impl HostForm {
             Field::User => self.user.push(c),
             Field::Identity => self.identity.push(c),
             Field::Password if self.secret_kind == SecretChoice::Password => self.password.push(c),
-            // Auth / Secret are chooser rows driven by ←/→; no text entry.
-            Field::Auth | Field::Secret | Field::Password => {}
+            // Auth / Credential / Secret are chooser/trigger rows driven by ←/→
+            // or Enter; no text entry.
+            Field::Auth | Field::Credential | Field::Secret | Field::Password => {}
         }
         if Some(self.focus) == self.error.map(SaveError::field) {
             self.error = None;
@@ -488,7 +522,7 @@ impl HostForm {
             Field::Password if self.secret_kind == SecretChoice::Password => {
                 self.password.pop();
             }
-            Field::Auth | Field::Secret | Field::Password => {}
+            Field::Auth | Field::Credential | Field::Secret | Field::Password => {}
         }
         if Some(self.focus) == self.error.map(SaveError::field) {
             self.error = None;
@@ -543,8 +577,9 @@ impl HostForm {
 
         let hint = match self.focus {
             Field::Auth => {
-                "  <- -> cycle Independent/Reference  ·  Shift-<- -> cycle credential  ·  ^s save  ·  Esc cancel"
+                "  <- -> cycle Independent/Reference  ·  Tab next  ·  ^s save  ·  Esc cancel"
             }
+            Field::Credential => "  Enter pick credential  ·  Esc cancel  ·  ^s save",
             Field::Secret => "  <- -> cycle None/Password/IdentityKey  ·  ^s save  ·  Esc cancel",
             _ => "  Tab/up-down next  ·  ^s save  ·  Esc cancel",
         };
@@ -574,7 +609,7 @@ impl HostForm {
             Field::User => self.user.chars().count(),
             Field::Identity => self.identity.chars().count(),
             Field::Password => self.password.chars().count(),
-            Field::Auth | Field::Secret => return None,
+            Field::Auth | Field::Credential | Field::Secret => return None,
         };
         Some((row, offset))
     }
@@ -595,7 +630,7 @@ impl HostForm {
         let focused = self.focus == field;
         let cursor = if focused { "▶ " } else { "  " };
         let label_span = Span::styled(
-            format!("{cursor}{label:>8}: "),
+            format!("{cursor}{label:>9}: "),
             if focused {
                 theme::accent().add_modifier(Modifier::BOLD)
             } else {
@@ -641,13 +676,24 @@ impl HostForm {
                 };
                 let ph = match self.auth_choice {
                     AuthChoice::Independent => Some("<- -> cycle to Reference"),
-                    AuthChoice::Reference { .. } => {
-                        if self.credential_names.is_empty() {
-                            Some("no credentials defined — add one with the cred wizard")
-                        } else {
-                            Some("Shift-<- -> cycle credential")
-                        }
-                    }
+                    AuthChoice::Reference { .. } => Some("<- -> cycle to Independent"),
+                };
+                (v, ph)
+            }
+            Field::Credential => {
+                // Mirror the Auth row's Reference display: the selected name, or
+                // a placeholder when none is chosen / none exist.
+                let v = match &self.auth_choice {
+                    AuthChoice::Reference { idx } => match self.credential_names.get(*idx) {
+                        Some(name) => name.clone(),
+                        None => "<none>".to_string(),
+                    },
+                    AuthChoice::Independent => String::new(),
+                };
+                let ph = if self.credential_names.is_empty() {
+                    Some("no credentials defined — add one with the cred wizard")
+                } else {
+                    Some("Enter to pick")
                 };
                 (v, ph)
             }
@@ -720,7 +766,7 @@ mod tests {
         let mut f = blank_form();
         f.focus = Field::Host;
         f.host_addr = "10.0.0.5".into();
-        // Independent + None: reachable rows are Name(0)/Host(1)/Port(2)/User(3)/Auth(4)/Secret(5).
+        // Independent + None: reachable rows are Name(0)/Host(1)/Port(2)/Auth(3)/User(4)/Secret(5).
         assert_eq!(f.cursor_target(), Some((1, 8)));
     }
 
@@ -744,7 +790,7 @@ mod tests {
         f.secret_kind = SecretChoice::Password;
         f.focus = Field::Password;
         f.password = Zeroizing::new("hunter2".into());
-        // Independent + Password: Name(0)/Host(1)/Port(2)/User(3)/Auth(4)/Secret(5)/Password(6).
+        // Independent + Password: Name(0)/Host(1)/Port(2)/Auth(3)/User(4)/Secret(5)/Password(6).
         assert_eq!(f.cursor_target(), Some((6, 7)));
     }
 
@@ -835,14 +881,14 @@ mod tests {
 
     #[test]
     fn tab_moves_focus_forward_through_independent_none_rows() {
-        // Independent + None: Name→Host→Port→User→Auth→Secret, then wraps.
+        // Independent + None: Name→Host→Port→Auth→User→Secret, then wraps.
         let mut f = blank_form();
         assert_eq!(f.focus, Field::Name);
         for next in [
             Field::Host,
             Field::Port,
-            Field::User,
             Field::Auth,
+            Field::User,
             Field::Secret,
         ] {
             f.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
@@ -858,7 +904,9 @@ mod tests {
         let mut f = blank_form();
         f.focus = Field::Auth;
         f.on_key(press(KeyCode::BackTab, KeyModifiers::SHIFT));
-        assert_eq!(f.focus, Field::User);
+        // Independent + None order: Name(0)/Host(1)/Port(2)/Auth(3)/User(4)/Secret(5);
+        // BackTab from Auth(3) lands on Port(2).
+        assert_eq!(f.focus, Field::Port);
     }
 
     #[test]
@@ -1036,6 +1084,9 @@ mod tests {
         assert_eq!(f.auth_choice, AuthChoice::Independent);
         f.on_key(press(KeyCode::Right, KeyModifiers::NONE));
         assert!(matches!(f.auth_choice, AuthChoice::Reference { .. }));
+        // cycle_auth converged focus to Credential; reset to Auth to test the
+        // wrap-around cycle (Right on the Credential row does not cycle auth).
+        f.focus = Field::Auth;
         f.on_key(press(KeyCode::Right, KeyModifiers::NONE));
         assert_eq!(f.auth_choice, AuthChoice::Independent);
     }
@@ -1049,46 +1100,110 @@ mod tests {
     }
 
     #[test]
-    fn shift_arrow_on_reference_cycles_the_credential_list() {
-        // Shift-←/Shift-→ cycle the credential list when the kind is Reference.
-        let mut f = complete_form();
-        f.credential_names = vec!["a".into(), "b".into(), "c".into()];
-        f.focus = Field::Auth;
-        f.auth_choice = AuthChoice::Reference { idx: 0 };
-        f.on_key(press(KeyCode::Right, KeyModifiers::SHIFT));
-        assert_eq!(f.selected_credential_name(), Some("b"));
-        f.on_key(press(KeyCode::Right, KeyModifiers::SHIFT));
-        assert_eq!(f.selected_credential_name(), Some("c"));
-        // Wraps.
-        f.on_key(press(KeyCode::Right, KeyModifiers::SHIFT));
-        assert_eq!(f.selected_credential_name(), Some("a"));
-        f.on_key(press(KeyCode::Left, KeyModifiers::SHIFT));
-        assert_eq!(f.selected_credential_name(), Some("c"));
-    }
-
-    #[test]
-    fn shift_arrow_off_reference_kind_is_a_noop() {
-        // Shift-←/Shift-→ on Independent do nothing (no credential to cycle);
-        // they must NOT cycle the auth kind.
-        let mut f = complete_form();
-        f.credential_names = vec!["a".into()];
-        f.focus = Field::Auth;
-        assert_eq!(f.auth_choice, AuthChoice::Independent);
-        f.on_key(press(KeyCode::Right, KeyModifiers::SHIFT));
-        assert_eq!(
-            f.auth_choice,
-            AuthChoice::Independent,
-            "shift must not cycle kind"
-        );
-    }
-
-    #[test]
     fn left_right_off_auth_row_are_ignored_for_cycling() {
         // On the Name row, Left/Right do NOT cycle auth.
         let mut f = complete_form();
         f.focus = Field::Name;
         f.on_key(press(KeyCode::Right, KeyModifiers::NONE));
         assert_eq!(f.auth_choice, AuthChoice::Independent);
+    }
+
+    // ---- credential picker wiring (Reference branch) ----
+
+    fn ref_form(names: &[&str]) -> HostForm {
+        // A Reference-form host: switch Auth to Reference so the Credential row
+        // is reachable. Focus starts on Credential.
+        let mut f = HostForm::new_add(names.iter().map(|s| s.to_string()).collect());
+        f.name = "h".into();
+        f.host_addr = "10.0.0.5".into();
+        // Cycle Auth Independent -> Reference, then focus the Credential row.
+        f.focus = Field::Auth;
+        let _ = f.on_key(press(KeyCode::Right, KeyModifiers::NONE));
+        assert!(matches!(f.auth_choice, AuthChoice::Reference { .. }));
+        assert_eq!(
+            f.focus,
+            Field::Credential,
+            "cycle_auth converged focus to Credential"
+        );
+        f
+    }
+
+    #[test]
+    fn credential_row_enter_opens_picker_when_credentials_exist() {
+        let mut f = ref_form(&["web-prod", "db"]);
+        assert!(f.cred_picker.is_none());
+        let _ = f.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            f.cred_picker.is_some(),
+            "Enter on Credential opened the picker"
+        );
+    }
+
+    #[test]
+    fn credential_row_enter_is_a_noop_when_no_credentials() {
+        let mut f = ref_form(&[]);
+        let _ = f.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            f.cred_picker.is_none(),
+            "no picker when there is nothing to pick"
+        );
+    }
+
+    #[test]
+    fn picker_select_writes_back_the_credential_index() {
+        let mut f = ref_form(&["web-prod", "db-staging", "web-dev"]);
+        let _ = f.on_key(press(KeyCode::Enter, KeyModifiers::NONE)); // open
+        // ranked at empty query = [1,2,0] (name order: db-staging, web-dev, web-prod);
+        // cursor at 0 → idx 1 (db-staging). Enter selects it.
+        let _ = f.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(f.cred_picker.is_none(), "picker closed after selecting");
+        assert_eq!(f.selected_credential_name(), Some("db-staging"));
+    }
+
+    #[test]
+    fn picker_escape_closes_without_changing_selection() {
+        let mut f = ref_form(&["web-prod", "db-staging"]);
+        // Pre-set an existing reference idx so we can prove Esc leaves it alone.
+        f.auth_choice = AuthChoice::Reference { idx: 0 }; // web-prod
+        let _ = f.on_key(press(KeyCode::Enter, KeyModifiers::NONE)); // open
+        let _ = f.on_key(press(KeyCode::Down, KeyModifiers::NONE)); // move cursor
+        let _ = f.on_key(press(KeyCode::Esc, KeyModifiers::NONE)); // cancel
+        assert!(f.cred_picker.is_none());
+        assert_eq!(
+            f.selected_credential_name(),
+            Some("web-prod"),
+            "Esc did not change the choice"
+        );
+    }
+
+    #[test]
+    fn credential_row_has_no_text_cursor() {
+        let mut f = ref_form(&["web-prod"]);
+        f.focus = Field::Credential;
+        assert_eq!(f.cursor_target(), None);
+    }
+
+    #[test]
+    fn independent_branch_never_renders_the_credential_row() {
+        // The Independent branch filters with a blacklist, so Credential must
+        // be explicitly excluded — pin that across all three secret kinds.
+        let mut f = HostForm::new_add(vec!["web-prod".into()]);
+        f.name = "h".into();
+        f.host_addr = "10.0.0.5".into();
+        assert!(
+            !f.reachable_fields().contains(&Field::Credential),
+            "Independent+None"
+        );
+        f.secret_kind = SecretChoice::Password;
+        assert!(
+            !f.reachable_fields().contains(&Field::Credential),
+            "Independent+Password"
+        );
+        f.secret_kind = SecretChoice::IdentityKey;
+        assert!(
+            !f.reachable_fields().contains(&Field::Credential),
+            "Independent+IdentityKey"
+        );
     }
 
     // ---- secret chooser cycling ----

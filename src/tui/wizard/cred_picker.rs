@@ -37,11 +37,6 @@ pub struct CredPicker {
     pub ranked: Vec<usize>,
 }
 
-// The picker is a pure state machine landed ahead of its host-wizard wiring
-// (task 2: host wizard Credential row + picker routing). Until that wiring
-// lands, the binary build has no production caller, so suppress dead_code for
-// the impl + types. Remove these allows once task 2 references them.
-#[allow(dead_code)]
 impl CredPicker {
     /// Fresh picker over `names`: empty query, cursor at the top, every name
     /// ranked (name order, since scores are all zero). Clones `names` so the

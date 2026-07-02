@@ -31,9 +31,6 @@ pub mod cred_picker;
 pub mod host;
 
 pub use cred::CredForm;
-// Re-export sits ahead of its first consumer (task 2: host wizard wiring).
-// Remove the allow once task 2 imports these via `super::wizard::CredPicker`.
-#[allow(unused_imports)]
 pub use cred_picker::{CredPicker, PickerOutcome};
 pub use host::HostForm;
 
@@ -94,6 +91,10 @@ pub enum Field {
     Port,
     User,
     Auth,
+    /// Pick which `[[credentials]]` entry this host reuses (Reference branch
+    /// only). A trigger row: `Enter` opens the fuzzy credential picker overlay,
+    /// not a text field. Unreachable under Independent.
+    Credential,
     Secret,
     Identity,
     Password,
@@ -105,8 +106,9 @@ impl Field {
         Field::Name,
         Field::Host,
         Field::Port,
-        Field::User,
         Field::Auth,
+        Field::Credential,
+        Field::User,
         Field::Secret,
         Field::Identity,
         Field::Password,
@@ -121,6 +123,7 @@ impl Field {
             Field::Port => "Port",
             Field::User => "User",
             Field::Auth => "Auth",
+            Field::Credential => "Credential",
             Field::Secret => "Secret",
             Field::Identity => "Identity",
             Field::Password => "Password",
@@ -345,10 +348,10 @@ pub(super) fn value_spans(value: &str, placeholder: Option<&str>) -> Vec<Span<'s
 }
 
 /// Column where the editable value begins within a rendered field row:
-/// `"▶ " (2) + right-aligned label + ": " (2)`. Host and credential labels are
-/// both padded to 8 (the longest host label is `Identity`/`Password` = 8).
-/// Used by each form's `draw` to place the terminal cursor.
-pub(super) const HOST_VALUE_COL: u16 = 2 + 8 + 2;
+/// `"▶ " (2) + right-aligned label + ": " (2)`. Host labels are padded to 9
+/// (the longest host label is `Credential` = 9); credential-wizard labels stay
+/// 8. Used by each form's `draw` to place the terminal cursor.
+pub(super) const HOST_VALUE_COL: u16 = 2 + 9 + 2;
 pub(super) const CRED_VALUE_COL: u16 = 2 + 8 + 2;
 
 #[cfg(test)]
@@ -408,6 +411,7 @@ mod tests {
         assert_eq!(Field::Port.label(), "Port");
         assert_eq!(Field::User.label(), "User");
         assert_eq!(Field::Auth.label(), "Auth");
+        assert_eq!(Field::Credential.label(), "Credential");
         assert_eq!(Field::Secret.label(), "Secret");
         assert_eq!(Field::Identity.label(), "Identity");
         assert_eq!(Field::Password.label(), "Password");
