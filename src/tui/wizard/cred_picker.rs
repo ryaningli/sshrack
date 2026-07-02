@@ -4,7 +4,7 @@
 //! original indices, and delegates matching to [`crate::tui::panel::rank_by_name`]
 //! (all-zero scores — credentials have no frecency). Pure: no I/O, so the whole
 //! state machine is unit-testable without a terminal. Rendering lives in
-//! [`CredPicker::draw_overlay`] (added in a later task).
+//! [`CredPicker::draw_overlay`].
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
