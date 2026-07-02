@@ -34,6 +34,7 @@ pub mod panel;
 pub mod persist;
 pub mod popup;
 pub mod prompt;
+pub mod run_loop;
 pub mod settings;
 pub mod shell;
 pub mod store;
@@ -45,8 +46,9 @@ pub mod wizard;
 #[cfg(test)]
 mod test_support;
 
-pub use app::{App, run_loop};
+pub use app::App;
 pub use intent::{Outcome, Overlay, Status};
+pub use run_loop::run_loop;
 pub use term::{TerminalGuard, TerminalHandle, Tui};
 
 /// Reverse lookup from a credential ULID to its display name, built once at
