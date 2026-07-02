@@ -462,19 +462,17 @@ Update `reachable_fields` so the Reference branch includes `Field::Credential`, 
             },
 ```
 
-In `cycle_auth`, after the `self.auth_choice = match next_kind { ... }` assignment, converge `focus` onto a reachable field so the cursor never sits on a now-unreachable row. Append before the method's closing brace:
+In `cycle_auth`, after the `self.auth_choice = match next_kind { ... }` assignment, converge `focus` so toggling auth never leaves the cursor on an unreachable (or now-less-relevant) row. The rule: landing on Reference moves focus to `Credential` (its distinctive field) unless the user was editing a field shared by both modes; landing on Independent from `Credential` moves to `User`. Append before the method's closing brace:
 
 ```rust
-        // Converge focus onto a field reachable in the new mode: switching to
-        // Reference from an Independent-only row (User/Secret/Identity/Password)
-        // lands on Credential; switching to Independent from Credential lands
-        // on User. (Auth/Name/Host/Port are reachable in both, so they stay.)
+        // Converge focus so toggling auth lands on the new mode's signature
+        // field: Reference → Credential, Independent (from Credential) → User.
+        // Name/Host/Port are common to both modes, so editing them is never
+        // interrupted by an auth toggle; Auth itself also converges to
+        // Credential on the Reference side (the test helper relies on this).
         match next_kind {
             AuthKind::Reference => {
-                if matches!(
-                    self.focus,
-                    Field::User | Field::Secret | Field::Identity | Field::Password
-                ) {
+                if !matches!(self.focus, Field::Name | Field::Host | Field::Port) {
                     self.focus = Field::Credential;
                 }
             }
@@ -711,38 +709,26 @@ pub fn render_popup<W: Widget>(frame: &mut Frame, title: &str, body: W) -> Rect 
 }
 ```
 
-Add a test asserting the returned rect sits inside the centered popup:
+Add a test asserting the returned rect sits inside the centered popup. Single draw captures the rect via the closure; `render_popup` and `centered_rect` are in scope through the test module's existing `use super::*` — use them WITHOUT a `popup::` prefix:
 
 ```rust
     #[test]
     fn render_popup_returns_inner_content_rect() {
         let backend = TestBackend::new(100, 40);
         let mut term = Terminal::new(backend).unwrap();
-        let content = term
-            .draw(|f| popup::render_popup(f, "Title", Paragraph::new("body")))
-            .map(|_| ())
-            .and_then(|_| {
-                // Re-run to capture the returned rect (draw consumes the closure).
-                Ok::<(), std::io::Error>(())
-            });
-        let _ = content;
-        // Re-draw purely to read the returned rect via a second call.
-        let rect = {
-            let mut captured = None;
-            let _ = term.draw(|f| {
-                captured = Some(popup::render_popup(f, "Title", Paragraph::new("body")));
-            });
-            captured.unwrap()
-        };
+        let mut captured = None;
+        let _ = term.draw(|f| {
+            captured = Some(render_popup(f, "Title", Paragraph::new("body")));
+        });
+        let rect = captured.unwrap();
         let screen = Rect::new(0, 0, 100, 40);
         let popup = centered_rect(screen);
-        assert!(rect.x >= popup.x && rect.x + rect.width <= popup.x + popup.width);
-        assert!(rect.y >= popup.y && rect.y + rect.height <= popup.y + popup.height);
-        assert!(rect.height <= popup.height);
+        assert!(rect.x >= popup.x);
+        assert!(rect.x + rect.width <= popup.x + popup.width);
+        assert!(rect.y >= popup.y);
+        assert!(rect.y + rect.height <= popup.y + popup.height);
     }
 ```
-
-(If the double-draw reads awkwardly, simplify to a single draw that captures the rect in a local `Option<Rect>` via the closure — the point is to assert the returned rect is bounded by `centered_rect`.)
 
 - [ ] **Step 2: Write the failing test for `draw_overlay` (RED)**
 
