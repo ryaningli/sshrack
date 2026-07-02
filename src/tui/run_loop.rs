@@ -21,7 +21,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyEvent};
+use crossterm::event::{self, Event};
 use sshrack_core::error::SshrackError;
 use sshrack_core::secret::PassphraseProvider;
 
@@ -35,14 +35,6 @@ use super::persist::{
 };
 use super::prompt::TuiPassphrase;
 use super::term::{TerminalHandle, Tui};
-
-/// A synthetic `Enter` Press event, used by [`App::primary_action`] to drive
-/// the launcher's `on_key` (which already owns the Enter→`pending_connect`→
-/// `ConnectRequested` logic) without re-implementing it.
-pub(crate) fn enter_press() -> KeyEvent {
-    use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
-    KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Press)
-}
 
 /// Blocking event loop. Renders `app`, polls crossterm for key events, and
 /// dispatches each key through [`App::on_key`]. Returns `Some(req)` when the

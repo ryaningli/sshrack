@@ -18,7 +18,6 @@ use super::dialog::draw_dialog;
 use super::help::draw_help_dialog;
 use super::intent::{Outcome, Overlay, Status};
 use super::launcher::Launcher;
-use super::run_loop::enter_press;
 use super::settings::SettingsPanel;
 use super::shell::draw_shell;
 use super::store::StoreView;
@@ -92,6 +91,14 @@ pub struct App {
     /// credential's name is captured here (not its id) because the core delete
     /// fn is name-keyed and the panel's cursor already resolved to a name.
     pub(super) pending_delete_cred: Option<String>,
+}
+
+/// A synthetic `Enter` Press event, used by [`App::primary_action`] to drive
+/// the launcher's `on_key` (which already owns the Enter→`pending_connect`→
+/// `ConnectRequested` logic) without re-implementing it.
+fn enter_press() -> KeyEvent {
+    use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+    KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Press)
 }
 
 impl App {
