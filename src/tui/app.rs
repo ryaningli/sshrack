@@ -94,6 +94,13 @@ pub struct App {
     /// credential's name is captured here (not its id) because the core delete
     /// fn is name-keyed and the panel's cursor already resolved to a name.
     pub(super) pending_delete_cred: Option<String>,
+    /// Vertical scroll offset of the Help overlay, in lines. Reset to 0 each
+    /// time Help opens (so reopening lands at the top). Bumped by ↑↓/j/k/PgUp/
+    /// PgDn while Help is the active overlay, clamped to
+    /// [`help::max_scroll`][super::help::max_scroll] of the largest Help body
+    /// (MAX_H − 3) so the offset can never scroll past the last line on a
+    /// full-size dialog; the renderer re-clamps per render for shorter screens.
+    pub help_scroll: u16,
 }
 
 /// A synthetic `Enter` Press event, used by [`App::primary_action`] to drive
@@ -134,6 +141,7 @@ impl App {
             pending_connect: None,
             pending_delete: None,
             pending_delete_cred: None,
+            help_scroll: 0,
         }
     }
 
@@ -503,8 +511,48 @@ impl App {
                 self.overlay = None;
                 return Outcome::CloseOverlay;
             }
+            // Reopen at the top so a prior scroll position does not carry over
+            // across close/reopen cycles.
+            self.help_scroll = 0;
             self.overlay = Some(Overlay::Help);
             return Outcome::OpenOverlay(Overlay::Help);
+        }
+
+        // Layer 1.5 — when the Help overlay is up, scroll keys (↑↓/j/k/PgUp/
+        // PgDn) bump `help_scroll` and short-circuit BEFORE the generic overlay
+        // close path below. F1 already closed Help via the Layer 1 toggle above;
+        // Esc / q fall through to `route_overlay`'s Help arm so dismiss still
+        // works. Up/Down here MUST NOT navigate panel fields — Help owns them.
+        if key.kind == KeyEventKind::Press
+            && self
+                .overlay
+                .as_ref()
+                .is_some_and(|o| matches!(o, Overlay::Help))
+        {
+            // Largest body a Help dialog can take (MAX_H minus border(2) and
+            // footer(1)); max_scroll of it is the smallest "hidden lines" value
+            // across screen sizes, so the offset can never scroll past the last
+            // line on the tallest dialog.
+            let m = crate::tui::help::max_scroll(crate::tui::dialog::MAX_H - 3);
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.help_scroll = self.help_scroll.saturating_add(1).min(m);
+                    return Outcome::Continue;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.help_scroll = self.help_scroll.saturating_sub(1);
+                    return Outcome::Continue;
+                }
+                KeyCode::PageDown => {
+                    self.help_scroll = self.help_scroll.saturating_add(5).min(m);
+                    return Outcome::Continue;
+                }
+                KeyCode::PageUp => {
+                    self.help_scroll = self.help_scroll.saturating_sub(5);
+                    return Outcome::Continue;
+                }
+                _ => {} // Esc / q / other keys fall through to the overlay path.
+            }
         }
 
         // Layer 2 — an open overlay owns the key. take() it so we can borrow
@@ -881,7 +929,7 @@ impl App {
     /// empty dialog (the loop drives their confirm popups).
     fn draw_overlay(&self, frame: &mut Frame, ov: &Overlay) {
         match ov {
-            Overlay::Help => draw_help_dialog(frame),
+            Overlay::Help => draw_help_dialog(frame, self.help_scroll),
             Overlay::HostWizard(form) => {
                 let body = draw_dialog(
                     frame,
@@ -1617,6 +1665,143 @@ mod tests {
             matches!(app.overlay(), Some(Overlay::Help)),
             "release must not dismiss help"
         );
+    }
+
+    // ===============================================================
+    // Task 4: Help overlay scroll keys (↑↓/j/k/PgUp/PgDn).
+    // ===============================================================
+
+    #[test]
+    fn f1_opening_help_resets_scroll_to_zero() {
+        // Reopening Help lands at the top even if a prior session scrolled down.
+        let mut app = app_with_host("web");
+        app.help_scroll = 7; // simulate leftover state from a prior open
+        let outcome = app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
+        assert!(matches!(outcome, Outcome::OpenOverlay(Overlay::Help)));
+        assert_eq!(app.help_scroll, 0, "F1 must reopen Help at the top");
+    }
+
+    #[test]
+    fn help_down_increments_scroll_and_keeps_overlay_open() {
+        let mut app = app_with_host("web");
+        app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
+        let outcome = app.on_key(press(KeyCode::Down, KeyModifiers::NONE));
+        assert!(matches!(outcome, Outcome::Continue));
+        assert!(matches!(app.overlay(), Some(Overlay::Help)));
+        assert_eq!(app.help_scroll, 1);
+    }
+
+    #[test]
+    fn help_j_increments_scroll_like_down() {
+        let mut app = app_with_host("web");
+        app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
+        let outcome = app.on_key(press(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert!(matches!(outcome, Outcome::Continue));
+        assert_eq!(app.help_scroll, 1);
+    }
+
+    #[test]
+    fn help_up_at_zero_saturates_to_zero() {
+        let mut app = app_with_host("web");
+        app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
+        let outcome = app.on_key(press(KeyCode::Up, KeyModifiers::NONE));
+        assert!(matches!(outcome, Outcome::Continue));
+        assert_eq!(app.help_scroll, 0, "Up at the top must saturate, not panic");
+    }
+
+    #[test]
+    fn help_k_after_j_decrements_scroll_like_up() {
+        let mut app = app_with_host("web");
+        app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
+        app.on_key(press(KeyCode::Char('j'), KeyModifiers::NONE));
+        app.on_key(press(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.help_scroll, 2);
+        app.on_key(press(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(app.help_scroll, 1);
+    }
+
+    #[test]
+    fn help_page_down_jumps_five_then_clamps_to_max() {
+        // max_scroll(MAX_H − 3) = max_scroll(21) = 31 − 21 = 10.
+        let mut app = app_with_host("web");
+        app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
+        // PgDn from 0 → 5.
+        app.on_key(press(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.help_scroll, 5);
+        // PgDn from 5 → 10 (clamped from 10).
+        app.on_key(press(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.help_scroll, 10);
+        // PgDn past the cap stays at 10 — no overflow, no scroll past the end.
+        app.on_key(press(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.help_scroll, 10);
+    }
+
+    #[test]
+    fn help_page_up_after_page_down_decrements_five_saturating() {
+        let mut app = app_with_host("web");
+        app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
+        app.on_key(press(KeyCode::PageDown, KeyModifiers::NONE));
+        app.on_key(press(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.help_scroll, 10);
+        // PgUp from 10 → 5.
+        app.on_key(press(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(app.help_scroll, 5);
+        // PgUp from 5 → 0 (saturating).
+        app.on_key(press(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(app.help_scroll, 0);
+    }
+
+    #[test]
+    fn help_down_does_not_clamp_below_page_down_cap() {
+        // Single-step Down also clamps to the same cap as PageDown (10). Pin the
+        // shared ceiling so the two paths never disagree.
+        let mut app = app_with_host("web");
+        app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
+        for _ in 0..20 {
+            app.on_key(press(KeyCode::Down, KeyModifiers::NONE));
+        }
+        assert_eq!(app.help_scroll, 10, "Down must clamp at max_scroll");
+    }
+
+    #[test]
+    fn help_scroll_keys_do_not_dismiss_overlay() {
+        // Scrolling must NOT close Help — only F1/Esc/q do. After a down/up
+        // cycle the overlay is still Help and help_scroll is back at 0.
+        let mut app = app_with_host("web");
+        app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
+        app.on_key(press(KeyCode::Down, KeyModifiers::NONE));
+        app.on_key(press(KeyCode::Char('j'), KeyModifiers::NONE));
+        app.on_key(press(KeyCode::PageDown, KeyModifiers::NONE));
+        assert!(matches!(app.overlay(), Some(Overlay::Help)));
+        // F1 still dismisses after scrolling (Layer 1 toggle path).
+        let outcome = app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
+        assert!(matches!(outcome, Outcome::CloseOverlay));
+        assert!(app.overlay().is_none());
+    }
+
+    #[test]
+    fn help_esc_still_closes_after_scrolling() {
+        // Esc must reach the dismiss path even after scrolling. The scroll
+        // handler's `_` arm falls through to route_overlay's Help arm.
+        let mut app = app_with_host("web");
+        app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
+        app.on_key(press(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.help_scroll, 5);
+        let outcome = app.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(outcome, Outcome::CloseOverlay));
+        assert!(app.overlay().is_none());
+    }
+
+    #[test]
+    fn help_q_still_closes_after_scrolling() {
+        // The existing q-dismiss path must survive the scroll handler (q is not
+        // j/k, so it falls through).
+        let mut app = app_with_host("web");
+        app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
+        app.on_key(press(KeyCode::Down, KeyModifiers::NONE));
+        let outcome = app.on_key(press(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(matches!(outcome, Outcome::CloseOverlay));
+        assert!(app.overlay().is_none());
     }
 
     #[test]

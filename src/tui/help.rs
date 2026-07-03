@@ -73,30 +73,42 @@ fn help_lines() -> Vec<Line<'static>> {
     ]
 }
 
+/// Max scroll offset that still shows the last help line, given the body
+/// height the dialog actually got. Returns 0 when the body fits every line;
+/// otherwise the number of lines hidden past the bottom. Pure: consumed by
+/// [`App::on_key`][super::app::App::on_key] to clamp `help_scroll`, and by
+/// [`draw_help_dialog`] to clamp the render-side scroll.
+pub fn max_scroll(body_height: u16) -> u16 {
+    let lines = help_lines().len() as u16;
+    lines.saturating_sub(body_height)
+}
+
 /// Render the help overlay as a centered dialog: a titled bordered area with a
-/// `F1/Esc · close` hotkey footer, and the keymap reference left-aligned in the
-/// body. Pure render — no I/O, no key handling.
-pub fn draw_help_dialog(frame: &mut Frame) {
-    // 31 lines today -> clamps to MAX_H; Task 4 will add scrolling for the
-    // overflow. Pass the real count rather than a hardcoded 0 so the clamp
-    // kicks in deterministically.
+/// `↑↓ · scroll` + `F1/Esc · close` hotkey footer, and the keymap reference
+/// left-aligned in the body. The body is scrolled by `scroll` rows (clamped to
+/// [`max_scroll`] of the rendered body height so it never scrolls past the last
+/// line). Pure render — no I/O, no key handling.
+pub fn draw_help_dialog(frame: &mut Frame, scroll: u16) {
     let body = draw_dialog(
         frame,
-        "help",
+        " help ",
         help_lines().len() as u16,
-        &[("F1/Esc", "close")],
+        &[("↑↓", "scroll"), ("F1/Esc", "close")],
     );
-    let paragraph = Paragraph::new(help_lines());
-    frame.render_widget(paragraph, body);
+    let lines = help_lines();
+    let clamped = scroll.min(max_scroll(body.height));
+    frame.render_widget(Paragraph::new(lines).scroll((clamped, 0)), body);
 }
 
 #[cfg(test)]
 mod tests {
     //! The overlay is pure render; the only logic worth pinning is that
-    //! `help_lines()` documents every surface, keeps the dismiss hint, and drops
-    //! the removed bindings (`c` / `Shift-C` / `F2` / `?`).
+    //! `help_lines()` documents every surface, keeps the dismiss hint, drops
+    //! the removed bindings (`c` / `Shift-C` / `F2` / `?`), and that
+    //! `max_scroll` + `draw_help_dialog` clamp scroll without panicking.
 
     use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
 
     #[test]
     fn help_lines_cover_every_surface_and_dismiss_hint() {
@@ -156,5 +168,50 @@ mod tests {
             !joined.contains("\n  c             "),
             "bare c add-credential binding removed"
         );
+    }
+
+    #[test]
+    fn max_scroll_is_zero_when_body_fits_all_lines() {
+        // 31 help lines fit in a 40-row body → no scroll needed.
+        assert_eq!(max_scroll(40), 0);
+    }
+
+    #[test]
+    fn max_scroll_is_excess_lines_when_body_too_short() {
+        // 31 lines in a 21-row body → 10 lines hidden, scroll 10 to reveal the
+        // last one.
+        assert_eq!(max_scroll(21), 10);
+    }
+
+    #[test]
+    fn max_scroll_is_zero_when_body_exceeds_line_count() {
+        // Body taller than the line list → still 0 (never scroll past the end).
+        assert_eq!(max_scroll(100), 0);
+    }
+
+    #[test]
+    fn draw_help_dialog_renders_without_panic_and_clamps_scroll() {
+        // Render at a typical terminal size. A `scroll` value larger than the
+        // body's max (10 for a 21-row body) must be silently clamped by
+        // `draw_help_dialog` — no panic, no overflow.
+        let backend = TestBackend::new(100, 40);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            draw_help_dialog(f, 999);
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn draw_help_dialog_renders_without_panic_on_short_screen() {
+        // A short terminal shrinks the dialog body, which changes max_scroll.
+        // The renderer must still not panic for any scroll value.
+        let backend = TestBackend::new(80, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            draw_help_dialog(f, 0);
+            draw_help_dialog(f, 50);
+        })
+        .unwrap();
     }
 }

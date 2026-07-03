@@ -16,7 +16,10 @@ use crate::tui::theme;
 /// Maximum dialog footprint. On larger terminals the dialog holds at this size
 /// rather than growing; on smaller ones it clamps down (see [`dialog_area`]).
 const MAX_W: u16 = 80;
-const MAX_H: u16 = 24;
+/// Max dialog outer height. `pub(crate)` so the Help scroll-key path in
+/// [`app`][super::app] can derive the largest possible Help body (MAX_H minus
+/// border+footer) and clamp `help_scroll` to the matching [`max_scroll`][super::help::max_scroll].
+pub(crate) const MAX_H: u16 = 24;
 
 /// Centered, content-fit dialog rect inside `screen`. The outer height is
 /// `body_rows + 2 (border) + 1 (footer)`, clamped down to [`MAX_H`] and to the
