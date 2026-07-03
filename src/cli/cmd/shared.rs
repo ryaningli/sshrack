@@ -386,25 +386,26 @@ mod tests {
     }
 
     #[test]
-    fn resolve_inline_identity_reads_private_and_cert_from_stdin() {
-        // --identity-stdin --certificate-stdin: the helper reads both from
-        // stdin in source order (private first, then certificate).
+    fn resolve_inline_identity_stdin_consumes_whole_stream_for_private_key() {
+        // --identity-stdin reads the ENTIRE stdin stream into the private key.
+        // There is no way to frame two separate reads (private then certificate)
+        // off one stdin handle: the second read would hit EOF and yield an empty
+        // certificate, silently corrupting the key. That is why clap rejects
+        // `--identity-stdin` together with `--certificate-stdin` at parse time
+        // (see the args.rs conflict tests) — a certificate via stdin must pair
+        // with `--identity-file <path>`, a separate stream. This helper-level
+        // test pins the contract that the private-stdin branch consumes stdin
+        // in full, so the helper's behavior matches the reason the combo is
+        // blocked upstream.
         let mut cursor = Cursor::new("PRIVATE-KEY-TEXT\nCERT-MATERIAL");
-        // We can't separate two stdin reads from one cursor cleanly here; the
-        // real CLI consumes stdin once per flag. The helper contract is "read
-        // private first, then certificate" — a single cursor would yield the
-        // whole stream to private. The handler tests below cover the per-flag
-        // behavior; here we only assert the private branch consumes stdin.
         let ik = resolve_inline_identity(true, None, false, None, &mut cursor)
             .unwrap()
             .expect("inline source present");
-        // The first read consumed the whole stream (no flag separator), so the
-        // private key text is the entire input. This pins the contract that
-        // stdin is read once per flag, NOT merged.
         assert_eq!(
             ik.private_key.as_ref().and_then(Secret::as_plain),
             Some("PRIVATE-KEY-TEXT\nCERT-MATERIAL")
         );
+        assert!(ik.certificate.is_none());
     }
 
     #[test]
