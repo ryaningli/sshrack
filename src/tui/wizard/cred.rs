@@ -25,7 +25,7 @@ use super::{
     bracketed, insert_char_at, validate_cred, value_spans,
 };
 use crate::tui::fit::truncate_cells;
-use sshrack_core::config::schema::{Credential, CredentialBody};
+use sshrack_core::config::schema::{Credential, CredentialBody, KeySource};
 
 /// The credential form's editable state. The password is held as a
 /// [`Zeroizing<String>`] so the plaintext is wiped on drop; it is rendered
@@ -66,6 +66,13 @@ pub struct CredForm {
     /// it onto the patched credential (preserving the keyring entry). `None` in
     /// add mode.
     pub orig_id: Option<Ulid>,
+    /// The original body's [`KeySource`] when the credential carried a key at
+    /// edit time. The wizard cannot paste-edit inline key text yet (Plan 2), so
+    /// an inline ([`KeySource::Inline`]) original is preserved verbatim when
+    /// the user does not switch the identity field to a new path — silently
+    /// dropping it would destroy the host's only secret. `None` in add mode
+    /// and when the original had no key.
+    pub orig_key: Option<KeySource>,
 }
 
 impl std::fmt::Debug for CredForm {
@@ -75,6 +82,8 @@ impl std::fmt::Debug for CredForm {
         // derives `Debug` by delegating to `Z`, so the derived impl would
         // otherwise print it. Mirrors the redacting Debug on `config::Secret`.
         // `identity` holds a key file *path*, not key material, so it is safe.
+        // `orig_key` delegates to `KeySource`'s redacting `Debug`, which
+        // surfaces the path but redacts inline key text.
         f.debug_struct("CredForm")
             .field("name", &self.name)
             .field("user", &self.user)
@@ -86,6 +95,7 @@ impl std::fmt::Debug for CredForm {
             .field("core_error", &self.core_error)
             .field("editing", &self.editing)
             .field("orig_id", &self.orig_id)
+            .field("orig_key", &self.orig_key)
             .finish()
     }
 }
@@ -106,6 +116,7 @@ impl CredForm {
             core_error: None,
             editing: false,
             orig_id: None,
+            orig_key: None,
         };
         form.cursor = form.focused_text_len();
         form
@@ -117,14 +128,25 @@ impl CredForm {
     /// itself lives in the keyring and is not surfaced as plaintext here — the
     /// wizard lets the user set a new password to overwrite it, or switch to a
     /// different kind).
+    ///
+    /// The original body's [`KeySource`] (path or inline) is carried into the
+    /// form as `orig_key`. The wizard cannot paste-edit inline key text yet
+    /// (Plan 2), so an inline original is preserved verbatim by
+    /// [`build_body`](Self::build_body) when the identity field is left blank
+    /// — silently dropping it would destroy the credential's only secret.
+    /// `identity` (the editable text field) surfaces only the path of a
+    /// [`KeySource::Path`] original; an inline original renders blank with the
+    /// placeholder shown, and its text is re-attached on save.
     pub fn new_edit(cred: &Credential) -> Self {
         use sshrack_core::config::schema::SecretKind;
         let body = &cred.body;
+        let orig_key = body.key.clone();
         let (secret_kind, identity) = match body.secret_kind() {
             SecretKind::Key => (
                 SecretChoice::IdentityKey,
                 body.key
                     .as_ref()
+                    .and_then(KeySource::as_path)
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_default(),
             ),
@@ -149,6 +171,7 @@ impl CredForm {
             core_error: None,
             editing: true,
             orig_id: Some(cred.id),
+            orig_key,
         };
         form.cursor = form.focused_text_len();
         form
@@ -376,6 +399,14 @@ impl CredForm {
     /// mode after this. An empty password under the Password choice leaves the
     /// password unset (the loop preserves the existing password in edit mode).
     ///
+    /// **Inline-key preservation (Plan 1 stopgap).** Under IdentityKey with the
+    /// editable identity field left blank, the original key is re-attached
+    /// verbatim when it was an inline ([`KeySource::Inline`]) source. Full
+    /// paste-editing of inline key text lands in Plan 2; for now the wizard
+    /// must not destroy the credential's only secret just because the field
+    /// could not display the key text. A path original that was edited to blank
+    /// is treated as "user cleared the field" (no key).
+    ///
     /// [`Secret::Plain`]: sshrack_core::config::schema::Secret::Plain
     pub fn build_body(&self) -> CredentialBody {
         let trimmed_user = self.user.trim().to_string();
@@ -393,6 +424,10 @@ impl CredForm {
                 let mut body = CredentialBody::new(trimmed_user);
                 if !key.is_empty() {
                     body = body.with_key(key);
+                } else if let Some(KeySource::Inline(ik)) = self.orig_key.clone() {
+                    // Field blank AND original was inline: preserve the inline
+                    // material verbatim (Plan 2 will add real paste-editing).
+                    body.key = Some(KeySource::Inline(ik));
                 }
                 body
             }
@@ -606,7 +641,7 @@ mod tests {
     //! chrome. No terminal and no filesystem are touched.
     use super::*;
     use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
-    use sshrack_core::config::schema::{Credential, CredentialBody, SecretKind};
+    use sshrack_core::config::schema::{Credential, CredentialBody, KeySource, SecretKind};
 
     fn press(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new_with_kind(code, mods, KeyEventKind::Press)
@@ -927,7 +962,7 @@ mod tests {
         let b = f.build_body();
         assert_eq!(b.secret_kind(), SecretKind::Key);
         assert_eq!(
-            b.key.as_deref(),
+            b.key.as_ref().and_then(KeySource::as_path),
             Some(std::path::Path::new("/home/me/.ssh/id_ed25519"))
         );
     }
@@ -951,6 +986,55 @@ mod tests {
         f.secret_kind = SecretChoice::Password;
         let b = f.build_body();
         assert_eq!(b.secret_kind(), SecretKind::Default);
+    }
+
+    // ---- inline-key preservation on edit (Plan 1 stopgap) ----
+    //
+    // The wizard cannot paste-edit inline key text yet (Plan 2). Editing a
+    // credential whose key is inline material must therefore preserve the
+    // original KeySource::Inline verbatim when the identity field is left
+    // blank — silently dropping it would destroy the credential's only secret.
+    // A path original left blank is treated as "user cleared the field".
+
+    #[test]
+    fn build_body_preserves_inline_key_when_identity_blank() {
+        use sshrack_core::config::schema::{InlineKey, Secret};
+        let mut f = complete_cred_form();
+        f.editing = true;
+        f.secret_kind = SecretChoice::IdentityKey;
+        // The identity field renders blank for an inline original (no path to
+        // show). orig_key carries the inline material through.
+        f.identity = String::new();
+        f.orig_key = Some(KeySource::Inline(InlineKey {
+            private_key: Some(Secret::Plain("PRIVATE-TEXT".into())),
+            certificate: None,
+            keyring: false,
+        }));
+        let b = f.build_body();
+        // The inline KeySource survives the build verbatim — never dropped.
+        match &b.key {
+            Some(KeySource::Inline(ik)) => {
+                assert_eq!(
+                    ik.private_key.as_ref().and_then(Secret::as_plain),
+                    Some("PRIVATE-TEXT"),
+                    "inline private key text must be preserved on edit"
+                );
+            }
+            other => panic!("expected Inline preservation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_body_path_key_blank_drops_the_key() {
+        // A path-key original edited to blank is "user cleared the field" —
+        // the path is gone, and no inline fallback is synthesised.
+        let mut f = complete_cred_form();
+        f.editing = true;
+        f.secret_kind = SecretChoice::IdentityKey;
+        f.identity = String::new();
+        f.orig_key = Some(KeySource::Path("/orig/id".into()));
+        let b = f.build_body();
+        assert!(b.key.is_none(), "blank path field must drop the key");
     }
 
     // ---- new_edit prefill ----

@@ -102,7 +102,15 @@ pub fn connect_host(
     let vault_key = vault::ensure_unlocked_vault_key(cfg, env_pw.as_ref(), &passphrase_provider)?;
 
     // ── Step 3: Resolve auth → PasswordSource (dangling ref fails here). ─────
-    let resolved_auth = credential::resolve(&resolved_host, cfg, vault_key.as_ref())?;
+    let mut resolved_auth = credential::resolve(&resolved_host, cfg, vault_key.as_ref())?;
+
+    // ── Step 3b: Materialize an inline (pasted) key to a temp file so ssh -i
+    // can read it. The artifact MUST outlive launch (its Drop deletes the temp
+    // files), so it is carried out via ConnectRequest.key_artifact and held by
+    // main across connect::launch. build_argv reads resolved_auth.key_path
+    // (now pointing at the temp private path) unchanged; it never sees key
+    // text. ───────────────────────────────────────────────────────────────────
+    let key_artifact = connect::materialize_inline_key(&mut resolved_auth)?;
 
     // ── Step 4: Host-key pre-flight via the TUI confirm closure. ─────────────
     // The closure renders the fingerprint in a y/n popup. A new key the user
@@ -139,6 +147,7 @@ pub fn connect_host(
     Ok(ConnectRequest {
         argv,
         source: resolved_auth.password,
+        key_artifact,
     })
 }
 

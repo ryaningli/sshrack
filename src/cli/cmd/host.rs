@@ -44,6 +44,10 @@ pub fn run(cli: &Cli, action: &HostAction) -> i32 {
             user,
             port,
             identity,
+            identity_stdin,
+            identity_file,
+            certificate_stdin,
+            certificate_file,
             credential,
             force,
         } => add(
@@ -53,6 +57,10 @@ pub fn run(cli: &Cli, action: &HostAction) -> i32 {
             user.as_deref(),
             *port,
             identity.as_deref(),
+            *identity_stdin,
+            identity_file.as_deref(),
+            *certificate_stdin,
+            certificate_file.as_deref(),
             credential.as_deref(),
             *force,
         ),
@@ -64,6 +72,10 @@ pub fn run(cli: &Cli, action: &HostAction) -> i32 {
             user,
             port,
             identity,
+            identity_stdin,
+            identity_file,
+            certificate_stdin,
+            certificate_file,
             rename,
             credential,
             clear_identity,
@@ -76,6 +88,10 @@ pub fn run(cli: &Cli, action: &HostAction) -> i32 {
             user.as_deref(),
             *port,
             identity.as_deref(),
+            *identity_stdin,
+            identity_file.as_deref(),
+            *certificate_stdin,
+            certificate_file.as_deref(),
             rename.as_deref(),
             credential.as_deref(),
             *clear_identity,
@@ -99,6 +115,10 @@ fn add(
     user: Option<&str>,
     port: Option<u16>,
     identity: Option<&std::path::Path>,
+    identity_stdin: bool,
+    identity_file: Option<&std::path::Path>,
+    certificate_stdin: bool,
+    certificate_file: Option<&std::path::Path>,
     credential: Option<&str>,
     force: bool,
 ) -> i32 {
@@ -137,19 +157,59 @@ fn add(
         }
     };
 
-    let opts = host::AddOptions {
-        host: Some(host_addr_owned.clone()),
-        port,
-        credential: cred_ulid,
-        user: user.map(Into::into),
-        identity: identity.map(std::path::PathBuf::from),
-        force,
+    // Identity source resolution (Independent branch only). --identity <path>
+    // stays a path reference via the existing AddOptions.identity field; the
+    // inline import flags (--identity-stdin / --identity-file) read the key
+    // CONTENTS into the body via with_inline_key so the file can be deleted
+    // afterward. Key text never enters argv. Mutually exclusive with
+    // --credential (clap-enforced route: --credential is Reference, the inline
+    // import flags are Independent-only).
+    let inline_key = if identity_stdin || identity_file.is_some() {
+        match super::shared::resolve_inline_identity(
+            identity_stdin,
+            identity_file,
+            certificate_stdin,
+            certificate_file,
+            &mut std::io::stdin(),
+        ) {
+            Ok(Some(ik)) => Some(ik),
+            Ok(None) => unreachable!("inline source guarded above"),
+            Err(e) => return fail(&format!("sshrack: {e:#}"), exit_code::VALIDATION),
+        }
+    } else {
+        None
     };
 
     let host_id = new_id();
-    let new_host = match host::merge_fields(host_id, &name, &opts) {
-        Ok(h) => h,
-        Err(e) => return fail(&format!("sshrack: {e}"), exit_code::VALIDATION),
+    let new_host = if let Some(ik) = inline_key {
+        // Independent-Inline branch: build the body directly via
+        // with_inline_key (AddOptions.identity is path-only). The default user
+        // mirrors build_auth: --user when given, "root" otherwise.
+        let user_owned = user.map(str::to_owned).unwrap_or_else(|| "root".into());
+        let private_sec = ik
+            .private_key
+            .expect("invariant: resolve_inline_identity sets private_key on the inline branch");
+        let body = CredentialBody::new(user_owned).with_inline_key(private_sec, ik.certificate);
+        sshrack_core::config::schema::Host {
+            id: host_id,
+            name: name.clone(),
+            host: host_addr_owned.clone(),
+            port: port.unwrap_or(22),
+            auth: Auth::inline(body),
+        }
+    } else {
+        let opts = host::AddOptions {
+            host: Some(host_addr_owned.clone()),
+            port,
+            credential: cred_ulid,
+            user: user.map(Into::into),
+            identity: identity.map(std::path::PathBuf::from),
+            force,
+        };
+        match host::merge_fields(host_id, &name, &opts) {
+            Ok(h) => h,
+            Err(e) => return fail(&format!("sshrack: {e}"), exit_code::VALIDATION),
+        }
     };
     // No password is collected here — passwords never enter argv. A password
     // host must be created via the TUI (where the inline password can be
@@ -292,6 +352,10 @@ fn edit(
     user: Option<&str>,
     port: Option<u16>,
     identity: Option<&std::path::Path>,
+    identity_stdin: bool,
+    identity_file: Option<&std::path::Path>,
+    certificate_stdin: bool,
+    certificate_file: Option<&std::path::Path>,
     rename: Option<&str>,
     credential: Option<&str>,
     clear_identity: bool,
@@ -323,6 +387,10 @@ fn edit(
         || port.is_some()
         || user.is_some()
         || identity.is_some()
+        || identity_stdin
+        || identity_file.is_some()
+        || certificate_stdin
+        || certificate_file.is_some()
         || rename.is_some()
         || credential.is_some()
         || clear_identity
@@ -342,20 +410,61 @@ fn edit(
     };
 
     // PATCH path: only flagged fields change (the hard rule).
-    let opts = host::EditOptions {
-        host: host_addr.map(Into::into),
-        port,
-        credential: cred_ulid,
-        user: user.map(Into::into),
-        identity: identity.map(std::path::PathBuf::from),
-        rename: rename.map(Into::into),
-        clear_identity,
-        clear_password,
-        clear_credential,
-    };
-    let updated = match host::apply_patch(&orig, &opts) {
-        Ok(h) => h,
-        Err(e) => return fail(&format!("sshrack: {e}"), exit_code::VALIDATION),
+    //
+    // The inline-key import flags (--identity-stdin / --identity-file) read key
+    // CONTENTS into the body — they bypass apply_patch (which is path-only)
+    // and rebuild the inline body directly. Only valid under Independent auth
+    // (a Reference host switches its auth via --credential / --clear-credential,
+    // never via identity flags). Key text never enters argv.
+    let updated = if identity_stdin || identity_file.is_some() {
+        let user_owned = match &orig.auth {
+            Auth::Inline(body) => user.map(str::to_owned).unwrap_or_else(|| body.user.clone()),
+            _ => user.map(str::to_owned).unwrap_or_else(|| "root".into()),
+        };
+        let inline_key = match super::shared::resolve_inline_identity(
+            identity_stdin,
+            identity_file,
+            certificate_stdin,
+            certificate_file,
+            &mut std::io::stdin(),
+        ) {
+            Ok(Some(ik)) => ik,
+            Ok(None) => unreachable!("inline source guarded above"),
+            Err(e) => return fail(&format!("sshrack: {e:#}"), exit_code::VALIDATION),
+        };
+        let private_sec = inline_key
+            .private_key
+            .expect("invariant: resolve_inline_identity sets private_key on the inline branch");
+        let body =
+            CredentialBody::new(user_owned).with_inline_key(private_sec, inline_key.certificate);
+        let mut h = orig.clone();
+        h.auth = Auth::inline(body);
+        if let Some(new_name) = rename {
+            h.name = new_name.to_owned();
+        }
+        if let Some(new_host) = host_addr {
+            h.host = new_host.to_owned();
+        }
+        if let Some(new_port) = port {
+            h.port = new_port;
+        }
+        h
+    } else {
+        let opts = host::EditOptions {
+            host: host_addr.map(Into::into),
+            port,
+            credential: cred_ulid,
+            user: user.map(Into::into),
+            identity: identity.map(std::path::PathBuf::from),
+            rename: rename.map(Into::into),
+            clear_identity,
+            clear_password,
+            clear_credential,
+        };
+        match host::apply_patch(&orig, &opts) {
+            Ok(h) => h,
+            Err(e) => return fail(&format!("sshrack: {e}"), exit_code::VALIDATION),
+        }
     };
 
     // Replace in place by id (orig may have been renamed).
@@ -647,7 +756,7 @@ fn format_detail(
 fn render_body_lines(body: &CredentialBody, reveal: &RevealedPassword, out: &mut String) {
     out.push_str(&format!("user:     {}\n", body.user));
     match (&body.key, body.password.is_some(), body.keyring) {
-        (Some(k), _, _) => out.push_str(&format!("key:      {}\n", k.display())),
+        (Some(k), _, _) => out.push_str(&format!("key:      {}\n", fmt::identity_display(k))),
         (None, _, true) => {
             let line = reveal.text_line(true);
             if !line.is_empty() {

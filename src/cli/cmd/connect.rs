@@ -130,7 +130,7 @@ pub fn run(cli: &Cli) -> i32 {
         };
 
     // ── Step 4: Resolve auth (dangling credential errors here). ──────────────
-    let resolved_auth = match credential::resolve(&resolved_host, &cfg, vault_key.as_ref()) {
+    let mut resolved_auth = match credential::resolve(&resolved_host, &cfg, vault_key.as_ref()) {
         Ok(a) => a,
         Err(SshrackError::CredentialNotFound { name, hint }) => {
             // The ref-by-id path surfaces a bare ULID as `name` (the host
@@ -153,6 +153,18 @@ pub fn run(cli: &Cli) -> i32 {
         }
         Err(e) => {
             eprintln!("sshrack: auth error: {e}");
+            return exit_code::CONNECT;
+        }
+    };
+
+    // ── Step 4b: Materialize an inline (pasted) key to a temp file so ssh -i
+    // can read it. The artifact MUST outlive launch — its Drop deletes the
+    // temp files. build_argv reads resolved_auth.key_path (now pointing at the
+    // temp private path) unchanged; it never sees the key text. ─────────────
+    let _key_artifact = match connect::materialize_inline_key(&mut resolved_auth) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("sshrack: failed to stage inline identity: {e}");
             return exit_code::CONNECT;
         }
     };

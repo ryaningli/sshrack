@@ -127,9 +127,21 @@ fn write_password_file(pw: &Zeroizing<String>) -> Result<PathBuf, SshrackError> 
 /// [`crate::credential::ResolvedAuth::key_path`] with [`KeyArtifact::private_path`]
 /// so argv assembly points `ssh -i` at the temp file, then holds the artifact
 /// across `launch` so `Drop` runs only after ssh exits.
+///
+/// `Debug` surfaces the temp file paths (filesystem locations, not key text);
+/// the key material itself lives only in the file, never on this struct.
 pub struct KeyArtifact {
     private: PathBuf,
     cert: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for KeyArtifact {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyArtifact")
+            .field("private", &self.private)
+            .field("cert", &self.cert)
+            .finish()
+    }
 }
 
 impl KeyArtifact {
@@ -228,6 +240,34 @@ impl Drop for KeyArtifact {
         if let Some(c) = &self.cert {
             let _ = std::fs::remove_file(c);
         }
+    }
+}
+
+/// Materialize a resolved identity's inline key (if any) to a `0600` temp file
+/// and point [`ResolvedAuth::key_path`] at it so argv assembly (`ssh -i`)
+/// picks up the temp path. Returns the [`KeyArtifact`] whose `Drop` removes the
+/// temp files — the caller MUST hold it across [`launch`] so the plaintext does
+/// not outlive the ssh process.
+///
+/// No-op (returns `None`) when the resolved auth carries no inline material
+/// (the path-key and no-key cases). Mutates `resolved` in place: takes
+/// `inline_key` (so it cannot be materialized twice) and, when present, fills
+/// `key_path` with the temp private path (overwriting any prior value — the
+/// inline branch leaves `key_path` `None` on resolve, so there is no clobber).
+///
+/// Pure seam over [`KeyArtifact::write`]: no shared state, no argv mutation.
+/// The caller still owns the resolved auth and the artifact's lifetime.
+pub fn materialize_inline_key(
+    resolved: &mut crate::credential::ResolvedAuth,
+) -> Result<Option<KeyArtifact>, SshrackError> {
+    let inline_key = resolved.inline_key.take();
+    match inline_key {
+        Some(mat) => {
+            let artifact = KeyArtifact::write(&mat.private, mat.certificate.as_ref())?;
+            resolved.key_path = Some(artifact.private_path().to_path_buf());
+            Ok(Some(artifact))
+        }
+        None => Ok(None),
     }
 }
 
@@ -404,5 +444,106 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    // ---- materialize_inline_key: the connect-side seam every launch site uses ----
+
+    fn resolved_with_inline(private: &str, cert: Option<&str>) -> crate::credential::ResolvedAuth {
+        use crate::credential::{InlineKeyMaterial, ResolvedAuth};
+        ResolvedAuth {
+            user: "u".into(),
+            key_path: None,
+            password: PasswordSource::None,
+            inline_key: Some(InlineKeyMaterial {
+                private: Zeroizing::new(private.into()),
+                certificate: cert.map(|c| Zeroizing::new(c.into())),
+            }),
+        }
+    }
+
+    #[test]
+    fn materialize_inline_key_writes_temp_and_fills_key_path() {
+        // An inline-key body: materialize_inline_key must write the private key
+        // to a 0600 temp file, fill key_path with that path, and return the
+        // artifact (so the caller can hold it across launch). Drop of the
+        // artifact removes the temp file.
+        let mut resolved = resolved_with_inline("PRIVATE-MATERIAL", None);
+        let path = {
+            let _artifact = materialize_inline_key(&mut resolved).unwrap().unwrap();
+            let p = resolved
+                .key_path
+                .as_deref()
+                .expect("materialize fills key_path")
+                .to_path_buf();
+            assert!(
+                p.exists(),
+                "temp private key must exist at {p:?} while artifact is live"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&p).unwrap(),
+                "PRIVATE-MATERIAL",
+                "temp file must hold the private key text exactly"
+            );
+            p
+        };
+        // Drop removed the temp file (artifact released at the block end).
+        assert!(
+            !path.exists(),
+            "temp private key must be removed after artifact drops"
+        );
+        // inline_key is taken — a second materialization is a no-op (returns None).
+        let again = materialize_inline_key(&mut resolved).unwrap();
+        assert!(again.is_none(), "inline_key must be taken on first call");
+    }
+
+    #[test]
+    fn materialize_inline_key_writes_cert_sibling_alongside_private() {
+        // With a certificate: the cert lands beside the private key as
+        // <private>-cert.pub so ssh -i auto-loads it. Both temp files share the
+        // artifact's lifetime.
+        let mut resolved = resolved_with_inline("PRIV", Some("CERT-MATERIAL"));
+        let artifact = materialize_inline_key(&mut resolved).unwrap().unwrap();
+        let p = resolved.key_path.as_deref().unwrap().to_path_buf();
+        let cert_sibling = p.with_file_name(format!(
+            "{}-cert.pub",
+            p.file_name()
+                .expect("invariant: temp path has a file name")
+                .to_string_lossy()
+        ));
+        assert!(
+            cert_sibling.exists(),
+            "cert sibling must exist at {cert_sibling:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&cert_sibling).unwrap(),
+            "CERT-MATERIAL"
+        );
+        // Both files removed when the artifact drops.
+        drop(artifact);
+        assert!(!p.exists(), "private must be removed after artifact drops");
+        assert!(
+            !cert_sibling.exists(),
+            "cert must be removed after artifact drops"
+        );
+    }
+
+    #[test]
+    fn materialize_inline_key_is_noop_for_path_key_body() {
+        // A path-key (or no-key) body has inline_key = None: materialize must be
+        // a no-op, returning None and leaving key_path untouched.
+        use crate::credential::ResolvedAuth;
+        let mut resolved = ResolvedAuth {
+            user: "u".into(),
+            key_path: Some(PathBuf::from("/home/u/.ssh/id_ed25519")),
+            password: PasswordSource::None,
+            inline_key: None,
+        };
+        let artifact = materialize_inline_key(&mut resolved).unwrap();
+        assert!(artifact.is_none(), "no inline key → no artifact");
+        assert_eq!(
+            resolved.key_path,
+            Some(PathBuf::from("/home/u/.ssh/id_ed25519")),
+            "existing key_path must be preserved"
+        );
     }
 }

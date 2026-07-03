@@ -14,7 +14,7 @@ use std::borrow::Cow;
 
 use zeroize::Zeroizing;
 
-use sshrack_core::config::schema::{Auth, Credential};
+use sshrack_core::config::schema::{Auth, Credential, CredentialBody};
 use sshrack_core::credential as cred_core;
 use sshrack_core::host;
 use sshrack_core::id::new_id;
@@ -35,12 +35,20 @@ pub fn run(cli: &Cli, action: &CredAction) -> i32 {
             name,
             user,
             identity,
+            identity_stdin,
+            identity_file,
+            certificate_stdin,
+            certificate_file,
             force,
         } => add(
             cli,
             name.as_deref(),
             user.as_deref(),
             identity.as_deref(),
+            *identity_stdin,
+            identity_file.as_deref(),
+            *certificate_stdin,
+            certificate_file.as_deref(),
             *force,
         ),
         CredAction::Ls { fields } => ls(cli, fields.as_deref()),
@@ -49,6 +57,10 @@ pub fn run(cli: &Cli, action: &CredAction) -> i32 {
             name,
             user,
             identity,
+            identity_stdin,
+            identity_file,
+            certificate_stdin,
+            certificate_file,
             clear_identity,
             rename,
         } => edit(
@@ -56,6 +68,10 @@ pub fn run(cli: &Cli, action: &CredAction) -> i32 {
             name.as_deref(),
             user.as_deref(),
             identity.as_deref(),
+            *identity_stdin,
+            identity_file.as_deref(),
+            *certificate_stdin,
+            certificate_file.as_deref(),
             *clear_identity,
             rename.as_deref(),
         ),
@@ -70,11 +86,16 @@ const ALL_CRED_FIELDS: &[&str] = &["name", "user", "secret"];
 // add
 // ===========================================================================
 
+#[allow(clippy::too_many_arguments)]
 fn add(
     cli: &Cli,
     name: Option<&str>,
     user: Option<&str>,
     identity: Option<&std::path::Path>,
+    identity_stdin: bool,
+    identity_file: Option<&std::path::Path>,
+    certificate_stdin: bool,
+    certificate_file: Option<&std::path::Path>,
     force: bool,
 ) -> i32 {
     let (path, cfg) = match load_config(cli.config.as_deref()) {
@@ -98,14 +119,47 @@ fn add(
 
     // Build the body from flags. `user` is required; a password cannot come
     // from a flag.
-    let opts = cred_core::AddOptions {
-        user: user.map(Into::into),
-        identity: identity.map(std::path::PathBuf::from),
-        force,
-    };
-    let body = match cred_core::build_body(&opts) {
-        Ok(b) => b,
-        Err(e) => return fail(&format!("sshrack: {e}"), exit_code::VALIDATION),
+    //
+    // Identity source resolution: --identity <path> stays a path reference
+    // (KeySource::Path) via the existing AddOptions.identity field. The inline
+    // import flags (--identity-stdin / --identity-file) read the key CONTENTS
+    // into the body via with_inline_key so the file can be deleted afterward.
+    // Key text never enters argv — only paths and the boolean stdin flag do.
+    let body = if identity_stdin || identity_file.is_some() {
+        let user_owned = match user {
+            Some(u) => u.to_string(),
+            None => {
+                return fail(
+                    "sshrack: missing required field: user (pass --user)",
+                    exit_code::VALIDATION,
+                );
+            }
+        };
+        let inline_key = match super::shared::resolve_inline_identity(
+            identity_stdin,
+            identity_file,
+            certificate_stdin,
+            certificate_file,
+            &mut std::io::stdin(),
+        ) {
+            Ok(Some(ik)) => ik,
+            Ok(None) => unreachable!("inline source guarded above"),
+            Err(e) => return fail(&format!("sshrack: {e:#}"), exit_code::VALIDATION),
+        };
+        let private_sec = inline_key
+            .private_key
+            .expect("invariant: resolve_inline_identity sets private_key on the inline branch");
+        CredentialBody::new(user_owned).with_inline_key(private_sec, inline_key.certificate)
+    } else {
+        let opts = cred_core::AddOptions {
+            user: user.map(Into::into),
+            identity: identity.map(std::path::PathBuf::from),
+            force,
+        };
+        match cred_core::build_body(&opts) {
+            Ok(b) => b,
+            Err(e) => return fail(&format!("sshrack: {e}"), exit_code::VALIDATION),
+        }
     };
 
     let next = match cred_core::add_credential(&cfg, cred_id, &name, body) {
@@ -203,11 +257,16 @@ fn show(cli: &Cli, name: &str, reveal: bool) -> i32 {
 // edit
 // ===========================================================================
 
+#[allow(clippy::too_many_arguments)]
 fn edit(
     cli: &Cli,
     name: Option<&str>,
     user: Option<&str>,
     identity: Option<&std::path::Path>,
+    identity_stdin: bool,
+    identity_file: Option<&std::path::Path>,
+    certificate_stdin: bool,
+    certificate_file: Option<&std::path::Path>,
     clear_identity: bool,
     rename: Option<&str>,
 ) -> i32 {
@@ -231,7 +290,14 @@ fn edit(
         }
     }
 
-    let has_any_flag = user.is_some() || identity.is_some() || clear_identity || rename.is_some();
+    let has_any_flag = user.is_some()
+        || identity.is_some()
+        || identity_stdin
+        || identity_file.is_some()
+        || certificate_stdin
+        || certificate_file.is_some()
+        || clear_identity
+        || rename.is_some();
     if !has_any_flag {
         // Patch-only: nothing to do.
         println!("no changes");
@@ -239,15 +305,49 @@ fn edit(
     }
 
     // PATCH path: only flagged fields change.
-    let opts = cred_core::EditOptions {
-        user: user.map(Into::into),
-        identity: identity.map(std::path::PathBuf::from),
-        clear_identity,
-        rename: rename.map(Into::into),
-    };
-    let updated = match cred_core::apply_credential_patch(&orig, &opts) {
-        Ok(c) => c,
-        Err(e) => return fail(&format!("sshrack: {e}"), exit_code::VALIDATION),
+    //
+    // The inline-key import flags (--identity-stdin / --identity-file) read key
+    // CONTENTS into the body — they bypass apply_credential_patch (which is
+    // path-only) and rebuild the body inline. Key text never enters argv.
+    let updated = if identity_stdin || identity_file.is_some() {
+        let user_owned = user
+            .map(str::to_owned)
+            .unwrap_or_else(|| orig.body.user.clone());
+        let inline_key = match super::shared::resolve_inline_identity(
+            identity_stdin,
+            identity_file,
+            certificate_stdin,
+            certificate_file,
+            &mut std::io::stdin(),
+        ) {
+            Ok(Some(ik)) => ik,
+            Ok(None) => unreachable!("inline source guarded above"),
+            Err(e) => return fail(&format!("sshrack: {e:#}"), exit_code::VALIDATION),
+        };
+        let private_sec = inline_key
+            .private_key
+            .expect("invariant: resolve_inline_identity sets private_key on the inline branch");
+        let body =
+            CredentialBody::new(user_owned).with_inline_key(private_sec, inline_key.certificate);
+        let final_name = rename
+            .map(str::to_owned)
+            .unwrap_or_else(|| orig.name.clone());
+        sshrack_core::config::schema::Credential {
+            id: orig.id,
+            name: final_name,
+            body,
+        }
+    } else {
+        let opts = cred_core::EditOptions {
+            user: user.map(Into::into),
+            identity: identity.map(std::path::PathBuf::from),
+            clear_identity,
+            rename: rename.map(Into::into),
+        };
+        match cred_core::apply_credential_patch(&orig, &opts) {
+            Ok(c) => c,
+            Err(e) => return fail(&format!("sshrack: {e}"), exit_code::VALIDATION),
+        }
     };
 
     // Replace in place by id (orig may have been renamed).
@@ -442,7 +542,7 @@ fn format_detail(cred: &Credential, reveal: &RevealedPassword) -> String {
         cred.body.password.is_some(),
         cred.body.keyring,
     ) {
-        (Some(k), _, _) => out.push_str(&format!("key:      {}\n", k.display())),
+        (Some(k), _, _) => out.push_str(&format!("key:      {}\n", fmt::identity_display(k))),
         (None, _, true) => {
             let line = reveal.text_line(true);
             if !line.is_empty() {

@@ -8,6 +8,7 @@ mod tui;
 
 use cli::args::{Command, CredAction, HostAction};
 use shared::exit_code;
+use tui::ConnectRequest;
 
 fn main() {
     // Askpass role: the launcher (or ssh) forks us with one of these set.
@@ -73,13 +74,25 @@ fn run_main() -> i32 {
                         return exit_code::CONNECT;
                     }
                 };
-                match sshrack_core::connect::launch(req.argv, req.source, &exe) {
+                // Pull the inline-key artifact out so it is held across launch
+                // (its Drop removes the temp files when this block ends —
+                // AFTER ssh exits). argv was built with the temp private path
+                // baked in, so build_argv is unchanged.
+                let ConnectRequest {
+                    argv,
+                    source,
+                    key_artifact: _key_artifact,
+                } = req;
+                match sshrack_core::connect::launch(argv, source, &exe) {
                     Ok(code) => code,
                     Err(e) => {
                         eprintln!("{e}");
                         exit_code::CONNECT
                     }
                 }
+                // `_key_artifact` (and any other binding) drops here, AFTER
+                // launch returns — the temp files holding an inline key live
+                // exactly as long as the ssh process needs them.
             }
             Err(e) => {
                 eprintln!("{e}");
@@ -158,18 +171,29 @@ fn host_add_or_edit_is_empty(action: &HostAction) -> bool {
             user,
             port,
             identity,
+            identity_stdin,
+            identity_file,
+            certificate_stdin,
+            certificate_file,
             credential,
             force,
         } => {
             // A name positional alone does NOT leave add empty — `host add x`
             // is still a partial add that the CLI rejects (missing --host); the
             // wizard is for a truly flag-less `host add`. Every content field
-            // (flags AND the name positional) must be unset.
+            // (flags AND the name positional) must be unset. The inline-key
+            // import flags (`--identity-stdin`/`--identity-file` and the
+            // certificate pair) are content flags too: a flagged field is
+            // always a CLI patch, never a wizard.
             name.is_none()
                 && host.is_none()
                 && user.is_none()
                 && port.is_none()
                 && identity.is_none()
+                && !*identity_stdin
+                && identity_file.is_none()
+                && !*certificate_stdin
+                && certificate_file.is_none()
                 && credential.is_none()
                 && !*force
         }
@@ -179,6 +203,10 @@ fn host_add_or_edit_is_empty(action: &HostAction) -> bool {
             user,
             port,
             identity,
+            identity_stdin,
+            identity_file,
+            certificate_stdin,
+            certificate_file,
             rename,
             credential,
             clear_identity,
@@ -192,6 +220,10 @@ fn host_add_or_edit_is_empty(action: &HostAction) -> bool {
                 && user.is_none()
                 && port.is_none()
                 && identity.is_none()
+                && !*identity_stdin
+                && identity_file.is_none()
+                && !*certificate_stdin
+                && certificate_file.is_none()
                 && rename.is_none()
                 && credential.is_none()
                 && !*clear_identity
@@ -212,12 +244,29 @@ fn cred_add_or_edit_is_empty(action: &CredAction) -> bool {
             name,
             user,
             identity,
+            identity_stdin,
+            identity_file,
+            certificate_stdin,
+            certificate_file,
             force,
-        } => name.is_none() && user.is_none() && identity.is_none() && !*force,
+        } => {
+            name.is_none()
+                && user.is_none()
+                && identity.is_none()
+                && !*identity_stdin
+                && identity_file.is_none()
+                && !*certificate_stdin
+                && certificate_file.is_none()
+                && !*force
+        }
         CredAction::Edit {
             name,
             user,
             identity,
+            identity_stdin,
+            identity_file,
+            certificate_stdin,
+            certificate_file,
             clear_identity,
             rename,
         } => {
@@ -226,6 +275,10 @@ fn cred_add_or_edit_is_empty(action: &CredAction) -> bool {
             name.is_some()
                 && user.is_none()
                 && identity.is_none()
+                && !*identity_stdin
+                && identity_file.is_none()
+                && !*certificate_stdin
+                && certificate_file.is_none()
                 && !*clear_identity
                 && rename.is_none()
         }
@@ -281,6 +334,10 @@ mod tests {
                 user: None,
                 port: None,
                 identity: None,
+                identity_stdin: false,
+                identity_file: None,
+                certificate_stdin: false,
+                certificate_file: None,
                 rename: None,
                 credential: None,
                 clear_identity: false,
@@ -301,6 +358,10 @@ mod tests {
                 user: None,
                 port: None,
                 identity: None,
+                identity_stdin: false,
+                identity_file: None,
+                certificate_stdin: false,
+                certificate_file: None,
                 rename: None,
                 credential: None,
                 clear_identity: false,
@@ -320,6 +381,10 @@ mod tests {
                 name: None,
                 user: None,
                 identity: None,
+                identity_stdin: false,
+                identity_file: None,
+                certificate_stdin: false,
+                certificate_file: None,
                 clear_identity: false,
                 rename: None,
             },
@@ -339,6 +404,10 @@ mod tests {
                 user: None,
                 port: None,
                 identity: None,
+                identity_stdin: false,
+                identity_file: None,
+                certificate_stdin: false,
+                certificate_file: None,
                 rename: None,
                 credential: None,
                 clear_identity: false,
@@ -360,6 +429,10 @@ mod tests {
                 user: None,
                 port: None,
                 identity: None,
+                identity_stdin: false,
+                identity_file: None,
+                certificate_stdin: false,
+                certificate_file: None,
                 credential: None,
                 force: false,
             },
@@ -378,6 +451,10 @@ mod tests {
                 user: None,
                 port: None,
                 identity: None,
+                identity_stdin: false,
+                identity_file: None,
+                certificate_stdin: false,
+                certificate_file: None,
                 credential: None,
                 force: false,
             },
@@ -394,6 +471,10 @@ mod tests {
                 user: None,
                 port: None,
                 identity: None,
+                identity_stdin: false,
+                identity_file: None,
+                certificate_stdin: false,
+                certificate_file: None,
                 credential: None,
                 force: false,
             },
@@ -412,6 +493,10 @@ mod tests {
                 user: None,
                 port: None,
                 identity: None,
+                identity_stdin: false,
+                identity_file: None,
+                certificate_stdin: false,
+                certificate_file: None,
                 credential: None,
                 force: true,
             },
@@ -428,6 +513,10 @@ mod tests {
                 user: None,
                 port: None,
                 identity: None,
+                identity_stdin: false,
+                identity_file: None,
+                certificate_stdin: false,
+                certificate_file: None,
                 rename: None,
                 credential: None,
                 clear_identity: false,
@@ -447,6 +536,10 @@ mod tests {
                 user: None,
                 port: Some(22),
                 identity: None,
+                identity_stdin: false,
+                identity_file: None,
+                certificate_stdin: false,
+                certificate_file: None,
                 rename: None,
                 credential: None,
                 clear_identity: false,
@@ -466,6 +559,10 @@ mod tests {
                 user: None,
                 port: None,
                 identity: None,
+                identity_stdin: false,
+                identity_file: None,
+                certificate_stdin: false,
+                certificate_file: None,
                 rename: None,
                 credential: None,
                 clear_identity: true,
@@ -494,6 +591,10 @@ mod tests {
                 name: None,
                 user: None,
                 identity: None,
+                identity_stdin: false,
+                identity_file: None,
+                certificate_stdin: false,
+                certificate_file: None,
                 force: false,
             },
         };
@@ -507,6 +608,10 @@ mod tests {
                 name: None,
                 user: Some("root".into()),
                 identity: None,
+                identity_stdin: false,
+                identity_file: None,
+                certificate_stdin: false,
+                certificate_file: None,
                 force: false,
             },
         };
@@ -520,6 +625,10 @@ mod tests {
                 name: Some("c".into()),
                 user: None,
                 identity: None,
+                identity_stdin: false,
+                identity_file: None,
+                certificate_stdin: false,
+                certificate_file: None,
                 clear_identity: false,
                 rename: None,
             },
@@ -534,6 +643,10 @@ mod tests {
                 name: Some("c".into()),
                 user: None,
                 identity: None,
+                identity_stdin: false,
+                identity_file: None,
+                certificate_stdin: false,
+                certificate_file: None,
                 clear_identity: false,
                 rename: Some("d".into()),
             },

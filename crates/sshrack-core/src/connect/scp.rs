@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 
+use super::KeyArtifact;
 use super::ssh::Overrides;
 use crate::config::schema::{Host, SshrackConfig};
 use crate::credential::{self, PasswordSource};
@@ -30,6 +31,12 @@ pub struct ScpPlan {
     /// Every remote `(host, port)` endpoint referenced by the operands
     /// (deduplicated, first-appearance order), for host-key confirmation.
     pub remote_hosts: Vec<(String, u16)>,
+    /// Temp files holding a pasted inline identity key, when the first remote's
+    /// resolved key was inline material. The caller MUST hold the plan across
+    /// `connect::launch` — its `Drop` removes the temp files so the plaintext
+    /// does not outlive scp. `None` for path-key / no-key remotes and all-local
+    /// operands. Acquired via [`super::materialize_inline_key`] inside `build`.
+    pub key_artifact: Option<KeyArtifact>,
 }
 
 /// Build the scp argv from raw arguments. A `left:rest` operand is rewritten
@@ -64,6 +71,7 @@ pub fn build(
     let mut identity: Option<PathBuf> = None;
     let mut remote_hosts: Vec<(String, u16)> = Vec::new();
     let mut password: PasswordSource = PasswordSource::None;
+    let mut key_artifact: Option<KeyArtifact> = None;
 
     let resolve_overrides = ResolveOverrides {
         ad_hoc: overrides.ad_hoc,
@@ -94,13 +102,18 @@ pub fn build(
             None if overrides.ad_hoc => resolve_target(cfg, left, &resolve_overrides)?,
             None => return Err(host_not_found(cfg, left)),
         };
-        let auth = credential::resolve(&host_cfg, cfg, vault)?;
+        let mut auth = credential::resolve(&host_cfg, cfg, vault)?;
         let user = overrides.user.as_deref().unwrap_or(&auth.user);
         out_args.push(format!("{user}@{}:{rest}", host_cfg.host));
         let port = overrides.port.unwrap_or(host_cfg.port);
         if host.is_none() {
             host = Some(host_cfg.clone());
             first_port = Some(port);
+            // Materialize an inline (pasted) key to a temp file before reading
+            // auth.key_path — the inline branch leaves key_path None and the
+            // temp path must reach argv via the same -i slot. The artifact
+            // lives in the plan so it survives across connect::launch.
+            key_artifact = super::materialize_inline_key(&mut auth)?;
             identity = overrides.identity.clone().or_else(|| auth.key_path.clone());
             // Carry the first remote's PasswordSource out so the launch path
             // does not re-resolve after the network host-key check. The source
@@ -130,6 +143,7 @@ pub fn build(
         host,
         password,
         remote_hosts,
+        key_artifact,
     })
 }
 

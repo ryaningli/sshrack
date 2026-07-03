@@ -212,6 +212,14 @@ pub enum HostAction {
     /// self-contained). With no auth flag the host is Independent with the
     /// default user `root`. A password cannot be set here — passwords never
     /// enter argv; use the TUI for a password host.
+    ///
+    /// Identity sources (Independent only, mutually exclusive): `--identity
+    /// <path>` keeps the key on disk and stores the path; `--identity-stdin`
+    /// / `--identity-file <path>` read the key **contents** into the config
+    /// (sealed per the store mode) so the file can be deleted afterward. An
+    /// optional `--certificate-stdin` / `--certificate-file <path>` pairs with
+    /// an inline identity (a path identity auto-loads its `-cert.pub` sibling).
+    /// Key contents never enter argv.
     Add {
         /// Host name to add (or overwrite when --force is set). Required.
         name: Option<String>,
@@ -229,6 +237,26 @@ pub enum HostAction {
         /// `--credential` is set.
         #[arg(long)]
         identity: Option<PathBuf>,
+        /// Read the private key **contents** from stdin (mutually exclusive
+        /// with `--identity` / `--identity-file`). The contents are stored
+        /// inline (encrypted under vault, or plaintext) — never passed on argv.
+        #[arg(long, conflicts_with_all = ["identity", "identity_file"])]
+        identity_stdin: bool,
+        /// Read the private key **contents** from this file (mutually exclusive
+        /// with `--identity` / `--identity-stdin`). The file is read once at
+        /// add time; its contents are stored inline, so the file may be deleted
+        /// afterward.
+        #[arg(long, conflicts_with_all = ["identity", "identity_stdin"])]
+        identity_file: Option<PathBuf>,
+        /// Read an SSH **certificate** from stdin (optional; pairs with
+        /// `--identity-stdin` / `--identity-file`). Ignored when the identity
+        /// is a path reference.
+        #[arg(long)]
+        certificate_stdin: bool,
+        /// Read an SSH **certificate** from this file (optional; pairs with
+        /// `--identity-stdin` / `--identity-file`).
+        #[arg(long, conflicts_with = "certificate_stdin")]
+        certificate_file: Option<PathBuf>,
         /// Reference a [[credentials]] entry by name (Reference mode, mutually
         /// exclusive with the independent flags `--user`/`--identity`).
         /// Resolved from name to id by the CLI layer, not by clap.
@@ -283,6 +311,26 @@ pub enum HostAction {
         /// New identity file path (Independent hosts only).
         #[arg(long)]
         identity: Option<PathBuf>,
+        /// Read the new private key **contents** from stdin (Independent hosts
+        /// only; mutually exclusive with `--identity` / `--identity-file`).
+        /// The contents are stored inline (encrypted under vault, or
+        /// plaintext) — never passed on argv.
+        #[arg(long, conflicts_with_all = ["identity", "identity_file"])]
+        identity_stdin: bool,
+        /// Read the new private key **contents** from this file (Independent
+        /// hosts only; mutually exclusive with `--identity` /
+        /// `--identity-stdin`). The file is read once at edit time; its
+        /// contents are stored inline, so the file may be deleted afterward.
+        #[arg(long, conflicts_with_all = ["identity", "identity_stdin"])]
+        identity_file: Option<PathBuf>,
+        /// Read an SSH **certificate** from stdin (optional; pairs with
+        /// `--identity-stdin` / `--identity-file`).
+        #[arg(long)]
+        certificate_stdin: bool,
+        /// Read an SSH **certificate** from this file (optional; pairs with
+        /// `--identity-stdin` / `--identity-file`).
+        #[arg(long, conflicts_with = "certificate_stdin")]
+        certificate_file: Option<PathBuf>,
         /// Rename the host to this new name.
         #[arg(long)]
         rename: Option<String>,
@@ -329,6 +377,13 @@ pub enum CredAction {
     /// Add a reusable credential. `--user` (and the name) are required; a
     /// password credential cannot be created from the CLI (passwords never
     /// enter argv) — use the TUI for that.
+    ///
+    /// Identity sources (mutually exclusive): `--identity <path>` keeps the
+    /// key on disk and stores the path; `--identity-stdin` / `--identity-file
+    /// <path>` read the key **contents** into the config (sealed per the store
+    /// mode) so the file can be deleted afterward. An optional
+    /// `--certificate-stdin` / `--certificate-file <path>` pairs with an inline
+    /// identity. Key contents never enter argv.
     Add {
         /// Credential name to add (or overwrite when --force is set). Required.
         name: Option<String>,
@@ -338,6 +393,25 @@ pub enum CredAction {
         /// Path to a private key file.
         #[arg(long)]
         identity: Option<PathBuf>,
+        /// Read the private key **contents** from stdin (mutually exclusive
+        /// with `--identity` / `--identity-file`). The contents are stored
+        /// inline (encrypted under vault, or plaintext) — never passed on argv.
+        #[arg(long, conflicts_with_all = ["identity", "identity_file"])]
+        identity_stdin: bool,
+        /// Read the private key **contents** from this file (mutually exclusive
+        /// with `--identity` / `--identity-stdin`). The file is read once at
+        /// add time; its contents are stored inline, so the file may be deleted
+        /// afterward.
+        #[arg(long, conflicts_with_all = ["identity", "identity_stdin"])]
+        identity_file: Option<PathBuf>,
+        /// Read an SSH **certificate** from stdin (optional; pairs with
+        /// `--identity-stdin` / `--identity-file`).
+        #[arg(long)]
+        certificate_stdin: bool,
+        /// Read an SSH **certificate** from this file (optional; pairs with
+        /// `--identity-stdin` / `--identity-file`).
+        #[arg(long, conflicts_with = "certificate_stdin")]
+        certificate_file: Option<PathBuf>,
         /// Overwrite an existing credential name.
         #[arg(long)]
         force: bool,
@@ -353,6 +427,25 @@ pub enum CredAction {
         /// New identity file path.
         #[arg(long)]
         identity: Option<PathBuf>,
+        /// Read the new private key **contents** from stdin (mutually exclusive
+        /// with `--identity` / `--identity-file`). The contents are stored
+        /// inline (encrypted under vault, or plaintext) — never passed on argv.
+        #[arg(long, conflicts_with_all = ["identity", "identity_file"])]
+        identity_stdin: bool,
+        /// Read the new private key **contents** from this file (mutually
+        /// exclusive with `--identity` / `--identity-stdin`). The file is read
+        /// once at edit time; its contents are stored inline, so the file may
+        /// be deleted afterward.
+        #[arg(long, conflicts_with_all = ["identity", "identity_stdin"])]
+        identity_file: Option<PathBuf>,
+        /// Read an SSH **certificate** from stdin (optional; pairs with
+        /// `--identity-stdin` / `--identity-file`).
+        #[arg(long)]
+        certificate_stdin: bool,
+        /// Read an SSH **certificate** from this file (optional; pairs with
+        /// `--identity-stdin` / `--identity-file`).
+        #[arg(long, conflicts_with = "certificate_stdin")]
+        certificate_file: Option<PathBuf>,
         /// Remove the identity file.
         #[arg(long, conflicts_with = "identity")]
         clear_identity: bool,

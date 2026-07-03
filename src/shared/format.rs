@@ -32,7 +32,7 @@ use std::borrow::Cow;
 use serde::Serialize;
 
 use sshrack_core::config::schema::{
-    Auth, Credential, CredentialBody, Host, SecretKind, SecretStore, SshrackConfig,
+    Auth, Credential, CredentialBody, Host, KeySource, SecretKind, SecretStore, SshrackConfig,
 };
 
 /// A single `host ls` row. Field names are the stable `--format json` schema.
@@ -161,11 +161,14 @@ pub fn host_list_row<'a>(host: &'a Host, credential_name: Option<&'a str>) -> Ho
 }
 
 /// Build a [`HostDetailRow`] from a host plus its referenced credential name
-/// and the string form of its id. Pure. `identity` borrows the inline body's
-/// key path when present; for a credential reference it is `None`. `password`
-/// is the revealed plaintext under `--reveal` (`None` otherwise); passing it
-/// here (rather than hand-splicing it into the JSON) is what keeps the password
-/// correctly escaped.
+/// and the string form of its id. Pure. `identity` renders the inline body's
+/// key when present: a path source surfaces the file path (via `to_string_lossy`
+/// so non-UTF-8 paths still serialize), while pasted inline material surfaces
+/// only the fixed marker `"<inline>"` — the key text itself is never emitted
+/// (it is as sensitive as a password). For a credential reference `identity` is
+/// `None`. `password` is the revealed plaintext under `--reveal` (`None`
+/// otherwise); passing it here (rather than hand-splicing it into the JSON) is
+/// what keeps the password correctly escaped.
 pub fn host_detail_row<'a>(
     host: &'a Host,
     id_str: &'a str,
@@ -183,9 +186,21 @@ pub fn host_detail_row<'a>(
         identity: host
             .auth
             .inline_body()
-            .and_then(|b| b.key.as_deref())
-            .map(|p| p.to_string_lossy()),
+            .and_then(|b| b.key.as_ref())
+            .map(identity_display),
         password,
+    }
+}
+
+/// The display form of a [`KeySource`] for `ls`/`show` output: the file path
+/// for [`KeySource::Path`] (lossy-converted so non-UTF-8 paths still serialize),
+/// and the fixed marker `"<inline>"` for [`KeySource::Inline`]. The inline key
+/// text is **never** rendered — it is as sensitive as a password, and leaking
+/// it to `ls`/`show`/JSON would violate the no-secret-in-output rule.
+pub fn identity_display(source: &KeySource) -> Cow<'_, str> {
+    match source {
+        KeySource::Path(p) => p.to_string_lossy(),
+        KeySource::Inline(_) => Cow::Borrowed("<inline>"),
     }
 }
 
@@ -349,6 +364,42 @@ mod tests {
         assert_eq!(obj["id"], id_str);
         assert_eq!(obj["auth_kind"], "key");
         assert_eq!(obj["identity"], "/home/u/.ssh/id_ed25519");
+    }
+
+    #[test]
+    fn host_detail_row_masks_inline_key_text_in_identity() {
+        // Security contract: an inline (pasted) private key must NEVER appear
+        // in `ls`/`show` JSON or text — it is as sensitive as a password. The
+        // `identity` field surfaces only the fixed marker "<inline>"; the key
+        // text itself is dropped at render time.
+        use sshrack_core::config::schema::{InlineKey, KeySource, Secret};
+        let host = Host {
+            id: Ulid::new(),
+            name: "box".into(),
+            host: "1.2.3.4".into(),
+            port: 22,
+            auth: Auth::Inline(CredentialBody {
+                user: "root".into(),
+                password: None,
+                key: Some(KeySource::Inline(InlineKey {
+                    private_key: Some(Secret::Plain("SUPERSECRET-KEY-TEXT".into())),
+                    certificate: None,
+                    keyring: false,
+                })),
+                keyring: false,
+            }),
+        };
+        let id_str = host.id.to_string();
+        let row = host_detail_row(&host, &id_str, None, None);
+        let json = serde_json::to_string(&row).unwrap();
+        assert!(
+            !json.contains("SUPERSECRET-KEY-TEXT"),
+            "inline key text leaked into JSON: {json}"
+        );
+        assert!(
+            json.contains("<inline>"),
+            "expected an <inline> marker, got: {json}"
+        );
     }
 
     #[test]

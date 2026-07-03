@@ -75,6 +75,11 @@ pub struct ConnectRequest {
     /// because [`sshrack_core::credential::PasswordSource`] owns a
     /// `Zeroizing<String>` for the inline case.
     pub source: sshrack_core::credential::PasswordSource,
+    /// Temp files holding a pasted inline identity key, when the resolved
+    /// auth's key was inline material. `main` MUST hold this across
+    /// [`sshrack_core::connect::launch`] — its `Drop` removes the temp files so
+    /// the plaintext does not outlive ssh. `None` for path-key / no-key hosts.
+    pub key_artifact: Option<sshrack_core::connect::KeyArtifact>,
 }
 
 /// The default store mode to apply when a freshly-loaded config has not chosen
@@ -255,6 +260,10 @@ mod tests {
                 user: None,
                 port: None,
                 identity: None,
+                identity_stdin: false,
+                identity_file: None,
+                certificate_stdin: false,
+                certificate_file: None,
                 credential: None,
                 force: false,
             },
@@ -273,6 +282,10 @@ mod tests {
                 user: None,
                 port: None,
                 identity: None,
+                identity_stdin: false,
+                identity_file: None,
+                certificate_stdin: false,
+                certificate_file: None,
                 rename: None,
                 credential: None,
                 clear_identity: false,
@@ -295,6 +308,10 @@ mod tests {
                 name: None,
                 user: None,
                 identity: None,
+                identity_stdin: false,
+                identity_file: None,
+                certificate_stdin: false,
+                certificate_file: None,
                 force: false,
             },
         };
@@ -314,6 +331,10 @@ mod tests {
                 name: Some("ops".into()),
                 user: None,
                 identity: None,
+                identity_stdin: false,
+                identity_file: None,
+                certificate_stdin: false,
+                certificate_file: None,
                 clear_identity: false,
                 rename: None,
             },

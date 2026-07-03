@@ -1086,7 +1086,10 @@ mod tests {
         let c = &reloaded.credentials[0];
         assert_eq!(c.body.secret_kind(), SecretKind::Key);
         assert_eq!(
-            c.body.key.as_deref(),
+            c.body
+                .key
+                .as_ref()
+                .and_then(sshrack_core::config::schema::KeySource::as_path),
             Some(std::path::Path::new("/home/me/.ssh/id_ed25519"))
         );
     }

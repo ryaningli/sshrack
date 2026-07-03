@@ -30,7 +30,7 @@ use super::{
     SaveError, SecretChoice, backspace_at, bracketed, insert_char_at, validate, value_spans,
 };
 use crate::tui::fit::truncate_cells;
-use sshrack_core::config::schema::{Auth, CredentialBody, Host};
+use sshrack_core::config::schema::{Auth, CredentialBody, Host, KeySource};
 
 /// The host form's editable state. All text fields are owned `String`s; the
 /// password is `Zeroizing` so it is wiped on drop. The wizard builds this empty
@@ -85,6 +85,14 @@ pub struct HostForm {
     /// When open, `on_key` routes every key into the picker before the form,
     /// and `draw_in_dialog` paints the picker overlay over the wizard.
     pub cred_picker: Option<CredPicker>,
+    /// The original body's [`KeySource`] when the host's inline auth carried a
+    /// key at edit time. The wizard cannot paste-edit inline key text yet
+    /// (Plan 2), so an inline ([`KeySource::Inline`]) original is preserved
+    /// verbatim by [`build_inline_body`](Self::build_inline_body) when the
+    /// identity field is left blank — silently dropping it would destroy the
+    /// host's only secret. `None` in add mode, under Reference, and when the
+    /// original had no key.
+    pub orig_key: Option<KeySource>,
 }
 
 impl std::fmt::Debug for HostForm {
@@ -107,6 +115,7 @@ impl std::fmt::Debug for HostForm {
             .field("orig_id", &self.orig_id)
             .field("cred_picker", &self.cred_picker)
             .field("credential_names", &self.credential_names)
+            .field("orig_key", &self.orig_key)
             .finish()
     }
 }
@@ -132,6 +141,7 @@ impl HostForm {
             orig_id: None,
             credential_names,
             cred_picker: None,
+            orig_key: None,
         };
         form.cursor = form.focused_text_len();
         form
@@ -143,12 +153,21 @@ impl HostForm {
     /// carried into the form: the user re-types to change it, and leaving the
     /// field empty on a Password-kind edit keeps the existing secret (handled by
     /// the loop at save time, mirroring CredForm).
+    ///
+    /// The original body's [`KeySource`] (path or inline) is carried into the
+    /// form as `orig_key` when the host's inline auth had a key. The wizard
+    /// cannot paste-edit inline key text yet (Plan 2); an inline original is
+    /// preserved verbatim by [`build_inline_body`](Self::build_inline_body)
+    /// when the identity field is left blank, so editing other fields never
+    /// destroys the host's only secret. `identity` (the editable text field)
+    /// surfaces only the path of a path original; an inline original renders
+    /// blank with the placeholder shown.
     pub fn new_edit(
         host: &Host,
         credential_names: Vec<String>,
         referenced_credential_name: Option<&str>,
     ) -> Self {
-        let (auth_choice, user, secret_kind, identity) = match &host.auth {
+        let (auth_choice, user, secret_kind, identity, orig_key) = match &host.auth {
             Auth::Ref { .. } => {
                 // Match the referenced credential's current name in the chooser
                 // list. unwrap_or(0) only fires when the referenced credential
@@ -161,16 +180,19 @@ impl HostForm {
                     String::new(),
                     SecretChoice::None,
                     String::new(),
+                    None,
                 )
             }
             Auth::Inline(body) => {
                 use sshrack_core::config::schema::SecretKind;
                 let u = body.user.clone();
+                let orig_key = body.key.clone();
                 let (sk, iden) = match body.secret_kind() {
                     SecretKind::Key => (
                         SecretChoice::IdentityKey,
                         body.key
                             .as_ref()
+                            .and_then(KeySource::as_path)
                             .map(|p| p.to_string_lossy().into_owned())
                             .unwrap_or_default(),
                     ),
@@ -179,7 +201,7 @@ impl HostForm {
                     }
                     SecretKind::Default => (SecretChoice::None, String::new()),
                 };
-                (AuthChoice::Independent, u, sk, iden)
+                (AuthChoice::Independent, u, sk, iden, orig_key)
             }
         };
         let mut form = Self {
@@ -202,6 +224,7 @@ impl HostForm {
             orig_id: Some(host.id),
             credential_names,
             cred_picker: None,
+            orig_key,
         };
         form.cursor = form.focused_text_len();
         form
@@ -272,6 +295,14 @@ impl HostForm {
     /// it per the store mode after this. An empty Password field leaves the body
     /// without a password (the loop preserves the existing password in edit
     /// mode). A None id / empty user falls back to "root".
+    ///
+    /// **Inline-key preservation (Plan 1 stopgap).** Under IdentityKey with the
+    /// editable identity field left blank, the original key is re-attached
+    /// verbatim when it was an inline ([`KeySource::Inline`]) source. Full
+    /// paste-editing of inline key text lands in Plan 2; for now the wizard
+    /// must not destroy the host's only secret just because the field could
+    /// not display the key text. A path original edited to blank is treated as
+    /// "user cleared the field" (no key).
     fn build_inline_body(&self) -> CredentialBody {
         let user = if self.user.trim().is_empty() {
             "root".to_string()
@@ -285,6 +316,10 @@ impl HostForm {
                 let mut body = CredentialBody::new(user);
                 if !key.is_empty() {
                     body = body.with_key(key);
+                } else if let Some(KeySource::Inline(ik)) = self.orig_key.clone() {
+                    // Field blank AND original was inline: preserve the inline
+                    // material verbatim (Plan 2 will add real paste-editing).
+                    body.key = Some(KeySource::Inline(ik));
                 }
                 body
             }
