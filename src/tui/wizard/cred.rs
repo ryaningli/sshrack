@@ -20,7 +20,10 @@ use zeroize::Zeroizing;
 
 use super::super::intent::Outcome;
 use super::super::theme;
-use super::{CRED_VALUE_COL, CredField, CredSaveError, SecretChoice, validate_cred, value_spans};
+use super::{
+    CRED_VALUE_COL, CredField, CredSaveError, SecretChoice, backspace_at, insert_char_at,
+    validate_cred, value_spans,
+};
 use crate::tui::fit::truncate_cells;
 use sshrack_core::config::schema::{Credential, CredentialBody};
 
@@ -45,6 +48,9 @@ pub struct CredForm {
     pub password: Zeroizing<String>,
     /// Currently focused field.
     pub focus: CredField,
+    /// Char-index cursor within the focused text field. Reset to the focused
+    /// field's end on focus change; clamped on read by [`cursor_target`].
+    pub(super) cursor: usize,
     /// A transient validation error to show under the bad field. Cleared on the
     /// next edit to that field.
     pub error: Option<CredSaveError>,
@@ -88,18 +94,21 @@ impl CredForm {
     /// Build a fresh add-mode form (all fields blank, focus on name, no
     /// secret).
     pub fn new_add() -> Self {
-        Self {
+        let mut form = Self {
             name: String::new(),
             user: String::new(),
             identity: String::new(),
             secret_kind: SecretChoice::None,
             password: Zeroizing::new(String::new()),
             focus: CredField::Name,
+            cursor: 0,
             error: None,
             core_error: None,
             editing: false,
             orig_id: None,
-        }
+        };
+        form.cursor = form.focused_text_len();
+        form
     }
 
     /// Build an edit-mode form prefilled from `cred`. The secret kind is
@@ -124,7 +133,7 @@ impl CredForm {
             }
             SecretKind::Default => (SecretChoice::None, String::new()),
         };
-        Self {
+        let mut form = Self {
             name: cred.name.clone(),
             user: body.user.clone(),
             identity,
@@ -135,11 +144,14 @@ impl CredForm {
             // (handled by the loop at save time).
             password: Zeroizing::new(String::new()),
             focus: CredField::Name,
+            cursor: 0,
             error: None,
             core_error: None,
             editing: true,
             orig_id: Some(cred.id),
-        }
+        };
+        form.cursor = form.focused_text_len();
+        form
     }
 
     /// Set a core-level persist error (from the loop). Cleared on the next
@@ -172,6 +184,7 @@ impl CredForm {
         let next = (cur + delta).rem_euclid(reachable.len() as i32) as usize;
         self.focus = reachable[next];
         self.error = None;
+        self.cursor = self.focused_text_len();
     }
 
     /// True when `field` is the last reachable field (Enter there submits).
@@ -187,8 +200,11 @@ impl CredForm {
     /// the host wizard's [`Outcome::SaveHost`].
     ///
     /// Bindings mirror [`super::HostForm::on_key`]:
-    /// - printable char / `Backspace` → edit the focused text field (name,
-    ///   user, identity, or password when the choice is Password).
+    /// - printable char / `Backspace` → edit the focused text field at the
+    ///   in-field cursor (name, user, identity, or password when the choice is
+    ///   Password).
+    /// - `←`/`→`/`Home`/`End` (and `Ctrl-A`/`Ctrl-E`) → move the in-field cursor
+    ///   on text fields; clamped to the field's char length.
     /// - `Tab` / `↓` → next field; `Shift-Tab` / `↑` → previous field.
     /// - `Enter` → next field, or — on the last reachable field — attempt save;
     ///   on validation error set `error` and move focus to the bad field.
@@ -211,6 +227,15 @@ impl CredForm {
         match key.code {
             KeyCode::Esc => Outcome::Cancel,
             KeyCode::Char('s') if ctrl => self.attempt_save(),
+            // Ctrl-A / Ctrl-E alias Home / End on text fields.
+            KeyCode::Char('a') if ctrl => {
+                self.cursor = 0;
+                Outcome::Continue
+            }
+            KeyCode::Char('e') if ctrl => {
+                self.cursor = self.focused_text_len();
+                Outcome::Continue
+            }
             KeyCode::Tab => {
                 self.move_focus(1);
                 Outcome::Continue
@@ -235,6 +260,7 @@ impl CredForm {
                     Outcome::Continue
                 }
             }
+            // Secret row: ←/→ cycle None / Password / IdentityKey.
             KeyCode::Left if self.focus == CredField::SecretKind => {
                 self.secret_kind = self.secret_kind.prev();
                 // Clear an errored password field's focus if it is now
@@ -247,28 +273,49 @@ impl CredForm {
                 self.error = None;
                 Outcome::Continue
             }
+            // Text fields: ←/→ move the in-field cursor; Home/End jump.
+            // (The SecretKind chooser row is handled by the arms above.)
+            KeyCode::Left if !ctrl => {
+                self.cursor = self.cursor.saturating_sub(1);
+                Outcome::Continue
+            }
+            KeyCode::Right if !ctrl => {
+                self.cursor = self.cursor.min(self.focused_text_len());
+                Outcome::Continue
+            }
+            KeyCode::Home => {
+                self.cursor = 0;
+                Outcome::Continue
+            }
+            KeyCode::End => {
+                self.cursor = self.focused_text_len();
+                Outcome::Continue
+            }
             KeyCode::Backspace => {
-                self.edit_focused_pop();
+                self.edit_focused_backspace();
                 Outcome::Continue
             }
             KeyCode::Char(c) if !ctrl => {
-                self.edit_focused_push(c);
+                self.edit_focused_insert(c);
                 Outcome::Continue
             }
             _ => Outcome::Continue,
         }
     }
 
-    fn edit_focused_push(&mut self, c: char) {
+    /// Insert `c` at the in-field cursor (advancing it one past the inserted
+    /// char). The SecretKind chooser is driven by ←/→; the Password field only
+    /// accepts input when secret_kind is Password.
+    fn edit_focused_insert(&mut self, c: char) {
         match self.focus {
-            CredField::Name => self.name.push(c),
-            CredField::User => self.user.push(c),
-            CredField::Identity => self.identity.push(c),
+            CredField::Name => self.cursor = insert_char_at(&mut self.name, self.cursor, c),
+            CredField::User => self.cursor = insert_char_at(&mut self.user, self.cursor, c),
+            CredField::Identity => self.cursor = insert_char_at(&mut self.identity, self.cursor, c),
             CredField::SecretKind => {
                 // The chooser is driven by ←/→; no text entry on this row.
             }
             CredField::Password if self.secret_kind == SecretChoice::Password => {
-                self.password.push(c);
+                self.cursor = insert_char_at(&mut self.password, self.cursor, c)
             }
             CredField::Password => {}
         }
@@ -277,20 +324,16 @@ impl CredForm {
         }
     }
 
-    fn edit_focused_pop(&mut self) {
+    /// Delete the char immediately before the in-field cursor (mirror of
+    /// [`edit_focused_insert`]). No-op when the cursor is already at the start.
+    fn edit_focused_backspace(&mut self) {
         match self.focus {
-            CredField::Name => {
-                self.name.pop();
-            }
-            CredField::User => {
-                self.user.pop();
-            }
-            CredField::Identity => {
-                self.identity.pop();
-            }
+            CredField::Name => self.cursor = backspace_at(&mut self.name, self.cursor),
+            CredField::User => self.cursor = backspace_at(&mut self.user, self.cursor),
+            CredField::Identity => self.cursor = backspace_at(&mut self.identity, self.cursor),
             CredField::SecretKind => {}
             CredField::Password if self.secret_kind == SecretChoice::Password => {
-                self.password.pop();
+                self.cursor = backspace_at(&mut self.password, self.cursor)
             }
             CredField::Password => {}
         }
@@ -403,19 +446,29 @@ impl CredForm {
         }
     }
 
-    /// The `(row, value_offset)` where the terminal cursor should sit for the
-    /// focused field, or `None` for the SecretKind chooser. `row` is the index
-    /// into the reachable rendered rows; `offset` is the char count already
-    /// typed (the masked password counts its chars). Pure;
-    /// [`CredForm::draw_in_dialog`] consumes it to call
-    /// `Frame::set_cursor_position`.
-    fn cursor_target(&self) -> Option<(usize, usize)> {
-        let row = self.focus_idx();
-        let offset = match self.focus {
+    /// Char count of the currently focused text field (0 for the chooser row).
+    fn focused_text_len(&self) -> usize {
+        match self.focus {
             CredField::Name => self.name.chars().count(),
             CredField::User => self.user.chars().count(),
             CredField::Identity => self.identity.chars().count(),
             CredField::Password => self.password.chars().count(),
+            CredField::SecretKind => 0,
+        }
+    }
+
+    /// The `(row, value_offset)` where the terminal cursor should sit for the
+    /// focused field, or `None` for the SecretKind chooser. `row` is the index
+    /// into the reachable rendered rows; `offset` is the stored char-index
+    /// cursor, clamped to the field's current length. Pure; consumed by
+    /// [`CredForm::draw_in_dialog`] to call `Frame::set_cursor_position`.
+    fn cursor_target(&self) -> Option<(usize, usize)> {
+        let row = self.focus_idx();
+        let offset = match self.focus {
+            CredField::Name => self.cursor.min(self.name.chars().count()),
+            CredField::User => self.cursor.min(self.user.chars().count()),
+            CredField::Identity => self.cursor.min(self.identity.chars().count()),
+            CredField::Password => self.cursor.min(self.password.chars().count()),
             CredField::SecretKind => return None,
         };
         Some((row, offset))
@@ -524,6 +577,10 @@ mod tests {
         let mut f = blank_cred_form();
         f.name = name.into();
         f.user = user.into();
+        // Keep the cursor consistent with the pre-filled Name (mirrors what
+        // move_focus / construction do), so backspace / cursor_target behave as
+        // if the user had just typed the value.
+        f.cursor = f.focused_text_len();
         f
     }
 
@@ -546,6 +603,9 @@ mod tests {
         f.secret_kind = SecretChoice::Password;
         f.focus = CredField::Password;
         f.password = Zeroizing::new(String::from("secret1"));
+        // Sync the cursor to the end of the pre-filled Password field, as if
+        // the user had just typed it — cursor_target then reports that position.
+        f.cursor = f.focused_text_len();
         // Password is the 5th reachable field when secret_kind == Password.
         assert_eq!(f.cursor_target(), Some((4, 7)));
     }
@@ -1052,5 +1112,57 @@ mod tests {
             captured_body.y,
             captured_body.y + captured_body.height
         );
+    }
+
+    // ---- in-field cursor movement (Task 3: RED -> GREEN) ----
+
+    #[test]
+    fn left_arrow_moves_cursor_within_a_cred_text_field() {
+        let mut form = CredForm::new_add();
+        for c in "ops".chars() {
+            form.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        form.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(form.name, "ops");
+        assert_eq!(form.cursor, 2);
+        assert_eq!(form.cursor_target(), Some((0, 2)));
+    }
+
+    #[test]
+    fn typing_inserts_at_cursor_in_cred_form() {
+        let mut form = CredForm::new_add();
+        for c in "ab".chars() {
+            form.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        form.on_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        form.on_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE));
+        assert_eq!(form.name, "Xab");
+    }
+
+    #[test]
+    fn backspace_deletes_before_cursor_in_cred_form() {
+        let mut form = CredForm::new_add();
+        for c in "abc".chars() {
+            form.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        // cursor at end (3). Left twice -> cursor 1. Backspace deletes 'a' -> "bc".
+        form.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        form.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        form.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(form.name, "bc");
+        assert_eq!(form.cursor, 0);
+    }
+
+    #[test]
+    fn left_right_still_cycle_kind_on_secretkind_row() {
+        let mut form = CredForm::new_add();
+        // Tab to SecretKind.
+        form.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // Name -> User
+        form.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // User -> Identity
+        form.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // Identity -> SecretKind
+        assert_eq!(form.focus, CredField::SecretKind);
+        let before = form.secret_kind;
+        form.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_ne!(form.secret_kind, before);
     }
 }
