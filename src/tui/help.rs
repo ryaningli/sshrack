@@ -77,7 +77,15 @@ fn help_lines() -> Vec<Line<'static>> {
 /// `F1/Esc · close` hotkey footer, and the keymap reference left-aligned in the
 /// body. Pure render — no I/O, no key handling.
 pub fn draw_help_dialog(frame: &mut Frame) {
-    let body = draw_dialog(frame, "help", 0, &[("F1/Esc", "close")]);
+    // 31 lines today -> clamps to MAX_H; Task 4 will add scrolling for the
+    // overflow. Pass the real count rather than a hardcoded 0 so the clamp
+    // kicks in deterministically.
+    let body = draw_dialog(
+        frame,
+        "help",
+        help_lines().len() as u16,
+        &[("F1/Esc", "close")],
+    );
     let paragraph = Paragraph::new(help_lines());
     frame.render_widget(paragraph, body);
 }

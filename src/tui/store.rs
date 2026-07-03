@@ -115,6 +115,13 @@ impl StoreView {
         self.selected = (cur + delta).rem_euclid(len) as usize;
     }
 
+    /// Content row count the dialog should size to: 3 modes x (name line +
+    /// blurb line) + 1 status line. Consumed by the App overlay layer to size
+    /// the dialog via [`crate::tui::dialog::draw_dialog`].
+    pub fn body_rows(&self) -> u16 {
+        StoreModeChoice::ORDER.len() as u16 * 2 + 1
+    }
+
     /// The mode under the cursor, if the list is non-empty (it always is).
     pub fn selected_mode(&self) -> Option<StoreModeChoice> {
         StoreModeChoice::ORDER.get(self.selected).copied()

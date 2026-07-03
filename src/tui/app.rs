@@ -886,7 +886,7 @@ impl App {
                 let body = draw_dialog(
                     frame,
                     &form.title(),
-                    0,
+                    form.body_rows(),
                     &[("Tab", "field"), ("^S", "save"), ("Esc", "cancel")],
                 );
                 form.draw_in_dialog(frame, body);
@@ -895,7 +895,7 @@ impl App {
                 let body = draw_dialog(
                     frame,
                     &form.title(),
-                    0,
+                    form.body_rows(),
                     &[("Tab", "field"), ("^S", "save"), ("Esc", "cancel")],
                 );
                 form.draw_in_dialog(frame, body);
@@ -904,7 +904,10 @@ impl App {
                 let body = draw_dialog(
                     frame,
                     " storage mode ",
-                    0,
+                    self.store_view
+                        .as_ref()
+                        .expect("invariant: store_view stashed while StorePicker overlay is open")
+                        .body_rows(),
                     &[("↑↓", "select"), ("Enter", "switch"), ("Esc", "cancel")],
                 );
                 self.store_view

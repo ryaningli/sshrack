@@ -18,15 +18,19 @@ use crate::tui::theme;
 const MAX_W: u16 = 80;
 const MAX_H: u16 = 24;
 
-/// Centered, clamped dialog rect inside `screen`.
-///
-/// The dialog is at most `MAX_W` x `MAX_H`, shrunk by a 2-cell margin
-/// (`w-4` / `h-4`) so it never touches the screen edge, and centered. When the
-/// screen is smaller than 6 cells on either axis the screen is returned as-is
-/// (we can't center meaningfully and a zero-size rect would panic downstream).
-pub fn dialog_area(screen: Rect) -> Rect {
+/// Centered, content-fit dialog rect inside `screen`. The outer height is
+/// `body_rows + 2 (border) + 1 (footer)`, clamped down to [`MAX_H`] and to the
+/// screen height (minus a 2-cell margin). Width stays at most [`MAX_W`] (forms
+/// need the room for long values). Returns `screen` as-is when either axis < 6.
+pub fn dialog_area(screen: Rect, body_rows: u16) -> Rect {
     let w = MAX_W.min(screen.width.saturating_sub(4));
-    let h = MAX_H.min(screen.height.saturating_sub(4));
+    let outer_h = body_rows
+        .saturating_add(3) // border(2) + footer(1)
+        .min(MAX_H)
+        .min(screen.height.saturating_sub(4));
+    // Floor the height at the dialog chrome itself (2 border + 1 footer = 3)
+    // so a zero/near-zero body_rows still yields a visible chrome.
+    let h = outer_h.max(3);
     if screen.width < 6 || screen.height < 6 {
         return screen;
     }
@@ -50,20 +54,20 @@ pub fn dialog_area(screen: Rect) -> Rect {
 /// Clear the dialog area, draw a titled bordered block with a 1-row hotkey
 /// footer, and return the body rect for the caller to fill.
 ///
-/// `_body_area_count` is intentionally unused: it is reserved in the signature
-/// so future callers can hint at the body's row count without changing the
-/// API (the leading underscore keeps clippy quiet). The body is everything
-/// inside the border minus the footer row.
+/// `body_rows` is the caller's content row count; it drives the outer height
+/// via [`dialog_area`] so the dialog fits its content instead of always
+/// maxing out at [`MAX_H`]. The body is everything inside the border minus the
+/// footer row.
 ///
 /// Footer `hints` are `(key, label)` pairs joined by ` · `, with keys in the
 /// accent color + bold and labels dimmed.
 pub fn draw_dialog(
     frame: &mut Frame,
     title: &str,
-    _body_area_count: u16,
+    body_rows: u16,
     footer_hints: &[(&str, &str)],
 ) -> Rect {
-    let area = dialog_area(frame.area());
+    let area = dialog_area(frame.area(), body_rows);
     // Clear the background so the shell behind doesn't bleed through (no dark
     // scrim — terminals can't do translucency, and a Clear is enough).
     frame.render_widget(Clear, area);
@@ -95,26 +99,41 @@ pub fn draw_dialog(
 #[cfg(test)]
 mod tests {
     //! Geometry + no-panic tests for the dialog chrome. Rendering itself is
-    //! ratatui's job; these pin our `dialog_area` math (centering + clamping)
-    //! and assert `draw_dialog` returns a usable body rect and doesn't panic
-    //! over a TestBackend.
+    //! ratatui's job; these pin our `dialog_area` math (content-fit height,
+    //! centering, and clamping) and assert `draw_dialog` returns a usable body
+    //! rect and doesn't panic over a TestBackend.
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
 
     #[test]
-    fn dialog_area_is_centered_and_clamped() {
+    fn dialog_area_height_tracks_body_rows_then_clamps_to_max() {
         let screen = Rect::new(0, 0, 100, 40);
-        let d = dialog_area(screen);
-        // Clamped to the max footprint.
+        // body 5 -> outer = 5 + 2 border + 1 footer = 8.
+        let d = dialog_area(screen, 5);
+        assert_eq!(d.height, 8);
+        // body 100 -> clamps to MAX_H (24).
+        let d = dialog_area(screen, 100);
+        assert_eq!(d.height, MAX_H);
+    }
+
+    #[test]
+    fn dialog_area_height_clamps_to_screen_when_terminal_short() {
+        // 12-row screen: outer must fit (minus 4-cell margin -> <= 8), not
+        // overflow.
+        let screen = Rect::new(0, 0, 100, 12);
+        let d = dialog_area(screen, 50);
+        assert!(d.height <= screen.height);
+        assert!(d.y + d.height <= screen.height, "must not overflow screen");
+    }
+
+    #[test]
+    fn dialog_area_still_centers_and_clamps_width() {
+        let screen = Rect::new(0, 0, 100, 40);
+        let d = dialog_area(screen, 5);
         assert!(d.width <= MAX_W);
-        assert!(d.height <= MAX_H);
-        // Centered: left margin equals right margin, top equals bottom.
         let left = d.x;
         let right = screen.width - (d.x + d.width);
-        assert_eq!(left, right);
-        let top = d.y;
-        let bottom = screen.height - (d.y + d.height);
-        assert_eq!(top, bottom);
+        assert_eq!(left, right, "horizontally centered");
     }
 
     #[test]
@@ -122,7 +141,7 @@ mod tests {
         // A terminal too small for the max footprint still yields a rect that
         // fits on screen (no overflow, no panic).
         let tiny = Rect::new(0, 0, 10, 5);
-        let d = dialog_area(tiny);
+        let d = dialog_area(tiny, 5);
         assert!(d.width <= tiny.width);
         assert!(d.height <= tiny.height);
     }

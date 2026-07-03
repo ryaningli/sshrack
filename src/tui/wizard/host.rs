@@ -647,6 +647,13 @@ impl HostForm {
         }
     }
 
+    /// Content row count the dialog should size to: reachable fields + 1 error
+    /// line + 1 hint line. Consumed by the App overlay layer to size the dialog
+    /// via [`crate::tui::dialog::draw_dialog`].
+    pub fn body_rows(&self) -> u16 {
+        self.reachable_fields().len() as u16 + 2
+    }
+
     /// Render one labeled field row, with the focus highlight + placeholder.
     fn render_row(&self, field: Field) -> Line<'static> {
         let label = field.label();
@@ -1057,7 +1064,7 @@ mod tests {
                             let body = draw_dialog(
                                 fr,
                                 &f.title(),
-                                0,
+                                f.body_rows(),
                                 &[("Tab", "field"), ("^S", "save"), ("Esc", "cancel")],
                             );
                             f.draw_in_dialog(fr, body);
@@ -1075,7 +1082,7 @@ mod tests {
                 let body = draw_dialog(
                     fr,
                     &f.title(),
-                    0,
+                    f.body_rows(),
                     &[("Tab", "field"), ("^S", "save"), ("Esc", "cancel")],
                 );
                 f.draw_in_dialog(fr, body);
@@ -1089,7 +1096,7 @@ mod tests {
                 let body = draw_dialog(
                     fr,
                     &f.title(),
-                    0,
+                    f.body_rows(),
                     &[("Tab", "field"), ("^S", "save"), ("Esc", "cancel")],
                 );
                 f.draw_in_dialog(fr, body);
