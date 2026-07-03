@@ -149,9 +149,10 @@ pub struct CredentialBody {
     /// Plaintext or encrypted password. `None` when not used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<Secret>,
-    /// Path to a private key. `None` when not used.
+    /// Identity key source: a path, or pasted inline contents. `None` when
+    /// not used. Mutually exclusive with `password` and the `keyring` marker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub key: Option<PathBuf>,
+    pub key: Option<KeySource>,
     /// Marker for keyring mode: when `true`, the password lives in the OS
     /// keyring (keyed by the owner id) and the body carries no inline secret.
     /// Mutually exclusive with `password` and `key`. Defaults to `false` and is
@@ -188,6 +189,81 @@ pub enum AuthChoice {
     Default,
 }
 
+/// Where an identity key lives: a file on disk ([`KeySource::Path`]), or pasted
+/// contents carried inline ([`KeySource::Inline`]). `untagged` so a legacy
+/// `key = "/path"` (bare string) still parses as [`KeySource::Path`] with no
+/// migration step.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum KeySource {
+    /// A path to a private key file on the local disk. Serializes as a bare
+    /// TOML string (`key = "/path"`), matching the pre-feature on-disk shape.
+    Path(PathBuf),
+    /// Pasted private-key material (and an optional certificate), carried as
+    /// [`Secret`] so vault/plaintext storage modes apply. Keyring mode is not
+    /// supported for inline keys (see [`CredentialBody::validate`]).
+    Inline(InlineKey),
+}
+
+impl std::fmt::Debug for KeySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact inline key material — it is key text, as sensitive as a password.
+        // Path is a filesystem location, not secret.
+        match self {
+            KeySource::Path(p) => f.debug_tuple("Path").field(p).finish(),
+            KeySource::Inline(_) => f.write_str("Inline(<redacted>)"),
+        }
+    }
+}
+
+impl KeySource {
+    /// The on-disk path if this is [`KeySource::Path`]; `None` for inline keys.
+    /// Connection code feeds this to ssh's `-i` flag; patch/resolve logic uses
+    /// it to keep behavior stable while inline-key handling lands in later tasks.
+    pub fn as_path(&self) -> Option<&std::path::Path> {
+        match self {
+            KeySource::Path(p) => Some(p.as_path()),
+            KeySource::Inline(_) => None,
+        }
+    }
+}
+
+/// The inline (pasted) form of a [`KeySource`]. `private_key` is the key text;
+/// `certificate` is an optional SSH certificate (`*-cert.pub` contents).
+/// `keyring` is reserved for a future keyring-backed inline key; for now
+/// [`CredentialBody::validate`] rejects `Inline` when it or the body-level
+/// `keyring` marker is set.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct InlineKey {
+    /// Private-key text. `None` only in a keyring-marker form (currently rejected).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_key: Option<Secret>,
+    /// Optional SSH certificate text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate: Option<Secret>,
+    /// Reserved: inline key lives in the OS keyring. Currently rejected in
+    /// [`CredentialBody::validate`] (inline keys need vault/plaintext mode).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keyring: bool,
+}
+
+impl std::fmt::Debug for InlineKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact both secrets; keyring is a boolean flag, not sensitive.
+        f.debug_struct("InlineKey")
+            .field(
+                "private_key",
+                &self.private_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "certificate",
+                &self.certificate.as_ref().map(|_| "<redacted>"),
+            )
+            .field("keyring", &self.keyring)
+            .finish()
+    }
+}
+
 impl CredentialBody {
     /// Build a default-only body (user, no secret). The owner assigns and
     /// carries the id; a body carries none.
@@ -209,9 +285,22 @@ impl CredentialBody {
         self
     }
 
-    /// Set the key secret (clears any password). Builder.
+    /// Set the key to a file path (clears any password). Builder.
     pub fn with_key(mut self, key: impl Into<PathBuf>) -> Self {
-        self.key = Some(key.into());
+        self.key = Some(KeySource::Path(key.into()));
+        self.password = None;
+        self.keyring = false;
+        self
+    }
+
+    /// Set the key to pasted inline material (clears any password). Builder.
+    /// `private_key` is the key text; `certificate` is an optional SSH cert.
+    pub fn with_inline_key(mut self, private_key: Secret, certificate: Option<Secret>) -> Self {
+        self.key = Some(KeySource::Inline(InlineKey {
+            private_key: Some(private_key),
+            certificate,
+            keyring: false,
+        }));
         self.password = None;
         self.keyring = false;
         self
@@ -230,10 +319,20 @@ impl CredentialBody {
         }
     }
 
-    /// Enforce the mutual-exclusion invariant: at most one of password / key /
-    /// keyring marker. Any pair set is a malformed body — no silent winner.
+    /// Enforce the mutual-exclusion invariant: at most one of password / key
+    /// (Path or Inline) / keyring marker. Any pair set is a malformed body — no
+    /// silent winner. Additionally reject an inline key when keyring storage
+    /// mode is implied (the body-level marker or the [`InlineKey`] `keyring`
+    /// flag), since inline key text cannot live in the OS keyring in this MVP.
     pub fn validate(&self) -> Result<(), SshrackError> {
-        let secrets_set = [self.password.is_some(), self.key.is_some(), self.keyring]
+        // Count the secret slots: password, any key (Path or Inline), and the
+        // body-level keyring marker (password-in-keyring). At most one allowed.
+        let key_present = self.key.is_some();
+        let inline_keyring = matches!(
+            self.key,
+            Some(KeySource::Inline(ref ik)) if ik.keyring
+        );
+        let secrets_set = [self.password.is_some(), key_present, self.keyring]
             .into_iter()
             .filter(|b| *b)
             .count();
@@ -241,6 +340,12 @@ impl CredentialBody {
             return Err(SshrackError::InvalidCredentialBody {
                 user: self.user.clone(),
             });
+        }
+        // Inline key contents are not supported in keyring storage mode: the
+        // body-level `keyring` marker or the Inline's own `keyring` flag both
+        // mean "key text in the OS keyring", which this MVP does not implement.
+        if inline_keyring || (matches!(self.key, Some(KeySource::Inline(_))) && self.keyring) {
+            return Err(SshrackError::InlineKeyNeedsVaultOrPlaintext);
         }
         Ok(())
     }
@@ -501,7 +606,10 @@ auth = { user = "root" }
         assert!(bp.key.is_none());
         assert!(!bp.keyring);
         let bk = CredentialBody::new("u").with_key("/k");
-        assert_eq!(bk.key.as_deref(), Some(std::path::Path::new("/k")));
+        assert_eq!(
+            bk.key.as_ref().and_then(KeySource::as_path),
+            Some(std::path::Path::new("/k"))
+        );
         assert!(bk.password.is_none());
     }
 
@@ -531,7 +639,7 @@ key = "~/.ssh/team_ed25519"
         assert_eq!(c.name, "team-dev");
         assert_eq!(c.body.user, "deploy");
         assert_eq!(
-            c.body.key.as_deref(),
+            c.body.key.as_ref().and_then(KeySource::as_path),
             Some(std::path::Path::new("~/.ssh/team_ed25519"))
         );
     }
@@ -656,7 +764,7 @@ auth = { user = "root" }
         let body = CredentialBody {
             user: "u".into(),
             password: Some(Secret::Plain("p".into())),
-            key: Some(PathBuf::from("/k")),
+            key: Some(KeySource::Path(PathBuf::from("/k"))),
             keyring: false,
         };
         assert!(matches!(
@@ -688,6 +796,120 @@ auth = { user = "root" }
             CredentialBody::new("u").with_key("/k").secret_kind(),
             SecretKind::Key
         );
+    }
+
+    // ---- KeySource: untagged serde keeps `key = "/path"` binary-compatible ----
+
+    #[test]
+    fn keysource_path_round_trips_as_bare_string() {
+        // The untagged enum must serialize Path back to a bare TOML string so the
+        // on-disk shape is unchanged for path keys (and pre-existing configs parse).
+        let body = CredentialBody::new("u").with_key("/home/me/.ssh/id_ed25519");
+        let toml = toml::to_string(&body).unwrap();
+        assert!(
+            toml.contains("key = \"/home/me/.ssh/id_ed25519\""),
+            "Path key must round-trip as a bare string, got:\n{toml}"
+        );
+        // And parse straight back.
+        let back: CredentialBody = toml::from_str(&toml).unwrap();
+        assert!(matches!(back.key, Some(KeySource::Path(_))));
+    }
+
+    #[test]
+    fn keysource_legacy_bare_string_parses_as_path() {
+        // A pre-feature config writes `key = "/old/path"`. That must parse into
+        // KeySource::Path with no migration step and no format_version bump.
+        let toml = r#"user = "deploy"
+key = "/old/path"
+"#;
+        let body: CredentialBody = toml::from_str(toml).unwrap();
+        assert_eq!(
+            body.key.as_ref().and_then(|k| match k {
+                KeySource::Path(p) => Some(p.to_string_lossy().into_owned()),
+                _ => None,
+            }),
+            Some("/old/path".to_string())
+        );
+    }
+
+    #[test]
+    fn keysource_inline_round_trips_via_plain_secret() {
+        let body = CredentialBody::new("u").with_inline_key(
+            Secret::Plain("PRIV".into()),
+            Some(Secret::Plain("CERT".into())),
+        );
+        let toml = toml::to_string(&body).unwrap();
+        let back: CredentialBody = toml::from_str(&toml).unwrap();
+        match &back.key {
+            Some(KeySource::Inline(ik)) => {
+                assert_eq!(
+                    ik.private_key.as_ref().and_then(Secret::as_plain),
+                    Some("PRIV")
+                );
+                assert_eq!(
+                    ik.certificate.as_ref().and_then(Secret::as_plain),
+                    Some("CERT")
+                );
+            }
+            other => panic!("expected Inline, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keysource_debug_redacts_inline_contents() {
+        // Key material must never survive {:?} formatting.
+        let body =
+            CredentialBody::new("u").with_inline_key(Secret::Plain("SUPERSECRET".into()), None);
+        let dbg = format!("{:?}", body.key);
+        assert!(
+            !dbg.contains("SUPERSECRET"),
+            "Debug leaked inline key text: {dbg}"
+        );
+    }
+
+    // ---- validate: mutex incl. Inline + keyring-mode rejection ----
+
+    #[test]
+    fn validate_rejects_inline_key_under_keyring_mode_marker() {
+        // The top-level `keyring = true` marker means "the password is in the OS
+        // keyring". Inline key contents are not supported in keyring mode (see plan
+        // design note), so the combination is a malformed body.
+        let body = CredentialBody {
+            user: "u".into(),
+            password: None,
+            key: Some(KeySource::Inline(InlineKey {
+                private_key: Some(Secret::Plain("k".into())),
+                certificate: None,
+                keyring: true,
+            })),
+            keyring: false,
+        };
+        assert!(body.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_inline_key_without_keyring_marker() {
+        let body = CredentialBody::new("u").with_inline_key(Secret::Plain("k".into()), None);
+        assert!(body.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_password_and_inline_key_together() {
+        let mut body = CredentialBody::new("u").with_password("p");
+        body.key = Some(KeySource::Inline(InlineKey {
+            private_key: Some(Secret::Plain("k".into())),
+            certificate: None,
+            keyring: false,
+        }));
+        assert!(body.validate().is_err());
+    }
+
+    // ---- secret_kind: Path and Inline both report Key ----
+
+    #[test]
+    fn secret_kind_is_key_for_inline_keysource() {
+        let body = CredentialBody::new("u").with_inline_key(Secret::Plain("k".into()), None);
+        assert_eq!(body.secret_kind(), SecretKind::Key);
     }
 
     #[test]
@@ -896,7 +1118,7 @@ keyring = true
         let body = CredentialBody {
             user: "u".into(),
             password: None,
-            key: Some(PathBuf::from("/k")),
+            key: Some(KeySource::Path(PathBuf::from("/k"))),
             keyring: true,
         };
         assert!(matches!(

@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use ulid::Ulid;
 use zeroize::Zeroizing;
 
-use crate::config::schema::{Auth, Credential, CredentialBody, Host, SshrackConfig};
+use crate::config::schema::{Auth, Credential, CredentialBody, Host, KeySource, SshrackConfig};
 use crate::error::{DidYouMean, SshrackError};
 use crate::host::validate_name_chars;
 use crate::id::{OwnerKind, keyring_key};
@@ -310,7 +310,16 @@ pub fn apply_credential_patch(
     let key = if opts.clear_identity {
         None
     } else {
-        opts.identity.clone().or(orig.body.key.clone())
+        // Staging: only a Path key can flow back into `with_key(impl Into<PathBuf>)`.
+        // Inline keys are dropped here for now; real inline-patch handling lands
+        // in a later task. `opts.identity` (a flag-supplied path) always wins.
+        opts.identity.clone().or_else(|| {
+            orig.body
+                .key
+                .as_ref()
+                .and_then(KeySource::as_path)
+                .map(std::path::Path::to_path_buf)
+        })
     };
     let (password, keyring) = if opts.identity.is_some() || opts.clear_identity {
         // Switching to / clearing a key drops any password/marker.
@@ -456,7 +465,13 @@ pub fn resolve(
                 })?;
                 (
                     cred.body.user.clone(),
-                    cred.body.key.clone(),
+                    // Staging: extract the path for ssh `-i`; inline-key resolution
+                    // (writing the material to a temp file) lands in a later task.
+                    cred.body
+                        .key
+                        .as_ref()
+                        .and_then(KeySource::as_path)
+                        .map(std::path::Path::to_path_buf),
                     cred.body.password.clone(),
                     cred.body.keyring,
                     OwnerKind::Credential,
@@ -469,7 +484,10 @@ pub fn resolve(
                 body.validate()?;
                 (
                     body.user.clone(),
-                    body.key.clone(),
+                    body.key
+                        .as_ref()
+                        .and_then(KeySource::as_path)
+                        .map(std::path::Path::to_path_buf),
                     body.password.clone(),
                     body.keyring,
                     OwnerKind::Host,
@@ -636,7 +654,7 @@ mod tests {
         let b = CredentialBody {
             user: "u".into(),
             password: Some(crate::config::schema::Secret::Plain("p".into())),
-            key: Some(PathBuf::from("/k")),
+            key: Some(KeySource::Path(PathBuf::from("/k"))),
             keyring: false,
         };
         let h = inline_host(b);
@@ -1098,7 +1116,7 @@ mod tests {
         let bad = CredentialBody {
             user: "u".into(),
             password: Some(crate::config::schema::Secret::Plain("p".into())),
-            key: Some(PathBuf::from("/k")),
+            key: Some(KeySource::Path(PathBuf::from("/k"))),
             keyring: false,
         };
         assert!(matches!(
@@ -1149,7 +1167,10 @@ mod tests {
         };
         let out = apply_credential_patch(&orig, &opts).unwrap();
         assert_eq!(out.body.user, "new");
-        assert_eq!(out.body.key.as_deref(), Some(std::path::Path::new("/k2")));
+        assert_eq!(
+            out.body.key.as_ref().and_then(KeySource::as_path),
+            Some(std::path::Path::new("/k2"))
+        );
     }
 
     #[test]
@@ -1184,7 +1205,10 @@ mod tests {
         };
         let out = apply_credential_patch(&orig, &opts).unwrap();
         assert_eq!(out.body.secret_kind(), SecretKind::Key);
-        assert_eq!(out.body.key.as_deref(), Some(std::path::Path::new("/k")));
+        assert_eq!(
+            out.body.key.as_ref().and_then(KeySource::as_path),
+            Some(std::path::Path::new("/k"))
+        );
         assert!(
             out.body.password.is_none(),
             "password must be dropped when switching to a key"

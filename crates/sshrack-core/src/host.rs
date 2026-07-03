@@ -17,7 +17,7 @@ use std::path::PathBuf;
 
 use ulid::Ulid;
 
-use crate::config::schema::{Auth, CredentialBody, Host, SshrackConfig};
+use crate::config::schema::{Auth, CredentialBody, Host, KeySource, SshrackConfig};
 use crate::error::{DidYouMean, SshrackError};
 use crate::id::{OwnerKind, new_id};
 use crate::secret::{self, SecretBackend};
@@ -380,7 +380,15 @@ fn patch_body(body: &CredentialBody, opts: &EditOptions) -> Result<CredentialBod
     let key = if opts.clear_identity {
         None
     } else {
-        opts.identity.clone().or(body.key.clone())
+        // Staging: only a Path key can flow back into `with_key(impl Into<PathBuf>)`.
+        // Inline keys are dropped here for now; real inline-patch handling lands
+        // in a later task. `opts.identity` (a flag-supplied path) always wins.
+        opts.identity.clone().or_else(|| {
+            body.key
+                .as_ref()
+                .and_then(KeySource::as_path)
+                .map(std::path::Path::to_path_buf)
+        })
     };
     let (password, keyring) = if opts.clear_password {
         (None, false)
@@ -727,7 +735,10 @@ mod tests {
         assert_eq!(cloned.port, src.port);
         let body = cloned.auth.inline_body().unwrap();
         assert_eq!(body.user, "deploy");
-        assert_eq!(body.key.as_deref(), Some(std::path::Path::new("/k")));
+        assert_eq!(
+            body.key.as_ref().and_then(KeySource::as_path),
+            Some(std::path::Path::new("/k"))
+        );
         assert_eq!(src.name, "web1");
     }
 
@@ -846,7 +857,10 @@ mod tests {
         assert_eq!(host.port, 2222);
         let body = host.auth.inline_body().unwrap();
         assert_eq!(body.user, "deploy");
-        assert_eq!(body.key.as_deref(), Some(std::path::Path::new("/k")));
+        assert_eq!(
+            body.key.as_ref().and_then(KeySource::as_path),
+            Some(std::path::Path::new("/k"))
+        );
     }
 
     #[test]
@@ -973,7 +987,10 @@ mod tests {
         assert_eq!(out.port, 2222);
         let body = out.auth.inline_body().unwrap();
         assert_eq!(body.user, "deploy");
-        assert_eq!(body.key.as_deref(), Some(std::path::Path::new("/k")));
+        assert_eq!(
+            body.key.as_ref().and_then(KeySource::as_path),
+            Some(std::path::Path::new("/k"))
+        );
     }
 
     #[test]

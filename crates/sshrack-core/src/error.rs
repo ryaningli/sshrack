@@ -68,6 +68,12 @@ pub enum SshrackError {
     #[error("credential body for user '{user}' must set at most one of password/key")]
     InvalidCredentialBody { user: String },
 
+    /// An inline (pasted) identity key was given on a body in keyring storage
+    /// mode, which is not supported. Inline keys require vault or plaintext
+    /// storage. The message never includes key material.
+    #[error("inline identity key requires vault or plaintext storage mode")]
+    InlineKeyNeedsVaultOrPlaintext,
+
     #[error("failed to read config file {path}: {source}")]
     ConfigRead {
         path: std::path::PathBuf,
