@@ -744,7 +744,11 @@ impl CredForm {
                 CredField::InlinePrivate => &self.inline_private,
                 CredField::InlineCert => &self.inline_cert,
                 // Guarded by `needs_block` above; unreachable in practice.
-                _ => return,
+                // A silent `return` here would mask a future invariant break AND
+                // skip the error/hint row rendering below, so panic loudly.
+                _ => unreachable!(
+                    "invariant: focus is InlinePrivate/InlineCert (guarded by needs_block)"
+                ),
             };
             frame.render_widget(ta, editor_area);
         }
@@ -1694,6 +1698,50 @@ mod tests {
             captured_body.y,
             captured_body.y + captured_body.height
         );
+    }
+
+    // ---- small-terminal viewport: textarea-focused render must not panic ----
+
+    #[test]
+    fn draw_in_dialog_renders_textarea_focus_without_panic_on_short_terminal() {
+        // Behavior pin for the `fields_h = body.height.saturating_sub(2 + editor_h)`
+        // viewport adjustment above (the multiline paste fields). The existing
+        // short-terminal test focuses Password where `editor_h == 0`, and the
+        // render-smoke runs at 100x40 where everything fits — so neither
+        // exercises the `editor_h == TEXTAREA_H` branch on a body too short to
+        // hold `2 + editor_h`. On a height-11 terminal the dialog body collapses
+        // to ~3 rows, so `body.height - (2 + TEXTAREA_H)` would UNDERFLOW without
+        // the `saturating_sub`. If that `saturating_sub` is ever reverted to a
+        // plain subtraction, this test panics in debug (subtract-with-overflow)
+        // and turns the silent regression visible. We cover both paste fields
+        // (InlinePrivate, InlineCert) so the `needs_block` match — and its
+        // `unreachable!` guard — is exercised on each.
+        use crate::tui::dialog::draw_dialog;
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut form = complete_cred_form();
+        form.secret_kind = SecretChoice::IdentityKey;
+        form.source = SourceChoice::Inline;
+
+        for focus in [CredField::InlinePrivate, CredField::InlineCert] {
+            form.focus = focus;
+            // Sanity: the textarea block really is in play for this focus.
+            assert!(form.body_rows() >= TEXTAREA_H + 2);
+
+            let mut term = Terminal::new(TestBackend::new(60, 11)).unwrap();
+            term.draw(|f| {
+                let body = draw_dialog(
+                    f,
+                    &form.title(),
+                    form.body_rows(),
+                    &[("Tab", "field"), ("^S", "save"), ("Esc", "cancel")],
+                );
+                form.draw_in_dialog(f, body);
+            })
+            .unwrap();
+            // No panic, no underflow — the viewport collapsed to an empty range
+            // and the textarea block rendered into whatever area was left.
+        }
     }
 
     // ---- in-field cursor movement (Task 3: RED -> GREEN) ----
