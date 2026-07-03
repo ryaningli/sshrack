@@ -161,12 +161,19 @@ impl CredForm {
     }
 
     /// The ordered list of fields the user can navigate to, given the current
-    /// secret choice. The Password row is reachable only under Password.
+    /// secret choice. Mirrors `HostForm::reachable_fields` under the Independent
+    /// branch: Identity and Password are mutually exclusive (one secret slot),
+    /// and both are hidden when the choice is None. SecretKind (the chooser) is
+    /// always reachable.
     fn reachable_fields(&self) -> Vec<CredField> {
         CredField::ORDER
             .iter()
             .copied()
-            .filter(|f| *f != CredField::Password || self.secret_kind == SecretChoice::Password)
+            .filter(|f| match self.secret_kind {
+                SecretChoice::None => !matches!(f, CredField::Identity | CredField::Password),
+                SecretChoice::IdentityKey => *f != CredField::Password,
+                SecretChoice::Password => *f != CredField::Identity,
+            })
             .collect()
     }
 
@@ -606,8 +613,8 @@ mod tests {
         // Sync the cursor to the end of the pre-filled Password field, as if
         // the user had just typed it — cursor_target then reports that position.
         f.cursor = f.focused_text_len();
-        // Password is the 5th reachable field when secret_kind == Password.
-        assert_eq!(f.cursor_target(), Some((4, 7)));
+        // Password is the 4th reachable field (index 3) when secret_kind == Password.
+        assert_eq!(f.cursor_target(), Some((3, 7)));
     }
 
     #[test]
@@ -696,8 +703,8 @@ mod tests {
     fn typing_password_masks_state_under_password_choice() {
         let mut f = complete_cred_form();
         f.secret_kind = SecretChoice::Password;
-        // Tab to the Password row (Name→User→Identity→SecretKind→Password).
-        for _ in 0..4 {
+        // Tab to the Password row (Name→User→SecretKind→Password).
+        for _ in 0..3 {
             f.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
         }
         assert_eq!(f.focus, CredField::Password);
@@ -737,11 +744,10 @@ mod tests {
         f.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(f.focus, CredField::User);
         f.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(f.focus, CredField::Identity);
-        f.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+        // SecretKind is None → Identity unreachable → skip to SecretKind.
         assert_eq!(f.focus, CredField::SecretKind);
         f.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
-        // SecretKind is None → Password row unreachable → wrap to Name.
+        // SecretKind is None → Password unreachable → wrap to Name.
         assert_eq!(f.focus, CredField::Name);
     }
 
@@ -750,7 +756,8 @@ mod tests {
         let mut f = blank_cred_form();
         f.focus = CredField::SecretKind;
         f.on_key(press(KeyCode::BackTab, KeyModifiers::SHIFT));
-        assert_eq!(f.focus, CredField::Identity);
+        // SecretKind is None → Identity unreachable → skip back to User.
+        assert_eq!(f.focus, CredField::User);
     }
 
     #[test]
@@ -1158,11 +1165,40 @@ mod tests {
         let mut form = CredForm::new_add();
         // Tab to SecretKind.
         form.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // Name -> User
-        form.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // User -> Identity
-        form.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // Identity -> SecretKind
+        form.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // User -> SecretKind (Identity hidden)
         assert_eq!(form.focus, CredField::SecretKind);
         let before = form.secret_kind;
         form.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         assert_ne!(form.secret_kind, before);
+    }
+
+    // ---- three-way secret mutex (Task 4: RED -> GREEN) ----
+
+    #[test]
+    fn reachable_under_none_hides_identity_and_password() {
+        let mut form = CredForm::new_add();
+        form.secret_kind = SecretChoice::None;
+        let reachable = form.reachable_fields();
+        assert!(!reachable.contains(&CredField::Identity));
+        assert!(!reachable.contains(&CredField::Password));
+        assert!(reachable.contains(&CredField::SecretKind));
+    }
+
+    #[test]
+    fn reachable_under_identitykey_shows_identity_not_password() {
+        let mut form = CredForm::new_add();
+        form.secret_kind = SecretChoice::IdentityKey;
+        let reachable = form.reachable_fields();
+        assert!(reachable.contains(&CredField::Identity));
+        assert!(!reachable.contains(&CredField::Password));
+    }
+
+    #[test]
+    fn reachable_under_password_shows_password_not_identity() {
+        let mut form = CredForm::new_add();
+        form.secret_kind = SecretChoice::Password;
+        let reachable = form.reachable_fields();
+        assert!(reachable.contains(&CredField::Password));
+        assert!(!reachable.contains(&CredField::Identity));
     }
 }
