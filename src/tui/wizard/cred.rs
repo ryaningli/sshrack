@@ -22,22 +22,12 @@ use super::super::intent::Outcome;
 use super::super::theme;
 use super::{
     CRED_LABEL_WIDTH, CRED_VALUE_COL, CredField, CredSaveError, SecretChoice, SourceChoice,
-    backspace_at, bracketed, insert_char_at, validate_cred, value_spans,
+    TEXTAREA_H, backspace_at, bracketed, insert_char_at, textarea_input_from, validate_cred,
+    value_spans,
 };
 use crate::tui::fit::truncate_cells;
-use ratatui_textarea::{Input, Key, TextArea};
+use ratatui_textarea::TextArea;
 use sshrack_core::config::schema::{Credential, CredentialBody, KeySource};
-
-/// Height of the multiline editor block expanded below the field list when a
-/// paste field ([`CredField::InlinePrivate`] / [`CredField::InlineCert`]) is
-/// focused. [`CredForm::body_rows`] grows by this many rows while a textarea
-/// owns focus so the dialog box always fits the expanded block, and
-/// [`CredForm::draw_in_dialog`] reserves a [`Layout`] segment of this height
-/// (0 when no textarea is focused) right below the single-line field rows for
-/// the focused [`TextArea`] to render into. The editor block is a separate
-/// area from the field list, so [`crate::tui::fit::focus_window`] (which
-/// operates on the list only) never scrolls it out of view.
-pub(crate) const TEXTAREA_H: u16 = 5;
 
 /// The credential form's editable state. The password is held as a
 /// [`Zeroizing<String>`] so the plaintext is wiped on drop; it is rendered
@@ -143,64 +133,6 @@ impl std::fmt::Debug for CredForm {
             .field("orig_id", &self.orig_id)
             .field("orig_key", &self.orig_key)
             .finish()
-    }
-}
-
-/// Map sshrack's `crossterm` 0.28 [`KeyEvent`] into a [`TextArea`]
-/// [`Input`].
-///
-/// `ratatui-textarea` 0.9 pulls crossterm 0.29 transitively (via
-/// `ratatui-crossterm`), whose `KeyEvent` is a *different type* than the
-/// crossterm 0.28 `KeyEvent` sshrack uses everywhere else — so
-/// `textarea.input(key)` won't type-check. Building an [`Input`] directly from
-/// the event's components sidesteps the version skew without forcing a
-/// workspace-wide crossterm upgrade. The mapping mirrors the textarea's own
-/// `From<ratatui_crossterm::crossterm::event::KeyEvent>` impl: a key-release
-/// becomes a no-op `Input::default()`; `BackTab` becomes `Tab` + shift;
-/// everything else maps its [`KeyCode`] to the textarea's [`Key`] and carries
-/// the ctrl/alt/shift modifiers through.
-fn textarea_input_from(key: KeyEvent) -> Input {
-    if key.kind == KeyEventKind::Release {
-        return Input::default();
-    }
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    let alt = key.modifiers.contains(KeyModifiers::ALT);
-    // crossterm reports Shift+Tab as BackTab (no SHIFT in modifiers); surface
-    // it to the textarea as a shifted Tab so its own shortcut logic matches.
-    if key.code == KeyCode::BackTab {
-        return Input {
-            key: Key::Tab,
-            shift: true,
-            ctrl,
-            alt,
-        };
-    }
-    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-    let key_code = match key.code {
-        KeyCode::Char(c) => Key::Char(c),
-        KeyCode::Backspace => Key::Backspace,
-        KeyCode::Enter => Key::Enter,
-        KeyCode::Left => Key::Left,
-        KeyCode::Right => Key::Right,
-        KeyCode::Up => Key::Up,
-        KeyCode::Down => Key::Down,
-        KeyCode::Tab => Key::Tab,
-        KeyCode::Delete => Key::Delete,
-        KeyCode::Home => Key::Home,
-        KeyCode::End => Key::End,
-        KeyCode::PageUp => Key::PageUp,
-        KeyCode::PageDown => Key::PageDown,
-        KeyCode::Esc => Key::Esc,
-        KeyCode::F(n) => Key::F(n),
-        // Insert / Null / any future variant the textarea does not care about:
-        // map to Null, which the textarea treats as a no-op.
-        _ => Key::Null,
-    };
-    Input {
-        key: key_code,
-        ctrl,
-        alt,
-        shift,
     }
 }
 
@@ -1342,13 +1274,14 @@ mod tests {
         assert_eq!(b.secret_kind(), SecretKind::Default);
     }
 
-    // ---- inline-key preservation on edit (Plan 1 stopgap) ----
+    // ---- inline-key preservation on edit (data safety) ----
     //
-    // The wizard cannot paste-edit inline key text yet (Plan 2). Editing a
-    // credential whose key is inline material must therefore preserve the
-    // original KeySource::Inline verbatim when the identity field is left
-    // blank — silently dropping it would destroy the credential's only secret.
-    // A path original left blank is treated as "user cleared the field".
+    // The inline textareas are NEVER prefilled with the existing key text on
+    // edit-entry (security). Editing a credential whose key is inline material
+    // must therefore preserve the original KeySource::Inline verbatim when the
+    // private field is left blank — silently dropping it would destroy the
+    // credential's only secret. A path original left blank is treated as "user
+    // cleared the field".
 
     #[test]
     fn build_body_preserves_inline_key_when_identity_blank() {
@@ -2131,6 +2064,6 @@ mod tests {
             expanded > collapsed,
             "focused textarea must grow the dialog"
         );
-        assert_eq!(expanded - collapsed, crate::tui::wizard::cred::TEXTAREA_H);
+        assert_eq!(expanded - collapsed, crate::tui::wizard::TEXTAREA_H);
     }
 }

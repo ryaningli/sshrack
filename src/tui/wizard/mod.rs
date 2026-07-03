@@ -22,8 +22,10 @@
 //! [`Outcome::SaveHost`]: super::intent::Outcome::SaveHost
 //! [`Outcome::SaveCred`]: super::intent::Outcome::SaveCred
 
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::style::Style;
 use ratatui::text::Span;
+use ratatui_textarea::{Input, Key};
 use sshrack_core::host::validate_name_chars;
 
 pub mod cred;
@@ -33,6 +35,81 @@ pub mod host;
 pub use cred::CredForm;
 pub use cred_picker::{CredPicker, PickerOutcome};
 pub use host::HostForm;
+
+/// Height of the multiline editor block expanded below the field list when a
+/// paste field ([`host::Field::InlinePrivate`] / [`host::Field::InlineCert`],
+/// or [`cred::CredField::InlinePrivate`] / [`cred::CredField::InlineCert`]) is
+/// focused. Each form's `body_rows` grows by this many rows while a textarea
+/// owns focus so the dialog box always fits the expanded block, and each
+/// form's `draw_in_dialog` reserves a [`Layout`] segment of this height (0 when
+/// no textarea is focused) right below the single-line field rows for the
+/// focused [`TextArea`] to render into. The editor block is a separate area
+/// from the field list, so [`crate::tui::fit::focus_window`] (which operates on
+/// the list only) never scrolls it out of view.
+pub(crate) const TEXTAREA_H: u16 = 5;
+
+/// Map sshrack's `crossterm` 0.28 [`KeyEvent`] into a [`TextArea`] [`Input`].
+///
+/// `ratatui-textarea` 0.9 pulls crossterm 0.29 transitively (via
+/// `ratatui-crossterm`), whose `KeyEvent` is a *different type* than the
+/// crossterm 0.28 `KeyEvent` sshrack uses everywhere else — so
+/// `textarea.input(key)` won't type-check. Building an [`Input`] directly from
+/// the event's components sidesteps the version skew without forcing a
+/// workspace-wide crossterm upgrade. The mapping mirrors the textarea's own
+/// `From<ratatui_crossterm::crossterm::event::KeyEvent>` impl: a key-release
+/// becomes a no-op `Input::default()`; `BackTab` becomes `Tab` + shift;
+/// everything else maps its [`KeyCode`] to the textarea's [`Key`] and carries
+/// the ctrl/alt/shift modifiers through.
+///
+/// Shared by [`CredForm`] and [`HostForm`] so both inline-paste textareas use
+/// one copy of the bridge (DRY, dev-stage rule). Private to `wizard`: only the
+/// two form submodules reach it via `use super::textarea_input_from`.
+///
+/// [`TextArea`]: ratatui_textarea::TextArea
+fn textarea_input_from(key: KeyEvent) -> Input {
+    if key.kind == KeyEventKind::Release {
+        return Input::default();
+    }
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    // crossterm reports Shift+Tab as BackTab (no SHIFT in modifiers); surface
+    // it to the textarea as a shifted Tab so its own shortcut logic matches.
+    if key.code == KeyCode::BackTab {
+        return Input {
+            key: Key::Tab,
+            shift: true,
+            ctrl,
+            alt,
+        };
+    }
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let key_code = match key.code {
+        KeyCode::Char(c) => Key::Char(c),
+        KeyCode::Backspace => Key::Backspace,
+        KeyCode::Enter => Key::Enter,
+        KeyCode::Left => Key::Left,
+        KeyCode::Right => Key::Right,
+        KeyCode::Up => Key::Up,
+        KeyCode::Down => Key::Down,
+        KeyCode::Tab => Key::Tab,
+        KeyCode::Delete => Key::Delete,
+        KeyCode::Home => Key::Home,
+        KeyCode::End => Key::End,
+        KeyCode::PageUp => Key::PageUp,
+        KeyCode::PageDown => Key::PageDown,
+        KeyCode::Esc => Key::Esc,
+        KeyCode::F(n) => Key::F(n),
+        // Insert / Null / any future variant the textarea does not care about:
+        // map to Null, which the textarea treats as a no-op.
+        _ => Key::Null,
+    };
+    Input {
+        key: key_code,
+        ctrl,
+        alt,
+        shift,
+    }
+}
 
 // ===========================================================================
 // Host wizard shared shape
@@ -99,24 +176,25 @@ pub enum Field {
     /// Identity-key source chooser (Path vs Inline). Sits between the
     /// `Secret` chooser and the slot rows so the Independent form reads
     /// top-down: pick the secret kind, then the source, then fill the slot.
-    /// Unreachable until Task 4 wires it in.
+    /// Reachable iff auth == [`AuthChoice::Independent`] AND secret ==
+    /// [`SecretChoice::IdentityKey`] (see [`HostForm::field_reachable`]).
     Source,
-    /// Multiline private-key paste (Inline source only).
-    /// Unreachable until Task 4 wires it in.
+    /// Multiline private-key paste (Inline source only). Reachable iff
+    /// Independent + IdentityKey + Inline.
     InlinePrivate,
-    /// Multiline optional certificate paste (Inline source only).
-    /// Unreachable until Task 4 wires it in.
+    /// Multiline optional certificate paste (Inline source only). Reachable
+    /// iff Independent + IdentityKey + Inline.
     InlineCert,
     Identity,
     Password,
 }
 
 impl Field {
-    /// Top-to-bottom render + navigation order.
-    ///
-    /// `Source` and the `Inline*` rows are staged in Task 1 and stay
-    /// unreachable until Task 4 wires them in ([`HostForm::field_reachable`]
-    /// returns `false`).
+    /// Top-to-bottom render + navigation order. `Secret` precedes the slot
+    /// rows it gates so the Independent form reads top-down: pick the kind,
+    /// then the source, then fill the slot it exposes. The slot rows are
+    /// filtered at navigation time by [`HostForm::reachable_fields`] according
+    /// to the (auth, secret, source) matrix.
     const ORDER: &'static [Field] = &[
         Field::Name,
         Field::Host,
@@ -261,12 +339,11 @@ impl SecretChoice {
 /// The identity-key source offered under `Secret = IdentityKey`: a file
 /// `Path` (typed) or pasted `Inline` contents (edited in a multiline area).
 /// Cycled by `←`/`→` on the Source row. Mirrors [`SecretChoice`]'s shape.
+/// Wired into both forms: [`CredForm`] (cred wizard) and [`HostForm`] (host
+/// wizard's Independent branch). The cycling logic is exercised by the unit
+/// tests below and by each form's `on_key` Source-cycle arms.
 ///
-/// Staging note: this enum and the matching `Source`/`InlinePrivate`/
-/// `InlineCert` field variants landed in Task 1. Task 2 wires the cred form's
-/// `Source` row (`on_key` ←/→ cycling) and the inline textareas; Task 4 does
-/// the host form. The cycling logic is exercised by the unit tests below and,
-/// from Task 2, by the cred form's `on_key` arms.
+/// [`CredForm`]: cred::CredForm
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceChoice {
     /// Identity key read from a file path (typed in the Identity row).
