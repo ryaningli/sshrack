@@ -354,6 +354,57 @@ pub(super) fn value_spans(value: &str, placeholder: Option<&str>) -> Vec<Span<'s
 pub(super) const HOST_VALUE_COL: u16 = 2 + 9 + 2;
 pub(super) const CRED_VALUE_COL: u16 = 2 + 8 + 2;
 
+// ===========================================================================
+// Cursor-edit helpers
+// ===========================================================================
+
+/// Insert `c` into `s` at the given char index, returning the new char index
+/// (one past the inserted char). Wizard text fields use this to type at the
+/// cursor rather than always appending. `cursor` beyond `s`'s char count
+/// clamps to the end (append). Pure aside from mutating `s`.
+#[allow(dead_code)]
+pub(super) fn insert_char_at(s: &mut String, cursor: usize, c: char) -> usize {
+    let original_len = s.chars().count();
+    let byte = char_byte_offset(s, cursor);
+    s.insert(byte, c);
+    // If cursor was at or past the end, we inserted at the end, so return the new end.
+    // Otherwise return cursor + 1 (one past the inserted char).
+    if cursor >= original_len {
+        s.chars().count()
+    } else {
+        cursor + 1
+    }
+}
+
+/// Delete the char immediately before the char-index `cursor` in `s`, returning
+/// the new cursor (one less), or the unchanged cursor when already at the
+/// start. Pure aside from mutating `s`.
+#[allow(dead_code)]
+pub(super) fn backspace_at(s: &mut String, cursor: usize) -> usize {
+    if cursor == 0 {
+        return 0;
+    }
+    let end = char_byte_offset(s, cursor);
+    // Byte offset of the char that ends at `end` (the char just before cursor).
+    let start = s[..end]
+        .char_indices()
+        .next_back()
+        .map(|(b, _)| b)
+        .unwrap_or(0);
+    s.replace_range(start..end, "");
+    cursor - 1
+}
+
+/// Byte offset of the char at char-index `idx`, or `s.len()` when `idx` is at
+/// or past the end (so an insert appends). Pure.
+#[allow(dead_code)]
+fn char_byte_offset(s: &str, idx: usize) -> usize {
+    s.char_indices()
+        .nth(idx)
+        .map(|(b, _)| b)
+        .unwrap_or_else(|| s.len())
+}
+
 #[cfg(test)]
 mod tests {
     //! Shared-helper tests for the value-area span builder. The form-specific
@@ -451,5 +502,89 @@ mod tests {
         assert_eq!(SecretChoice::Password.label(), "Password");
         assert_eq!(SecretChoice::IdentityKey.label(), "IdentityKey");
         assert_eq!(SecretChoice::None.label(), "None");
+    }
+}
+
+#[cfg(test)]
+mod cursor_edit_tests {
+    use super::{backspace_at, insert_char_at};
+
+    #[test]
+    fn insert_at_middle_splits_correctly() {
+        let mut s = String::from("abc");
+        let cur = insert_char_at(&mut s, 1, 'X');
+        assert_eq!(s, "aXbc");
+        assert_eq!(cur, 2);
+    }
+
+    #[test]
+    fn insert_at_end_appends() {
+        let mut s = String::from("abc");
+        let cur = insert_char_at(&mut s, 3, 'X');
+        assert_eq!(s, "abcX");
+        assert_eq!(cur, 4);
+    }
+
+    #[test]
+    fn insert_at_start_prepends() {
+        let mut s = String::from("abc");
+        let cur = insert_char_at(&mut s, 0, 'X');
+        assert_eq!(s, "Xabc");
+        assert_eq!(cur, 1);
+    }
+
+    #[test]
+    fn insert_past_end_behaves_like_append() {
+        // idx beyond len clamps to end (char_byte_offset returns s.len()).
+        let mut s = String::from("ab");
+        let cur = insert_char_at(&mut s, 99, 'X');
+        assert_eq!(s, "abX");
+        assert_eq!(cur, 3);
+    }
+
+    #[test]
+    fn backspace_at_middle_removes_prev_char() {
+        let mut s = String::from("abc");
+        let cur = backspace_at(&mut s, 2);
+        assert_eq!(s, "ac");
+        assert_eq!(cur, 1);
+    }
+
+    #[test]
+    fn backspace_at_end_removes_last() {
+        let mut s = String::from("abc");
+        let cur = backspace_at(&mut s, 3);
+        assert_eq!(s, "ab");
+        assert_eq!(cur, 2);
+    }
+
+    #[test]
+    fn backspace_at_zero_is_noop() {
+        let mut s = String::from("abc");
+        let cur = backspace_at(&mut s, 0);
+        assert_eq!(s, "abc");
+        assert_eq!(cur, 0);
+    }
+
+    #[test]
+    fn insert_respects_wide_char_byte_boundaries() {
+        // "中文" — each char is 3 bytes. Insert at char idx 1 (byte offset 3).
+        let mut s = String::from("中文");
+        let cur = insert_char_at(&mut s, 1, 'X');
+        assert_eq!(s, "中X文");
+        assert_eq!(cur, 2);
+    }
+
+    #[test]
+    fn backspace_removes_a_wide_char_correctly() {
+        let mut s = String::from("中X文");
+        // cursor after "中X" (idx 2): backspace removes 'X' (1 byte).
+        let cur = backspace_at(&mut s, 2);
+        assert_eq!(s, "中文");
+        assert_eq!(cur, 1);
+        // now backspace at idx 1 removes '中' (3 bytes).
+        let cur = backspace_at(&mut s, 1);
+        assert_eq!(s, "文");
+        assert_eq!(cur, 0);
     }
 }
