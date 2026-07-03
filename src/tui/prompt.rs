@@ -375,13 +375,17 @@ const EMPTY_PASSPHRASE_FLASH: &str = "Passphrase must not be empty";
 /// retried on the next keystroke loop iteration.
 fn render_password_popup(terminal: &mut Tui, title: &str, buffer: &str, flash: Option<&str>) {
     use crate::tui::fit::truncate_cells;
+    use unicode_width::UnicodeWidthStr;
     const HINT: &str = "[Enter] confirm   [Esc] cancel";
     // Each typed char contributes one MASK cell to the visible width.
     let mask_width = buffer.chars().count();
     // Inner content width: the widest of the masked row and the hint, plus 2
     // padding cells. Capped at POPUP_WIDTH - 2 (border) so a very long passphrase
-    // cannot stretch the popup past the classic footprint.
-    let inner_w = (mask_width.max(HINT.len()) as u16 + 2).min(popup::POPUP_WIDTH.saturating_sub(2));
+    // cannot stretch the popup past the classic footprint. Measured in display
+    // cells (matches confirm_popup / store_pick_popup); HINT is ASCII so this
+    // is behavior-preserving.
+    let inner_w =
+        (mask_width.max(HINT.width()) as u16 + 2).min(popup::POPUP_WIDTH.saturating_sub(2));
     // Visible mask, truncated to the inner width if the passphrase is longer
     // than the popup can show.
     let mask_visible_w = mask_width.min(inner_w as usize) as u16;

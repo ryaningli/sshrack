@@ -486,8 +486,9 @@ impl App {
     /// 2. **Overlay** — when an overlay is open it owns the key. Help dismisses
     ///    on `F1`/`Esc`/`q`; a wizard's `on_key` returns `SaveHost`/`SaveCred`/
     ///    `Cancel`/`Continue`; the store picker delegates to the stashed
-    ///    `StoreView::on_key` (Up/Down/Enter/Esc); DeleteHost/DeleteCred close
-    ///    on `Esc`.
+    ///    `StoreView::on_key` (Up/Down/Enter/Esc). Deletes are not overlays:
+    ///    `Ctrl-D` returns `Outcome::DeleteHost`/`DeleteCred`, which the loop
+    ///    drives through `confirm_popup` (no overlay is opened for them).
     /// 3. **Panel/tab** — when no overlay is open: `tab_key_decision` switches
     ///    tabs (Tab / Shift-Tab), then `Ctrl-A/E/D` + `Enter` + `Esc`, then
     ///    the active panel consumes printable chars / arrows.
@@ -927,8 +928,8 @@ impl App {
     /// Render the active overlay on top of the shell. Wizards draw their field
     /// rows into the body rect [`draw_dialog`] hands them; Help is the static
     /// keymap reference; StorePicker draws the three-mode list into the dialog
-    /// body via [`StoreView::draw_in_dialog`]; DeleteHost/DeleteCred render an
-    /// empty dialog (the loop drives their confirm popups).
+    /// body via [`StoreView::draw_in_dialog`]. Deletes are not overlays and so
+    /// are not rendered here — the loop drives them via `confirm_popup`.
     fn draw_overlay(&self, frame: &mut Frame, ov: &Overlay) {
         match ov {
             Overlay::Help => draw_help_dialog(frame, self.help_scroll),

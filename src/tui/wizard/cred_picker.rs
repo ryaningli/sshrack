@@ -140,6 +140,9 @@ impl CredPicker {
     /// Build the visible list rows: a window of `ranked` around `selected`,
     /// each rendered with the cursor row highlighted and non-matching entries
     /// excluded (they are already filtered out of `ranked` by `recompute`).
+    /// The window math is the shared [`crate::tui::fit::focus_window`] helper
+    /// (center + clamp), so the picker scrolls exactly like the host/cred
+    /// wizards and the Help overlay on small terminals.
     fn windowed_lines(&self) -> Vec<Line<'static>> {
         if self.ranked.is_empty() {
             return vec![Line::from(Span::styled(
@@ -147,12 +150,9 @@ impl CredPicker {
                 Style::new().dim(),
             ))];
         }
-        let visible = PICKER_VISIBLE_ROWS;
-        let half = visible / 2;
-        let start = self.selected.saturating_sub(half);
-        let end = (start + visible).min(self.ranked.len());
-        let start = end.saturating_sub(visible).min(start);
-        (start..end)
+        let win =
+            crate::tui::fit::focus_window(self.ranked.len(), self.selected, PICKER_VISIBLE_ROWS);
+        (win.start..win.end)
             .map(|i| {
                 let name = self.names.get(self.ranked[i]).cloned().unwrap_or_default();
                 let is_sel = i == self.selected;
