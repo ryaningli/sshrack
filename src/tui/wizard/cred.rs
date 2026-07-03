@@ -615,16 +615,22 @@ impl CredForm {
     /// mode after this. An empty password under the Password choice leaves the
     /// password unset (the loop preserves the existing password in edit mode).
     ///
-    /// **Inline-key preservation (Plan 1 stopgap).** Under IdentityKey with the
-    /// editable identity field left blank, the original key is re-attached
-    /// verbatim when it was an inline ([`KeySource::Inline`]) source. Full
-    /// paste-editing of inline key text lands in Plan 2; for now the wizard
-    /// must not destroy the credential's only secret just because the field
-    /// could not display the key text. A path original that was edited to blank
-    /// is treated as "user cleared the field" (no key).
+    /// **IdentityKey routing.** The Source chooser picks how the key is
+    /// supplied:
+    /// - **Path** — `identity` non-empty → `with_key(path)`; blank + an inline
+    ///   original → preserve that inline material verbatim (data safety — never
+    ///   destroy the credential's only secret just because the path field is
+    ///   empty); blank with no inline original → no key.
+    /// - **Inline** — the private textarea's joined lines become an inline key
+    ///   via [`CredentialBody::with_inline_key`], with the cert textarea
+    ///   attached only when non-empty. A blank private field on edit preserves
+    ///   the original inline material verbatim (the textareas are NEVER
+    ///   prefilled with key text on edit-entry — security; this rule is the
+    ///   only thing standing between the user and silently losing their key).
     ///
     /// [`Secret::Plain`]: sshrack_core::config::schema::Secret::Plain
     pub fn build_body(&self) -> CredentialBody {
+        use sshrack_core::config::schema::Secret;
         let trimmed_user = self.user.trim().to_string();
         match self.secret_kind {
             SecretChoice::Password => {
@@ -636,14 +642,31 @@ impl CredForm {
                 }
             }
             SecretChoice::IdentityKey => {
-                let key = self.identity.trim();
                 let mut body = CredentialBody::new(trimmed_user);
-                if !key.is_empty() {
-                    body = body.with_key(key);
-                } else if let Some(KeySource::Inline(ik)) = self.orig_key.clone() {
-                    // Field blank AND original was inline: preserve the inline
-                    // material verbatim (Plan 2 will add real paste-editing).
-                    body.key = Some(KeySource::Inline(ik));
+                match self.source {
+                    SourceChoice::Path => {
+                        let key = self.identity.trim();
+                        if !key.is_empty() {
+                            body = body.with_key(key);
+                        } else if let Some(KeySource::Inline(ik)) = self.orig_key.clone() {
+                            // Field blank AND original was inline: preserve the
+                            // inline material verbatim.
+                            body.key = Some(KeySource::Inline(ik));
+                        }
+                    }
+                    SourceChoice::Inline => {
+                        let private = self.inline_private.lines().join("\n");
+                        let cert = self.inline_cert.lines().join("\n");
+                        if !private.trim().is_empty() {
+                            let cert_sec = (!cert.trim().is_empty()).then_some(Secret::Plain(cert));
+                            body = body.with_inline_key(Secret::Plain(private), cert_sec);
+                        } else if let Some(KeySource::Inline(ik)) = self.orig_key.clone() {
+                            // Private blank on edit: preserve the original
+                            // inline material verbatim (do not destroy the only
+                            // secret).
+                            body.key = Some(KeySource::Inline(ik));
+                        }
+                    }
                 }
                 body
             }
@@ -1302,6 +1325,81 @@ mod tests {
         f.orig_key = Some(KeySource::Path("/orig/id".into()));
         let b = f.build_body();
         assert!(b.key.is_none(), "blank path field must drop the key");
+    }
+
+    // ---- Task 3: build_body routes inline source to with_inline_key (RED -> GREEN) ----
+    //
+    // Under SourceChoice::Inline the private textarea's joined lines become a
+    // KeySource::Inline body via with_inline_key; the cert textarea is attached
+    // only when non-empty. A blank private field on edit must preserve the
+    // original inline material verbatim (data safety — never destroy the only
+    // secret). The Path branch keeps its pre-Plan-2 behavior unchanged.
+
+    #[test]
+    fn build_body_inline_source_attaches_inline_key() {
+        let mut f = complete_cred_form();
+        f.secret_kind = SecretChoice::IdentityKey;
+        f.source = SourceChoice::Inline;
+        f.inline_private = TextArea::new(vec!["PRIVATE-KEY-TEXT".into()]);
+        f.inline_cert = TextArea::new(vec!["CERT-TEXT".into()]);
+        let b = f.build_body();
+        assert_eq!(b.secret_kind(), SecretKind::Key);
+        match b.key {
+            Some(KeySource::Inline(ik)) => {
+                assert_eq!(ik.private_key.unwrap().as_plain(), Some("PRIVATE-KEY-TEXT"));
+                assert_eq!(ik.certificate.unwrap().as_plain(), Some("CERT-TEXT"));
+            }
+            other => panic!("expected Inline, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_body_inline_source_multiline_joins_with_newline() {
+        // A pasted key has many lines; they must round-trip as one string.
+        let mut f = complete_cred_form();
+        f.secret_kind = SecretChoice::IdentityKey;
+        f.source = SourceChoice::Inline;
+        f.inline_private = TextArea::new(vec!["line1".into(), "line2".into(), "line3".into()]);
+        let b = f.build_body();
+        let plain = match b.key {
+            Some(KeySource::Inline(ik)) => ik.private_key.unwrap().as_plain().unwrap().to_string(),
+            _ => panic!("expected Inline"),
+        };
+        assert_eq!(plain, "line1\nline2\nline3");
+    }
+
+    #[test]
+    fn build_body_inline_blank_on_edit_preserves_original_inline_key() {
+        use sshrack_core::config::schema::{InlineKey, KeySource, Secret};
+        let mut f = complete_cred_form();
+        f.editing = true;
+        f.secret_kind = SecretChoice::IdentityKey;
+        f.source = SourceChoice::Inline;
+        f.inline_private = TextArea::default(); // empty — user did not re-paste
+        f.orig_key = Some(KeySource::Inline(InlineKey {
+            private_key: Some(Secret::Plain("ORIGINAL".into())),
+            certificate: None,
+            keyring: false,
+        }));
+        let b = f.build_body();
+        match b.key {
+            Some(KeySource::Inline(ik)) => {
+                assert_eq!(ik.private_key.unwrap().as_plain(), Some("ORIGINAL"))
+            }
+            _ => panic!("original inline key must be preserved when private stays blank"),
+        }
+    }
+
+    #[test]
+    fn build_body_path_source_unchanged_behavior() {
+        let mut f = complete_cred_form();
+        f.secret_kind = SecretChoice::IdentityKey;
+        f.source = SourceChoice::Path;
+        f.identity = "/k/id".into();
+        assert_eq!(
+            f.build_body().key.as_ref().and_then(KeySource::as_path),
+            Some(std::path::Path::new("/k/id"))
+        );
     }
 
     // ---- new_edit prefill ----
