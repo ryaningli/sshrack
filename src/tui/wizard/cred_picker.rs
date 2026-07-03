@@ -74,8 +74,11 @@ impl CredPicker {
     /// Fuzzy-rank `names` for `query` via the shared helper, with all-zero
     /// scores (credentials carry no frecency). Returns original indices.
     fn rank(names: &[String], query: &str) -> Vec<usize> {
+        // Wrap each name as its own single-field row so the shared multi-field
+        // helper ranks the picker the same way it ranks the panels.
+        let rows: Vec<Vec<String>> = names.iter().map(|n| vec![n.clone()]).collect();
         let scores = vec![0.0f64; names.len()];
-        crate::tui::panel::rank_by_name(names, &scores, query)
+        crate::tui::panel::rank_by_fields(&rows, &scores, query)
     }
 
     fn clamp(&mut self) {

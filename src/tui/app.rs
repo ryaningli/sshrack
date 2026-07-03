@@ -123,7 +123,7 @@ impl App {
         frecency: Frecency,
         credential_names: CredentialNames,
     ) -> Self {
-        let launcher = Launcher::new(&config.hosts, &frecency);
+        let launcher = Launcher::new(&config.hosts, &config.credentials, &frecency);
         let mut cred_panel = CredPanel::new();
         cred_panel.recompute(&config.credentials);
         Self {
@@ -257,7 +257,8 @@ impl App {
     /// visible tab reflects any change. Centralized so a new panel never gets
     /// forgotten on a reload path.
     pub(super) fn recompute_panels(&mut self) {
-        self.launcher.recompute(&self.config.hosts, &self.frecency);
+        self.launcher
+            .recompute(&self.config.hosts, &self.config.credentials, &self.frecency);
         self.cred_panel.recompute(&self.config.credentials);
     }
 
@@ -797,9 +798,12 @@ impl App {
     fn primary_action(&mut self) -> Outcome {
         match self.active_tab {
             Tab::Hosts => {
-                let out = self
-                    .launcher
-                    .on_key(enter_press(), &self.config.hosts, &self.frecency);
+                let out = self.launcher.on_key(
+                    enter_press(),
+                    &self.config.hosts,
+                    &self.config.credentials,
+                    &self.frecency,
+                );
                 self.pending_connect = self.launcher.pending_connect;
                 // When Enter hit no host (empty list / filtered out), the
                 // launcher returns Continue with pending_connect still None.
@@ -824,9 +828,12 @@ impl App {
     fn route_active_panel_key(&mut self, key: KeyEvent) -> Outcome {
         match self.active_tab {
             Tab::Hosts => {
-                let out = self
-                    .launcher
-                    .on_key(key, &self.config.hosts, &self.frecency);
+                let out = self.launcher.on_key(
+                    key,
+                    &self.config.hosts,
+                    &self.config.credentials,
+                    &self.frecency,
+                );
                 if matches!(out, Outcome::Quit) {
                     self.should_quit = true;
                 }
@@ -855,7 +862,11 @@ impl App {
         match self.active_tab {
             Tab::Hosts => {
                 self.launcher.query.clear();
-                self.launcher.recompute(&self.config.hosts, &self.frecency);
+                self.launcher.recompute(
+                    &self.config.hosts,
+                    &self.config.credentials,
+                    &self.frecency,
+                );
             }
             Tab::Credentials => {
                 self.cred_panel.query.clear();

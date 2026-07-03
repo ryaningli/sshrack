@@ -33,7 +33,7 @@ use ratatui::{
 use sshrack_core::config::schema::{Credential, SecretKind};
 
 use super::intent::{Outcome, Status};
-use super::panel::rank_by_name;
+use super::panel;
 use super::parts;
 use super::theme;
 
@@ -241,7 +241,16 @@ impl CredPanel {
             .ranked
             .iter()
             .enumerate()
-            .map(|(i, &idx)| cred_row(&creds[idx], i == self.selected, name_w, user_w, area.width))
+            .map(|(i, &idx)| {
+                cred_row(
+                    &creds[idx],
+                    &self.query,
+                    i == self.selected,
+                    name_w,
+                    user_w,
+                    area.width,
+                )
+            })
             .collect();
 
         let list = List::new(items).highlight_style(Style::new().add_modifier(Modifier::BOLD));
@@ -260,11 +269,17 @@ impl CredPanel {
 /// Delegates to the shared [`rank_by_name`] helper so host and credential lists
 /// rank identically. Pure: no I/O.
 pub fn rank_credentials(creds: &[Credential], query: &str) -> Vec<usize> {
-    let names: Vec<String> = creds.iter().map(|c| c.name.clone()).collect();
+    let rows: Vec<Vec<String>> = creds.iter().map(cred_search_fields).collect();
     // Credentials carry no frecency; pass all-zero scores so the name-ascending
     // tiebreak is the only signal on the empty-query branch.
     let scores = vec![0.0_f64; creds.len()];
-    rank_by_name(&names, &scores, query)
+    panel::rank_by_fields(&rows, &scores, query)
+}
+
+/// The searchable text fields for a credential: its `name` and `user`. Each is
+/// matched independently by nucleo.
+fn cred_search_fields(cred: &Credential) -> Vec<String> {
+    vec![cred.name.clone(), cred.body.user.clone()]
 }
 
 /// Width cap for the adaptive name column. Names longer than this overflow
@@ -275,10 +290,12 @@ const CRED_NAME_COL_CAP: usize = 20;
 const CRED_USER_COL_CAP: usize = 12;
 
 /// Build the display line for one credential: the focus marker (`▶ ` when
-/// selected, two spaces otherwise), the name padded to `name_w`, a dimmed
-/// `user` column padded to `user_w`, and `kind` right-aligned to `width`.
-/// `kind` ∈ password / identity / none; **no secret plaintext is ever read** —
-/// only [`CredentialBody::secret_kind`](SecretKind) is consulted.
+/// selected, two spaces otherwise), the name padded to `name_w`, a `user`
+/// column padded to `user_w`, and `kind` right-aligned to `width`. The name
+/// and user segments fuzzy-highlight the query (matched chars bold +
+/// `theme::MATCH`); the user sits on a dim base. `kind` ∈ password / identity
+/// / none; **no secret plaintext is ever read** — only
+/// [`CredentialBody::secret_kind`](SecretKind) is consulted.
 ///
 /// `name_w`/`user_w` are the maxima across the visible rows (computed in
 /// [`CredPanel::draw_list`], capped at [`CRED_NAME_COL_CAP`] /
@@ -287,6 +304,7 @@ const CRED_USER_COL_CAP: usize = 12;
 /// so both lists line up visually.
 fn cred_row(
     cred: &Credential,
+    query: &str,
     selected: bool,
     name_w: usize,
     user_w: usize,
@@ -299,14 +317,14 @@ fn cred_row(
         SecretKind::Default => "none",
     };
     let mut spans = vec![theme::focus_marker(selected)];
-    // Name column (padded to name_w).
-    spans.push(Span::raw(cred.name.clone()));
+    // Name column (padded to name_w) with fuzzy-match highlighting.
+    spans.extend(panel::highlighted_spans(&cred.name, query, Style::new()));
     spans.push(Span::raw(
         " ".repeat(name_w.saturating_sub(cred.name.chars().count())),
     ));
     spans.push(Span::raw("  ")); // gap between name and user columns
-    // User column (dim, padded to user_w).
-    spans.push(Span::styled(user.clone(), Style::new().dim()));
+    // User column (dim base, padded to user_w) with fuzzy-match highlighting.
+    spans.extend(panel::highlighted_spans(&user, query, Style::new().dim()));
     spans.push(Span::raw(
         " ".repeat(user_w.saturating_sub(user.chars().count())),
     ));
@@ -372,6 +390,15 @@ mod tests {
         let order = rank_credentials(&creds, "web");
         let names: Vec<&str> = order.iter().map(|i| creds[*i].name.as_str()).collect();
         assert_eq!(names, vec!["web-dev", "web-prod"]);
+    }
+
+    #[test]
+    fn query_matches_user_field() {
+        // name "deploy" doesn't match "alice"; only the user field does. The
+        // row must still be kept and ranked.
+        let creds = vec![cred("deploy", "alice"), cred("other", "bob")];
+        let order = rank_credentials(&creds, "alice");
+        assert_eq!(order, vec![0]);
     }
 
     #[test]
@@ -526,17 +553,17 @@ mod tests {
         // Render each row and assert the secondary text contains the right kind
         // label AND never the plaintext password. Pass small column widths + a
         // comfortable `width` so the right-aligned kind column still fits.
-        let pw_line = format!("{}", cred_row(&pw, false, 8, 4, 40));
+        let pw_line = format!("{}", cred_row(&pw, "", false, 8, 4, 40));
         assert!(pw_line.contains("password"), "pw_line: {pw_line}");
         assert!(!pw_line.contains("hunter2"), "plaintext leaked: {pw_line}");
 
-        let key_line = format!("{}", cred_row(&key, false, 8, 4, 40));
+        let key_line = format!("{}", cred_row(&key, "", false, 8, 4, 40));
         assert!(key_line.contains("identity"), "key_line: {key_line}");
 
-        let kr_line = format!("{}", cred_row(&kr, false, 8, 4, 40));
+        let kr_line = format!("{}", cred_row(&kr, "", false, 8, 4, 40));
         assert!(kr_line.contains("password"), "kr_line: {kr_line}");
 
-        let none_line = format!("{}", cred_row(&none, false, 8, 4, 40));
+        let none_line = format!("{}", cred_row(&none, "", false, 8, 4, 40));
         assert!(none_line.contains("none"), "none_line: {none_line}");
 
         // Touch Secret so the unused import stays meaningful in this test.
@@ -608,7 +635,7 @@ mod tests {
         // name_w=12 so the name column is padded with 5 trailing spaces, and a
         // width big enough that the right-aligned kind fits.
         let c = cred("web-key", "root");
-        let line = cred_row(&c, false, 12, 8, 50);
+        let line = cred_row(&c, "", false, 12, 8, 50);
         let s = format!("{line}");
         // Name padded to 12: "web-key" + 5 spaces.
         assert!(s.contains("web-key     "), "name not padded: {s}");

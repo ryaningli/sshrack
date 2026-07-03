@@ -9,21 +9,21 @@
 //!   [`Launcher::on_key`] decision function. `on_key` performs no I/O; the
 //!   event loop in [`super::app`] applies its [`Outcome`].
 //!
-//! Ranking contract:
+//! Ranking contract (delegated to the shared
+//! [`crate::tui::panel::rank_by_fields`] helper over each host's searchable
+//! fields — name, resolved user, and host address):
 //! - **Empty query** — every host is returned, ordered by frecency score
-//!   descending with a name-ascending tiebreak (via the shared
-//!   [`crate::tui::panel::rank_by_name`] helper over all hosts).
-//! - **Non-empty query** — hosts are fuzzy-matched against their `name` via
-//!   nucleo; non-matches are excluded. Matches are ordered by descending
-//!   nucleo match score, tie-broken by frecency score then name ascending.
+//!   descending with a name-ascending tiebreak.
+//! - **Non-empty query** — hosts are fuzzy-matched against any of their
+//!   searchable fields (name / user / host) via nucleo; a host is kept when at
+//!   least one field matches, scored by its best field. Matches are ordered by
+//!   descending match score, tie-broken by frecency score then name ascending.
 //!
 //! The returned [`RankedHost`] carries the original slice index (`host_idx`)
 //! so the view can render into the source list without copying hosts, plus the
 //! nucleo `score` (0 for the empty-query frecency branch).
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
-use nucleo_matcher::{Config, Matcher, Utf32Str};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Layout},
@@ -36,6 +36,7 @@ use sshrack_core::frecency::Frecency;
 use ulid::Ulid;
 
 use super::intent::{Outcome, Status};
+use super::panel;
 use super::parts;
 use super::theme;
 
@@ -56,23 +57,34 @@ pub struct RankedHost {
     pub score: u32,
 }
 
-/// Rank hosts by frecency (empty query) or nucleo fuzzy match (non-empty).
+/// Rank hosts by frecency (empty query) or nucleo fuzzy match (non-empty)
+/// across each host's searchable fields: name, resolved user, and host
+/// address. A host is kept when at least one field matches; its score is the
+/// best field score.
 ///
 /// Pure: no I/O, no printing, no env access. See the module docs for the full
 /// contract.
 ///
-/// Delegates ordering to [`crate::tui::panel::rank_by_name`], the shared
+/// Delegates ordering to [`crate::tui::panel::rank_by_fields`], the shared
 /// helper that the Credentials panel also uses, then re-attaches the nucleo
 /// match score (0 on the empty-query branch) that [`RankedHost::score`]
-/// carries for callers/tests.
-pub fn rank_hosts(hosts: &[Host], frecency: &Frecency, query: &str) -> Vec<RankedHost> {
-    // Pair each host with its original slice index and its frecency score —
-    // the same score source the previous inlined comparator used
-    // (`frecency.score(&id)`). `rank_by_name` consumes parallel slices and
-    // returns display-ordered original indices.
-    let names: Vec<String> = hosts.iter().map(|h| h.name.clone()).collect();
+/// carries for callers/tests. `credentials` resolves the user for
+/// [`Auth::Ref`] hosts so the referenced credential's user is searchable too.
+pub fn rank_hosts(
+    hosts: &[Host],
+    credentials: &[Credential],
+    frecency: &Frecency,
+    query: &str,
+) -> Vec<RankedHost> {
+    // Pair each host with its searchable fields and its frecency score.
+    // `rank_by_fields` consumes parallel slices and returns display-ordered
+    // original indices.
+    let rows: Vec<Vec<String>> = hosts
+        .iter()
+        .map(|h| host_search_fields(h, credentials))
+        .collect();
     let scores: Vec<f64> = hosts.iter().map(|h| frecency.score(&h.id)).collect();
-    let order = crate::tui::panel::rank_by_name(&names, &scores, query);
+    let order = panel::rank_by_fields(&rows, &scores, query);
 
     if query.is_empty() {
         // Empty-query branch reports score 0 (ordering is the signal).
@@ -84,21 +96,29 @@ pub fn rank_hosts(hosts: &[Host], frecency: &Frecency, query: &str) -> Vec<Ranke
             })
             .collect()
     } else {
-        // Re-attach the nucleo match score for each matched host. The pattern
-        // is deterministic, so re-scoring post-sort yields the same value as
-        // the pre-sort score `rank_by_name` used internally.
-        let mut matcher = Matcher::new(Config::DEFAULT);
-        let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
+        // Re-attach the best-field match score for each matched host. The
+        // pattern is deterministic, so re-scoring post-sort yields the same
+        // value as the pre-sort score `rank_by_fields` used internally.
         order
             .into_iter()
             .map(|i| RankedHost {
                 host_idx: i,
-                score: pattern
-                    .score(Utf32Str::Ascii(hosts[i].name.as_bytes()), &mut matcher)
-                    .unwrap_or(0),
+                score: panel::best_field_score(&rows[i], query).unwrap_or(0),
             })
             .collect()
     }
+}
+
+/// The searchable text fields for a host: its `name`, the connect `user`
+/// (resolved from the referenced credential for [`Auth::Ref`], with a `?`
+/// fallback when none resolves), and the `host` address. Each field is matched
+/// independently by nucleo.
+fn host_search_fields(host: &Host, credentials: &[Credential]) -> Vec<String> {
+    vec![
+        host.name.clone(),
+        host_user(host, credentials),
+        host.host.clone(),
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -149,10 +169,12 @@ pub struct Launcher {
 
 impl Launcher {
     /// Construct a fresh launcher over an already-ranked empty query. The
-    /// caller passes the full host slice and frecency so the initial ranking
-    /// (frecency order, no filter) is ready to render immediately.
-    pub fn new(hosts: &[Host], frecency: &Frecency) -> Self {
-        let ranked = rank_hosts(hosts, frecency, "");
+    /// caller passes the full host slice, the credential slice (for resolving
+    /// `Auth::Ref` users into the searchable fields), and frecency so the
+    /// initial ranking (frecency order, no filter) is ready to render
+    /// immediately.
+    pub fn new(hosts: &[Host], credentials: &[Credential], frecency: &Frecency) -> Self {
+        let ranked = rank_hosts(hosts, credentials, frecency, "");
         Self {
             query: String::new(),
             selected: 0,
@@ -164,8 +186,8 @@ impl Launcher {
     /// Recompute [`Launcher::ranked`] from the current query and clamp the
     /// selection back into range. Called after every mutation of `query` (and
     /// once at construction). Pure: no I/O.
-    pub fn recompute(&mut self, hosts: &[Host], frecency: &Frecency) {
-        self.ranked = rank_hosts(hosts, frecency, &self.query);
+    pub fn recompute(&mut self, hosts: &[Host], credentials: &[Credential], frecency: &Frecency) {
+        self.ranked = rank_hosts(hosts, credentials, frecency, &self.query);
         self.clamp_selection();
     }
 
@@ -224,7 +246,13 @@ impl Launcher {
     /// feedback flows through `App::status` (set by App-layer routing), which
     /// each panel renders as its own bottom status row (the shell footer is
     /// hotkey-only now).
-    pub fn on_key(&mut self, key: KeyEvent, hosts: &[Host], frecency: &Frecency) -> Outcome {
+    pub fn on_key(
+        &mut self,
+        key: KeyEvent,
+        hosts: &[Host],
+        credentials: &[Credential],
+        frecency: &Frecency,
+    ) -> Outcome {
         // Only react to Press events; Release/Repeat are ignored (crossterm
         // emits them on some platforms).
         if key.kind != KeyEventKind::Press {
@@ -246,7 +274,7 @@ impl Launcher {
                     Outcome::Quit
                 } else {
                     self.query.clear();
-                    self.recompute(hosts, frecency);
+                    self.recompute(hosts, credentials, frecency);
                     Outcome::Continue
                 }
             }
@@ -266,7 +294,7 @@ impl Launcher {
             }
             KeyCode::Backspace => {
                 self.query.pop();
-                self.recompute(hosts, frecency);
+                self.recompute(hosts, credentials, frecency);
                 Outcome::Continue
             }
             KeyCode::Down if !ctrl => {
@@ -291,7 +319,7 @@ impl Launcher {
             KeyCode::Char('e') if ctrl => Outcome::Continue,
             KeyCode::Char(c) if !ctrl => {
                 self.query.push(c);
-                self.recompute(hosts, frecency);
+                self.recompute(hosts, credentials, frecency);
                 Outcome::Continue
             }
             _ => Outcome::Continue,
@@ -439,10 +467,12 @@ fn host_user(host: &Host, credentials: &[Credential]) -> String {
 }
 
 /// Build the display line for one host: the focus marker (`▶ ` when selected,
-/// two spaces otherwise), the name padded to `name_w` with fuzzy-match
-/// highlighting, a dimmed `user@host:port` address column, and the frecency
-/// tier right-aligned to `width`. The credential NAME is no longer shown — the
-/// user is the load-bearing piece for "who will I connect as".
+/// two spaces otherwise), the name padded to `name_w`, a `user@host:port`
+/// address column, and the frecency tier right-aligned to `width`. The name
+/// and the address's `user`/`host` segments fuzzy-highlight the query (matched
+/// chars bold + `theme::MATCH`); the address sits on a dim base. The
+/// credential NAME is no longer shown — the user is the load-bearing piece for
+/// "who will I connect as".
 fn host_line(
     host: &Host,
     query: &str,
@@ -456,16 +486,23 @@ fn host_line(
     spans.push(theme::focus_marker(selected));
 
     // Name column (padded to name_w) with fuzzy-match highlighting.
-    spans.extend(highlighted_name(&host.name, query));
+    spans.extend(panel::highlighted_spans(&host.name, query, Style::new()));
     let name_pad = name_w.saturating_sub(host.name.chars().count());
     spans.push(Span::raw(" ".repeat(name_pad)));
     spans.push(Span::raw("  ")); // gap between name and address
 
-    // Address column: user@host:port.
+    // Address column: user@host:port. The user and host segments are
+    // fuzzy-highlighted against the query (dim base; matched chars bold +
+    // theme::MATCH); the punctuation stays dim.
+    let dim = Style::new().dim();
     let user = host_user(host, credentials);
-    let addr = format!("{user}@{}:{}", host.host, host.port);
-    let addr_len = addr.chars().count();
-    spans.push(Span::styled(addr, Style::new().dim()));
+    let port_str = host.port.to_string();
+    spans.extend(panel::highlighted_spans(&user, query, dim));
+    spans.push(Span::styled("@", dim));
+    spans.extend(panel::highlighted_spans(&host.host, query, dim));
+    spans.push(Span::styled(":", dim));
+    spans.push(Span::styled(port_str.clone(), dim));
+    let addr_len = user.chars().count() + 1 + host.host.chars().count() + 1 + port_str.len();
 
     // Tier badge right-aligned to the list area's right edge.
     let tier = frecency_tier(frecency.score(&host.id));
@@ -480,66 +517,6 @@ fn host_line(
     ));
 
     Line::from(spans)
-}
-
-/// Render a host's name as a sequence of spans, with the fuzzy-matched
-/// characters (per nucleo) highlighted bold + `theme::MATCH`. When the query
-/// is empty the whole name is one plain span.
-fn highlighted_name(name: &str, query: &str) -> Vec<Span<'static>> {
-    if query.is_empty() {
-        return vec![Span::raw(name.to_string())];
-    }
-    let Some(matched) = match_indices(name, query) else {
-        return vec![Span::raw(name.to_string())];
-    };
-    let highlight = Style::new().add_modifier(Modifier::BOLD).fg(theme::MATCH);
-    let mut spans = Vec::with_capacity(matched.len() + 1);
-    let mut prev = 0usize;
-    for idx in matched {
-        // `idx` is a char index; advance to the byte offset. Between `prev`
-        // and the byte offset is an unmatched run rendered plain.
-        let byte = char_to_byte(name, idx);
-        if byte > prev {
-            spans.push(Span::raw(name[prev..byte].to_string()));
-        }
-        // The matched char itself (one char in width).
-        let next = byte
-            + name[byte..]
-                .chars()
-                .next()
-                .map(|c| c.len_utf8())
-                .unwrap_or(0);
-        spans.push(Span::styled(name[byte..next].to_string(), highlight));
-        prev = next;
-    }
-    if prev < name.len() {
-        spans.push(Span::raw(name[prev..].to_string()));
-    }
-    spans
-}
-
-/// The nucleo match indices for `query` against `name`, as char indices into
-/// `name`, deduplicated and sorted. Returns `None` when the query does not
-/// match (nucleo `indices` returns `None`). Pure: no I/O.
-fn match_indices(name: &str, query: &str) -> Option<Vec<u32>> {
-    let mut matcher = Matcher::new(Config::DEFAULT);
-    let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
-    let mut indices: Vec<u32> = Vec::new();
-    let _score = pattern.indices(Utf32Str::Ascii(name.as_bytes()), &mut matcher, &mut indices)?;
-    // nucleo appends per-atom indices without dedup/sort (per its docs); sort
-    // and dedup so highlighting is monotonic and unique.
-    indices.sort_unstable();
-    indices.dedup();
-    Some(indices)
-}
-
-/// Map a char index into `s` to its byte offset. Falls back to `s.len()` for
-/// an out-of-range index so a malformed index never panics.
-fn char_to_byte(s: &str, char_idx: u32) -> usize {
-    s.char_indices()
-        .nth(char_idx as usize)
-        .map(|(b, _)| b)
-        .unwrap_or(s.len())
 }
 
 #[cfg(test)]
@@ -664,7 +641,7 @@ mod tests {
         fr.record_at(&hosts[1].id, t0); // beta: 1.0
         fr.record_at(&hosts[1].id, t0 + Duration::from_secs(60)); // beta: 5.0
 
-        let ranked = rank_hosts(&hosts, &fr, "");
+        let ranked = rank_hosts(&hosts, &[], &fr, "");
         let names: Vec<&str> = ranked
             .iter()
             .map(|r| hosts[r.host_idx].name.as_str())
@@ -681,7 +658,7 @@ mod tests {
         let hosts = vec![bravo, alpha];
         let fr = Frecency::default(); // no records → all tie at score 0.0
 
-        let ranked = rank_hosts(&hosts, &fr, "");
+        let ranked = rank_hosts(&hosts, &[], &fr, "");
         let names: Vec<&str> = ranked
             .iter()
             .map(|r| hosts[r.host_idx].name.as_str())
@@ -693,7 +670,7 @@ mod tests {
     fn empty_query_returns_all_hosts() {
         let hosts = vec![host(1, "a"), host(2, "b"), host(3, "c")];
         let fr = Frecency::default();
-        let ranked = rank_hosts(&hosts, &fr, "");
+        let ranked = rank_hosts(&hosts, &[], &fr, "");
         assert_eq!(ranked.len(), hosts.len());
         // Indices are a permutation of 0..len.
         let mut idxs: Vec<usize> = ranked.iter().map(|r| r.host_idx).collect();
@@ -704,7 +681,7 @@ mod tests {
     #[test]
     fn empty_hosts_returns_empty() {
         let fr = Frecency::default();
-        let ranked = rank_hosts(&[], &fr, "");
+        let ranked = rank_hosts(&[], &[], &fr, "");
         assert!(ranked.is_empty());
     }
 
@@ -718,7 +695,7 @@ mod tests {
         let hosts = vec![web_prod, db_staging, web_dev];
         let fr = Frecency::default();
 
-        let ranked = rank_hosts(&hosts, &fr, "web");
+        let ranked = rank_hosts(&hosts, &[], &fr, "web");
         let names: Vec<&str> = ranked
             .iter()
             .map(|r| hosts[r.host_idx].name.as_str())
@@ -739,7 +716,7 @@ mod tests {
         let hosts = vec![host(1, "web-prod"), host(2, "xwyexbz")];
         let fr = Frecency::default();
 
-        let ranked = rank_hosts(&hosts, &fr, "web");
+        let ranked = rank_hosts(&hosts, &[], &fr, "web");
         // "web-prod" has a clean prefix match; "xwyexbz" is a gap-filled fuzzy
         // match with lower score → ranks second.
         assert_eq!(hosts[ranked[0].host_idx].name, "web-prod");
@@ -756,7 +733,7 @@ mod tests {
         // web-bravo recorded, web-alpha not → web-bravo has higher frecency.
         fr.record_at(&hosts[1].id, now());
 
-        let ranked = rank_hosts(&hosts, &fr, "web-");
+        let ranked = rank_hosts(&hosts, &[], &fr, "web-");
         // Both match "web-" with equal score; frecency tiebreak → bravo first.
         assert_eq!(hosts[ranked[0].host_idx].name, "web-bravo");
         assert_eq!(hosts[ranked[1].host_idx].name, "web-alpha");
@@ -769,7 +746,7 @@ mod tests {
         let hosts = vec![bravo, alpha];
         let fr = Frecency::default(); // equal frecency (0.0)
 
-        let ranked = rank_hosts(&hosts, &fr, "web-");
+        let ranked = rank_hosts(&hosts, &[], &fr, "web-");
         let names: Vec<&str> = ranked
             .iter()
             .map(|r| hosts[r.host_idx].name.as_str())
@@ -782,7 +759,7 @@ mod tests {
     fn query_no_matches_returns_empty() {
         let hosts = vec![host(1, "alpha"), host(2, "beta")];
         let fr = Frecency::default();
-        let ranked = rank_hosts(&hosts, &fr, "zzz");
+        let ranked = rank_hosts(&hosts, &[], &fr, "zzz");
         assert!(ranked.is_empty());
     }
 
@@ -790,7 +767,7 @@ mod tests {
     fn query_is_case_insensitive_smart_match() {
         let hosts = vec![host(1, "Web-Prod")];
         let fr = Frecency::default();
-        let ranked = rank_hosts(&hosts, &fr, "web");
+        let ranked = rank_hosts(&hosts, &[], &fr, "web");
         assert_eq!(ranked.len(), 1);
         assert_eq!(hosts[ranked[0].host_idx].name, "Web-Prod");
     }
@@ -799,7 +776,7 @@ mod tests {
     fn ranked_host_score_is_nucleo_match_score_for_query() {
         let hosts = vec![host(1, "web-prod")];
         let fr = Frecency::default();
-        let ranked = rank_hosts(&hosts, &fr, "web");
+        let ranked = rank_hosts(&hosts, &[], &fr, "web");
         assert_eq!(ranked.len(), 1);
         // Nucleo match scores are positive for a match.
         assert!(ranked[0].score > 0);
@@ -828,9 +805,9 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         let hosts = vec![host(1, "web")];
         let frecency = Frecency::default();
-        let mut p = Launcher::new(&hosts, &frecency);
+        let mut p = Launcher::new(&hosts, &[], &frecency);
         p.query = "w".into();
-        p.recompute(&hosts, &frecency);
+        p.recompute(&hosts, &[], &frecency);
 
         term.draw(|f| {
             let area = crate::tui::shell::draw_shell(
@@ -879,7 +856,7 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         let hosts = vec![host(1, "web")];
         let frecency = Frecency::default();
-        let p = Launcher::new(&hosts, &frecency);
+        let p = Launcher::new(&hosts, &[], &frecency);
 
         term.draw(|f| {
             let area = crate::tui::shell::draw_shell(
@@ -940,7 +917,7 @@ mod tests {
     fn launcher_new_ranks_all_hosts_in_frecency_order() {
         let hosts = vec![host(1, "alpha"), host(2, "beta")];
         let fr = Frecency::default();
-        let launcher = Launcher::new(&hosts, &fr);
+        let launcher = Launcher::new(&hosts, &[], &fr);
         assert!(launcher.query.is_empty());
         assert_eq!(launcher.selected, 0);
         assert_eq!(launcher.ranked.len(), 2);
@@ -950,8 +927,13 @@ mod tests {
     fn on_key_printable_char_appends_to_query_and_filters() {
         let hosts = vec![host(1, "web"), host(2, "db")];
         let fr = Frecency::default();
-        let mut launcher = Launcher::new(&hosts, &fr);
-        let outcome = launcher.on_key(key(KeyCode::Char('w'), KeyModifiers::NONE), &hosts, &fr);
+        let mut launcher = Launcher::new(&hosts, &[], &fr);
+        let outcome = launcher.on_key(
+            key(KeyCode::Char('w'), KeyModifiers::NONE),
+            &hosts,
+            &[],
+            &fr,
+        );
         assert!(matches!(outcome, Outcome::Continue));
         assert_eq!(launcher.query, "w");
         // Only "web" matches "w".
@@ -963,13 +945,28 @@ mod tests {
     fn on_key_backspace_pops_query() {
         let hosts = vec![host(1, "web")];
         let fr = Frecency::default();
-        let mut launcher = Launcher::new(&hosts, &fr);
-        launcher.on_key(key(KeyCode::Char('w'), KeyModifiers::NONE), &hosts, &fr);
-        launcher.on_key(key(KeyCode::Char('x'), KeyModifiers::NONE), &hosts, &fr);
+        let mut launcher = Launcher::new(&hosts, &[], &fr);
+        launcher.on_key(
+            key(KeyCode::Char('w'), KeyModifiers::NONE),
+            &hosts,
+            &[],
+            &fr,
+        );
+        launcher.on_key(
+            key(KeyCode::Char('x'), KeyModifiers::NONE),
+            &hosts,
+            &[],
+            &fr,
+        );
         assert_eq!(launcher.query, "wx");
         // "wx" matches nothing.
         assert!(launcher.ranked.is_empty());
-        let outcome = launcher.on_key(key(KeyCode::Backspace, KeyModifiers::NONE), &hosts, &fr);
+        let outcome = launcher.on_key(
+            key(KeyCode::Backspace, KeyModifiers::NONE),
+            &hosts,
+            &[],
+            &fr,
+        );
         assert!(matches!(outcome, Outcome::Continue));
         assert_eq!(launcher.query, "w");
         assert_eq!(launcher.ranked.len(), 1);
@@ -979,12 +976,17 @@ mod tests {
     fn on_key_esc_clears_nonempty_query_then_quits_on_second_press() {
         let hosts = vec![host(1, "web")];
         let fr = Frecency::default();
-        let mut launcher = Launcher::new(&hosts, &fr);
-        launcher.on_key(key(KeyCode::Char('w'), KeyModifiers::NONE), &hosts, &fr);
-        let first = launcher.on_key(key(KeyCode::Esc, KeyModifiers::NONE), &hosts, &fr);
+        let mut launcher = Launcher::new(&hosts, &[], &fr);
+        launcher.on_key(
+            key(KeyCode::Char('w'), KeyModifiers::NONE),
+            &hosts,
+            &[],
+            &fr,
+        );
+        let first = launcher.on_key(key(KeyCode::Esc, KeyModifiers::NONE), &hosts, &[], &fr);
         assert!(matches!(first, Outcome::Continue));
         assert!(launcher.query.is_empty());
-        let second = launcher.on_key(key(KeyCode::Esc, KeyModifiers::NONE), &hosts, &fr);
+        let second = launcher.on_key(key(KeyCode::Esc, KeyModifiers::NONE), &hosts, &[], &fr);
         assert!(matches!(second, Outcome::Quit));
     }
 
@@ -992,8 +994,8 @@ mod tests {
     fn on_key_esc_on_empty_query_quits_immediately() {
         let hosts = vec![host(1, "web")];
         let fr = Frecency::default();
-        let mut launcher = Launcher::new(&hosts, &fr);
-        let outcome = launcher.on_key(key(KeyCode::Esc, KeyModifiers::NONE), &hosts, &fr);
+        let mut launcher = Launcher::new(&hosts, &[], &fr);
+        let outcome = launcher.on_key(key(KeyCode::Esc, KeyModifiers::NONE), &hosts, &[], &fr);
         assert!(matches!(outcome, Outcome::Quit));
     }
 
@@ -1001,9 +1003,19 @@ mod tests {
     fn on_key_ctrl_c_quits_regardless_of_query() {
         let hosts = vec![host(1, "web")];
         let fr = Frecency::default();
-        let mut launcher = Launcher::new(&hosts, &fr);
-        launcher.on_key(key(KeyCode::Char('w'), KeyModifiers::NONE), &hosts, &fr);
-        let outcome = launcher.on_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &hosts, &fr);
+        let mut launcher = Launcher::new(&hosts, &[], &fr);
+        launcher.on_key(
+            key(KeyCode::Char('w'), KeyModifiers::NONE),
+            &hosts,
+            &[],
+            &fr,
+        );
+        let outcome = launcher.on_key(
+            key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &hosts,
+            &[],
+            &fr,
+        );
         assert!(matches!(outcome, Outcome::Quit));
     }
 
@@ -1011,13 +1023,14 @@ mod tests {
     fn on_key_ctrl_shift_c_is_not_quit() {
         let hosts = vec![host(1, "web")];
         let fr = Frecency::default();
-        let mut launcher = Launcher::new(&hosts, &fr);
+        let mut launcher = Launcher::new(&hosts, &[], &fr);
         let outcome = launcher.on_key(
             key(
                 KeyCode::Char('c'),
                 KeyModifiers::CONTROL | KeyModifiers::SHIFT,
             ),
             &hosts,
+            &[],
             &fr,
         );
         assert!(matches!(outcome, Outcome::Continue));
@@ -1027,17 +1040,17 @@ mod tests {
     fn on_key_down_up_moves_and_wraps_selection() {
         let hosts = vec![host(1, "a"), host(2, "b"), host(3, "c")];
         let fr = Frecency::default();
-        let mut launcher = Launcher::new(&hosts, &fr);
+        let mut launcher = Launcher::new(&hosts, &[], &fr);
         assert_eq!(launcher.selected, 0);
-        launcher.on_key(key(KeyCode::Down, KeyModifiers::NONE), &hosts, &fr);
+        launcher.on_key(key(KeyCode::Down, KeyModifiers::NONE), &hosts, &[], &fr);
         assert_eq!(launcher.selected, 1);
-        launcher.on_key(key(KeyCode::Down, KeyModifiers::NONE), &hosts, &fr);
+        launcher.on_key(key(KeyCode::Down, KeyModifiers::NONE), &hosts, &[], &fr);
         assert_eq!(launcher.selected, 2);
         // Down past the end wraps to the top.
-        launcher.on_key(key(KeyCode::Down, KeyModifiers::NONE), &hosts, &fr);
+        launcher.on_key(key(KeyCode::Down, KeyModifiers::NONE), &hosts, &[], &fr);
         assert_eq!(launcher.selected, 0);
         // Up from the top wraps to the bottom.
-        launcher.on_key(key(KeyCode::Up, KeyModifiers::NONE), &hosts, &fr);
+        launcher.on_key(key(KeyCode::Up, KeyModifiers::NONE), &hosts, &[], &fr);
         assert_eq!(launcher.selected, 2);
     }
 
@@ -1045,10 +1058,20 @@ mod tests {
     fn on_key_ctrl_n_ctrl_p_move_selection() {
         let hosts = vec![host(1, "a"), host(2, "b")];
         let fr = Frecency::default();
-        let mut launcher = Launcher::new(&hosts, &fr);
-        launcher.on_key(key(KeyCode::Char('n'), KeyModifiers::CONTROL), &hosts, &fr);
+        let mut launcher = Launcher::new(&hosts, &[], &fr);
+        launcher.on_key(
+            key(KeyCode::Char('n'), KeyModifiers::CONTROL),
+            &hosts,
+            &[],
+            &fr,
+        );
         assert_eq!(launcher.selected, 1);
-        launcher.on_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL), &hosts, &fr);
+        launcher.on_key(
+            key(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            &hosts,
+            &[],
+            &fr,
+        );
         assert_eq!(launcher.selected, 0);
     }
 
@@ -1056,8 +1079,13 @@ mod tests {
     fn on_key_plain_n_is_a_query_char_not_navigation() {
         let hosts = vec![host(1, "n")];
         let fr = Frecency::default();
-        let mut launcher = Launcher::new(&hosts, &fr);
-        let outcome = launcher.on_key(key(KeyCode::Char('n'), KeyModifiers::NONE), &hosts, &fr);
+        let mut launcher = Launcher::new(&hosts, &[], &fr);
+        let outcome = launcher.on_key(
+            key(KeyCode::Char('n'), KeyModifiers::NONE),
+            &hosts,
+            &[],
+            &fr,
+        );
         assert!(matches!(outcome, Outcome::Continue));
         assert_eq!(launcher.query, "n");
     }
@@ -1070,8 +1098,8 @@ mod tests {
         let hosts = vec![host(1, "web")];
         let expected_id = hosts[0].id;
         let fr = Frecency::default();
-        let mut launcher = Launcher::new(&hosts, &fr);
-        let outcome = launcher.on_key(key(KeyCode::Enter, KeyModifiers::NONE), &hosts, &fr);
+        let mut launcher = Launcher::new(&hosts, &[], &fr);
+        let outcome = launcher.on_key(key(KeyCode::Enter, KeyModifiers::NONE), &hosts, &[], &fr);
         assert!(matches!(outcome, Outcome::ConnectRequested));
         assert_eq!(launcher.pending_connect, Some(expected_id));
     }
@@ -1084,8 +1112,8 @@ mod tests {
         // App::status (the App-layer primary_action path).
         let hosts: Vec<Host> = vec![];
         let fr = Frecency::default();
-        let mut launcher = Launcher::new(&hosts, &fr);
-        let outcome = launcher.on_key(key(KeyCode::Enter, KeyModifiers::NONE), &hosts, &fr);
+        let mut launcher = Launcher::new(&hosts, &[], &fr);
+        let outcome = launcher.on_key(key(KeyCode::Enter, KeyModifiers::NONE), &hosts, &[], &fr);
         assert!(matches!(outcome, Outcome::Continue));
         assert!(launcher.pending_connect.is_none());
     }
@@ -1102,8 +1130,8 @@ mod tests {
             key(KeyCode::Char('a'), KeyModifiers::CONTROL),
             key(KeyCode::Char('e'), KeyModifiers::CONTROL),
         ] {
-            let mut launcher = Launcher::new(&hosts, &fr);
-            let outcome = launcher.on_key(k, &hosts, &fr);
+            let mut launcher = Launcher::new(&hosts, &[], &fr);
+            let outcome = launcher.on_key(k, &hosts, &[], &fr);
             assert!(
                 matches!(outcome, Outcome::Continue),
                 "deferred key must not quit"
@@ -1115,10 +1143,10 @@ mod tests {
     fn on_key_release_is_ignored() {
         let hosts = vec![host(1, "web")];
         let fr = Frecency::default();
-        let mut launcher = Launcher::new(&hosts, &fr);
+        let mut launcher = Launcher::new(&hosts, &[], &fr);
         let release =
             KeyEvent::new_with_kind(KeyCode::Esc, KeyModifiers::NONE, KeyEventKind::Release);
-        let outcome = launcher.on_key(release, &hosts, &fr);
+        let outcome = launcher.on_key(release, &hosts, &[], &fr);
         assert!(matches!(outcome, Outcome::Continue));
     }
 
@@ -1126,13 +1154,18 @@ mod tests {
     fn selection_clamps_after_filter_shrinks_list() {
         let hosts = vec![host(1, "web1"), host(2, "web2"), host(3, "db")];
         let fr = Frecency::default();
-        let mut launcher = Launcher::new(&hosts, &fr);
+        let mut launcher = Launcher::new(&hosts, &[], &fr);
         // Move selection to index 2 (db), then filter to "web" so the list
         // shrinks to 2 and the old index is out of range.
-        launcher.on_key(key(KeyCode::Down, KeyModifiers::NONE), &hosts, &fr);
-        launcher.on_key(key(KeyCode::Down, KeyModifiers::NONE), &hosts, &fr);
+        launcher.on_key(key(KeyCode::Down, KeyModifiers::NONE), &hosts, &[], &fr);
+        launcher.on_key(key(KeyCode::Down, KeyModifiers::NONE), &hosts, &[], &fr);
         assert_eq!(launcher.selected, 2);
-        launcher.on_key(key(KeyCode::Char('w'), KeyModifiers::NONE), &hosts, &fr);
+        launcher.on_key(
+            key(KeyCode::Char('w'), KeyModifiers::NONE),
+            &hosts,
+            &[],
+            &fr,
+        );
         assert_eq!(launcher.ranked.len(), 2);
         assert!(
             launcher.selected < launcher.ranked.len(),
@@ -1144,8 +1177,8 @@ mod tests {
     fn move_selection_on_empty_list_is_a_noop() {
         let hosts: Vec<Host> = vec![];
         let fr = Frecency::default();
-        let mut launcher = Launcher::new(&hosts, &fr);
-        launcher.on_key(key(KeyCode::Down, KeyModifiers::NONE), &hosts, &fr);
+        let mut launcher = Launcher::new(&hosts, &[], &fr);
+        launcher.on_key(key(KeyCode::Down, KeyModifiers::NONE), &hosts, &[], &fr);
         assert_eq!(launcher.selected, 0);
     }
 
@@ -1153,12 +1186,12 @@ mod tests {
     fn selected_host_returns_cursor_target() {
         let hosts = vec![host(1, "a"), host(2, "b")];
         let fr = Frecency::default();
-        let mut launcher = Launcher::new(&hosts, &fr);
+        let mut launcher = Launcher::new(&hosts, &[], &fr);
         assert_eq!(
             launcher.selected_host(&hosts).map(|h| h.name.as_str()),
             Some("a")
         );
-        launcher.on_key(key(KeyCode::Down, KeyModifiers::NONE), &hosts, &fr);
+        launcher.on_key(key(KeyCode::Down, KeyModifiers::NONE), &hosts, &[], &fr);
         assert_eq!(
             launcher.selected_host(&hosts).map(|h| h.name.as_str()),
             Some("b")
@@ -1169,47 +1202,8 @@ mod tests {
     fn selected_host_none_when_no_hosts() {
         let hosts: Vec<Host> = vec![];
         let fr = Frecency::default();
-        let launcher = Launcher::new(&hosts, &fr);
+        let launcher = Launcher::new(&hosts, &[], &fr);
         assert!(launcher.selected_host(&hosts).is_none());
-    }
-
-    #[test]
-    fn match_indices_returns_char_positions_for_prefix_match() {
-        // "web" against "web-prod" should match positions 0,1,2.
-        let indices = match_indices("web-prod", "web").unwrap();
-        assert_eq!(indices, vec![0, 1, 2]);
-    }
-
-    #[test]
-    fn match_indices_none_when_no_match() {
-        assert!(match_indices("alpha", "zzz").is_none());
-    }
-
-    #[test]
-    fn match_indices_empty_query_is_handled_by_caller_not_here() {
-        // match_indices is only called with a non-empty query (highlighted_name
-        // short-circuits on empty). Calling it with an empty query returns
-        // Some(all indices) per nucleo's empty-pattern semantics — we don't
-        // assert the exact set, only that it doesn't panic.
-        let _ = match_indices("abc", "");
-    }
-
-    #[test]
-    fn char_to_byte_maps_char_index_to_byte_offset() {
-        // ASCII: char index == byte offset.
-        assert_eq!(char_to_byte("abc", 0), 0);
-        assert_eq!(char_to_byte("abc", 2), 2);
-    }
-
-    #[test]
-    fn char_to_byte_out_of_range_returns_len() {
-        assert_eq!(char_to_byte("ab", 9), 2);
-    }
-
-    #[test]
-    fn char_to_byte_handles_multibyte() {
-        // "é" is 2 bytes; the second char "b" sits at byte offset 2.
-        assert_eq!(char_to_byte("éb", 1), 2);
     }
 
     #[test]
