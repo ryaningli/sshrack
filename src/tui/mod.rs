@@ -29,6 +29,7 @@ pub mod app;
 pub mod connect;
 pub mod cred_panel;
 pub mod dialog;
+pub mod fit;
 pub mod help;
 pub mod intent;
 pub mod launcher;
