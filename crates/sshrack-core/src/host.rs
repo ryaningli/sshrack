@@ -377,18 +377,19 @@ pub fn apply_patch(orig: &Host, opts: &EditOptions) -> Result<Host, SshrackError
 /// `--rename`) never orphans the keyring entry keyed by the host's id.
 fn patch_body(body: &CredentialBody, opts: &EditOptions) -> Result<CredentialBody, SshrackError> {
     let user = opts.user.clone().unwrap_or_else(|| body.user.clone());
+    // Decide the key slot directly as a KeySource so an existing Inline key
+    // survives a non-identity patch (a patch must touch only the named field).
+    // The old code folded the slot through `KeySource::as_path` (which returns
+    // None for Inline) and silently downgraded inline-key bodies to Default.
+    // `--identity <path>` → KeySource::Path; `--clear_identity` → None;
+    // otherwise preserve the original key verbatim (Path or Inline).
     let key = if opts.clear_identity {
         None
     } else {
-        // Staging: only a Path key can flow back into `with_key(impl Into<PathBuf>)`.
-        // Inline keys are dropped here for now; real inline-patch handling lands
-        // in a later task. `opts.identity` (a flag-supplied path) always wins.
-        opts.identity.clone().or_else(|| {
-            body.key
-                .as_ref()
-                .and_then(KeySource::as_path)
-                .map(std::path::Path::to_path_buf)
-        })
+        match &opts.identity {
+            Some(p) => Some(KeySource::Path(p.clone())),
+            None => body.key.clone(),
+        }
     };
     let (password, keyring) = if opts.clear_password {
         (None, false)
@@ -397,15 +398,12 @@ fn patch_body(body: &CredentialBody, opts: &EditOptions) -> Result<CredentialBod
         // inline password keeps its Secret, a keyring body keeps its marker.
         (body.password.clone(), body.keyring)
     };
-    let mut new_body = CredentialBody {
+    let new_body = CredentialBody {
         user,
         password,
-        key: None,
+        key,
         keyring,
     };
-    if let Some(k) = key {
-        new_body = new_body.with_key(k); // with_key clears password (mutual exclusion)
-    }
     new_body.validate()?;
     Ok(new_body)
 }
@@ -1114,6 +1112,148 @@ mod tests {
             "keyring marker must be dropped on --clear-password"
         );
         assert!(body.password.is_none());
+    }
+
+    #[test]
+    fn apply_patch_preserves_inline_key_on_non_identity_edit() {
+        // I1 regression: a non-identity patch (--user / --port / --rename) on
+        // an inline-key host must NOT destroy the only copy of the key. The
+        // patch touches only the named field; the KeySource::Inline survives
+        // verbatim. The old patch_body routed the key through KeySource::as_path
+        // (which returns None for Inline) and silently downgraded the body to
+        // Default.
+        use crate::config::schema::{InlineKey, KeySource, Secret};
+        let inline = KeySource::Inline(InlineKey {
+            private_key: Some(Secret::Plain("PRIV-TEXT".into())),
+            certificate: Some(Secret::Plain("CERT-TEXT".into())),
+            keyring: false,
+        });
+        let orig = Host {
+            id: new_id(),
+            name: "web1".into(),
+            host: "10.0.0.5".into(),
+            port: 22,
+            auth: Auth::inline(CredentialBody {
+                user: "deploy".into(),
+                password: None,
+                key: Some(inline.clone()),
+                keyring: false,
+            }),
+        };
+        let opts = EditOptions {
+            user: Some("ops".into()),
+            ..Default::default()
+        };
+        let out = apply_patch(&orig, &opts).unwrap();
+        let body = out.auth.inline_body().unwrap();
+        assert_eq!(body.user, "ops");
+        assert_eq!(
+            body.key,
+            Some(inline),
+            "inline KeySource must survive a non-identity patch"
+        );
+    }
+
+    #[test]
+    fn apply_patch_rename_preserves_inline_key() {
+        // I1 regression, second surface: --rename must also preserve an inline
+        // key. rename exercises the "no key flag supplied at all" path.
+        use crate::config::schema::{InlineKey, KeySource, Secret};
+        let inline = KeySource::Inline(InlineKey {
+            private_key: Some(Secret::Plain("PRIV-TEXT".into())),
+            certificate: None,
+            keyring: false,
+        });
+        let orig = Host {
+            id: new_id(),
+            name: "web1".into(),
+            host: "10.0.0.5".into(),
+            port: 22,
+            auth: Auth::inline(CredentialBody {
+                user: "deploy".into(),
+                password: None,
+                key: Some(inline.clone()),
+                keyring: false,
+            }),
+        };
+        let opts = EditOptions {
+            rename: Some("web2".into()),
+            ..Default::default()
+        };
+        let out = apply_patch(&orig, &opts).unwrap();
+        assert_eq!(out.name, "web2");
+        let body = out.auth.inline_body().unwrap();
+        assert_eq!(
+            body.key,
+            Some(inline),
+            "inline KeySource must survive a rename"
+        );
+    }
+
+    #[test]
+    fn apply_patch_identity_replaces_inline_key_with_path() {
+        // Confirm --identity <path> still wins over a preserved inline key:
+        // the patch replaces the inline material with a path reference and
+        // produces a Path-key body.
+        use crate::config::schema::{InlineKey, KeySource, Secret};
+        let inline = KeySource::Inline(InlineKey {
+            private_key: Some(Secret::Plain("PRIV-TEXT".into())),
+            certificate: None,
+            keyring: false,
+        });
+        let orig = Host {
+            id: new_id(),
+            name: "web1".into(),
+            host: "10.0.0.5".into(),
+            port: 22,
+            auth: Auth::inline(CredentialBody {
+                user: "deploy".into(),
+                password: None,
+                key: Some(inline),
+                keyring: false,
+            }),
+        };
+        let opts = EditOptions {
+            identity: Some(PathBuf::from("/new/key")),
+            ..Default::default()
+        };
+        let out = apply_patch(&orig, &opts).unwrap();
+        let body = out.auth.inline_body().unwrap();
+        assert_eq!(
+            body.key.as_ref().and_then(KeySource::as_path),
+            Some(std::path::Path::new("/new/key"))
+        );
+    }
+
+    #[test]
+    fn apply_patch_clear_identity_removes_inline_key() {
+        // --clear_identity on an inline-key body clears the slot entirely and
+        // yields a Default body.
+        use crate::config::schema::{InlineKey, KeySource, Secret};
+        let inline = KeySource::Inline(InlineKey {
+            private_key: Some(Secret::Plain("PRIV-TEXT".into())),
+            certificate: None,
+            keyring: false,
+        });
+        let orig = Host {
+            id: new_id(),
+            name: "web1".into(),
+            host: "10.0.0.5".into(),
+            port: 22,
+            auth: Auth::inline(CredentialBody {
+                user: "deploy".into(),
+                password: None,
+                key: Some(inline),
+                keyring: false,
+            }),
+        };
+        let opts = EditOptions {
+            clear_identity: true,
+            ..Default::default()
+        };
+        let out = apply_patch(&orig, &opts).unwrap();
+        let body = out.auth.inline_body().unwrap();
+        assert!(body.key.is_none());
     }
 
     #[test]

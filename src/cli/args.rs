@@ -252,16 +252,17 @@ pub enum HostAction {
         /// `--identity-file`, NOT `--identity-stdin` — the private key and
         /// certificate cannot share one stdin stream). Ignored when the
         /// identity is a path reference.
-        #[arg(long, conflicts_with_all = ["certificate_file", "identity_stdin"])]
+        #[arg(long, conflicts_with_all = ["certificate_file", "identity_stdin", "identity"])]
         certificate_stdin: bool,
         /// Read an SSH **certificate** from this file (optional; pairs with
         /// `--identity-stdin` / `--identity-file`).
-        #[arg(long, conflicts_with = "certificate_stdin")]
+        #[arg(long, conflicts_with_all = ["certificate_stdin", "identity"])]
         certificate_file: Option<PathBuf>,
         /// Reference a [[credentials]] entry by name (Reference mode, mutually
-        /// exclusive with the independent flags `--user`/`--identity`).
+        /// exclusive with the independent flags `--user`/`--identity` and the
+        /// inline-import flags `--identity-stdin`/`--identity-file`).
         /// Resolved from name to id by the CLI layer, not by clap.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["identity_stdin", "identity_file"])]
         credential: Option<String>,
         /// Overwrite an existing name.
         #[arg(long)]
@@ -327,18 +328,19 @@ pub enum HostAction {
         /// Read an SSH **certificate** from stdin (optional; requires
         /// `--identity-file`, NOT `--identity-stdin` — the private key and
         /// certificate cannot share one stdin stream).
-        #[arg(long, conflicts_with_all = ["certificate_file", "identity_stdin"])]
+        #[arg(long, conflicts_with_all = ["certificate_file", "identity_stdin", "identity"])]
         certificate_stdin: bool,
         /// Read an SSH **certificate** from this file (optional; pairs with
         /// `--identity-stdin` / `--identity-file`).
-        #[arg(long, conflicts_with = "certificate_stdin")]
+        #[arg(long, conflicts_with_all = ["certificate_stdin", "identity"])]
         certificate_file: Option<PathBuf>,
         /// Rename the host to this new name.
         #[arg(long)]
         rename: Option<String>,
         /// Switch to Reference auth, pointing at this [[credentials]] entry by
-        /// name (sets `Auth::Ref`). Mutually exclusive with --clear-credential.
-        #[arg(long, conflicts_with = "clear_credential")]
+        /// name (sets `Auth::Ref`). Mutually exclusive with --clear-credential
+        /// and the inline-import flags `--identity-stdin`/`--identity-file`.
+        #[arg(long, conflicts_with_all = ["clear_credential", "identity_stdin", "identity_file"])]
         credential: Option<String>,
         /// Remove the identity file (set key_path to none).
         #[arg(long, conflicts_with = "identity")]
@@ -409,11 +411,11 @@ pub enum CredAction {
         /// Read an SSH **certificate** from stdin (optional; requires
         /// `--identity-file`, NOT `--identity-stdin` — the private key and
         /// certificate cannot share one stdin stream).
-        #[arg(long, conflicts_with_all = ["certificate_file", "identity_stdin"])]
+        #[arg(long, conflicts_with_all = ["certificate_file", "identity_stdin", "identity"])]
         certificate_stdin: bool,
         /// Read an SSH **certificate** from this file (optional; pairs with
         /// `--identity-stdin` / `--identity-file`).
-        #[arg(long, conflicts_with = "certificate_stdin")]
+        #[arg(long, conflicts_with_all = ["certificate_stdin", "identity"])]
         certificate_file: Option<PathBuf>,
         /// Overwrite an existing credential name.
         #[arg(long)]
@@ -444,11 +446,11 @@ pub enum CredAction {
         /// Read an SSH **certificate** from stdin (optional; requires
         /// `--identity-file`, NOT `--identity-stdin` — the private key and
         /// certificate cannot share one stdin stream).
-        #[arg(long, conflicts_with_all = ["certificate_file", "identity_stdin"])]
+        #[arg(long, conflicts_with_all = ["certificate_file", "identity_stdin", "identity"])]
         certificate_stdin: bool,
         /// Read an SSH **certificate** from this file (optional; pairs with
         /// `--identity-stdin` / `--identity-file`).
-        #[arg(long, conflicts_with = "certificate_stdin")]
+        #[arg(long, conflicts_with_all = ["certificate_stdin", "identity"])]
         certificate_file: Option<PathBuf>,
         /// Remove the identity file.
         #[arg(long, conflicts_with = "identity")]
@@ -613,6 +615,159 @@ mod tests {
             "somename",
             "--identity-stdin",
             "--certificate-stdin",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    // M1: --certificate-stdin / --certificate-file are unreachable when the
+    // identity source is `--identity <path>` (a path identity auto-loads its
+    // own `-cert.pub` sibling). The cert flag would be silently swallowed.
+    // clap now rejects the combo at parse time on all four surfaces.
+
+    #[test]
+    fn cred_add_rejects_identity_path_with_certificate_stdin() {
+        let err = Cli::try_parse_from([
+            "sshrack",
+            "cred",
+            "add",
+            "--user",
+            "u",
+            "--identity",
+            "/p",
+            "--certificate-stdin",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn cred_add_rejects_identity_path_with_certificate_file() {
+        let err = Cli::try_parse_from([
+            "sshrack",
+            "cred",
+            "add",
+            "--user",
+            "u",
+            "--identity",
+            "/p",
+            "--certificate-file",
+            "/c",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn cred_edit_rejects_identity_path_with_certificate_stdin() {
+        let err = Cli::try_parse_from([
+            "sshrack",
+            "cred",
+            "edit",
+            "somename",
+            "--identity",
+            "/p",
+            "--certificate-stdin",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn host_add_rejects_identity_path_with_certificate_stdin() {
+        let err = Cli::try_parse_from([
+            "sshrack",
+            "host",
+            "add",
+            "--host",
+            "h",
+            "--identity",
+            "/p",
+            "--certificate-stdin",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn host_edit_rejects_identity_path_with_certificate_stdin() {
+        let err = Cli::try_parse_from([
+            "sshrack",
+            "host",
+            "edit",
+            "somename",
+            "--identity",
+            "/p",
+            "--certificate-stdin",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    // M2: --credential is Reference auth; the inline-import flags
+    // (--identity-stdin / --identity-file) rebuild an Inline body, so --credential
+    // is silently ignored alongside them. clap now rejects the combo on host
+    // add/edit.
+
+    #[test]
+    fn host_add_rejects_credential_with_identity_stdin() {
+        let err = Cli::try_parse_from([
+            "sshrack",
+            "host",
+            "add",
+            "--host",
+            "h",
+            "--credential",
+            "team",
+            "--identity-stdin",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn host_add_rejects_credential_with_identity_file() {
+        let err = Cli::try_parse_from([
+            "sshrack",
+            "host",
+            "add",
+            "--host",
+            "h",
+            "--credential",
+            "team",
+            "--identity-file",
+            "/k",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn host_edit_rejects_credential_with_identity_stdin() {
+        let err = Cli::try_parse_from([
+            "sshrack",
+            "host",
+            "edit",
+            "somename",
+            "--credential",
+            "team",
+            "--identity-stdin",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn host_edit_rejects_credential_with_identity_file() {
+        let err = Cli::try_parse_from([
+            "sshrack",
+            "host",
+            "edit",
+            "somename",
+            "--credential",
+            "team",
+            "--identity-file",
+            "/k",
         ])
         .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
