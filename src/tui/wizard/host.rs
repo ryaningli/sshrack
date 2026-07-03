@@ -380,6 +380,17 @@ impl HostForm {
     /// blacklisted in every Independent arm (the Independent branch filters with
     /// `!matches!`, so omitting it would let the Credential row leak through).
     fn field_reachable(field: Field, auth: &AuthChoice, secret: SecretChoice) -> bool {
+        // Task 1 staging: the Source / InlinePrivate / InlineCert rows are not
+        // wired into the form yet (Task 4 does). Keep them unreachable so the
+        // existing navigation/render behavior is unchanged — the Independent
+        // branch below uses negative matches (`!matches!`), so without this
+        // guard the new variants would slip through as reachable.
+        if matches!(
+            field,
+            Field::Source | Field::InlinePrivate | Field::InlineCert
+        ) {
+            return false;
+        }
         match auth {
             AuthChoice::Reference { .. } => matches!(
                 field,
@@ -599,6 +610,9 @@ impl HostForm {
             // Auth / Credential / Secret are chooser/trigger rows driven by ←/→
             // or Enter; no text entry.
             Field::Auth | Field::Credential | Field::Secret | Field::Password => {}
+            // Task 1 staging: Source/Inline* rows are unreachable (see
+            // `field_reachable`); Task 4 wires real editing. No-op for now.
+            Field::Source | Field::InlinePrivate | Field::InlineCert => {}
         }
         if Some(self.focus) == self.error.map(SaveError::field) {
             self.error = None;
@@ -618,6 +632,8 @@ impl HostForm {
                 self.cursor = backspace_at(&mut self.password, self.cursor)
             }
             Field::Auth | Field::Credential | Field::Secret | Field::Password => {}
+            // Task 1 staging: see `edit_focused_insert`.
+            Field::Source | Field::InlinePrivate | Field::InlineCert => {}
         }
         if Some(self.focus) == self.error.map(SaveError::field) {
             self.error = None;
@@ -735,6 +751,8 @@ impl HostForm {
             Field::Identity => self.identity.chars().count(),
             Field::Password => self.password.chars().count(),
             Field::Auth | Field::Credential | Field::Secret => 0,
+            // Task 1 staging: unreachable; Task 4 wires real text areas.
+            Field::Source | Field::InlinePrivate | Field::InlineCert => 0,
         }
     }
 
@@ -753,6 +771,9 @@ impl HostForm {
             Field::Identity => self.cursor.min(self.identity.chars().count()),
             Field::Password => self.cursor.min(self.password.chars().count()),
             Field::Auth | Field::Credential | Field::Secret => return None,
+            // Task 1 staging: unreachable; no terminal cursor on these rows
+            // until Task 4 wires in the multiline areas.
+            Field::Source | Field::InlinePrivate | Field::InlineCert => return None,
         };
         Some((row, offset))
     }
@@ -899,6 +920,10 @@ impl HostForm {
                 };
                 (masked, ph)
             }
+            // Task 1 staging: these rows are unreachable (field_reachable
+            // returns false), so the value never renders. Task 4 replaces
+            // these arms with real Source-chooser / multiline-paste rendering.
+            Field::Source | Field::InlinePrivate | Field::InlineCert => (String::new(), None),
         }
     }
 }

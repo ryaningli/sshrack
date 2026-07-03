@@ -96,12 +96,27 @@ pub enum Field {
     /// not a text field. Unreachable under Independent.
     Credential,
     Secret,
+    /// Identity-key source chooser (Path vs Inline). Sits between the
+    /// `Secret` chooser and the slot rows so the Independent form reads
+    /// top-down: pick the secret kind, then the source, then fill the slot.
+    /// Unreachable until Task 4 wires it in.
+    Source,
+    /// Multiline private-key paste (Inline source only).
+    /// Unreachable until Task 4 wires it in.
+    InlinePrivate,
+    /// Multiline optional certificate paste (Inline source only).
+    /// Unreachable until Task 4 wires it in.
+    InlineCert,
     Identity,
     Password,
 }
 
 impl Field {
     /// Top-to-bottom render + navigation order.
+    ///
+    /// `Source` and the `Inline*` rows are staged in Task 1 and stay
+    /// unreachable until Task 4 wires them in ([`HostForm::field_reachable`]
+    /// returns `false`).
     const ORDER: &'static [Field] = &[
         Field::Name,
         Field::Host,
@@ -110,7 +125,10 @@ impl Field {
         Field::Credential,
         Field::User,
         Field::Secret,
+        Field::Source,
         Field::Identity,
+        Field::InlinePrivate,
+        Field::InlineCert,
         Field::Password,
     ];
 
@@ -125,6 +143,9 @@ impl Field {
             Field::Auth => "Auth",
             Field::Credential => "Credential",
             Field::Secret => "Secret",
+            Field::Source => "Source",
+            Field::InlinePrivate => "Privkey",
+            Field::InlineCert => "Cert",
             Field::Identity => "Identity",
             Field::Password => "Password",
         }
@@ -237,6 +258,54 @@ impl SecretChoice {
     }
 }
 
+/// The identity-key source offered under `Secret = IdentityKey`: a file
+/// `Path` (typed) or pasted `Inline` contents (edited in a multiline area).
+/// Cycled by `←`/`→` on the Source row. Mirrors [`SecretChoice`]'s shape.
+///
+/// Staging note: this enum and the matching `Source`/`InlinePrivate`/
+/// `InlineCert` field variants land in Task 1, but stay unreachable until
+/// Tasks 2/4 wire them into the cred/host forms' `field_reachable` and
+/// `on_key` arms. The cycling logic is exercised by the unit tests below;
+/// production callers arrive in Task 2. `#[allow(dead_code)]` is narrowed to
+/// this enum + impl and dropped once Task 2 starts calling `next`/`prev`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum SourceChoice {
+    /// Identity key read from a file path (typed in the Identity row).
+    Path,
+    /// Identity key pasted as raw contents (edited in a multiline area).
+    Inline,
+}
+
+#[allow(dead_code)]
+impl SourceChoice {
+    /// Display order used by the chooser's `←`/`→` cycling.
+    const ORDER: &'static [SourceChoice] = &[SourceChoice::Path, SourceChoice::Inline];
+
+    fn idx(self) -> usize {
+        Self::ORDER
+            .iter()
+            .position(|s| *s == self)
+            .expect("invariant: every SourceChoice variant is in ORDER")
+    }
+
+    pub(crate) fn next(self) -> Self {
+        Self::ORDER[(self.idx() + 1) % Self::ORDER.len()]
+    }
+
+    pub(crate) fn prev(self) -> Self {
+        Self::ORDER[(self.idx() + Self::ORDER.len() - 1) % Self::ORDER.len()]
+    }
+
+    /// One-word label shown in the chooser row.
+    fn label(self) -> &'static str {
+        match self {
+            SourceChoice::Path => "Path",
+            SourceChoice::Inline => "Inline",
+        }
+    }
+}
+
 /// The focused field in the credential form. `Tab`/`↑`/`↓` (and `Enter` to
 /// advance) move through the reachable ones in declaration order; the last
 /// reachable field's `Enter` triggers a save. The secret row is a three-way
@@ -252,6 +321,18 @@ pub enum CredField {
     User,
     Identity,
     SecretKind,
+    /// Identity-key source chooser (Path vs Inline). Sits between the
+    /// Secret-kind chooser and the slot rows so the form reads top-down:
+    /// pick the kind, then the source, then fill the slot it exposes.
+    /// Unreachable until Task 2 wires it in.
+    Source,
+    /// Multiline private-key paste (Inline source only). Sits below `Source`
+    /// and above `Identity` to mirror the Path/Inline slot layout.
+    /// Unreachable until Task 2 wires it in.
+    InlinePrivate,
+    /// Multiline optional certificate paste (Inline source only).
+    /// Unreachable until Task 2 wires it in.
+    InlineCert,
     /// Masked password input; reachable only under [`SecretChoice::Password`].
     Password,
 }
@@ -259,18 +340,23 @@ pub enum CredField {
 impl CredField {
     /// Top-to-bottom render + navigation order. `SecretKind` (the chooser)
     /// precedes the secret-slot rows it gates so the form reads top-down: pick
-    /// the kind, then fill the slot it exposes — mirroring [`Field::ORDER`]'s
-    /// Independent layout, where `Secret` precedes `Identity` / `Password`.
-    /// The slot rows are filtered out at navigation time by
-    /// [`CredForm::reachable_fields`] according to the three-way
+    /// the kind, then the source, then fill the slot it exposes — mirroring
+    /// [`Field::ORDER`]'s Independent layout, where `Secret` precedes
+    /// `Identity` / `Password`. The slot rows are filtered out at navigation
+    /// time by [`CredForm::reachable_fields`] according to the three-way
     /// [`SecretChoice`] mutex: under `None` both are hidden, under
     /// `IdentityKey` only `Identity` shows, under `Password` only `Password`
-    /// shows. `SecretKind` itself is always reachable.
+    /// shows. `SecretKind` itself is always reachable. The `Source` and
+    /// `Inline*` rows are staged in Task 1 and stay unreachable until
+    /// Task 2 wires them in ([`CredForm::field_reachable`] returns `false`).
     const ORDER: &'static [CredField] = &[
         CredField::Name,
         CredField::User,
         CredField::SecretKind,
+        CredField::Source,
         CredField::Identity,
+        CredField::InlinePrivate,
+        CredField::InlineCert,
         CredField::Password,
     ];
 
@@ -280,6 +366,9 @@ impl CredField {
             CredField::User => "User",
             CredField::Identity => "Identity",
             CredField::SecretKind => "Secret",
+            CredField::Source => "Source",
+            CredField::InlinePrivate => "Privkey",
+            CredField::InlineCert => "Cert",
             CredField::Password => "Password",
         }
     }
@@ -572,6 +661,40 @@ mod tests {
             .expect("Password is in ORDER");
         assert!(sk < id, "SecretKind must render above Identity");
         assert!(sk < pw, "SecretKind must render above Password");
+    }
+
+    // ---- SourceChoice: Path/Inline cycling + labels (Task 1: RED -> GREEN) ----
+
+    #[test]
+    fn source_choice_cycles_path_and_inline() {
+        assert_eq!(SourceChoice::Path.next(), SourceChoice::Inline);
+        assert_eq!(SourceChoice::Inline.next(), SourceChoice::Path);
+        assert_eq!(SourceChoice::Inline.prev(), SourceChoice::Path);
+    }
+
+    #[test]
+    fn source_choice_labels_are_capitalized() {
+        assert_eq!(SourceChoice::Path.label(), "Path");
+        assert_eq!(SourceChoice::Inline.label(), "Inline");
+    }
+
+    #[test]
+    fn cred_field_order_puts_source_above_identity_and_password() {
+        let order = CredField::ORDER;
+        let src = order
+            .iter()
+            .position(|f| *f == CredField::Source)
+            .expect("Source in ORDER");
+        let id = order
+            .iter()
+            .position(|f| *f == CredField::Identity)
+            .expect("Identity in ORDER");
+        let privk = order
+            .iter()
+            .position(|f| *f == CredField::InlinePrivate)
+            .expect("InlinePrivate in ORDER");
+        assert!(src < id, "Source must render above Identity");
+        assert!(src < privk, "Source must render above InlinePrivate");
     }
 }
 

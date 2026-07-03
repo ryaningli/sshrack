@@ -32,6 +32,10 @@ ratatui = "0.30"
 crossterm = "0.28"
 nucleo-matcher = "0.3"
 unicode-width = "0.2"
+# Multiline text area widget for the inline-key paste rows (Task 1 adds the
+# dep; Tasks 2/4 wire it into the cred/host wizards). Default features pull in
+# crossterm, matching our existing ratatui backend.
+ratatui-textarea = "0.9"
 
 [dev-dependencies]
 tempfile = "3"

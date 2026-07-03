@@ -201,6 +201,15 @@ impl CredForm {
     /// secret slot), and both are hidden when the choice is None. SecretKind
     /// (the chooser) is always reachable.
     fn field_reachable(field: CredField, secret: SecretChoice) -> bool {
+        // Task 1 staging: the Source / InlinePrivate / InlineCert rows are not
+        // wired into the form yet (Task 2 does). Keep them unreachable so the
+        // existing navigation/render behavior is unchanged.
+        if matches!(
+            field,
+            CredField::Source | CredField::InlinePrivate | CredField::InlineCert
+        ) {
+            return false;
+        }
         match secret {
             SecretChoice::None => !matches!(field, CredField::Identity | CredField::Password),
             SecretChoice::IdentityKey => field != CredField::Password,
@@ -358,6 +367,9 @@ impl CredForm {
                 self.cursor = insert_char_at(&mut self.password, self.cursor, c)
             }
             CredField::Password => {}
+            // Task 1 staging: Source/Inline* rows are unreachable (see
+            // `field_reachable`); Task 2 wires real editing. No-op for now.
+            CredField::Source | CredField::InlinePrivate | CredField::InlineCert => {}
         }
         if Some(self.focus) == self.error.map(CredSaveError::field) {
             self.error = None;
@@ -376,6 +388,8 @@ impl CredForm {
                 self.cursor = backspace_at(&mut self.password, self.cursor)
             }
             CredField::Password => {}
+            // Task 1 staging: see `edit_focused_insert`.
+            CredField::Source | CredField::InlinePrivate | CredField::InlineCert => {}
         }
         if Some(self.focus) == self.error.map(CredSaveError::field) {
             self.error = None;
@@ -511,6 +525,8 @@ impl CredForm {
             CredField::Identity => self.identity.chars().count(),
             CredField::Password => self.password.chars().count(),
             CredField::SecretKind => 0,
+            // Task 1 staging: unreachable; Task 2 wires real text areas.
+            CredField::Source | CredField::InlinePrivate | CredField::InlineCert => 0,
         }
     }
 
@@ -527,6 +543,9 @@ impl CredForm {
             CredField::Identity => self.cursor.min(self.identity.chars().count()),
             CredField::Password => self.cursor.min(self.password.chars().count()),
             CredField::SecretKind => return None,
+            // Task 1 staging: unreachable; no terminal cursor on these rows
+            // until Task 2 wires in the multiline areas.
+            CredField::Source | CredField::InlinePrivate | CredField::InlineCert => return None,
         };
         Some((row, offset))
     }
@@ -628,6 +647,12 @@ impl CredForm {
                     Some("type the password")
                 };
                 (masked, ph)
+            }
+            // Task 1 staging: these rows are unreachable (field_reachable
+            // returns false), so the value never renders. Task 2 replaces
+            // these arms with real Source-chooser / multiline-paste rendering.
+            CredField::Source | CredField::InlinePrivate | CredField::InlineCert => {
+                (String::new(), None)
             }
         }
     }
