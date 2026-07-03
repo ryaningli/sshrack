@@ -15,12 +15,6 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 /// - `total == 0` or `visible == 0` → empty range (`0..0`).
 /// - `visible >= total` → the full range (`0..total`); everything fits.
 /// - `selected` is clamped into `[0, total)` defensively.
-// Foundation helpers produced before their callers: the dialog/picker/help
-// renderers in later tasks (forms, help overlay, credential picker) consume
-// these. `allow` (not `expect`) because the unit tests already call them, so
-// `expect` would be flagged "unfulfilled" in the test build; revisit once the
-// renderer consumers land.
-#[allow(dead_code)]
 pub fn focus_window(total: usize, selected: usize, visible: usize) -> std::ops::Range<usize> {
     if total == 0 || visible == 0 {
         return 0..0;
@@ -39,7 +33,6 @@ pub fn focus_window(total: usize, selected: usize, visible: usize) -> std::ops::
 /// Asian Width (so CJK glyphs count as 2) via the `unicode-width` crate.
 ///
 /// Pure. `max == 0` → `""`. Input already within budget → returned unchanged.
-#[allow(dead_code)]
 pub fn truncate_cells(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();

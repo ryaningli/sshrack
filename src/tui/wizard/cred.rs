@@ -21,6 +21,7 @@ use zeroize::Zeroizing;
 use super::super::intent::Outcome;
 use super::super::theme;
 use super::{CRED_VALUE_COL, CredField, CredSaveError, SecretChoice, validate_cred, value_spans};
+use crate::tui::fit::truncate_cells;
 use sshrack_core::config::schema::{Credential, CredentialBody};
 
 /// The credential form's editable state. The password is held as a
@@ -344,10 +345,19 @@ impl CredForm {
     /// the dialog already drew the chrome.
     pub fn draw_in_dialog(&self, frame: &mut Frame, body: ratatui::layout::Rect) {
         let reachable = self.reachable_fields();
-        let rows: Vec<Line> = reachable.iter().map(|f| self.render_row(*f)).collect();
+        let total = reachable.len();
+        // The fields area is `body.height` minus the error(1) + hint(1) rows
+        // rendered below. When the terminal is too short to fit every field,
+        // `focus_window` picks the viewport that keeps the focused one visible.
+        let fields_h = body.height.saturating_sub(2) as usize;
+        let win = crate::tui::fit::focus_window(total, self.focus_idx(), fields_h);
+        let rows: Vec<Line> = reachable[win.clone()]
+            .iter()
+            .map(|f| self.render_row(*f, body.width))
+            .collect();
 
         let [fields_area, error_area, hint_area] = Layout::vertical([
-            Constraint::Length(reachable.len() as u16),
+            Constraint::Length(rows.len() as u16),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
@@ -379,12 +389,17 @@ impl CredForm {
         frame.render_widget(Paragraph::new(hint).style(Style::new().dim()), hint_area);
 
         // Place the real terminal cursor on the focused text field (no drawn
-        // glyph — see HostForm::draw_in_dialog). SecretKind is a chooser.
+        // glyph — see HostForm::draw_in_dialog). SecretKind is a chooser. The
+        // row index is translated into the viewport so the cursor never points
+        // below the fields area when the list scrolls.
         if let Some((row, offset)) = self.cursor_target() {
-            let max_x = fields_area.x + fields_area.width.saturating_sub(1);
-            let x = (fields_area.x + CRED_VALUE_COL + offset as u16).min(max_x);
-            let y = fields_area.y + row as u16;
-            frame.set_cursor_position((x, y));
+            if win.start <= row && row < win.end {
+                let in_win_row = row - win.start;
+                let max_x = fields_area.x + fields_area.width.saturating_sub(1);
+                let x = (fields_area.x + CRED_VALUE_COL + offset as u16).min(max_x);
+                let y = fields_area.y + in_win_row as u16;
+                frame.set_cursor_position((x, y));
+            }
         }
     }
 
@@ -423,7 +438,14 @@ impl CredForm {
         self.reachable_fields().len() as u16 + 2
     }
 
-    fn render_row(&self, field: CredField) -> Line<'static> {
+    /// Render one labeled field row, with the focus highlight + placeholder.
+    /// `row_width` is the available cells for the whole row (the dialog body
+    /// width); the value column starts at [`CRED_VALUE_COL`] and runs to the
+    /// right edge, so an over-wide value/placeholder is passed through
+    /// [`truncate_cells`] and ends in `…` instead of running past the border.
+    /// Truncation is display-only — the cursor offset in [`cursor_target`]
+    /// still uses the stored value's char count.
+    fn render_row(&self, field: CredField, row_width: u16) -> Line<'static> {
         let label = field.label();
         let focused = self.focus == field;
         let cursor = if focused { "▶ " } else { "  " };
@@ -437,9 +459,14 @@ impl CredForm {
         );
 
         let (value_str, placeholder) = self.row_value_and_placeholder(field);
+        // Truncate the displayed text (value, else placeholder) to the cells
+        // right of the label so it never overflows the dialog border.
+        let avail = row_width.saturating_sub(CRED_VALUE_COL) as usize;
+        let trunc_value = truncate_cells(&value_str, avail);
+        let trunc_ph = placeholder.map(|p| truncate_cells(p, avail));
 
         let mut spans = vec![label_span];
-        spans.extend(value_spans(&value_str, placeholder));
+        spans.extend(value_spans(&trunc_value, trunc_ph.as_deref()));
         Line::from(spans).alignment(Alignment::Left)
     }
 
@@ -977,5 +1004,53 @@ mod tests {
                 f.draw_in_dialog(fr, body);
             })
             .unwrap();
+    }
+
+    // ---- small-terminal viewport: focused field stays inside the body rect ----
+
+    #[test]
+    fn draw_in_dialog_keeps_focused_cursor_inside_body_when_terminal_short() {
+        // Behavior pin mirroring the host variant: with a short terminal the
+        // focus-following viewport must scroll the focused field into view.
+        // We focus the Password row (the last reachable text field under
+        // SecretChoice::Password) and render through a height-10 TestBackend.
+        // Without the viewport the cursor would land at `fields_area.y + 4`
+        // (past the body bottom); with it the in-window row index stays inside.
+        use crate::tui::dialog::draw_dialog;
+        use ratatui::{
+            Terminal,
+            backend::{Backend, TestBackend},
+            layout::Rect,
+        };
+
+        let mut form = complete_cred_form();
+        form.secret_kind = SecretChoice::Password;
+        let last = *form
+            .reachable_fields()
+            .last()
+            .expect("invariant: reachable fields non-empty under Password");
+        form.focus = last;
+
+        let mut term = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        let mut captured_body = Rect::default();
+        term.draw(|f| {
+            let body = draw_dialog(
+                f,
+                &form.title(),
+                form.body_rows(),
+                &[("Tab", "field"), ("^S", "save"), ("Esc", "cancel")],
+            );
+            form.draw_in_dialog(f, body);
+            captured_body = body;
+        })
+        .unwrap();
+
+        let cy = term.backend_mut().get_cursor_position().unwrap().y;
+        assert!(
+            captured_body.y <= cy && cy < captured_body.y + captured_body.height,
+            "focused field cursor y={cy} must sit inside body rect y={}..{}",
+            captured_body.y,
+            captured_body.y + captured_body.height
+        );
     }
 }
