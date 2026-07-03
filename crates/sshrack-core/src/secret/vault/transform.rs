@@ -14,7 +14,7 @@
 
 use zeroize::Zeroizing;
 
-use crate::config::schema::{CredentialBody, Secret, SecretStore, SshrackConfig};
+use crate::config::schema::{CredentialBody, KeySource, Secret, SecretStore, SshrackConfig};
 use crate::error::SshrackError;
 use crate::id::{OwnerKind, keyring_key};
 use crate::secret::SecretBackend;
@@ -49,6 +49,29 @@ pub fn finalize_password(
     }
 }
 
+/// Finalize one inline **key/cert** secret the same way [`finalize_password`]
+/// finalizes a password: encrypt under vault when a key is present, else keep
+/// plaintext. Separate name from `finalize_password` so call sites read as
+/// "key material", not "password". Keyring mode is never reached here (an
+/// inline key on a keyring-mode body is rejected by `CredentialBody::validate`
+/// before sealing).
+pub fn finalize_secret(
+    plain: &str,
+    cfg: &SshrackConfig,
+    key: Option<&VaultKey>,
+) -> Result<Secret, SshrackError> {
+    // Identical logic to finalize_password; the duplication is intentional and
+    // small, and avoids passing a "kind" flag that would couple these two
+    // unrelated concerns.
+    match (&cfg.store, key) {
+        (Some(SecretStore::Vault { .. }), Some(k)) => {
+            Ok(Secret::Encrypted(crypto::encrypt(plain.as_bytes(), k)?))
+        }
+        (Some(SecretStore::Vault { .. }), None) => Err(SshrackError::VaultLocked),
+        _ => Ok(Secret::Plain(plain.to_string())),
+    }
+}
+
 /// Count stored password secrets across credentials and inline host auth.
 /// Returns `(encrypted_count, plaintext_count, keyring_count)`. A body counts
 /// once, by its own representation (`Encrypted` / `Plain` / `keyring == true`);
@@ -69,9 +92,31 @@ pub fn count_secrets(cfg: &SshrackConfig) -> (usize, usize, usize) {
                 Some(Secret::Plain(_)) => plain += 1,
                 None => {}
             }
+            // Inline key material counts each secret it carries (private key +
+            // optional certificate), so store-mode switches / rekeys see them.
+            // Keyring-mode inline keys are rejected by `CredentialBody::validate`
+            // before reaching here, so they never land in the `keyring` arm.
+            if let Some(KeySource::Inline(ik)) = &b.key {
+                if let Some(s) = &ik.private_key {
+                    count_one_secret(s, &mut enc, &mut plain);
+                }
+                if let Some(s) = &ik.certificate {
+                    count_one_secret(s, &mut enc, &mut plain);
+                }
+            }
         }
     }
     (enc, plain, keyring)
+}
+
+/// Tally one [`Secret`] into the encrypted/plaintext counters. A local helper
+/// so the inline-key arms in [`count_secrets`] read the same shape as the
+/// password match without duplicating the `Encrypted`/`Plain` dispatch.
+fn count_one_secret(s: &Secret, enc: &mut usize, plain: &mut usize) {
+    match s {
+        Secret::Encrypted(_) => *enc += 1,
+        Secret::Plain(_) => *plain += 1,
+    }
 }
 
 /// A copy of `body` with an encrypted password (if any) decrypted under `key`,
@@ -422,6 +467,24 @@ mod tests {
             ..SshrackConfig::default()
         };
         assert_eq!(count_secrets(&cfg), (1, 1, 1)); // 1 encrypted, 1 plaintext, 1 keyring
+    }
+
+    #[test]
+    fn count_secrets_counts_inline_key_secrets() {
+        // An inline key contributes both its private_key and its certificate to
+        // the secret tally, so store-mode switches / rekeys see them.
+        let cfg = SshrackConfig {
+            credentials: vec![Credential {
+                id: ulid::Ulid::new(),
+                name: "ops".into(),
+                body: CredentialBody::new("u")
+                    .with_inline_key(Secret::Plain("k".into()), Some(Secret::Plain("c".into()))),
+            }],
+            ..SshrackConfig::default()
+        };
+        let (enc, plain, _keyring) = count_secrets(&cfg);
+        // private_key + certificate = 2 plaintext secrets.
+        assert_eq!((enc, plain), (0, 2));
     }
 
     #[test]

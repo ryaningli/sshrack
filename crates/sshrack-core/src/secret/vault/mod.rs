@@ -40,7 +40,9 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use ulid::Ulid;
 use zeroize::Zeroizing;
 
-use crate::config::schema::{Auth, CredentialBody, Secret, SecretStore, SshrackConfig, VaultMeta};
+use crate::config::schema::{
+    Auth, CredentialBody, InlineKey, KeySource, Secret, SecretStore, SshrackConfig, VaultMeta,
+};
 use crate::error::SshrackError;
 use crate::id::OwnerKind;
 use crate::secret::PassphraseProvider;
@@ -269,6 +271,14 @@ pub fn seal_body(
         // Already-sealed (Encrypted) or marker-only bodies pass through.
         other => other,
     };
+    let key = match body.key {
+        // Inline key material: re-host private_key + certificate per the mode.
+        Some(KeySource::Inline(ik)) => {
+            Some(KeySource::Inline(seal_inline_key(ik, cfg, vault_key)?))
+        }
+        // A path reference or absent key passes through unchanged.
+        other => other,
+    };
     // Keyring mode stored the password in the backend (or the body was already
     // a keyring-marker body with `password = None`): `password.is_none()` is
     // the signal, so flip the marker so `resolve` produces PasswordSource::Keyring.
@@ -276,9 +286,28 @@ pub fn seal_body(
     Ok(CredentialBody {
         user: body.user,
         password,
-        key: body.key,
+        key,
         keyring,
     })
+}
+
+/// Seal an inline key's freshly collected plaintext secrets (private key, and
+/// the optional certificate) per the active mode. Already-sealed (`Encrypted`)
+/// secrets pass through. Keyring mode is rejected upstream by
+/// [`CredentialBody::validate`](crate::config::schema::CredentialBody::validate),
+/// so this helper never needs a keyring branch.
+fn seal_inline_key(
+    mut ik: InlineKey,
+    cfg: &SshrackConfig,
+    vault_key: Option<&VaultKey>,
+) -> Result<InlineKey, SshrackError> {
+    if let Some(Secret::Plain(ref p)) = ik.private_key {
+        ik.private_key = Some(transform::finalize_secret(p, cfg, vault_key)?);
+    }
+    if let Some(Secret::Plain(ref c)) = ik.certificate {
+        ik.certificate = Some(transform::finalize_secret(c, cfg, vault_key)?);
+    }
+    Ok(ik)
 }
 
 /// Seal an inline auth's freshly collected plaintext password (if any) per the
@@ -708,6 +737,64 @@ mod tests {
         let out = seal_body(body, OwnerKind::Host, &id, &cfg, None, &backend).unwrap();
         assert!(out.keyring, "marker must be preserved in keyring mode");
         assert!(out.password.is_none());
+    }
+
+    #[test]
+    fn seal_body_encrypts_inline_private_key_and_certificate_under_vault() {
+        // Vault mode seals every inline key plaintext: both the private_key and
+        // the optional certificate become Secret::Encrypted. Mirrors
+        // seal_body_vault_mode_encrypts_inline_password for key material.
+        use crate::config::schema::KeySource;
+        let mut cfg = SshrackConfig::default();
+        let backend = FakeBackend::new();
+        let key = enable(&mut cfg, "test-passphrase", None, &backend).unwrap();
+        let body = CredentialBody::new("u").with_inline_key(
+            Secret::Plain("PRIV-TEXT".into()),
+            Some(Secret::Plain("CERT-TEXT".into())),
+        );
+        let sealed = seal_body(
+            body,
+            OwnerKind::Credential,
+            &ulid::Ulid::new(),
+            &cfg,
+            Some(&key),
+            &backend,
+        )
+        .unwrap();
+        match sealed.key {
+            Some(KeySource::Inline(ik)) => {
+                assert!(ik.private_key.unwrap().is_encrypted(), "private_key sealed");
+                assert!(ik.certificate.unwrap().is_encrypted(), "certificate sealed");
+            }
+            other => panic!("expected Inline, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn seal_body_leaves_inline_key_plaintext_in_plaintext_mode() {
+        // Plaintext mode keeps inline key material as Secret::Plain, mirroring
+        // how plaintext mode treats passwords.
+        use crate::config::schema::KeySource;
+        let cfg = SshrackConfig {
+            store: Some(SecretStore::Plaintext),
+            ..SshrackConfig::default()
+        };
+        let body = CredentialBody::new("u").with_inline_key(Secret::Plain("PRIV".into()), None);
+        let sealed = seal_body(
+            body,
+            OwnerKind::Credential,
+            &ulid::Ulid::new(),
+            &cfg,
+            None,
+            &FakeBackend::new(),
+        )
+        .unwrap();
+        match sealed.key {
+            Some(KeySource::Inline(ik)) => {
+                assert_eq!(ik.private_key.unwrap().as_plain(), Some("PRIV"));
+            }
+            other => panic!("expected Inline, got {other:?}"),
+        }
     }
 
     // ---- seal_auth ----
