@@ -139,7 +139,7 @@ pub enum Outcome {
 /// `Option<HostForm>` field.
 //
 // `large_enum_variant`: the wizard variants carry full forms while
-// Help/StorePicker/DeleteHost are near-ZSTs — the enum is box-free by intent
+// Help/StorePicker are near-ZSTs — the enum is box-free by intent
 // (a single live overlay, cloned only on OpenOverlay).
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone)]

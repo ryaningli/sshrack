@@ -165,7 +165,7 @@ pub fn run_loop(
                 }
                 Outcome::CloseOverlay => {
                     // Esc / Ctrl-C inside a non-wizard overlay (Help /
-                    // StorePicker / DeleteHost). on_key already cleared it; the
+                    // StorePicker). on_key already cleared it; the
                     // overlay closing is the feedback, so no status write.
                 }
                 Outcome::SwitchTab(_) | Outcome::OpenOverlay(_) | Outcome::Continue => {
