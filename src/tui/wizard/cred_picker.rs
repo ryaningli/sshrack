@@ -122,7 +122,13 @@ impl CredPicker {
         lines.extend(list_lines);
         let body = Paragraph::new(lines).alignment(Alignment::Left);
 
-        let content = crate::tui::popup::render_popup(frame, " pick credential ", body);
+        let content = crate::tui::popup::render_popup(
+            frame,
+            " pick credential ",
+            body,
+            crate::tui::popup::POPUP_WIDTH,
+            crate::tui::popup::POPUP_HEIGHT,
+        );
 
         // Place the real terminal cursor right after the typed query on row 0.
         // "> " is 2 chars; offset by the query length.

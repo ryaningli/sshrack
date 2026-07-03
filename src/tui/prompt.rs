@@ -250,19 +250,32 @@ pub fn prompt_password_confirm(
 /// Returns `Ok(true)` on Yes, `Ok(false)` on No/Esc, `Err(Interrupted)` on
 /// `Ctrl-C`.
 pub fn confirm_popup(terminal: &mut Tui, text: &str) -> Result<bool, SshrackError> {
+    use unicode_width::UnicodeWidthStr;
+    const HINT: &str = "[y] yes   [n] no";
     loop {
-        let lines = text
+        let body_lines = text
             .lines()
             .map(Line::from)
             .chain(std::iter::once(Line::from("")))
-            .chain(std::iter::once(
-                Line::from("[y] yes   [n] no").style(Style::new().dim()),
-            ))
+            .chain(std::iter::once(Line::from(HINT).style(Style::new().dim())))
             .collect::<Vec<_>>();
-        let body = Paragraph::new(lines).alignment(Alignment::Left);
+        // Size the popup to its content: width = widest line's display width
+        // (text lines or the hint) + 2 padding cells; height = line count +
+        // 2 border rows. Wide glyphs (em dash, CJK) count correctly via
+        // UnicodeWidthStr on the raw source strings.
+        let max_text_w = text.lines().map(|l| l.width()).max().unwrap_or(0);
+        let content_w = max_text_w.max(HINT.width()) + 2;
+        let content_h = body_lines.len();
+        let body = Paragraph::new(body_lines).alignment(Alignment::Left);
         terminal
             .draw(|f| {
-                popup::render_popup(f, "Confirm", body);
+                popup::render_popup(
+                    f,
+                    "Confirm",
+                    body,
+                    content_w as u16 + 2,
+                    content_h as u16 + 2,
+                );
             })
             .map_err(SshrackError::from_prompt_io)?;
 
@@ -354,17 +367,41 @@ const EMPTY_PASSPHRASE_FLASH: &str = "Passphrase must not be empty";
 /// Render the password popup. `buffer` is masked with [`MASK`]; `flash`, when
 /// set, overrides `title` for this frame to signal a rejected submission (an
 /// empty passphrase, or a confirmation mismatch) so the user sees why their
-/// Enter did not proceed. Draw errors are tolerated (best-effort render); a
-/// transient failure is retried on the next keystroke loop iteration.
+/// Enter did not proceed. The popup is sized to its content — three rows total
+/// (masked input, blank, hint) — rather than the legacy 60x20 box, and a real
+/// terminal cursor is placed at the end of the visible mask on row 0, so unlike
+/// the old fixed-footprint popup the user sees a blinking cursor while typing.
+/// Draw errors are tolerated (best-effort render); a transient failure is
+/// retried on the next keystroke loop iteration.
 fn render_password_popup(terminal: &mut Tui, title: &str, buffer: &str, flash: Option<&str>) {
-    let masked: String = std::iter::repeat_n(MASK, buffer.chars().count()).collect();
-    let mut lines = vec![Line::from(masked.as_str()).bold()];
-    lines.push(Line::from(""));
-    lines.push(Line::from("[Enter] confirm   [Esc] cancel").style(Style::new().dim()));
+    use crate::tui::fit::truncate_cells;
+    const HINT: &str = "[Enter] confirm   [Esc] cancel";
+    // Each typed char contributes one MASK cell to the visible width.
+    let mask_width = buffer.chars().count();
+    // Inner content width: the widest of the masked row and the hint, plus 2
+    // padding cells. Capped at POPUP_WIDTH - 2 (border) so a very long passphrase
+    // cannot stretch the popup past the classic footprint.
+    let inner_w = (mask_width.max(HINT.len()) as u16 + 2).min(popup::POPUP_WIDTH.saturating_sub(2));
+    // Visible mask, truncated to the inner width if the passphrase is longer
+    // than the popup can show.
+    let mask_visible_w = mask_width.min(inner_w as usize) as u16;
+    let masked: String = std::iter::repeat_n(MASK, mask_width).collect();
+    let shown_mask = truncate_cells(&masked, inner_w as usize);
+    let lines = vec![
+        Line::from(shown_mask).bold(),
+        Line::from(""),
+        Line::from(HINT).style(Style::new().dim()),
+    ];
     let body = Paragraph::new(lines).alignment(Alignment::Left);
     let title = popup_title(title, flash);
     let _ = terminal.draw(|f| {
-        popup::render_popup(f, title, body);
+        // 3 content rows + 2 border rows.
+        let c = popup::render_popup(f, title, body, inner_w + 2, 3 + 2);
+        // Place the terminal cursor at the end of the masked input on row 0,
+        // clamped to the content rect's right edge so it never lands on the
+        // border when the mask is truncated to the inner width.
+        let cx = (c.x + mask_visible_w).min(c.x + c.width.saturating_sub(1));
+        f.set_cursor_position((cx, c.y));
     });
 }
 
@@ -469,28 +506,42 @@ pub fn prompt_store_pick(handle: &TerminalHandle) -> Result<Option<StorePick>, S
 
 /// Render the three store modes with a cursor marker and read keys until the
 /// user confirms or cancels. Mirrors [`confirm_popup`]'s render/poll/read loop.
+/// Sized to its content (widest option line + hint). No terminal cursor — this
+/// is an up/down pick, not free text.
 fn store_pick_popup(terminal: &mut Tui) -> Result<Option<StorePick>, SshrackError> {
+    use unicode_width::UnicodeWidthStr;
+    const HINT: &str = "[↑/↓] select   [Enter] confirm   [Esc] cancel";
     let mut cursor: usize = 0;
     let len = StorePick::ORDER.len();
     loop {
-        let mut lines: Vec<Line> = StorePick::ORDER
+        // Build the option rows as raw strings first so we can measure their
+        // display width (wide glyphs like the em dash count correctly via
+        // UnicodeWidthStr) before wrapping them in `Line`.
+        let opt_strings: Vec<String> = StorePick::ORDER
             .iter()
             .enumerate()
             .map(|(i, m)| {
                 let marker = if i == cursor { "▶ " } else { "  " };
-                Line::from(format!("{marker}{} — {}", m.label(), m.blurb()))
+                format!("{marker}{} — {}", m.label(), m.blurb())
             })
             .collect();
+        let max_opt_w = opt_strings.iter().map(|s| s.width()).max().unwrap_or(0);
+        let mut lines: Vec<Line> = opt_strings.into_iter().map(Line::from).collect();
         lines.push(Line::from(""));
-        lines.push(
-            Line::from("[↑/↓] select   [Enter] confirm   [Esc] cancel")
-                .style(ratatui::style::Style::new().dim()),
-        );
+        lines.push(Line::from(HINT).style(ratatui::style::Style::new().dim()));
+        let content_w = max_opt_w.max(HINT.width()) + 2;
+        let content_h = lines.len();
         let body =
             ratatui::widgets::Paragraph::new(lines).alignment(ratatui::layout::Alignment::Left);
         terminal
             .draw(|f| {
-                popup::render_popup(f, "Choose store mode", body);
+                popup::render_popup(
+                    f,
+                    "Choose store mode",
+                    body,
+                    content_w as u16 + 2,
+                    content_h as u16 + 2,
+                );
             })
             .map_err(SshrackError::from_prompt_io)?;
 
