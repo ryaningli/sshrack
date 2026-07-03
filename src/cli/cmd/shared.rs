@@ -18,11 +18,15 @@ use ulid::Ulid;
 use zeroize::Zeroizing;
 
 use sshrack_core::config::path as config_path;
-use sshrack_core::config::schema::{Host, InlineKey, Secret, SshrackConfig};
+use sshrack_core::config::schema::{
+    CredentialBody, Host, InlineKey, KeySource, Secret, SshrackConfig,
+};
 use sshrack_core::config::store;
 use sshrack_core::credential;
 use sshrack_core::error::SshrackError;
 use sshrack_core::frecency;
+use sshrack_core::id::OwnerKind;
+use sshrack_core::secret::OsKeyring;
 use sshrack_core::secret::PassphraseProvider;
 use sshrack_core::secret::vault;
 
@@ -89,6 +93,49 @@ pub fn unlock_vault_key(cfg: &SshrackConfig) -> Result<Option<vault::VaultKey>, 
     vault::ensure_unlocked_vault_key(cfg, env_pw.as_ref(), &provider).map_err(|e| {
         (
             format!("sshrack: vault unlock failed: {e}"),
+            exit_code::STORE,
+        )
+    })
+}
+
+/// Seal an inline-key body's freshly collected plaintext secrets (private key,
+/// optional certificate) per the active store mode, mirroring the TUI persist
+/// path. Vault mode encrypts them under the master passphrase sourced from
+/// `SSHRACK_PASSPHRASE` (errors as `STORE` if unset); plaintext mode stores
+/// them verbatim; an undecided mode is treated as plaintext by [`vault::seal_body`].
+///
+/// Bodies without an inline key (path-key, password-only, or secretless) pass
+/// through unchanged — only [`KeySource::Inline`] carries plaintext material
+/// that needs sealing. `owner_kind` + `owner_id` select the keyring account;
+/// they are unused while keyring mode rejects inline keys at validation time,
+/// but threaded for symmetry with [`vault::seal_body`].
+///
+/// Returns the printed-message + exit-code pair on failure so callers can
+/// return it directly. Never puts key text in the error message.
+pub fn seal_inline_body(
+    body: CredentialBody,
+    owner_kind: OwnerKind,
+    owner_id: &Ulid,
+    cfg: &SshrackConfig,
+) -> Result<CredentialBody, (String, i32)> {
+    // Only inline-key bodies carry plaintext secret material that needs sealing.
+    // Path-key / password-only / secretless bodies have nothing to re-host.
+    if !matches!(body.key, Some(KeySource::Inline(_))) {
+        return Ok(body);
+    }
+    let vault_key = unlock_vault_key(cfg)?;
+    let backend = OsKeyring;
+    vault::seal_body(
+        body,
+        owner_kind,
+        owner_id,
+        cfg,
+        vault_key.as_ref(),
+        &backend,
+    )
+    .map_err(|e| {
+        (
+            format!("sshrack: failed to seal inline key: {e}"),
             exit_code::STORE,
         )
     })
@@ -438,5 +485,109 @@ mod tests {
         );
         let _ = std::fs::remove_file(&priv_path);
         let _ = std::fs::remove_file(&cert_path);
+    }
+
+    // ---- seal_inline_body: per-mode sealing at the CLI boundary ----
+    //
+    // These pin the regression where the CLI add/edit handlers stored inline
+    // key text as plaintext even under vault mode: `seal_inline_body` must
+    // delegate to `vault::seal_body` so vault mode encrypts, plaintext mode
+    // keeps verbatim, and non-inline bodies pass through.
+
+    use sshrack_core::config::schema::{CredentialBody, KeySource};
+    use sshrack_core::id::OwnerKind;
+    use sshrack_core::secret::OsKeyring;
+    use sshrack_core::secret::vault;
+    use ulid::Ulid;
+
+    #[test]
+    fn seal_inline_body_passes_through_path_key_body_unchanged() {
+        // A path-key body has no plaintext secret to re-host; it must return
+        // verbatim (same user, same path, no encryption applied).
+        let cfg = SshrackConfig::default(); // undecided mode
+        let id = Ulid::new();
+        let body = CredentialBody::new("u").with_key("/home/u/.ssh/id_ed25519");
+        let out = seal_inline_body(body, OwnerKind::Credential, &id, &cfg).unwrap();
+        assert_eq!(out.user, "u");
+        assert!(matches!(
+            out.key,
+            Some(KeySource::Path(ref p)) if p == std::path::Path::new("/home/u/.ssh/id_ed25519")
+        ));
+    }
+
+    #[test]
+    fn seal_inline_body_keeps_plaintext_in_undecided_mode() {
+        // Undecided store mode (None) is treated as plaintext: a freshly
+        // collected inline key stays Secret::Plain — no encryption is applied,
+        // and no vault unlock is attempted (so the call succeeds without
+        // SSHRACK_PASSPHRASE).
+        let cfg = SshrackConfig::default();
+        let id = Ulid::new();
+        let body =
+            CredentialBody::new("u").with_inline_key(Secret::Plain("PRIVATE-TEXT".into()), None);
+        let out = seal_inline_body(body, OwnerKind::Host, &id, &cfg).unwrap();
+        match out.key {
+            Some(KeySource::Inline(ik)) => {
+                assert_eq!(
+                    ik.private_key.as_ref().and_then(Secret::as_plain),
+                    Some("PRIVATE-TEXT"),
+                    "undecided mode must keep plaintext"
+                );
+            }
+            other => panic!("expected Inline key, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn seal_inline_body_encrypts_inline_key_under_vault_mode() {
+        // REGRESSION: the CLI add/edit handlers used to skip sealing, storing
+        // inline key text as plaintext even when the user chose vault mode.
+        // `seal_inline_body` must encrypt under vault mode (the helper derives
+        // the vault key from SSHRACK_PASSPHRASE the same way `cred add` does).
+        //
+        // Requires SSHRACK_PASSPHRASE to be set (the standard test-run
+        // contract); skip gracefully if a developer runs `cargo test` without
+        // it, rather than failing opaquely.
+        let Some(passphrase) = vault::passphrase_from_env() else {
+            eprintln!(
+                "[skip] seal_inline_body_encrypts_inline_key_under_vault_mode: \
+                 SSHRACK_PASSPHRASE unset"
+            );
+            return;
+        };
+        let mut cfg = SshrackConfig::default();
+        let backend = OsKeyring;
+        // Turn on vault mode with the same passphrase seal_inline_body will
+        // read back from the env, so the derived key matches the verifier.
+        vault::enable(&mut cfg, passphrase.as_str(), None, &backend).unwrap();
+        let id = Ulid::new();
+        let body = CredentialBody::new("u").with_inline_key(
+            Secret::Plain("SUPER-SECRET-PRIVATE-KEY-BODY".into()),
+            Some(Secret::Plain("CERT-BODY".into())),
+        );
+        let out = seal_inline_body(body, OwnerKind::Credential, &id, &cfg).unwrap();
+        let ik = match out.key {
+            Some(KeySource::Inline(ik)) => ik,
+            other => panic!("expected Inline key, got {other:?}"),
+        };
+        // Both secrets must be Encrypted now, and the plaintext must NOT
+        // appear anywhere in the body.
+        assert!(
+            matches!(ik.private_key, Some(Secret::Encrypted(_))),
+            "private_key must be Encrypted under vault mode"
+        );
+        assert!(
+            matches!(ik.certificate, Some(Secret::Encrypted(_))),
+            "certificate must be Encrypted under vault mode"
+        );
+        let serialized = format!("{ik:?}");
+        assert!(
+            !serialized.contains("SUPER-SECRET-PRIVATE-KEY-BODY"),
+            "plaintext key leaked through sealing: {serialized}"
+        );
+        assert!(
+            !serialized.contains("CERT-BODY"),
+            "plaintext cert leaked through sealing: {serialized}"
+        );
     }
 }

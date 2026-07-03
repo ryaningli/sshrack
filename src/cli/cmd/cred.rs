@@ -24,7 +24,8 @@ use crate::shared::exit_code;
 use crate::shared::format as fmt;
 
 use super::shared::{
-    fail, load_config, print_json_array, save_config, selected_fields, unlock_vault_key,
+    fail, load_config, print_json_array, save_config, seal_inline_body, selected_fields,
+    unlock_vault_key,
 };
 use crate::cli::table::print_text_table;
 
@@ -149,7 +150,20 @@ fn add(
         let private_sec = inline_key
             .private_key
             .expect("invariant: resolve_inline_identity sets private_key on the inline branch");
-        CredentialBody::new(user_owned).with_inline_key(private_sec, inline_key.certificate)
+        let body =
+            CredentialBody::new(user_owned).with_inline_key(private_sec, inline_key.certificate);
+        // Seal the freshly collected plaintext key/cert per the active store
+        // mode (vault encrypts under SSHRACK_PASSPHRASE; plaintext stores
+        // verbatim). Bodies without an inline key pass through unchanged.
+        match seal_inline_body(
+            body,
+            sshrack_core::id::OwnerKind::Credential,
+            &cred_id,
+            &cfg,
+        ) {
+            Ok(sealed) => sealed,
+            Err((msg, code)) => return fail(&msg, code),
+        }
     } else {
         let opts = cred_core::AddOptions {
             user: user.map(Into::into),
@@ -329,13 +343,26 @@ fn edit(
             .expect("invariant: resolve_inline_identity sets private_key on the inline branch");
         let body =
             CredentialBody::new(user_owned).with_inline_key(private_sec, inline_key.certificate);
+        // Seal the freshly collected plaintext key/cert per the active store
+        // mode (vault encrypts under SSHRACK_PASSPHRASE; plaintext stores
+        // verbatim) before persisting. The credential id is stable across
+        // edits, so keyring keying (if ever enabled for inline keys) stays safe.
+        let sealed_body = match seal_inline_body(
+            body,
+            sshrack_core::id::OwnerKind::Credential,
+            &orig.id,
+            &cfg,
+        ) {
+            Ok(b) => b,
+            Err((msg, code)) => return fail(&msg, code),
+        };
         let final_name = rename
             .map(str::to_owned)
             .unwrap_or_else(|| orig.name.clone());
         sshrack_core::config::schema::Credential {
             id: orig.id,
             name: final_name,
-            body,
+            body: sealed_body,
         }
     } else {
         let opts = cred_core::EditOptions {

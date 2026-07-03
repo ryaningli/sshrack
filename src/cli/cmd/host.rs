@@ -30,8 +30,8 @@ use crate::shared::exit_code;
 use crate::shared::format as fmt;
 
 use super::shared::{
-    fail, load_config, print_json_array, resolve_credential_name, save_config, selected_fields,
-    sort_hosts, unlock_vault_key,
+    fail, load_config, print_json_array, resolve_credential_name, save_config, seal_inline_body,
+    selected_fields, sort_hosts, unlock_vault_key,
 };
 use crate::cli::table::print_text_table;
 
@@ -190,12 +190,21 @@ fn add(
             .private_key
             .expect("invariant: resolve_inline_identity sets private_key on the inline branch");
         let body = CredentialBody::new(user_owned).with_inline_key(private_sec, ik.certificate);
+        // Seal the freshly collected plaintext key/cert per the active store
+        // mode (vault encrypts under SSHRACK_PASSPHRASE; plaintext stores
+        // verbatim) before persisting. Keyed by the host's stable id so a
+        // future inline-keyring path would land in the right account.
+        let sealed_body =
+            match seal_inline_body(body, sshrack_core::id::OwnerKind::Host, &host_id, &cfg) {
+                Ok(b) => b,
+                Err((msg, code)) => return fail(&msg, code),
+            };
         sshrack_core::config::schema::Host {
             id: host_id,
             name: name.clone(),
             host: host_addr_owned.clone(),
             port: port.unwrap_or(22),
-            auth: Auth::inline(body),
+            auth: Auth::inline(sealed_body),
         }
     } else {
         let opts = host::AddOptions {
@@ -437,8 +446,16 @@ fn edit(
             .expect("invariant: resolve_inline_identity sets private_key on the inline branch");
         let body =
             CredentialBody::new(user_owned).with_inline_key(private_sec, inline_key.certificate);
+        // Seal the freshly collected plaintext key/cert per the active store
+        // mode (vault encrypts under SSHRACK_PASSPHRASE; plaintext stores
+        // verbatim) before persisting. The host id is stable across edits.
+        let sealed_body =
+            match seal_inline_body(body, sshrack_core::id::OwnerKind::Host, &orig.id, &cfg) {
+                Ok(b) => b,
+                Err((msg, code)) => return fail(&msg, code),
+            };
         let mut h = orig.clone();
-        h.auth = Auth::inline(body);
+        h.auth = Auth::inline(sealed_body);
         if let Some(new_name) = rename {
             h.name = new_name.to_owned();
         }

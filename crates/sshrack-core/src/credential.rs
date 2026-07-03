@@ -619,6 +619,33 @@ mod tests {
         assert!(!dbg.contains("hunter2"), "ResolvedAuth Debug leaked: {dbg}");
     }
 
+    #[test]
+    fn resolved_auth_debug_transitively_redacts_populated_inline_key() {
+        // Belt-and-suspenders for the populated inline_key path: when a body
+        // carries pasted key material, resolve attaches an InlineKeyMaterial
+        // whose manual Debug redacts the private text. ResolvedAuth's derived
+        // Debug must reach that manual impl transitively — the key text never
+        // appears, even though inline_key was None in the sibling test above.
+        let r = ResolvedAuth {
+            user: "root".into(),
+            key_path: None,
+            password: PasswordSource::None,
+            inline_key: Some(InlineKeyMaterial {
+                private: Zeroizing::new("KNOWN-PRIVATE-KEY-TEXT".into()),
+                certificate: None,
+            }),
+        };
+        let dbg = format!("{r:?}");
+        assert!(
+            !dbg.contains("KNOWN-PRIVATE-KEY-TEXT"),
+            "ResolvedAuth Debug leaked inline key text: {dbg}"
+        );
+        assert!(
+            dbg.contains("<redacted>"),
+            "missing redaction marker for inline key: {dbg}"
+        );
+    }
+
     // ---- Task 3: resolve carries inline key material + InlineKeyMaterial Debug ----
 
     #[test]
