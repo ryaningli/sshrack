@@ -21,10 +21,11 @@ use zeroize::Zeroizing;
 use super::super::intent::Outcome;
 use super::super::theme;
 use super::{
-    CRED_LABEL_WIDTH, CRED_VALUE_COL, CredField, CredSaveError, SecretChoice, backspace_at,
-    bracketed, insert_char_at, validate_cred, value_spans,
+    CRED_LABEL_WIDTH, CRED_VALUE_COL, CredField, CredSaveError, SecretChoice, SourceChoice,
+    backspace_at, bracketed, insert_char_at, validate_cred, value_spans,
 };
 use crate::tui::fit::truncate_cells;
+use ratatui_textarea::{Input, Key, TextArea};
 use sshrack_core::config::schema::{Credential, CredentialBody, KeySource};
 
 /// The credential form's editable state. The password is held as a
@@ -39,10 +40,32 @@ pub struct CredForm {
     /// Editable login user. Required.
     pub user: String,
     /// Editable identity-key path, edited when the secret choice is
-    /// [`SecretChoice::IdentityKey`]. Empty for Password / None choices.
+    /// [`SecretChoice::IdentityKey`] AND the source is [`SourceChoice::Path`].
+    /// Empty for Password / None choices and under the Inline source (the key
+    /// text lives in [`CredForm::inline_private`]).
     pub identity: String,
     /// The selected secret kind, cycled by `←`/`→` on the secret row.
     pub secret_kind: SecretChoice,
+    /// Identity-key source (Path | Inline), cycled by `←`/`→` on the Source
+    /// row. Relevant only under [`SecretChoice::IdentityKey`]; ignored (and
+    /// stays [`SourceChoice::Path`]) for Password / None.
+    pub source: SourceChoice,
+    /// Multiline private-key paste, edited when the secret choice is
+    /// [`SecretChoice::IdentityKey`] AND the source is [`SourceChoice::Inline`].
+    /// Always empty on edit-entry (the existing key text is NEVER echoed back —
+    /// security; [`CredForm::build_body`] preserves the original on save when
+    /// this stays blank). [`TextArea`] is not [`PartialEq`] and its [`Debug`]
+    /// prints contents, so this field never participates in whole-form equality
+    /// (none exists) and the form's hand-written [`Debug`] shows only its line
+    /// COUNT.
+    ///
+    /// [`PartialEq`]: std::cmp::PartialEq
+    /// [`Debug`]: std::fmt::Debug
+    pub inline_private: TextArea<'static>,
+    /// Multiline optional certificate paste, companion to
+    /// [`CredForm::inline_private`]. Same lifecycle: always empty on
+    /// edit-entry, edited only under Inline source.
+    pub inline_cert: TextArea<'static>,
     /// The masked password, edited when the secret choice is
     /// [`SecretChoice::Password`]. `Zeroizing` so it is wiped on drop.
     pub password: Zeroizing<String>,
@@ -50,6 +73,8 @@ pub struct CredForm {
     pub focus: CredField,
     /// Char-index cursor within the focused text field. Reset to the focused
     /// field's end on focus change; clamped on read by [`cursor_target`].
+    /// Irrelevant for the Source chooser and the multiline paste fields (the
+    /// [`TextArea`] owns its own cursor).
     pub(super) cursor: usize,
     /// A transient validation error to show under the bad field. Cleared on the
     /// next edit to that field.
@@ -67,11 +92,11 @@ pub struct CredForm {
     /// add mode.
     pub orig_id: Option<Ulid>,
     /// The original body's [`KeySource`] when the credential carried a key at
-    /// edit time. The wizard cannot paste-edit inline key text yet (Plan 2), so
-    /// an inline ([`KeySource::Inline`]) original is preserved verbatim when
-    /// the user does not switch the identity field to a new path — silently
-    /// dropping it would destroy the host's only secret. `None` in add mode
-    /// and when the original had no key.
+    /// edit time. Under the Inline source the textareas start EMPTY (the key
+    /// text is never echoed); [`CredForm::build_body`] re-attaches this
+    /// verbatim when the private field stays blank, so silently dropping it
+    /// never destroys the credential's only secret. `None` in add mode and when
+    /// the original had no key.
     pub orig_key: Option<KeySource>,
 }
 
@@ -84,11 +109,21 @@ impl std::fmt::Debug for CredForm {
         // `identity` holds a key file *path*, not key material, so it is safe.
         // `orig_key` delegates to `KeySource`'s redacting `Debug`, which
         // surfaces the path but redacts inline key text.
+        //
+        // The two inline-paste TextAreas are NEVER surfaced directly:
+        // `TextArea`'s derived `Debug` prints the `lines: Vec<String>` field,
+        // which would leak the pasted private key / certificate to any
+        // `dbg!(form)` / `format!("{form:?}")` call. Surface ONLY their line
+        // count, so a glance at the form's Debug still tells you whether the
+        // user has pasted anything without ever showing what.
         f.debug_struct("CredForm")
             .field("name", &self.name)
             .field("user", &self.user)
             .field("identity", &self.identity)
             .field("secret_kind", &self.secret_kind)
+            .field("source", &self.source)
+            .field("inline_private_lines", &self.inline_private.lines().len())
+            .field("inline_cert_lines", &self.inline_cert.lines().len())
             .field("password", &"<redacted>")
             .field("focus", &self.focus)
             .field("error", &self.error)
@@ -100,15 +135,76 @@ impl std::fmt::Debug for CredForm {
     }
 }
 
+/// Map sshrack's `crossterm` 0.28 [`KeyEvent`] into a [`TextArea`]
+/// [`Input`].
+///
+/// `ratatui-textarea` 0.9 pulls crossterm 0.29 transitively (via
+/// `ratatui-crossterm`), whose `KeyEvent` is a *different type* than the
+/// crossterm 0.28 `KeyEvent` sshrack uses everywhere else — so
+/// `textarea.input(key)` won't type-check. Building an [`Input`] directly from
+/// the event's components sidesteps the version skew without forcing a
+/// workspace-wide crossterm upgrade. The mapping mirrors the textarea's own
+/// `From<ratatui_crossterm::crossterm::event::KeyEvent>` impl: a key-release
+/// becomes a no-op `Input::default()`; `BackTab` becomes `Tab` + shift;
+/// everything else maps its [`KeyCode`] to the textarea's [`Key`] and carries
+/// the ctrl/alt/shift modifiers through.
+fn textarea_input_from(key: KeyEvent) -> Input {
+    if key.kind == KeyEventKind::Release {
+        return Input::default();
+    }
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    // crossterm reports Shift+Tab as BackTab (no SHIFT in modifiers); surface
+    // it to the textarea as a shifted Tab so its own shortcut logic matches.
+    if key.code == KeyCode::BackTab {
+        return Input {
+            key: Key::Tab,
+            shift: true,
+            ctrl,
+            alt,
+        };
+    }
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let key_code = match key.code {
+        KeyCode::Char(c) => Key::Char(c),
+        KeyCode::Backspace => Key::Backspace,
+        KeyCode::Enter => Key::Enter,
+        KeyCode::Left => Key::Left,
+        KeyCode::Right => Key::Right,
+        KeyCode::Up => Key::Up,
+        KeyCode::Down => Key::Down,
+        KeyCode::Tab => Key::Tab,
+        KeyCode::Delete => Key::Delete,
+        KeyCode::Home => Key::Home,
+        KeyCode::End => Key::End,
+        KeyCode::PageUp => Key::PageUp,
+        KeyCode::PageDown => Key::PageDown,
+        KeyCode::Esc => Key::Esc,
+        KeyCode::F(n) => Key::F(n),
+        // Insert / Null / any future variant the textarea does not care about:
+        // map to Null, which the textarea treats as a no-op.
+        _ => Key::Null,
+    };
+    Input {
+        key: key_code,
+        ctrl,
+        alt,
+        shift,
+    }
+}
+
 impl CredForm {
     /// Build a fresh add-mode form (all fields blank, focus on name, no
-    /// secret).
+    /// secret, source defaults to [`SourceChoice::Path`]).
     pub fn new_add() -> Self {
         let mut form = Self {
             name: String::new(),
             user: String::new(),
             identity: String::new(),
             secret_kind: SecretChoice::None,
+            source: SourceChoice::Path,
+            inline_private: TextArea::default(),
+            inline_cert: TextArea::default(),
             password: Zeroizing::new(String::new()),
             focus: CredField::Name,
             cursor: 0,
@@ -129,37 +225,52 @@ impl CredForm {
     /// wizard lets the user set a new password to overwrite it, or switch to a
     /// different kind).
     ///
-    /// The original body's [`KeySource`] (path or inline) is carried into the
-    /// form as `orig_key`. The wizard cannot paste-edit inline key text yet
-    /// (Plan 2), so an inline original is preserved verbatim by
-    /// [`build_body`](Self::build_body) when the identity field is left blank
-    /// — silently dropping it would destroy the credential's only secret.
-    /// `identity` (the editable text field) surfaces only the path of a
-    /// [`KeySource::Path`] original; an inline original renders blank with the
-    /// placeholder shown, and its text is re-attached on save.
+    /// **Source + identity prefill.** Under a `Key` body the source chooser
+    /// opens reflecting the original: [`SourceChoice::Path`] with `identity`
+    /// prefilled from the path, or [`SourceChoice::Inline`] with `identity`
+    /// left blank (the key text is NEVER echoed into a textarea — security).
+    /// The original [`KeySource`] is carried as `orig_key` regardless, so
+    /// [`build_body`](Self::build_body) can re-attach an inline original
+    /// verbatim when the user does not paste a new key — silently dropping it
+    /// would destroy the credential's only secret. The two inline textareas
+    /// always start EMPTY on edit entry, even when the original was inline
+    /// material; the user pastes a NEW key to replace it, or leaves the
+    /// private field blank to keep the original.
     pub fn new_edit(cred: &Credential) -> Self {
         use sshrack_core::config::schema::SecretKind;
         let body = &cred.body;
         let orig_key = body.key.clone();
-        let (secret_kind, identity) = match body.secret_kind() {
-            SecretKind::Key => (
-                SecretChoice::IdentityKey,
-                body.key
-                    .as_ref()
-                    .and_then(KeySource::as_path)
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-            ),
-            SecretKind::Password | SecretKind::KeyringPassword => {
-                (SecretChoice::Password, String::new())
+        let (secret_kind, source, identity) = match body.secret_kind() {
+            SecretKind::Key => {
+                let (source, identity) = match body.key.as_ref() {
+                    Some(KeySource::Path(p)) => {
+                        (SourceChoice::Path, p.to_string_lossy().into_owned())
+                    }
+                    // Inline original: default to Inline so the user can paste
+                    // a NEW key (the old text is never echoed); orig_key
+                    // preserves it on save when the private field stays blank.
+                    Some(KeySource::Inline(_)) => (SourceChoice::Inline, String::new()),
+                    None => (SourceChoice::Path, String::new()),
+                };
+                (SecretChoice::IdentityKey, source, identity)
             }
-            SecretKind::Default => (SecretChoice::None, String::new()),
+            SecretKind::Password | SecretKind::KeyringPassword => {
+                (SecretChoice::Password, SourceChoice::Path, String::new())
+            }
+            SecretKind::Default => (SecretChoice::None, SourceChoice::Path, String::new()),
         };
         let mut form = Self {
             name: cred.name.clone(),
             user: body.user.clone(),
             identity,
             secret_kind,
+            source,
+            // Inline textareas ALWAYS start empty on edit entry. An inline
+            // original's key text is never echoed back (security); the user
+            // pastes a new key to replace it, or leaves the private field
+            // blank so build_body re-attaches the original.
+            inline_private: TextArea::default(),
+            inline_cert: TextArea::default(),
             // Never carry the existing plaintext into the form: a password is
             // not echoed back. The user re-types to set a new one; leaving the
             // field empty on a Password-kind edit keeps the existing secret
@@ -184,36 +295,55 @@ impl CredForm {
     }
 
     /// The ordered list of fields the user can navigate to, given the current
-    /// secret choice. See [`CredForm::field_reachable`] for the predicate.
+    /// secret + source choices. See [`CredForm::field_reachable`] for the
+    /// predicate.
     fn reachable_fields(&self) -> Vec<CredField> {
         CredField::ORDER
             .iter()
             .copied()
-            .filter(|&f| Self::field_reachable(f, self.secret_kind))
+            .filter(|&f| Self::field_reachable(f, self.secret_kind, self.source))
             .collect()
     }
 
-    /// Whether `field` is reachable under the given `secret` choice. Pure
-    /// (takes no `&self`) so [`body_rows`](CredForm::body_rows) can sweep every
-    /// secret state to size the dialog to its stable worst-case height without
-    /// cloning the form. Mirrors `HostForm::field_reachable` under the
-    /// Independent branch: Identity and Password are mutually exclusive (one
-    /// secret slot), and both are hidden when the choice is None. SecretKind
-    /// (the chooser) is always reachable.
-    fn field_reachable(field: CredField, secret: SecretChoice) -> bool {
-        // Task 1 staging: the Source / InlinePrivate / InlineCert rows are not
-        // wired into the form yet (Task 2 does). Keep them unreachable so the
-        // existing navigation/render behavior is unchanged.
-        if matches!(
-            field,
-            CredField::Source | CredField::InlinePrivate | CredField::InlineCert
-        ) {
-            return false;
-        }
+    /// Whether `field` is reachable under the given `secret` + `source` state.
+    /// Pure (takes no `&self`) so [`body_rows`](CredForm::body_rows) can sweep
+    /// every (secret, source) combination to size the dialog to its stable
+    /// worst-case height without cloning the form.
+    ///
+    /// The matrix mirrors the wizard's top-down reading:
+    /// - **None** — only Name / User / SecretKind are reachable (no secret
+    ///   slot, no Source chooser).
+    /// - **Password** — Name / User / SecretKind / Password (no Identity, no
+    ///   Source/Inline rows).
+    /// - **IdentityKey + Path** — Name / User / SecretKind / Source / Identity
+    ///   (the Source chooser appears; the single Identity path-slot is filled).
+    /// - **IdentityKey + Inline** — Name / User / SecretKind / Source /
+    ///   InlinePrivate / InlineCert (Identity is hidden; the two paste areas
+    ///   replace it).
+    fn field_reachable(field: CredField, secret: SecretChoice, source: SourceChoice) -> bool {
         match secret {
-            SecretChoice::None => !matches!(field, CredField::Identity | CredField::Password),
-            SecretChoice::IdentityKey => field != CredField::Password,
-            SecretChoice::Password => field != CredField::Identity,
+            SecretChoice::None => !matches!(
+                field,
+                CredField::Identity
+                    | CredField::Password
+                    | CredField::Source
+                    | CredField::InlinePrivate
+                    | CredField::InlineCert
+            ),
+            SecretChoice::Password => !matches!(
+                field,
+                CredField::Identity
+                    | CredField::Source
+                    | CredField::InlinePrivate
+                    | CredField::InlineCert
+            ),
+            SecretChoice::IdentityKey => match source {
+                SourceChoice::Path => !matches!(
+                    field,
+                    CredField::Password | CredField::InlinePrivate | CredField::InlineCert
+                ),
+                SourceChoice::Inline => !matches!(field, CredField::Password | CredField::Identity),
+            },
         }
     }
 
@@ -255,8 +385,16 @@ impl CredForm {
     /// - `Tab` / `↓` → next field; `Shift-Tab` / `↑` → previous field.
     /// - `Enter` → next field, or — on the last reachable field — attempt save;
     ///   on validation error set `error` and move focus to the bad field.
+    ///   Inside an inline textarea, `Enter` instead inserts a newline (the
+    ///   textarea owns multiline editing; see the guard below).
     /// - `Ctrl-S` → attempt save from any field.
     /// - `←`/`→` on the secret row → cycle secret kind.
+    /// - `←`/`→` on the Source row (IdentityKey only) → cycle Path / Inline.
+    /// - When an inline textarea (`InlinePrivate` / `InlineCert`) is focused,
+    ///   every text-editing key is forwarded to the textarea so it owns its
+    ///   cursor / newlines / backspace. Navigation (`Tab` / `BackTab` / `↑` /
+    ///   `↓`), save (`Ctrl-S`), and cancel (`Esc` / `Ctrl-C`) still navigate /
+    ///   act globally — only text-editing keys are captured.
     /// - `Esc` / `Ctrl-C` → cancel back.
     pub fn on_key(&mut self, key: KeyEvent) -> Outcome {
         if key.kind != KeyEventKind::Press {
@@ -269,6 +407,36 @@ impl CredForm {
 
         if ctrl_c_only {
             return Outcome::Cancel;
+        }
+
+        // Inline-paste textareas: the focused TextArea owns all text-editing
+        // (chars, Enter→newline, Backspace, arrows, Home/End, and its own
+        // Emacs-style Ctrl shortcuts). A bare Enter therefore inserts a newline
+        // at the textarea cursor instead of advancing to the next field.
+        // Navigation (Tab / BackTab / Up / Down), cancel (Esc), and save
+        // (Ctrl-S) bypass this guard so they keep working as field navigation
+        // and global actions. (Ctrl-C was already handled above.) The textarea
+        // returns whether it modified the buffer; we ignore that — we always
+        // `Continue` because there is nothing else to do for a captured key.
+        if matches!(self.focus, CredField::InlinePrivate | CredField::InlineCert)
+            && !matches!(
+                key.code,
+                KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down | KeyCode::Esc
+            )
+            && !(ctrl && key.code == KeyCode::Char('s'))
+        {
+            match self.focus {
+                CredField::InlinePrivate => {
+                    self.inline_private.input(textarea_input_from(key));
+                }
+                CredField::InlineCert => {
+                    self.inline_cert.input(textarea_input_from(key));
+                }
+                // Guard above restricts to these two variants; the unreachable
+                // arms keep the match exhaustive without a wider `_ =>`.
+                _ => {}
+            }
+            return Outcome::Continue;
         }
 
         match key.code {
@@ -300,6 +468,10 @@ impl CredForm {
                 Outcome::Continue
             }
             KeyCode::Enter => {
+                // The inline textareas never reach this arm: the guard above
+                // captures Enter (and every other text-editing key) when one is
+                // focused, so Enter there inserts a newline in the textarea.
+                // For the chooser/text fields, Enter advances or saves.
                 if self.is_last_reachable(self.focus) {
                     self.attempt_save()
                 } else {
@@ -320,8 +492,29 @@ impl CredForm {
                 self.error = None;
                 Outcome::Continue
             }
+            // Source row: ←/→ cycle Path / Inline. Only relevant under
+            // IdentityKey (Source is unreachable otherwise), but the guard is
+            // defensive against a directly-set focus in tests.
+            KeyCode::Left
+                if self.focus == CredField::Source
+                    && self.secret_kind == SecretChoice::IdentityKey =>
+            {
+                self.source = self.source.prev();
+                self.error = None;
+                Outcome::Continue
+            }
+            KeyCode::Right
+                if self.focus == CredField::Source
+                    && self.secret_kind == SecretChoice::IdentityKey =>
+            {
+                self.source = self.source.next();
+                self.error = None;
+                Outcome::Continue
+            }
             // Text fields: ←/→ move the in-field cursor; Home/End jump.
-            // (The SecretKind chooser row is handled by the arms above.)
+            // (The SecretKind and Source chooser rows are handled by the arms
+            // above. The inline textareas never reach here: the guard above
+            // captures all their text-editing keys, including ←/→.)
             KeyCode::Left if !ctrl => {
                 self.cursor = self.cursor.saturating_sub(1);
                 Outcome::Continue
@@ -353,8 +546,13 @@ impl CredForm {
     }
 
     /// Insert `c` at the in-field cursor (advancing it one past the inserted
-    /// char). The SecretKind chooser is driven by ←/→; the Password field only
-    /// accepts input when secret_kind is Password.
+    /// char). The SecretKind and Source choosers are driven by ←/→; the
+    /// Password field only accepts input when secret_kind is Password. The
+    /// inline textareas are NEVER edited through this char-based path —
+    /// [`on_key`](Self::on_key)'s textarea guard forwards the original
+    /// `KeyEvent` to `TextArea::input` (which owns the cursor / newlines) — so
+    /// those arms are no-ops here, reached only if a future caller bypasses the
+    /// guard.
     fn edit_focused_insert(&mut self, c: char) {
         match self.focus {
             CredField::Name => self.cursor = insert_char_at(&mut self.name, self.cursor, c),
@@ -367,8 +565,9 @@ impl CredForm {
                 self.cursor = insert_char_at(&mut self.password, self.cursor, c)
             }
             CredField::Password => {}
-            // Task 1 staging: Source/Inline* rows are unreachable (see
-            // `field_reachable`); Task 2 wires real editing. No-op for now.
+            // No char-based text entry on these rows: Source is a ←/→ chooser;
+            // InlinePrivate / InlineCert are edited via `TextArea::input` from
+            // `on_key`'s textarea guard, which never calls this function.
             CredField::Source | CredField::InlinePrivate | CredField::InlineCert => {}
         }
         if Some(self.focus) == self.error.map(CredSaveError::field) {
@@ -378,6 +577,9 @@ impl CredForm {
 
     /// Delete the char immediately before the in-field cursor (mirror of
     /// [`edit_focused_insert`]). No-op when the cursor is already at the start.
+    /// As with [`edit_focused_insert`], the inline textareas handle backspace
+    /// themselves via `TextArea::input`; their arms here are unreachable
+    /// no-ops.
     fn edit_focused_backspace(&mut self) {
         match self.focus {
             CredField::Name => self.cursor = backspace_at(&mut self.name, self.cursor),
@@ -388,7 +590,7 @@ impl CredForm {
                 self.cursor = backspace_at(&mut self.password, self.cursor)
             }
             CredField::Password => {}
-            // Task 1 staging: see `edit_focused_insert`.
+            // See `edit_focused_insert`: textareas own their own backspace.
             CredField::Source | CredField::InlinePrivate | CredField::InlineCert => {}
         }
         if Some(self.focus) == self.error.map(CredSaveError::field) {
@@ -497,6 +699,10 @@ impl CredForm {
 
         let hint = if self.focus == CredField::SecretKind {
             "  <- -> cycle kind"
+        } else if self.focus == CredField::Source {
+            "  <- -> cycle source"
+        } else if matches!(self.focus, CredField::InlinePrivate | CredField::InlineCert) {
+            "  Enter=newline  Tab=next field"
         } else {
             "  up/down next field"
         };
@@ -517,7 +723,10 @@ impl CredForm {
         }
     }
 
-    /// Char count of the currently focused text field (0 for the chooser row).
+    /// Char count of the currently focused text field. Returns 0 for the
+    /// SecretKind and Source chooser rows (no in-field cursor) and for the
+    /// inline textareas (the [`TextArea`] owns its own cursor, so this form
+    /// cursor is irrelevant for them).
     fn focused_text_len(&self) -> usize {
         match self.focus {
             CredField::Name => self.name.chars().count(),
@@ -525,16 +734,18 @@ impl CredForm {
             CredField::Identity => self.identity.chars().count(),
             CredField::Password => self.password.chars().count(),
             CredField::SecretKind => 0,
-            // Task 1 staging: unreachable; Task 2 wires real text areas.
             CredField::Source | CredField::InlinePrivate | CredField::InlineCert => 0,
         }
     }
 
     /// The `(row, value_offset)` where the terminal cursor should sit for the
-    /// focused field, or `None` for the SecretKind chooser. `row` is the index
-    /// into the reachable rendered rows; `offset` is the stored char-index
-    /// cursor, clamped to the field's current length. Pure; consumed by
-    /// [`CredForm::draw_in_dialog`] to call `Frame::set_cursor_position`.
+    /// focused field, or `None` for the SecretKind / Source choosers and the
+    /// inline textareas. `row` is the index into the reachable rendered rows;
+    /// `offset` is the stored char-index cursor, clamped to the field's current
+    /// length. Pure; consumed by [`CredForm::draw_in_dialog`] to call
+    /// `Frame::set_cursor_position`. The inline textareas return `None` because
+    /// [`TextArea`] positions its own cursor internally; the Source row is a
+    /// chooser like SecretKind.
     fn cursor_target(&self) -> Option<(usize, usize)> {
         let row = self.focus_idx();
         let offset = match self.focus {
@@ -543,8 +754,6 @@ impl CredForm {
             CredField::Identity => self.cursor.min(self.identity.chars().count()),
             CredField::Password => self.cursor.min(self.password.chars().count()),
             CredField::SecretKind => return None,
-            // Task 1 staging: unreachable; no terminal cursor on these rows
-            // until Task 2 wires in the multiline areas.
             CredField::Source | CredField::InlinePrivate | CredField::InlineCert => return None,
         };
         Some((row, offset))
@@ -561,11 +770,13 @@ impl CredForm {
     }
 
     /// Stable body row count the dialog sizes to: the **maximum** reachable
-    /// field count across every secret state, plus one error row and one hint
-    /// row. Pinned to the worst case on purpose — toggling the Secret chooser
-    /// changes which rows are filled, but the dialog box must never resize
-    /// while the form is open, so the unused slot renders blank instead of the
-    /// border growing/shrinking. Consumed by the App overlay layer via
+    /// field count across every (secret, source) state, plus one error row and
+    /// one hint row. Pinned to the worst case on purpose — toggling the Secret
+    /// or Source chooser changes which rows are filled, but the dialog box must
+    /// never resize while the form is open, so the unused slot renders blank
+    /// instead of the border growing/shrinking. The IdentityKey + Inline state
+    /// has the most rows (Name / User / SecretKind / Source / InlinePrivate /
+    /// InlineCert = 6). Consumed by the App overlay layer via
     /// [`crate::tui::dialog::draw_dialog`].
     pub fn body_rows(&self) -> u16 {
         let max_fields = [
@@ -574,10 +785,15 @@ impl CredForm {
             SecretChoice::IdentityKey,
         ]
         .iter()
-        .map(|&secret| {
+        .flat_map(|&secret| {
+            [SourceChoice::Path, SourceChoice::Inline]
+                .iter()
+                .map(move |&source| (secret, source))
+        })
+        .map(|(secret, source)| {
             CredField::ORDER
                 .iter()
-                .filter(|&&f| Self::field_reachable(f, secret))
+                .filter(|&&f| Self::field_reachable(f, secret, source))
                 .count()
         })
         .max()
@@ -633,9 +849,37 @@ impl CredForm {
                 let ph = match self.secret_kind {
                     SecretChoice::None => Some("<- -> cycle: Password / IdentityKey / None"),
                     SecretChoice::Password => Some("type the password below"),
-                    SecretChoice::IdentityKey => Some("type the key path"),
+                    SecretChoice::IdentityKey => Some("Path or Inline (Source row below)"),
                 };
                 (v, ph)
+            }
+            CredField::Source => {
+                // Chooser row: bracketed like SecretKind. The placeholder hints
+                // the cycle direction. (Task 4 may refine the render.)
+                let v = bracketed(self.source.label());
+                let ph = Some("<- -> cycle: Path / Inline");
+                (v, ph)
+            }
+            CredField::InlinePrivate => {
+                // Never echo the pasted key text as the row value (security —
+                // the textarea renders its own buffer in Task 4; for now the
+                // row reads blank with a placeholder). On edit the placeholder
+                // reminds the user the original is preserved when this stays
+                // empty.
+                let ph = if self.editing {
+                    Some("paste a NEW key (blank keeps existing)")
+                } else {
+                    Some("paste the private key")
+                };
+                (String::new(), ph)
+            }
+            CredField::InlineCert => {
+                let ph = if self.editing {
+                    Some("paste a NEW cert (blank keeps existing)")
+                } else {
+                    Some("paste the certificate (optional)")
+                };
+                (String::new(), ph)
             }
             CredField::Password => {
                 // Masked: one bullet per char. Never echo the plaintext.
@@ -647,12 +891,6 @@ impl CredForm {
                     Some("type the password")
                 };
                 (masked, ph)
-            }
-            // Task 1 staging: these rows are unreachable (field_reachable
-            // returns false), so the value never renders. Task 2 replaces
-            // these arms with real Source-chooser / multiline-paste rendering.
-            CredField::Source | CredField::InlinePrivate | CredField::InlineCert => {
-                (String::new(), None)
             }
         }
     }
@@ -812,18 +1050,22 @@ mod tests {
 
     #[test]
     fn password_row_is_unreachable_under_non_password_choice() {
-        // IdentityKey choice: Tabbing skips the Password row and wraps Name.
+        // IdentityKey choice: Tabbing skips the Password row. Under IdentityKey
+        // the reachable cycle is Name→User→SecretKind→Source→Identity→(wrap),
+        // so Password is never visited. We tab through a full cycle (5 reachable
+        // fields under the Path source default) and assert Password never
+        // appears, then we land back on Name.
         let mut f = complete_cred_form();
         f.secret_kind = SecretChoice::IdentityKey;
-        // Tab through Name→User→SecretKind→Identity, then wrap to Name.
-        for _ in 0..4 {
+        for _ in 0..5 {
+            assert_ne!(
+                f.focus,
+                CredField::Password,
+                "Password row must be skipped under IdentityKey"
+            );
             f.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
         }
-        assert_eq!(
-            f.focus,
-            CredField::Name,
-            "Password row must be skipped under IdentityKey"
-        );
+        assert_eq!(f.focus, CredField::Name, "five tabs wrap back to Name");
     }
 
     #[test]
@@ -1190,6 +1432,33 @@ mod tests {
                 f.draw_in_dialog(fr, body);
             })
             .unwrap();
+        // Exercise the Source chooser + inline textarea rows under
+        // IdentityKey, across both Source branches (Path renders Identity;
+        // Inline renders InlinePrivate + InlineCert). Drives the new
+        // row_value_and_placeholder arms and the Source/textarea hint rows
+        // through the real Dialog chrome so any panic surfaces here.
+        f.secret_kind = SecretChoice::IdentityKey;
+        for source in [SourceChoice::Path, SourceChoice::Inline] {
+            f.source = source;
+            for field in [
+                CredField::Source,
+                CredField::InlinePrivate,
+                CredField::InlineCert,
+            ] {
+                f.focus = field;
+                terminal
+                    .draw(|fr| {
+                        let body = draw_dialog(
+                            fr,
+                            &f.title(),
+                            f.body_rows(),
+                            &[("Tab", "field"), ("^S", "save"), ("Esc", "cancel")],
+                        );
+                        f.draw_in_dialog(fr, body);
+                    })
+                    .unwrap();
+            }
+        }
         // And error / core_error lines.
         f.focus = CredField::Name;
         f.error = Some(CredSaveError::MissingName);
@@ -1372,27 +1641,35 @@ mod tests {
     // reachable field count (regression pin) ----
 
     #[test]
-    fn body_rows_is_stable_across_secret_states() {
-        // Password/IdentityKey expose a secret-slot row (4 reachable fields);
-        // None exposes none (3). body_rows() must report the SAME value for
-        // every state — the max (4) + error + hint = 6 — so the dialog box
-        // stays a fixed height while the form is open.
+    fn body_rows_is_stable_across_secret_and_source_states() {
+        // IdentityKey + Inline exposes the most rows: Name, User, SecretKind,
+        // Source, InlinePrivate, InlineCert = 6 fields + error + hint = 8.
+        // body_rows() must report this SAME value for every (secret, source)
+        // state so the dialog box stays a fixed height while the form is open
+        // — toggling Secret or Source changes which rows are filled, not the
+        // border size.
         let mut form = CredForm::new_add();
         form.name = "ops".into();
         form.user = "deploy".into();
         let stable = form.body_rows();
-        assert_eq!(stable, 6, "max = a secret-slot kind (4) + error + hint");
+        assert_eq!(
+            stable, 8,
+            "max = IdentityKey+Inline (6 fields) + error + hint"
+        );
         for secret in [
             SecretChoice::None,
             SecretChoice::Password,
             SecretChoice::IdentityKey,
         ] {
-            form.secret_kind = secret;
-            assert_eq!(
-                form.body_rows(),
-                stable,
-                "body_rows must be stable under secret={secret:?}"
-            );
+            for source in [SourceChoice::Path, SourceChoice::Inline] {
+                form.secret_kind = secret;
+                form.source = source;
+                assert_eq!(
+                    form.body_rows(),
+                    stable,
+                    "body_rows must be stable under secret={secret:?} source={source:?}"
+                );
+            }
         }
     }
 
@@ -1404,5 +1681,187 @@ mod tests {
         form.secret_kind = SecretChoice::IdentityKey;
         let (value, _placeholder) = form.row_value_and_placeholder(CredField::SecretKind);
         assert_eq!(value, "< IdentityKey >");
+    }
+
+    // ---- Task 2: Source cycling + inline textarea input (RED -> GREEN) ----
+
+    #[test]
+    fn identity_key_shows_source_row_and_path_branch_reaches_identity() {
+        let mut f = CredForm::new_add();
+        f.secret_kind = SecretChoice::IdentityKey;
+        f.source = SourceChoice::Path;
+        let r = f.reachable_fields();
+        assert!(r.contains(&CredField::Source));
+        assert!(r.contains(&CredField::Identity));
+        assert!(!r.contains(&CredField::InlinePrivate));
+    }
+
+    #[test]
+    fn inline_source_hides_identity_and_reaches_textareas() {
+        let mut f = CredForm::new_add();
+        f.secret_kind = SecretChoice::IdentityKey;
+        f.source = SourceChoice::Inline;
+        let r = f.reachable_fields();
+        assert!(r.contains(&CredField::InlinePrivate));
+        assert!(r.contains(&CredField::InlineCert));
+        assert!(!r.contains(&CredField::Identity));
+    }
+
+    #[test]
+    fn right_arrow_on_source_cycles_path_to_inline() {
+        let mut f = CredForm::new_add();
+        f.secret_kind = SecretChoice::IdentityKey;
+        f.focus = CredField::Source;
+        f.source = SourceChoice::Path;
+        f.on_key(press(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(f.source, SourceChoice::Inline);
+    }
+
+    #[test]
+    fn typing_into_inline_private_goes_to_the_textarea() {
+        let mut f = CredForm::new_add();
+        f.secret_kind = SecretChoice::IdentityKey;
+        f.source = SourceChoice::Inline;
+        f.focus = CredField::InlinePrivate;
+        for c in "PRIVATE-KEY-TEXT".chars() {
+            f.on_key(press(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(f.inline_private.lines().join("\n"), "PRIVATE-KEY-TEXT");
+    }
+
+    #[test]
+    fn new_edit_inline_original_defaults_source_to_inline_with_empty_textarea() {
+        // Editing an inline-key owner: Source defaults to Inline, but the key
+        // text is NEVER echoed into the textarea (security). build_body must
+        // preserve the original on save when the private field stays blank.
+        use sshrack_core::config::schema::{KeySource, Secret};
+        let cred = Credential {
+            id: Ulid::new(),
+            name: "ops".into(),
+            body: CredentialBody::new("u")
+                .with_inline_key(Secret::Plain("SECRET-TEXT".into()), None),
+        };
+        let f = CredForm::new_edit(&cred);
+        assert_eq!(f.secret_kind, SecretChoice::IdentityKey);
+        assert_eq!(f.source, SourceChoice::Inline);
+        assert!(
+            f.inline_private.lines().join("\n").is_empty(),
+            "key text must NOT echo"
+        );
+        assert!(matches!(f.orig_key, Some(KeySource::Inline(_))));
+    }
+
+    #[test]
+    fn enter_inside_textarea_inserts_newline_instead_of_advancing_field() {
+        // A bare Enter in a multiline paste field must insert a newline at the
+        // textarea cursor (the textarea's default mapping), NOT advance focus
+        // to the next reachable field. Tab still navigates between fields.
+        let mut f = CredForm::new_add();
+        f.secret_kind = SecretChoice::IdentityKey;
+        f.source = SourceChoice::Inline;
+        f.focus = CredField::InlinePrivate;
+        // Type "line1", press Enter, type "line2".
+        for c in "line1".chars() {
+            f.on_key(press(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let focus_before = f.focus;
+        f.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
+        // Focus must NOT have advanced.
+        assert_eq!(
+            f.focus, focus_before,
+            "Enter must not advance focus in a textarea"
+        );
+        for c in "line2".chars() {
+            f.on_key(press(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(f.inline_private.lines().join("\n"), "line1\nline2");
+    }
+
+    #[test]
+    fn tab_and_arrows_navigate_between_textareas_and_out() {
+        // Tab / Up / Down bypass the textarea-input guard, so they still
+        // navigate between the inline textareas and out to the Source row.
+        // Pins the navigation matrix under IdentityKey + Inline: the reachable
+        // cycle is Name→User→SecretKind→Source→InlinePrivate→InlineCert→wrap.
+        let mut f = CredForm::new_add();
+        f.secret_kind = SecretChoice::IdentityKey;
+        f.source = SourceChoice::Inline;
+        f.focus = CredField::Source;
+        // Tab from Source → InlinePrivate.
+        f.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(f.focus, CredField::InlinePrivate);
+        // Tab again → InlineCert.
+        f.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(f.focus, CredField::InlineCert);
+        // Up from InlineCert → InlinePrivate.
+        f.on_key(press(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(f.focus, CredField::InlinePrivate);
+        // BackTab from InlinePrivate → Source.
+        f.on_key(press(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(f.focus, CredField::Source);
+    }
+
+    #[test]
+    fn backspace_inside_textarea_deletes_within_the_textarea() {
+        // Backspace is forwarded to the textarea (it owns its own cursor), so
+        // it deletes inside the pasted buffer rather than calling the form's
+        // char-based `backspace_at` helper (which would be a no-op on a
+        // textarea anyway). Type "abc", backspace once → "ab".
+        let mut f = CredForm::new_add();
+        f.secret_kind = SecretChoice::IdentityKey;
+        f.source = SourceChoice::Inline;
+        f.focus = CredField::InlineCert;
+        for c in "abc".chars() {
+            f.on_key(press(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        f.on_key(press(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(f.inline_cert.lines().join("\n"), "ab");
+    }
+
+    #[test]
+    fn new_edit_path_original_defaults_source_to_path_with_identity_prefilled() {
+        // Counterpart to the inline-original test: a Path original defaults
+        // Source to Path with the identity field prefilled (the path IS shown,
+        // unlike inline text).
+        let cred = Credential {
+            id: Ulid::new(),
+            name: "ops".into(),
+            body: CredentialBody::new("u").with_key("/home/me/.ssh/id_ed25519"),
+        };
+        let f = CredForm::new_edit(&cred);
+        assert_eq!(f.secret_kind, SecretChoice::IdentityKey);
+        assert_eq!(f.source, SourceChoice::Path);
+        assert_eq!(f.identity, "/home/me/.ssh/id_ed25519");
+        assert!(matches!(f.orig_key, Some(KeySource::Path(_))));
+    }
+
+    #[test]
+    fn debug_impl_does_not_leak_textarea_contents() {
+        // The hand-written Debug must show only the line COUNT, never the
+        // pasted key text. `format!("{:?}", form)` going to logs/errors must
+        // not leak "PRIVATE-SECRET".
+        let mut f = CredForm::new_add();
+        f.secret_kind = SecretChoice::IdentityKey;
+        f.source = SourceChoice::Inline;
+        f.focus = CredField::InlinePrivate;
+        for c in "PRIVATE-SECRET-TEXT".chars() {
+            f.inline_private.input(textarea_input_from(press(
+                KeyCode::Char(c),
+                KeyModifiers::NONE,
+            )));
+        }
+        let dbg = format!("{f:?}");
+        assert!(
+            !dbg.contains("PRIVATE-SECRET-TEXT"),
+            "Debug must not leak textarea contents: {dbg}"
+        );
+        assert!(
+            dbg.contains("inline_private_lines"),
+            "Debug must surface the line count field: {dbg}"
+        );
+        assert!(
+            dbg.contains("inline_private_lines: 1"),
+            "expected 1 line: {dbg}"
+        );
     }
 }

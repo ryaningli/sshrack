@@ -263,13 +263,11 @@ impl SecretChoice {
 /// Cycled by `←`/`→` on the Source row. Mirrors [`SecretChoice`]'s shape.
 ///
 /// Staging note: this enum and the matching `Source`/`InlinePrivate`/
-/// `InlineCert` field variants land in Task 1, but stay unreachable until
-/// Tasks 2/4 wire them into the cred/host forms' `field_reachable` and
-/// `on_key` arms. The cycling logic is exercised by the unit tests below;
-/// production callers arrive in Task 2. `#[allow(dead_code)]` is narrowed to
-/// this enum + impl and dropped once Task 2 starts calling `next`/`prev`.
+/// `InlineCert` field variants landed in Task 1. Task 2 wires the cred form's
+/// `Source` row (`on_key` ←/→ cycling) and the inline textareas; Task 4 does
+/// the host form. The cycling logic is exercised by the unit tests below and,
+/// from Task 2, by the cred form's `on_key` arms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum SourceChoice {
     /// Identity key read from a file path (typed in the Identity row).
     Path,
@@ -277,7 +275,6 @@ pub enum SourceChoice {
     Inline,
 }
 
-#[allow(dead_code)]
 impl SourceChoice {
     /// Display order used by the chooser's `←`/`→` cycling.
     const ORDER: &'static [SourceChoice] = &[SourceChoice::Path, SourceChoice::Inline];
@@ -307,14 +304,17 @@ impl SourceChoice {
 }
 
 /// The focused field in the credential form. `Tab`/`↑`/`↓` (and `Enter` to
-/// advance) move through the reachable ones in declaration order; the last
+/// advance, except inside a multiline textarea where `Enter` inserts a
+/// newline) move through the reachable ones in declaration order; the last
 /// reachable field's `Enter` triggers a save. The secret row is a three-way
 /// mutex gated by [`SecretChoice`]: under [`SecretChoice::None`] both
-/// `Identity` and `Password` are hidden; under [`SecretChoice::IdentityKey`]
-/// only `Identity` is reachable; under [`SecretChoice::Password`] only
-/// `Password` is reachable. `SecretKind` (the chooser) is always reachable.
-/// The form filters the unreachable slots at navigation time via
-/// [`CredForm::reachable_fields`].
+/// `Identity` and `Password` (and the Source/Inline rows) are hidden; under
+/// [`SecretChoice::IdentityKey`] the `Source` chooser appears, and its current
+/// value (`Path` vs `Inline`) decides whether `Identity` (Path) or
+/// `InlinePrivate`+`InlineCert` (Inline) is reachable; under
+/// [`SecretChoice::Password`] only `Password` is reachable. `SecretKind` (the
+/// chooser) is always reachable. The form filters the unreachable slots at
+/// navigation time via [`CredForm::reachable_fields`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredField {
     Name,
@@ -324,14 +324,12 @@ pub enum CredField {
     /// Identity-key source chooser (Path vs Inline). Sits between the
     /// Secret-kind chooser and the slot rows so the form reads top-down:
     /// pick the kind, then the source, then fill the slot it exposes.
-    /// Unreachable until Task 2 wires it in.
+    /// Reachable iff secret == [`SecretChoice::IdentityKey`].
     Source,
     /// Multiline private-key paste (Inline source only). Sits below `Source`
     /// and above `Identity` to mirror the Path/Inline slot layout.
-    /// Unreachable until Task 2 wires it in.
     InlinePrivate,
     /// Multiline optional certificate paste (Inline source only).
-    /// Unreachable until Task 2 wires it in.
     InlineCert,
     /// Masked password input; reachable only under [`SecretChoice::Password`].
     Password,
@@ -343,12 +341,12 @@ impl CredField {
     /// the kind, then the source, then fill the slot it exposes — mirroring
     /// [`Field::ORDER`]'s Independent layout, where `Secret` precedes
     /// `Identity` / `Password`. The slot rows are filtered out at navigation
-    /// time by [`CredForm::reachable_fields`] according to the three-way
-    /// [`SecretChoice`] mutex: under `None` both are hidden, under
-    /// `IdentityKey` only `Identity` shows, under `Password` only `Password`
-    /// shows. `SecretKind` itself is always reachable. The `Source` and
-    /// `Inline*` rows are staged in Task 1 and stay unreachable until
-    /// Task 2 wires them in ([`CredForm::field_reachable`] returns `false`).
+    /// time by [`CredForm::reachable_fields`] according to the
+    /// [`SecretChoice`] + [`SourceChoice`] matrix: under `None` everything
+    /// below `SecretKind` is hidden, under `IdentityKey` the `Source` row
+    /// appears and its value decides whether `Identity` (Path) or
+    /// `InlinePrivate`+`InlineCert` (Inline) is reachable, under `Password`
+    /// only `Password` shows. `SecretKind` itself is always reachable.
     const ORDER: &'static [CredField] = &[
         CredField::Name,
         CredField::User,
