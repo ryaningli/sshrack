@@ -724,7 +724,7 @@ mod tests {
         // IdentityKey choice: Tabbing skips the Password row and wraps Name.
         let mut f = complete_cred_form();
         f.secret_kind = SecretChoice::IdentityKey;
-        // Tab through Name→User→Identity→SecretKind, then wrap to Name.
+        // Tab through Name→User→SecretKind→Identity, then wrap to Name.
         for _ in 0..4 {
             f.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
         }
@@ -749,10 +749,11 @@ mod tests {
         f.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(f.focus, CredField::User);
         f.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
-        // SecretKind is None → Identity unreachable → skip to SecretKind.
+        // Order is Name→User→SecretKind→(Identity/Password); under None both
+        // slot rows are hidden, so Tab lands on SecretKind.
         assert_eq!(f.focus, CredField::SecretKind);
         f.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
-        // SecretKind is None → Password unreachable → wrap to Name.
+        // SecretKind is None → no slot row reachable → wrap to Name.
         assert_eq!(f.focus, CredField::Name);
     }
 
@@ -761,7 +762,7 @@ mod tests {
         let mut f = blank_cred_form();
         f.focus = CredField::SecretKind;
         f.on_key(press(KeyCode::BackTab, KeyModifiers::SHIFT));
-        // SecretKind is None → Identity unreachable → skip back to User.
+        // Order is Name→User→SecretKind; BackTab from SecretKind lands on User.
         assert_eq!(f.focus, CredField::User);
     }
 

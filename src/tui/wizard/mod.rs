@@ -257,8 +257,11 @@ pub enum CredField {
 }
 
 impl CredField {
-    /// Top-to-bottom render + navigation order. The secret-slot rows
-    /// (`Identity` / `Password`) are filtered out at navigation time by
+    /// Top-to-bottom render + navigation order. `SecretKind` (the chooser)
+    /// precedes the secret-slot rows it gates so the form reads top-down: pick
+    /// the kind, then fill the slot it exposes — mirroring [`Field::ORDER`]'s
+    /// Independent layout, where `Secret` precedes `Identity` / `Password`.
+    /// The slot rows are filtered out at navigation time by
     /// [`CredForm::reachable_fields`] according to the three-way
     /// [`SecretChoice`] mutex: under `None` both are hidden, under
     /// `IdentityKey` only `Identity` shows, under `Password` only `Password`
@@ -266,8 +269,8 @@ impl CredField {
     const ORDER: &'static [CredField] = &[
         CredField::Name,
         CredField::User,
-        CredField::Identity,
         CredField::SecretKind,
+        CredField::Identity,
         CredField::Password,
     ];
 
@@ -543,6 +546,32 @@ mod tests {
         assert_eq!("Identity".chars().count(), 8);
         assert_eq!(CRED_LABEL_WIDTH, 8);
         assert_eq!(CRED_VALUE_COL, 2 + CRED_LABEL_WIDTH + 2);
+    }
+
+    // ---- cred field order: Secret chooser renders ABOVE the slot rows it gates
+    // (Task: regression pin) ----
+
+    #[test]
+    fn cred_secret_kind_row_precedes_identity_and_password() {
+        // The Secret chooser must render above the secret-slot rows it gates, so
+        // the form reads top-down: pick the kind, then fill the slot it exposes.
+        // Mirrors HostForm's Independent layout, where `Secret` precedes
+        // `Identity` / `Password`. Pin the relative order (not absolute index).
+        let order = CredField::ORDER;
+        let sk = order
+            .iter()
+            .position(|f| *f == CredField::SecretKind)
+            .expect("SecretKind is in ORDER");
+        let id = order
+            .iter()
+            .position(|f| *f == CredField::Identity)
+            .expect("Identity is in ORDER");
+        let pw = order
+            .iter()
+            .position(|f| *f == CredField::Password)
+            .expect("Password is in ORDER");
+        assert!(sk < id, "SecretKind must render above Identity");
+        assert!(sk < pw, "SecretKind must render above Password");
     }
 }
 
