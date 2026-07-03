@@ -509,7 +509,9 @@ impl HostForm {
                 Outcome::Continue
             }
             KeyCode::Right if !ctrl => {
-                self.cursor = self.cursor.min(self.focused_text_len());
+                // Advance one, clamped to the field's char length (no overshoot
+                // past the end). Left mirrors this with a saturating decrement.
+                self.cursor = (self.cursor + 1).min(self.focused_text_len());
                 Outcome::Continue
             }
             KeyCode::Home => {
@@ -1706,6 +1708,24 @@ mod tests {
         // cursor at end (2). Right must not overshoot.
         form.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         assert_eq!(form.cursor, 2);
+    }
+
+    #[test]
+    fn right_arrow_advances_cursor_within_a_text_field() {
+        // Regression pin: Right must MOVE the cursor forward, not just clamp
+        // it. After typing "abc" (cursor at end 3), Left twice lands the
+        // cursor at 1; Right then advances to 2.
+        let mut form = HostForm::new_add(vec![]);
+        for c in "abc".chars() {
+            form.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        form.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        form.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(form.cursor, 1);
+        form.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(form.cursor, 2);
+        // cursor_target reports the stored cursor, not the tail.
+        assert_eq!(form.cursor_target(), Some((0, 2)));
     }
 
     #[test]
