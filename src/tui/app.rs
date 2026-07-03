@@ -97,10 +97,11 @@ pub struct App {
     /// Vertical scroll offset of the Help overlay, in lines. Reset to 0 each
     /// time Help opens (so reopening lands at the top). Bumped by ↑↓/j/k/PgUp/
     /// PgDn while Help is the active overlay, clamped to
-    /// [`help::max_scroll`][super::help::max_scroll] of the largest Help body
-    /// (MAX_H − 3) so the offset can never scroll past the last line on a
-    /// full-size dialog; the renderer re-clamps per render for shorter screens.
-    pub help_scroll: u16,
+    /// [`help::help_lines().len()`][super::help::help_lines] — the largest value
+    /// [`help::max_scroll`][super::help::max_scroll] can return across all body
+    /// sizes — so the tail stays reachable on short terminals. The renderer
+    /// re-clamps the offset to the real body height each frame.
+    pub(super) help_scroll: u16,
 }
 
 /// A synthetic `Enter` Press event, used by [`App::primary_action`] to drive
@@ -524,16 +525,17 @@ impl App {
         // Esc / q fall through to `route_overlay`'s Help arm so dismiss still
         // works. Up/Down here MUST NOT navigate panel fields — Help owns them.
         if key.kind == KeyEventKind::Press
+            && key.modifiers.is_empty()
             && self
                 .overlay
                 .as_ref()
                 .is_some_and(|o| matches!(o, Overlay::Help))
         {
-            // Largest body a Help dialog can take (MAX_H minus border(2) and
-            // footer(1)); max_scroll of it is the smallest "hidden lines" value
-            // across screen sizes, so the offset can never scroll past the last
-            // line on the tallest dialog.
-            let m = crate::tui::help::max_scroll(crate::tui::dialog::MAX_H - 3);
+            // help_lines().len() is the largest value max_scroll(body) can
+            // return across all screen sizes (it's lines − body, maximized when
+            // the body is smallest), so the offset can reach the tail on a
+            // short screen. The renderer re-clamps per render to the real body.
+            let m = crate::tui::help::help_lines().len() as u16;
             match key.code {
                 KeyCode::Down | KeyCode::Char('j') => {
                     self.help_scroll = self.help_scroll.saturating_add(1).min(m);
@@ -1722,18 +1724,28 @@ mod tests {
 
     #[test]
     fn help_page_down_jumps_five_then_clamps_to_max() {
-        // max_scroll(MAX_H − 3) = max_scroll(21) = 31 − 21 = 10.
+        // The cap is help_lines().len() — the largest max_scroll across body
+        // sizes — NOT the old max_scroll(MAX_H − 3) = 10, so the Help tail
+        // stays reachable on a short terminal. PgDn steps 5 each time and
+        // clamps at that cap.
+        let max = crate::tui::help::help_lines().len() as u16;
         let mut app = app_with_host("web");
         app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
         // PgDn from 0 → 5.
         app.on_key(press(KeyCode::PageDown, KeyModifiers::NONE));
         assert_eq!(app.help_scroll, 5);
-        // PgDn from 5 → 10 (clamped from 10).
+        // Keep paging until we saturate at the cap.
+        for _ in 0..10 {
+            app.on_key(press(KeyCode::PageDown, KeyModifiers::NONE));
+        }
+        assert_eq!(
+            app.help_scroll, max,
+            "PgDn must clamp at help_lines().len()"
+        );
+        // One more PgDn past the cap stays clamped — no overflow.
         app.on_key(press(KeyCode::PageDown, KeyModifiers::NONE));
-        assert_eq!(app.help_scroll, 10);
-        // PgDn past the cap stays at 10 — no overflow, no scroll past the end.
-        app.on_key(press(KeyCode::PageDown, KeyModifiers::NONE));
-        assert_eq!(app.help_scroll, 10);
+        assert_eq!(app.help_scroll, max);
+        assert!(max > 10, "cap must exceed the old MAX_H-3 ceiling of 10");
     }
 
     #[test]
@@ -1753,14 +1765,56 @@ mod tests {
 
     #[test]
     fn help_down_does_not_clamp_below_page_down_cap() {
-        // Single-step Down also clamps to the same cap as PageDown (10). Pin the
-        // shared ceiling so the two paths never disagree.
+        // Single-step Down clamps to the same cap as PageDown. Pin the shared
+        // ceiling (help_lines().len(), NOT the old 10) so the two paths never
+        // disagree.
+        let max = crate::tui::help::help_lines().len() as u16;
         let mut app = app_with_host("web");
         app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
-        for _ in 0..20 {
+        for _ in 0..40 {
             app.on_key(press(KeyCode::Down, KeyModifiers::NONE));
         }
-        assert_eq!(app.help_scroll, 10, "Down must clamp at max_scroll");
+        assert_eq!(
+            app.help_scroll, max,
+            "Down must clamp at help_lines().len()"
+        );
+    }
+
+    #[test]
+    fn help_scroll_reaches_past_old_cap_of_ten() {
+        // Regression: the cap used to be max_scroll(MAX_H − 3) = 10, which kept
+        // the Help tail unreachable on short terminals. The cap is now
+        // help_lines().len(), so Down can push help_scroll past 10 — the
+        // renderer clamps to the real body per frame.
+        let mut app = app_with_host("web");
+        app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
+        for _ in 0..15 {
+            app.on_key(press(KeyCode::Down, KeyModifiers::NONE));
+        }
+        assert!(
+            app.help_scroll > 10,
+            "Down past 10 presses must exceed the old cap, got {}",
+            app.help_scroll
+        );
+    }
+
+    #[test]
+    fn help_scroll_keys_ignore_modifier_combos() {
+        // Ctrl-J / Ctrl-K (and any non-empty modifier combo) must NOT scroll —
+        // only bare ↑↓/j/k/PgUp/PgDn do. Guards against surprise-scrolling when
+        // a user holds Ctrl.
+        let mut app = app_with_host("web");
+        app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
+        app.on_key(press(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        assert_eq!(app.help_scroll, 0, "Ctrl-J must not scroll Help");
+        app.on_key(press(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert_eq!(app.help_scroll, 0, "Ctrl-K must not scroll Help");
+        app.on_key(press(KeyCode::Down, KeyModifiers::SHIFT));
+        assert_eq!(app.help_scroll, 0, "Shift-Down must not scroll Help");
+        assert!(
+            matches!(app.overlay(), Some(Overlay::Help)),
+            "modifier combos must not dismiss Help either"
+        );
     }
 
     #[test]

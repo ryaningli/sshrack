@@ -21,7 +21,12 @@ use super::dialog::draw_dialog;
 /// never appear as bindings here: they reach the active panel's search box, so
 /// the keymap deliberately has no single-char hotkeys (the conflict fix). Newlines
 /// between sections give visual breathing room.
-fn help_lines() -> Vec<Line<'static>> {
+///
+/// `on_key` uses the line count as the theoretical maximum scroll offset (the
+/// largest value [`max_scroll`] can return across all body sizes) so the tail is
+/// reachable even on short terminals; the renderer then re-clamps to the real
+/// body height each frame.
+pub fn help_lines() -> Vec<Line<'static>> {
     let section = |heading: &'static str| {
         Line::from(vec![Span::styled(
             heading,
