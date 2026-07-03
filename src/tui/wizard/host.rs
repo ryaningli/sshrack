@@ -323,31 +323,41 @@ impl HostForm {
         self.core_error = Some(msg);
     }
 
-    /// The ordered list of fields the user can navigate to. Reference shows only
-    /// Name/Host/Port/Auth/Credential (the user comes from the credential).
-    /// Independent always shows User/Auth/Secret, plus Identity (IdentityKey) or
-    /// Password (Password) — never both, never neither's secret-specific row.
-    /// Credential is Reference-only and must be blacklisted in every Independent
-    /// arm (the Independent branch filters with `!matches!`, so omitting it would
-    /// let the Credential row leak through).
+    /// The ordered list of fields the user can navigate to, given the current
+    /// auth + secret state. See [`HostForm::field_reachable`] for the predicate.
     fn reachable_fields(&self) -> Vec<Field> {
         Field::ORDER
             .iter()
             .copied()
-            .filter(|f| match self.auth_choice {
-                AuthChoice::Reference { .. } => matches!(
-                    f,
-                    Field::Name | Field::Host | Field::Port | Field::Auth | Field::Credential
-                ),
-                AuthChoice::Independent => match self.secret_kind {
-                    SecretChoice::None => {
-                        !matches!(f, Field::Credential | Field::Identity | Field::Password)
-                    }
-                    SecretChoice::IdentityKey => !matches!(f, Field::Credential | Field::Password),
-                    SecretChoice::Password => !matches!(f, Field::Credential | Field::Identity),
-                },
-            })
+            .filter(|&f| Self::field_reachable(f, &self.auth_choice, self.secret_kind))
             .collect()
+    }
+
+    /// Whether `field` is reachable under the given `(auth, secret)` state.
+    /// Pure (takes no `&self`) so [`body_rows`](HostForm::body_rows) can sweep
+    /// every auth×secret combination to size the dialog to its stable
+    /// worst-case height without cloning the form.
+    ///
+    /// Reference shows only Name/Host/Port/Auth/Credential (the user comes from
+    /// the credential). Independent always shows User/Auth/Secret, plus
+    /// Identity (IdentityKey) or Password (Password) — never both, never
+    /// neither's secret-specific row. Credential is Reference-only and is
+    /// blacklisted in every Independent arm (the Independent branch filters with
+    /// `!matches!`, so omitting it would let the Credential row leak through).
+    fn field_reachable(field: Field, auth: &AuthChoice, secret: SecretChoice) -> bool {
+        match auth {
+            AuthChoice::Reference { .. } => matches!(
+                field,
+                Field::Name | Field::Host | Field::Port | Field::Auth | Field::Credential
+            ),
+            AuthChoice::Independent => match secret {
+                SecretChoice::None => {
+                    !matches!(field, Field::Credential | Field::Identity | Field::Password)
+                }
+                SecretChoice::IdentityKey => !matches!(field, Field::Credential | Field::Password),
+                SecretChoice::Password => !matches!(field, Field::Credential | Field::Identity),
+            },
+        }
     }
 
     fn focus_idx(&self) -> usize {
@@ -625,8 +635,13 @@ impl HostForm {
             .map(|f| self.render_row(*f, body.width))
             .collect();
 
+        // Fields area is `Fill(1)` so it absorbs the slack between the
+        // top-aligned field rows and the error/hint rows pinned to the body's
+        // bottom. This keeps the error line + field-specific hint at a FIXED y
+        // (just above the dialog footer) regardless of how many fields are
+        // reachable — the dialog box is a stable container, content flows in it.
         let [fields_area, error_area, hint_area] = Layout::vertical([
-            Constraint::Length(rows.len() as u16),
+            Constraint::Fill(1),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
@@ -717,11 +732,29 @@ impl HostForm {
         }
     }
 
-    /// Content row count the dialog should size to: reachable fields + 1 error
-    /// line + 1 hint line. Consumed by the App overlay layer to size the dialog
-    /// via [`crate::tui::dialog::draw_dialog`].
+    /// Stable body row count the dialog sizes to: the **maximum** reachable
+    /// field count across every auth×secret state, plus one error row and one
+    /// hint row. Pinned to the worst case on purpose — toggling Auth/Secret
+    /// changes which rows are filled, but the dialog box must never resize
+    /// while the form is open, so the unused slots render blank instead of the
+    /// border growing/shrinking. Consumed by the App overlay layer via
+    /// [`crate::tui::dialog::draw_dialog`].
     pub fn body_rows(&self) -> u16 {
-        self.reachable_fields().len() as u16 + 2
+        let mut max_fields = 0usize;
+        for auth in [AuthChoice::Independent, AuthChoice::Reference { idx: 0 }] {
+            for secret in [
+                SecretChoice::None,
+                SecretChoice::Password,
+                SecretChoice::IdentityKey,
+            ] {
+                let n = Field::ORDER
+                    .iter()
+                    .filter(|&&f| Self::field_reachable(f, &auth, secret))
+                    .count();
+                max_fields = max_fields.max(n);
+            }
+        }
+        (max_fields + 2) as u16 // + error row + hint row
     }
 
     /// Render one labeled field row, with the focus highlight + placeholder.
@@ -1810,6 +1843,41 @@ mod tests {
     // ---- field hints: field-specific ONLY — the permanent dialog footer
     // already shows Tab/^s/Esc, so a field hint must not repeat them.
     // (Task 7: RED -> GREEN) ----
+
+    // ---- dialog height stability: body_rows pinned to the worst-case max so
+    // the dialog box never resizes when Auth/Secret toggles change the
+    // reachable field count (regression pin) ----
+
+    #[test]
+    fn body_rows_is_stable_across_auth_and_secret_states() {
+        // Independent+Password/IdentityKey is the widest state (7 reachable
+        // fields); Reference is the narrowest (5). body_rows() must report the
+        // SAME value for every state — the max (7) + error + hint = 9 — so the
+        // dialog box stays a fixed height while the form is open.
+        let mut form = HostForm::new_add(vec!["ops".into()]);
+        form.name = "h".into();
+        form.host_addr = "10.0.0.5".into();
+        let stable = form.body_rows();
+        assert_eq!(
+            stable, 9,
+            "max = Independent + a secret slot (7) + error + hint"
+        );
+        for auth in [AuthChoice::Independent, AuthChoice::Reference { idx: 0 }] {
+            for secret in [
+                SecretChoice::None,
+                SecretChoice::Password,
+                SecretChoice::IdentityKey,
+            ] {
+                form.auth_choice = auth.clone();
+                form.secret_kind = secret;
+                assert_eq!(
+                    form.body_rows(),
+                    stable,
+                    "body_rows must be stable under auth={auth:?} secret={secret:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn field_hints_do_not_repeat_save_or_cancel() {

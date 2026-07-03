@@ -161,20 +161,28 @@ impl CredForm {
     }
 
     /// The ordered list of fields the user can navigate to, given the current
-    /// secret choice. Mirrors `HostForm::reachable_fields` under the Independent
-    /// branch: Identity and Password are mutually exclusive (one secret slot),
-    /// and both are hidden when the choice is None. SecretKind (the chooser) is
-    /// always reachable.
+    /// secret choice. See [`CredForm::field_reachable`] for the predicate.
     fn reachable_fields(&self) -> Vec<CredField> {
         CredField::ORDER
             .iter()
             .copied()
-            .filter(|f| match self.secret_kind {
-                SecretChoice::None => !matches!(f, CredField::Identity | CredField::Password),
-                SecretChoice::IdentityKey => *f != CredField::Password,
-                SecretChoice::Password => *f != CredField::Identity,
-            })
+            .filter(|&f| Self::field_reachable(f, self.secret_kind))
             .collect()
+    }
+
+    /// Whether `field` is reachable under the given `secret` choice. Pure
+    /// (takes no `&self`) so [`body_rows`](CredForm::body_rows) can sweep every
+    /// secret state to size the dialog to its stable worst-case height without
+    /// cloning the form. Mirrors `HostForm::field_reachable` under the
+    /// Independent branch: Identity and Password are mutually exclusive (one
+    /// secret slot), and both are hidden when the choice is None. SecretKind
+    /// (the chooser) is always reachable.
+    fn field_reachable(field: CredField, secret: SecretChoice) -> bool {
+        match secret {
+            SecretChoice::None => !matches!(field, CredField::Identity | CredField::Password),
+            SecretChoice::IdentityKey => field != CredField::Password,
+            SecretChoice::Password => field != CredField::Identity,
+        }
     }
 
     fn focus_idx(&self) -> usize {
@@ -408,8 +416,13 @@ impl CredForm {
             .map(|f| self.render_row(*f, body.width))
             .collect();
 
+        // Fields area is `Fill(1)` so it absorbs the slack between the
+        // top-aligned field rows and the error/hint rows pinned to the body's
+        // bottom. This keeps the error line + field-specific hint at a FIXED y
+        // (just above the dialog footer) regardless of how many fields are
+        // reachable — the dialog box is a stable container, content flows in it.
         let [fields_area, error_area, hint_area] = Layout::vertical([
-            Constraint::Length(rows.len() as u16),
+            Constraint::Fill(1),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
@@ -493,11 +506,29 @@ impl CredForm {
         }
     }
 
-    /// Content row count the dialog should size to: reachable fields + 1 error
-    /// line + 1 hint line. Consumed by the App overlay layer to size the dialog
-    /// via [`crate::tui::dialog::draw_dialog`].
+    /// Stable body row count the dialog sizes to: the **maximum** reachable
+    /// field count across every secret state, plus one error row and one hint
+    /// row. Pinned to the worst case on purpose — toggling the Secret chooser
+    /// changes which rows are filled, but the dialog box must never resize
+    /// while the form is open, so the unused slot renders blank instead of the
+    /// border growing/shrinking. Consumed by the App overlay layer via
+    /// [`crate::tui::dialog::draw_dialog`].
     pub fn body_rows(&self) -> u16 {
-        self.reachable_fields().len() as u16 + 2
+        let max_fields = [
+            SecretChoice::None,
+            SecretChoice::Password,
+            SecretChoice::IdentityKey,
+        ]
+        .iter()
+        .map(|&secret| {
+            CredField::ORDER
+                .iter()
+                .filter(|&&f| Self::field_reachable(f, secret))
+                .count()
+        })
+        .max()
+        .unwrap_or(0);
+        (max_fields + 2) as u16 // + error row + hint row
     }
 
     /// Render one labeled field row, with the focus highlight + placeholder.
@@ -1225,6 +1256,35 @@ mod tests {
         let reachable = form.reachable_fields();
         assert!(reachable.contains(&CredField::Password));
         assert!(!reachable.contains(&CredField::Identity));
+    }
+
+    // ---- dialog height stability: body_rows pinned to the worst-case max so
+    // the dialog box never resizes when the Secret toggle changes the
+    // reachable field count (regression pin) ----
+
+    #[test]
+    fn body_rows_is_stable_across_secret_states() {
+        // Password/IdentityKey expose a secret-slot row (4 reachable fields);
+        // None exposes none (3). body_rows() must report the SAME value for
+        // every state — the max (4) + error + hint = 6 — so the dialog box
+        // stays a fixed height while the form is open.
+        let mut form = CredForm::new_add();
+        form.name = "ops".into();
+        form.user = "deploy".into();
+        let stable = form.body_rows();
+        assert_eq!(stable, 6, "max = a secret-slot kind (4) + error + hint");
+        for secret in [
+            SecretChoice::None,
+            SecretChoice::Password,
+            SecretChoice::IdentityKey,
+        ] {
+            form.secret_kind = secret;
+            assert_eq!(
+                form.body_rows(),
+                stable,
+                "body_rows must be stable under secret={secret:?}"
+            );
+        }
     }
 
     // ---- row_value_and_placeholder: secret-kind value is bracketed (Task 6: RED -> GREEN) ----
