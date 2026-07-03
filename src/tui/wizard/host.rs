@@ -26,8 +26,8 @@ use zeroize::Zeroizing;
 use super::super::intent::Outcome;
 use super::super::theme;
 use super::{
-    AuthChoice, AuthKind, CredPicker, Field, HOST_VALUE_COL, PickerOutcome, SaveError,
-    SecretChoice, backspace_at, bracketed, insert_char_at, validate, value_spans,
+    AuthChoice, AuthKind, CredPicker, Field, HOST_LABEL_WIDTH, HOST_VALUE_COL, PickerOutcome,
+    SaveError, SecretChoice, backspace_at, bracketed, insert_char_at, validate, value_spans,
 };
 use crate::tui::fit::truncate_cells;
 use sshrack_core::config::schema::{Auth, CredentialBody, Host};
@@ -590,6 +590,22 @@ impl HostForm {
         }
     }
 
+    /// The field-specific hotkey hint for `field`. Field-specific ONLY — the
+    /// permanent dialog footer already shows `Tab field · ^s save · Esc
+    /// cancel`, so those are intentionally not repeated here. Chooser rows
+    /// (Auth / Credential / Secret) advertise their own `←`/`→` cycling (and
+    /// `Enter` for the credential picker); text rows get a light navigation
+    /// hint. Pure; extracted from `draw_in_dialog` so the hint wording is
+    /// unit-testable.
+    fn hint_for_focus(&self, field: Field) -> &'static str {
+        match field {
+            Field::Auth => "  <- -> cycle Independent/Reference",
+            Field::Credential => "  <- -> cycle  ·  Enter pick credential",
+            Field::Secret => "  <- -> cycle None/Password/IdentityKey",
+            _ => "  up/down next field",
+        }
+    }
+
     /// Render the field rows + error/hint lines into `body` (the rect a
     /// [`crate::tui::dialog::draw_dialog`] hands the form). No outer border —
     /// the dialog already drew the chrome. Places the real terminal cursor on
@@ -632,16 +648,7 @@ impl HostForm {
         };
         frame.render_widget(error_line, error_area);
 
-        let hint = match self.focus {
-            Field::Auth => {
-                "  <- -> cycle Independent/Reference  ·  Tab next  ·  ^s save  ·  Esc cancel"
-            }
-            Field::Credential => {
-                "  <- -> cycle  ·  Enter pick credential  ·  ^s save  ·  Esc cancel"
-            }
-            Field::Secret => "  <- -> cycle None/Password/IdentityKey  ·  ^s save  ·  Esc cancel",
-            _ => "  Tab/up-down next  ·  ^s save  ·  Esc cancel",
-        };
+        let hint = self.hint_for_focus(self.focus);
         frame.render_widget(Paragraph::new(hint).style(Style::new().dim()), hint_area);
 
         // Place the real terminal cursor on the focused text field (no drawn
@@ -727,7 +734,10 @@ impl HostForm {
         let focused = self.focus == field;
         let cursor = if focused { "▶ " } else { "  " };
         let label_span = Span::styled(
-            format!("{cursor}{label:>9}: "),
+            format!(
+                "{cursor}{label:>WIDTH$}: ",
+                WIDTH = HOST_LABEL_WIDTH as usize
+            ),
             if focused {
                 theme::accent().add_modifier(Modifier::BOLD)
             } else {
@@ -1193,9 +1203,11 @@ mod tests {
         // its terminal cursor lands inside the body rect. We focus the LAST
         // reachable field under Independent+Password (a text field — Password —
         // so `cursor_target` returns a real position), and render through a
-        // height-10 TestBackend. Without the viewport the cursor would sit at
-        // `fields_area.y + last_row` (well past the body bottom); with it the
-        // in-window row index lands at the top of the fields area.
+        // height-11 TestBackend (the dialog's blank-separator + footer + border
+        // chrome leaves a 3-row body — tall enough for fields/error/hint, but
+        // not for all 7 reachable fields). Without the viewport the cursor
+        // would sit at `fields_area.y + last_row` (well past the body bottom);
+        // with it the in-window row index lands at the top of the fields area.
         use crate::tui::dialog::draw_dialog;
         use ratatui::{
             Terminal,
@@ -1215,7 +1227,7 @@ mod tests {
             .expect("invariant: reachable fields non-empty under Independent+Password");
         form.focus = last;
 
-        let mut term = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(60, 11)).unwrap();
         let mut captured_body = Rect::default();
         term.draw(|f| {
             let body = draw_dialog(
@@ -1773,5 +1785,39 @@ mod tests {
         form.secret_kind = SecretChoice::Password;
         let (value, _placeholder) = form.row_value_and_placeholder(Field::Secret);
         assert_eq!(value, "< Password >");
+    }
+
+    // ---- field hints: field-specific ONLY — the permanent dialog footer
+    // already shows Tab/^s/Esc, so a field hint must not repeat them.
+    // (Task 7: RED -> GREEN) ----
+
+    #[test]
+    fn field_hints_do_not_repeat_save_or_cancel() {
+        let form = HostForm::new_add(vec![]);
+        for f in [
+            Field::Auth,
+            Field::Credential,
+            Field::Secret,
+            Field::Name,
+            Field::Host,
+            Field::Port,
+            Field::User,
+            Field::Identity,
+            Field::Password,
+        ] {
+            let hint = form.hint_for_focus(f);
+            assert!(
+                !hint.contains("^s"),
+                "field hint must not include ^s save: {hint:?}"
+            );
+            assert!(
+                !hint.contains("Esc"),
+                "field hint must not include Esc cancel: {hint:?}"
+            );
+            assert!(
+                !hint.contains("Tab"),
+                "field hint must not include Tab next: {hint:?}"
+            );
+        }
     }
 }

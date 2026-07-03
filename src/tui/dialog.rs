@@ -22,18 +22,19 @@ const MAX_W: u16 = 80;
 pub(crate) const MAX_H: u16 = 24;
 
 /// Centered, content-fit dialog rect inside `screen`. The outer height is
-/// `body_rows + 2 (border) + 1 (footer)`, clamped down to [`MAX_H`] and to the
-/// screen height (minus a 2-cell margin). Width stays at most [`MAX_W`] (forms
-/// need the room for long values). Returns `screen` as-is when either axis < 6.
+/// `body_rows + 2 (border) + 1 (blank separator) + 1 (footer)`, clamped down
+/// to [`MAX_H`] and to the screen height (minus a 2-cell margin). Width stays
+/// at most [`MAX_W`] (forms need the room for long values). Returns `screen`
+/// as-is when either axis < 6.
 pub fn dialog_area(screen: Rect, body_rows: u16) -> Rect {
     let w = MAX_W.min(screen.width.saturating_sub(4));
     let outer_h = body_rows
-        .saturating_add(3) // border(2) + footer(1)
+        .saturating_add(4) // border(2) + blank separator(1) + footer(1)
         .min(MAX_H)
         .min(screen.height.saturating_sub(4));
-    // Floor the height at the dialog chrome itself (2 border + 1 footer = 3)
-    // so a zero/near-zero body_rows still yields a visible chrome.
-    let h = outer_h.max(3);
+    // Floor the height at the dialog chrome itself (2 border + 1 blank + 1
+    // footer = 4) so a zero/near-zero body_rows still yields a visible chrome.
+    let h = outer_h.max(4);
     if screen.width < 6 || screen.height < 6 {
         return screen;
     }
@@ -80,9 +81,18 @@ pub fn draw_dialog(
         .title_style(theme::accent().add_modifier(Modifier::BOLD));
     frame.render_widget(&block, area);
     let inner = block.inner(area);
-    // Body gets everything except the bottom 1-row footer.
-    let [body, footer] =
-        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(inner);
+    // Body gets everything except a 1-row blank separator and the bottom
+    // 1-row footer. The blank row visually separates the form's own content
+    // (which ends with the field-specific hint) from the permanent footer, so
+    // the two never read as one cluttered line.
+    let [body, blank, footer] = Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    // `blank` is intentionally left empty.
+    let _ = blank;
 
     let mut spans: Vec<Span> = Vec::new();
     for (i, (key, label)) in footer_hints.iter().enumerate() {
@@ -111,9 +121,9 @@ mod tests {
     #[test]
     fn dialog_area_height_tracks_body_rows_then_clamps_to_max() {
         let screen = Rect::new(0, 0, 100, 40);
-        // body 5 -> outer = 5 + 2 border + 1 footer = 8.
+        // body 5 -> outer = 5 + 2 border + 1 blank + 1 footer = 9.
         let d = dialog_area(screen, 5);
-        assert_eq!(d.height, 8);
+        assert_eq!(d.height, 9);
         // body 100 -> clamps to MAX_H (24).
         let d = dialog_area(screen, 100);
         assert_eq!(d.height, MAX_H);

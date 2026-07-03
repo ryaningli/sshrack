@@ -238,9 +238,14 @@ impl SecretChoice {
 }
 
 /// The focused field in the credential form. `Tab`/`↑`/`↓` (and `Enter` to
-/// advance) move through these in declaration order; the last field's `Enter`
-/// triggers a save. The `Password` row is only focusable / editable when the
-/// secret choice is [`SecretChoice::Password`].
+/// advance) move through the reachable ones in declaration order; the last
+/// reachable field's `Enter` triggers a save. The secret row is a three-way
+/// mutex gated by [`SecretChoice`]: under [`SecretChoice::None`] both
+/// `Identity` and `Password` are hidden; under [`SecretChoice::IdentityKey`]
+/// only `Identity` is reachable; under [`SecretChoice::Password`] only
+/// `Password` is reachable. `SecretKind` (the chooser) is always reachable.
+/// The form filters the unreachable slots at navigation time via
+/// [`CredForm::reachable_fields`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredField {
     Name,
@@ -252,9 +257,12 @@ pub enum CredField {
 }
 
 impl CredField {
-    /// Top-to-bottom render + navigation order. The `Password` slot is skipped
-    /// during navigation when the secret choice is not Password (the wizard
-    /// filters it out at navigation time).
+    /// Top-to-bottom render + navigation order. The secret-slot rows
+    /// (`Identity` / `Password`) are filtered out at navigation time by
+    /// [`CredForm::reachable_fields`] according to the three-way
+    /// [`SecretChoice`] mutex: under `None` both are hidden, under
+    /// `IdentityKey` only `Identity` shows, under `Password` only `Password`
+    /// shows. `SecretKind` itself is always reachable.
     const ORDER: &'static [CredField] = &[
         CredField::Name,
         CredField::User,
@@ -356,12 +364,27 @@ pub(super) fn bracketed(label: &str) -> String {
     format!("< {label} >")
 }
 
+/// Right-alignment width for a host field label. The longest host label is
+/// `Credential` (10 chars), so this is 10; the credential-wizard labels stay
+/// 8 ([`CRED_LABEL_WIDTH`]). Used by [`HostForm::render_row`] and to derive
+/// [`HOST_VALUE_COL`] below.
+pub(super) const HOST_LABEL_WIDTH: u16 = 10;
+
+/// Right-alignment width for a credential field label. The longest cred label
+/// is `Identity` / `Password` (8 chars). Kept narrower than
+/// [`HOST_LABEL_WIDTH`] because the cred form has no 10-char `Credential` row.
+pub(super) const CRED_LABEL_WIDTH: u16 = 8;
+
 /// Column where the editable value begins within a rendered field row:
-/// `"▶ " (2) + right-aligned label + ": " (2)`. Host labels are padded to 9
-/// (the longest host label is `Credential` = 9); credential-wizard labels stay
-/// 8. Used by each form's `draw` to place the terminal cursor.
-pub(super) const HOST_VALUE_COL: u16 = 2 + 9 + 2;
-pub(super) const CRED_VALUE_COL: u16 = 2 + 8 + 2;
+/// `"▶ " (2) + right-aligned label + ": " (2)`. Derived from
+/// [`HOST_LABEL_WIDTH`] so the value column tracks the longest host label
+/// (`Credential` = 10). Used by each form's `draw` to place the terminal
+/// cursor and to truncate over-wide values.
+pub(super) const HOST_VALUE_COL: u16 = 2 + HOST_LABEL_WIDTH + 2;
+
+/// Credential-wizard counterpart of [`HOST_VALUE_COL`], derived from
+/// [`CRED_LABEL_WIDTH`].
+pub(super) const CRED_VALUE_COL: u16 = 2 + CRED_LABEL_WIDTH + 2;
 
 // ===========================================================================
 // Cursor-edit helpers
@@ -504,6 +527,22 @@ mod tests {
         assert_eq!(SecretChoice::Password.label(), "Password");
         assert_eq!(SecretChoice::IdentityKey.label(), "IdentityKey");
         assert_eq!(SecretChoice::None.label(), "None");
+    }
+
+    // ---- label column width: derived from the longest host label (Task 7: RED -> GREEN) ----
+
+    #[test]
+    fn host_label_column_fits_the_longest_label() {
+        // "Credential" is 10 chars — the column must be at least that wide so
+        // every host row's value starts at the same x.
+        assert_eq!("Credential".chars().count(), 10);
+        assert!(HOST_LABEL_WIDTH as usize >= 10);
+        assert_eq!(HOST_VALUE_COL, 2 + HOST_LABEL_WIDTH + 2);
+        // Cred labels max out at "Identity" / "Password" = 8 chars; pin that
+        // the cred column derives the same way and stays 8.
+        assert_eq!("Identity".chars().count(), 8);
+        assert_eq!(CRED_LABEL_WIDTH, 8);
+        assert_eq!(CRED_VALUE_COL, 2 + CRED_LABEL_WIDTH + 2);
     }
 }
 

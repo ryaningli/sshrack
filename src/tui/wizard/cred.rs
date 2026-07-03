@@ -21,8 +21,8 @@ use zeroize::Zeroizing;
 use super::super::intent::Outcome;
 use super::super::theme;
 use super::{
-    CRED_VALUE_COL, CredField, CredSaveError, SecretChoice, backspace_at, bracketed,
-    insert_char_at, validate_cred, value_spans,
+    CRED_LABEL_WIDTH, CRED_VALUE_COL, CredField, CredSaveError, SecretChoice, backspace_at,
+    bracketed, insert_char_at, validate_cred, value_spans,
 };
 use crate::tui::fit::truncate_cells;
 use sshrack_core::config::schema::{Credential, CredentialBody};
@@ -432,9 +432,9 @@ impl CredForm {
         frame.render_widget(error_line, error_area);
 
         let hint = if self.focus == CredField::SecretKind {
-            "  <- -> cycle kind  ·  ^s save  ·  Esc cancel"
+            "  <- -> cycle kind"
         } else {
-            "  Tab/up-down next  ·  ^s save  ·  Esc cancel"
+            "  up/down next field"
         };
         frame.render_widget(Paragraph::new(hint).style(Style::new().dim()), hint_area);
 
@@ -510,7 +510,10 @@ impl CredForm {
         let focused = self.focus == field;
         let cursor = if focused { "▶ " } else { "  " };
         let label_span = Span::styled(
-            format!("{cursor}{label:>8}: "),
+            format!(
+                "{cursor}{label:>WIDTH$}: ",
+                WIDTH = CRED_LABEL_WIDTH as usize
+            ),
             if focused {
                 theme::accent().add_modifier(Modifier::BOLD)
             } else {
@@ -1080,9 +1083,11 @@ mod tests {
         // Behavior pin mirroring the host variant: with a short terminal the
         // focus-following viewport must scroll the focused field into view.
         // We focus the Password row (the last reachable text field under
-        // SecretChoice::Password) and render through a height-10 TestBackend.
-        // Without the viewport the cursor would land at `fields_area.y + 4`
-        // (past the body bottom); with it the in-window row index stays inside.
+        // SecretChoice::Password) and render through a height-11 TestBackend
+        // (the dialog's blank-separator + footer + border chrome leaves a
+        // 3-row body). Without the viewport the cursor would land at
+        // `fields_area.y + 4` (past the body bottom); with it the in-window
+        // row index stays inside.
         use crate::tui::dialog::draw_dialog;
         use ratatui::{
             Terminal,
@@ -1098,7 +1103,7 @@ mod tests {
             .expect("invariant: reachable fields non-empty under Password");
         form.focus = last;
 
-        let mut term = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(60, 11)).unwrap();
         let mut captured_body = Rect::default();
         term.draw(|f| {
             let body = draw_dialog(
