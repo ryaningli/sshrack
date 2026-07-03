@@ -97,12 +97,15 @@ fn fresh_shim() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
     (dir, shim, capture)
 }
 
-/// A key-only host: the launcher sets the `SSH_ASKPASS` triplet so ssh knows to
-/// fork the helper, but carries NO payload env (`SSHRACK_ASKPASS_FILE` /
-/// `SSHRACK_KEYRING_KEY`) because there is no password to deliver — ssh uses the
-/// key / agent. This is the happy path for the most common host shape.
+/// A key-only host: the launcher sets NO askpass env at all. There is no
+/// account password to inject, so ssh must NOT be pointed at our payload-less
+/// askpass helper — if it were, an encrypted private key would make ssh call
+/// the helper (which has nothing to deliver) and fail. Leaving `SSH_ASKPASS`
+/// unset lets ssh fall back to `/dev/tty` and prompt the user for the key
+/// passphrase itself. argv shape is unaffected. This is the happy path for the
+/// most common host shape.
 #[test]
-fn key_only_host_launches_ssh_with_argv_and_askpass_triplet_no_payload() {
+fn key_only_host_launches_ssh_with_argv_and_no_askpass_env() {
     let (_dir, shim_path, capture_path) = fresh_shim();
     let self_exe = std::env::current_exe().expect("current_exe");
 
@@ -144,27 +147,23 @@ fn key_only_host_launches_ssh_with_argv_and_askpass_triplet_no_payload() {
         .expect("host present");
     assert_eq!(&received[host_idx + 1..], &["uname", "-r"]);
 
-    // (b) SSH_ASKPASS triplet is set so ssh knows to fork the helper.
-    assert_eq!(
-        cap.env.get("SSH_ASKPASS").map(String::as_str),
-        Some(self_exe.to_str().unwrap())
-    );
-    assert_eq!(
-        cap.env.get("SSH_ASKPASS_REQUIRE").map(String::as_str),
-        Some("force")
-    );
-    assert_eq!(cap.env.get("DISPLAY").map(String::as_str), Some(":0"));
-
-    // (c) No payload env for a key-only host: the askpass role would have
-    // nothing to deliver, so neither the file nor the keyring key is set.
-    assert!(
-        !cap.env.contains_key("SSHRACK_ASKPASS_FILE"),
-        "key-only host must not stage an askpass file"
-    );
-    assert!(
-        !cap.env.contains_key("SSHRACK_KEYRING_KEY"),
-        "key-only host must not set the keyring key"
-    );
+    // (b) The launcher adds no askpass env for a key-only host. SSH_ASKPASS and
+    // SSH_ASKPASS_REQUIRE are what make ssh call the helper — neither may be
+    // set, nor may the payload envs. (DISPLAY alone never triggers askpass, and
+    // the child inherits the parent's env, so DISPLAY is not asserted here —
+    // the pure `env_for(None)` unit test locks that the launcher adds nothing.)
+    for k in [
+        "SSH_ASKPASS",
+        "SSH_ASKPASS_REQUIRE",
+        "SSHRACK_ASKPASS_FILE",
+        "SSHRACK_KEYRING_KEY",
+    ] {
+        assert!(
+            !cap.env.contains_key(k),
+            "key-only host must not set askpass env {k}, got {:?}",
+            cap.env
+        );
+    }
 }
 
 /// The keyring path: the launcher sets `SSHRACK_KEYRING_KEY` (and NOT the
@@ -241,14 +240,15 @@ fn inline_source_stages_askpass_file_not_keyring() {
 /// keys each variant sets, independent of any shell shim quirks.
 #[test]
 fn env_for_seam_documents_env_shape_per_source() {
-    // None: triplet only, no payload.
+    // None: no askpass env at all. A key-only connection has no account
+    // password to inject, so ssh must NOT be pointed at our payload-less
+    // askpass helper — leaving SSH_ASKPASS unset lets ssh prompt at /dev/tty
+    // for an encrypted private key's passphrase itself.
     let none = connect::env_for(&PasswordSource::None);
-    let none_keys: std::collections::HashSet<&str> = none.iter().map(|(k, _)| *k).collect();
-    assert!(none_keys.contains("SSH_ASKPASS"));
-    assert!(none_keys.contains("SSH_ASKPASS_REQUIRE"));
-    assert!(none_keys.contains("DISPLAY"));
-    assert!(!none_keys.contains("SSHRACK_ASKPASS_FILE"));
-    assert!(!none_keys.contains("SSHRACK_KEYRING_KEY"));
+    assert!(
+        none.is_empty(),
+        "key-only connections set no askpass env, got {none:?}"
+    );
 
     // Keyring: triplet + keyring key, no file.
     let kr = connect::env_for(&PasswordSource::Keyring {

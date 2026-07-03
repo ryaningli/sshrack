@@ -29,14 +29,23 @@ pub fn current_exe() -> Result<PathBuf, SshrackError> {
 /// `None` for the keyring path (no temp file, no plaintext in this process) and
 /// the none path (no askpass payload at all).
 ///
-/// Always sets the `SSH_ASKPASS` triplet so ssh knows to fork the helper; the
-/// payload env (`SSHRACK_ASKPASS_FILE` vs `SSHRACK_KEYRING_KEY`) is what tells
-/// the helper which branch to take.
+/// For `Inline` and `Keyring` the `SSH_ASKPASS` triplet is set so ssh forks the
+/// helper, plus the payload env (`SSHRACK_ASKPASS_FILE` vs `SSHRACK_KEYRING_KEY`)
+/// that tells the helper which branch to take. For [`PasswordSource::None`] no
+/// env is set at all: a key-only connection has no account password to inject,
+/// and leaving askpass unset lets ssh prompt at `/dev/tty` for an encrypted
+/// private key's passphrase instead of calling this payload-less helper.
 fn askpass_env_for(
     self_exe: &Path,
     source: &PasswordSource,
     pw_file: Option<&Path>,
 ) -> Vec<(&'static str, String)> {
+    // Key-only / default-auth connection: nothing to inject. Leaving askpass
+    // unset lets ssh prompt at /dev/tty for an encrypted key's passphrase
+    // (otherwise ssh would call this payload-less helper and fail).
+    if matches!(source, PasswordSource::None) {
+        return Vec::new();
+    }
     let mut env: Vec<(&'static str, String)> = vec![
         ("SSH_ASKPASS", self_exe.to_string_lossy().into_owned()),
         ("SSH_ASKPASS_REQUIRE", "force".to_string()),
@@ -258,18 +267,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn env_for_none_has_required_keys_and_no_secret_env() {
-        // None (key/default-auth): SSH_ASKPASS triplet set, but neither the
-        // askpass file nor the keyring key — ssh uses the key/agent and the
-        // askpass role is never invoked.
+    fn env_for_none_sets_no_askpass_so_ssh_asks_passphrase_at_tty() {
+        // A key-only (or default) connection has no account password to inject, so
+        // ssh must NOT be pointed at our askpass helper: if the private key is
+        // encrypted, ssh would call askpass (which has no payload for a key-only
+        // connection) and fail. Leaving SSH_ASKPASS unset lets ssh fall back to
+        // /dev/tty and prompt the user for the key passphrase itself.
         let env = env_for(&PasswordSource::None);
-        let map: std::collections::HashMap<&str, &str> =
-            env.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        assert_eq!(map.get("SSH_ASKPASS").copied(), Some("/sshrack"));
-        assert_eq!(map.get("SSH_ASKPASS_REQUIRE").copied(), Some("force"));
-        assert_eq!(map.get("DISPLAY").copied(), Some(":0"));
-        assert!(!map.contains_key(ASKPASS_FILE_ENV));
-        assert!(!map.contains_key(KEYRING_KEY_ENV));
+        assert!(
+            env.is_empty(),
+            "key-only connections set no askpass env, got {env:?}"
+        );
     }
 
     #[test]
