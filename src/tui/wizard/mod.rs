@@ -362,24 +362,18 @@ pub(super) const CRED_VALUE_COL: u16 = 2 + 8 + 2;
 /// (one past the inserted char). Wizard text fields use this to type at the
 /// cursor rather than always appending. `cursor` beyond `s`'s char count
 /// clamps to the end (append). Pure aside from mutating `s`.
-#[allow(dead_code)]
 pub(super) fn insert_char_at(s: &mut String, cursor: usize, c: char) -> usize {
     let original_len = s.chars().count();
     let byte = char_byte_offset(s, cursor);
     s.insert(byte, c);
-    // If cursor was at or past the end, we inserted at the end, so return the new end.
-    // Otherwise return cursor + 1 (one past the inserted char).
-    if cursor >= original_len {
-        s.chars().count()
-    } else {
-        cursor + 1
-    }
+    // If cursor was at or past the end, we inserted at the end, so the new
+    // cursor is one past the original end. Otherwise it's one past the insert.
+    cursor.min(original_len) + 1
 }
 
 /// Delete the char immediately before the char-index `cursor` in `s`, returning
 /// the new cursor (one less), or the unchanged cursor when already at the
 /// start. Pure aside from mutating `s`.
-#[allow(dead_code)]
 pub(super) fn backspace_at(s: &mut String, cursor: usize) -> usize {
     if cursor == 0 {
         return 0;
@@ -397,7 +391,6 @@ pub(super) fn backspace_at(s: &mut String, cursor: usize) -> usize {
 
 /// Byte offset of the char at char-index `idx`, or `s.len()` when `idx` is at
 /// or past the end (so an insert appends). Pure.
-#[allow(dead_code)]
 fn char_byte_offset(s: &str, idx: usize) -> usize {
     s.char_indices()
         .nth(idx)
@@ -507,6 +500,7 @@ mod tests {
 
 #[cfg(test)]
 mod cursor_edit_tests {
+    //! Cursor-edit helper tests for insert_char_at / backspace_at.
     use super::{backspace_at, insert_char_at};
 
     #[test]

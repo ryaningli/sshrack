@@ -27,7 +27,7 @@ use super::super::intent::Outcome;
 use super::super::theme;
 use super::{
     AuthChoice, AuthKind, CredPicker, Field, HOST_VALUE_COL, PickerOutcome, SaveError,
-    SecretChoice, validate, value_spans,
+    SecretChoice, backspace_at, insert_char_at, validate, value_spans,
 };
 use crate::tui::fit::truncate_cells;
 use sshrack_core::config::schema::{Auth, CredentialBody, Host};
@@ -59,6 +59,9 @@ pub struct HostForm {
     pub password: Zeroizing<String>,
     /// Currently focused field.
     pub focus: Field,
+    /// Char-index cursor within the focused text field. Reset to the focused
+    /// field's end on focus change; clamped on read by [`cursor_target`].
+    pub(super) cursor: usize,
     /// A transient validation error to show under the bad field. Cleared on the
     /// next edit to that field. Set by `on_key` when a save attempt fails
     /// [`validate`](super::validate).
@@ -112,7 +115,7 @@ impl HostForm {
     /// Fresh add-mode form: Independent + None (zero-config default), focus Name.
     /// `credential_names` seeds the Reference chooser.
     pub fn new_add(credential_names: Vec<String>) -> Self {
-        Self {
+        let mut form = Self {
             name: String::new(),
             host_addr: String::new(),
             port: String::new(),
@@ -122,13 +125,16 @@ impl HostForm {
             identity: String::new(),
             password: Zeroizing::new(String::new()),
             focus: Field::Name,
+            cursor: 0,
             error: None,
             core_error: None,
             editing: false,
             orig_id: None,
             credential_names,
             cred_picker: None,
-        }
+        };
+        form.cursor = form.focused_text_len();
+        form
     }
 
     /// Edit-mode form prefilled from `host`. Reference → `Reference{idx}` (the
@@ -176,7 +182,7 @@ impl HostForm {
                 (AuthChoice::Independent, u, sk, iden)
             }
         };
-        Self {
+        let mut form = Self {
             name: host.name.clone(),
             host_addr: host.host.clone(),
             port: host.port.to_string(),
@@ -189,13 +195,16 @@ impl HostForm {
             // field empty on a Password-kind edit keeps the existing secret.
             password: Zeroizing::new(String::new()),
             focus: Field::Name,
+            cursor: 0,
             error: None,
             core_error: None,
             editing: true,
             orig_id: Some(host.id),
             credential_names,
             cred_picker: None,
-        }
+        };
+        form.cursor = form.focused_text_len();
+        form
     }
 
     /// Advance the auth chooser by `delta` (signed), wrapping. Pure. Does not
@@ -355,6 +364,7 @@ impl HostForm {
         let next = (cur + delta).rem_euclid(reachable.len() as i32) as usize;
         self.focus = reachable[next];
         self.error = None;
+        self.cursor = self.focused_text_len();
     }
 
     /// True when `field` is the last reachable field (Enter there submits).
@@ -367,9 +377,11 @@ impl HostForm {
     /// [`Outcome::SaveHost`].
     ///
     /// Bindings:
-    /// - printable char / `Backspace` → edit the focused text field (name, host,
-    ///   port, user, identity when secret_kind is IdentityKey, password when
-    ///   secret_kind is Password).
+    /// - printable char / `Backspace` → edit the focused text field at the
+    ///   in-field cursor (name, host, port, user, identity when secret_kind is
+    ///   IdentityKey, password when secret_kind is Password).
+    /// - `←`/`→`/`Home`/`End` (and `Ctrl-A`/`Ctrl-E`) → move the in-field cursor
+    ///   on text fields; clamped to the field's char length.
     /// - `Tab` / `↓` → next reachable field; `Shift-Tab` / `↑` → previous.
     /// - `Enter` → next reachable field, or — on the last reachable field —
     ///   attempt save (validate then signal [`Outcome::SaveHost`]); on
@@ -421,6 +433,15 @@ impl HostForm {
         match key.code {
             KeyCode::Esc => Outcome::Cancel,
             KeyCode::Char('s') if ctrl => self.attempt_save(),
+            // Ctrl-A / Ctrl-E alias Home / End on text fields.
+            KeyCode::Char('a') if ctrl => {
+                self.cursor = 0;
+                Outcome::Continue
+            }
+            KeyCode::Char('e') if ctrl => {
+                self.cursor = self.focused_text_len();
+                Outcome::Continue
+            }
             KeyCode::Tab | KeyCode::Down if !ctrl => {
                 self.move_focus(1);
                 Outcome::Continue
@@ -481,32 +502,53 @@ impl HostForm {
                 self.error = None;
                 Outcome::Continue
             }
+            // Text fields: ←/→ move the in-field cursor; Home/End jump.
+            // (Chooser rows are handled by the arms above.)
+            KeyCode::Left if !ctrl => {
+                self.cursor = self.cursor.saturating_sub(1);
+                Outcome::Continue
+            }
+            KeyCode::Right if !ctrl => {
+                self.cursor = self.cursor.min(self.focused_text_len());
+                Outcome::Continue
+            }
+            KeyCode::Home => {
+                self.cursor = 0;
+                Outcome::Continue
+            }
+            KeyCode::End => {
+                self.cursor = self.focused_text_len();
+                Outcome::Continue
+            }
             KeyCode::Backspace => {
-                self.edit_focused_pop();
+                self.edit_focused_backspace();
                 Outcome::Continue
             }
             KeyCode::Char(c) if !ctrl => {
-                self.edit_focused_push(c);
+                self.edit_focused_insert(c);
                 Outcome::Continue
             }
             _ => Outcome::Continue,
         }
     }
 
-    /// Append `c` to the focused text input. Auth / Secret are chooser rows
-    /// driven by ←/→; Password only accepts input when secret_kind is Password.
-    fn edit_focused_push(&mut self, c: char) {
+    /// Insert `c` at the in-field cursor (advancing it one past the inserted
+    /// char). Auth / Credential / Secret are chooser rows driven by ←/→; the
+    /// Password field only accepts input when secret_kind is Password.
+    fn edit_focused_insert(&mut self, c: char) {
         match self.focus {
-            Field::Name => self.name.push(c),
-            Field::Host => self.host_addr.push(c),
+            Field::Name => self.cursor = insert_char_at(&mut self.name, self.cursor, c),
+            Field::Host => self.cursor = insert_char_at(&mut self.host_addr, self.cursor, c),
             Field::Port => {
                 if c.is_ascii_digit() {
-                    self.port.push(c);
+                    self.cursor = insert_char_at(&mut self.port, self.cursor, c);
                 }
             }
-            Field::User => self.user.push(c),
-            Field::Identity => self.identity.push(c),
-            Field::Password if self.secret_kind == SecretChoice::Password => self.password.push(c),
+            Field::User => self.cursor = insert_char_at(&mut self.user, self.cursor, c),
+            Field::Identity => self.cursor = insert_char_at(&mut self.identity, self.cursor, c),
+            Field::Password if self.secret_kind == SecretChoice::Password => {
+                self.cursor = insert_char_at(&mut self.password, self.cursor, c)
+            }
             // Auth / Credential / Secret are chooser/trigger rows driven by ←/→
             // or Enter; no text entry.
             Field::Auth | Field::Credential | Field::Secret | Field::Password => {}
@@ -516,26 +558,17 @@ impl HostForm {
         }
     }
 
-    /// Pop one char from the focused text input (mirror of [`edit_focused_push`]).
-    fn edit_focused_pop(&mut self) {
+    /// Delete the char immediately before the in-field cursor (mirror of
+    /// [`edit_focused_insert`]). No-op when the cursor is already at the start.
+    fn edit_focused_backspace(&mut self) {
         match self.focus {
-            Field::Name => {
-                self.name.pop();
-            }
-            Field::Host => {
-                self.host_addr.pop();
-            }
-            Field::Port => {
-                self.port.pop();
-            }
-            Field::User => {
-                self.user.pop();
-            }
-            Field::Identity => {
-                self.identity.pop();
-            }
+            Field::Name => self.cursor = backspace_at(&mut self.name, self.cursor),
+            Field::Host => self.cursor = backspace_at(&mut self.host_addr, self.cursor),
+            Field::Port => self.cursor = backspace_at(&mut self.port, self.cursor),
+            Field::User => self.cursor = backspace_at(&mut self.user, self.cursor),
+            Field::Identity => self.cursor = backspace_at(&mut self.identity, self.cursor),
             Field::Password if self.secret_kind == SecretChoice::Password => {
-                self.password.pop();
+                self.cursor = backspace_at(&mut self.password, self.cursor)
             }
             Field::Auth | Field::Credential | Field::Secret | Field::Password => {}
         }
@@ -633,20 +666,33 @@ impl HostForm {
         }
     }
 
-    /// The `(row, value_offset)` where the terminal cursor should sit for the
-    /// focused field, or `None` for the Auth / Secret chooser rows. `row` is the
-    /// index into the reachable rendered rows; `offset` is the char count
-    /// already typed. Pure; [`HostForm::draw_in_dialog`] consumes it to call
-    /// `Frame::set_cursor_position`.
-    fn cursor_target(&self) -> Option<(usize, usize)> {
-        let row = self.focus_idx();
-        let offset = match self.focus {
+    /// Char count of the currently focused text field (0 for chooser rows).
+    fn focused_text_len(&self) -> usize {
+        match self.focus {
             Field::Name => self.name.chars().count(),
             Field::Host => self.host_addr.chars().count(),
             Field::Port => self.port.chars().count(),
             Field::User => self.user.chars().count(),
             Field::Identity => self.identity.chars().count(),
             Field::Password => self.password.chars().count(),
+            Field::Auth | Field::Credential | Field::Secret => 0,
+        }
+    }
+
+    /// The `(row, value_offset)` where the terminal cursor should sit for the
+    /// focused field, or `None` for the Auth / Secret chooser rows. `row` is the
+    /// index into the reachable rendered rows; `offset` is the stored char-index
+    /// cursor, clamped to the field's current length. Pure; consumed by
+    /// [`HostForm::draw_in_dialog`] to call `Frame::set_cursor_position`.
+    fn cursor_target(&self) -> Option<(usize, usize)> {
+        let row = self.focus_idx();
+        let offset = match self.focus {
+            Field::Name => self.cursor.min(self.name.chars().count()),
+            Field::Host => self.cursor.min(self.host_addr.chars().count()),
+            Field::Port => self.cursor.min(self.port.chars().count()),
+            Field::User => self.cursor.min(self.user.chars().count()),
+            Field::Identity => self.cursor.min(self.identity.chars().count()),
+            Field::Password => self.cursor.min(self.password.chars().count()),
             Field::Auth | Field::Credential | Field::Secret => return None,
         };
         Some((row, offset))
@@ -801,6 +847,10 @@ mod tests {
         let mut f = blank_form();
         f.name = name.into();
         f.host_addr = host.into();
+        // Keep the cursor consistent with the pre-filled Name (mirrors what
+        // move_focus / construction do), so backspace / cursor_target behave as
+        // if the user had just typed the value.
+        f.cursor = f.focused_text_len();
         f
     }
 
@@ -822,6 +872,9 @@ mod tests {
         let mut f = blank_form();
         f.focus = Field::Host;
         f.host_addr = "10.0.0.5".into();
+        // Sync the cursor to the end of the pre-filled Host field, as if the
+        // user had just typed it — cursor_target then reports that position.
+        f.cursor = f.focused_text_len();
         // Independent + None: reachable rows are Name(0)/Host(1)/Port(2)/Auth(3)/User(4)/Secret(5).
         assert_eq!(f.cursor_target(), Some((1, 8)));
     }
@@ -846,6 +899,7 @@ mod tests {
         f.secret_kind = SecretChoice::Password;
         f.focus = Field::Password;
         f.password = Zeroizing::new("hunter2".into());
+        f.cursor = f.focused_text_len();
         // Independent + Password: Name(0)/Host(1)/Port(2)/Auth(3)/User(4)/Secret(5)/Password(6).
         assert_eq!(f.cursor_target(), Some((6, 7)));
     }
@@ -856,6 +910,7 @@ mod tests {
         f.secret_kind = SecretChoice::IdentityKey;
         f.focus = Field::Identity;
         f.identity = "/k/id".into();
+        f.cursor = f.focused_text_len();
         // Independent + IdentityKey: rows end with Identity at index 6.
         assert_eq!(f.cursor_target(), Some((6, 5)));
     }
@@ -1419,6 +1474,7 @@ mod tests {
         f.host_addr = "10.0.0.1".into();
         f.auth_choice = AuthChoice::Independent;
         f.secret_kind = secret;
+        f.cursor = f.focused_text_len();
         f
     }
 
@@ -1582,5 +1638,111 @@ mod tests {
             AuthChoice::Reference { idx: 0 },
             "dangling ref falls back to idx 0"
         );
+    }
+
+    // ---- in-field cursor movement (Task 2: RED -> GREEN) ----
+
+    #[test]
+    fn left_arrow_moves_cursor_within_a_text_field() {
+        let mut form = HostForm::new_add(vec![]);
+        // Type "abc" into Name (focus starts on Name).
+        for c in "abc".chars() {
+            form.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(form.name, "abc");
+        assert_eq!(form.cursor, 3);
+        // Left moves the cursor back to 2 without changing the text.
+        form.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(form.name, "abc");
+        assert_eq!(form.cursor, 2);
+        // cursor_target reports the stored cursor, not the tail.
+        assert_eq!(form.cursor_target(), Some((0, 2)));
+    }
+
+    #[test]
+    fn typing_inserts_at_cursor_not_tail() {
+        let mut form = HostForm::new_add(vec![]);
+        for c in "abc".chars() {
+            form.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        // Move cursor to start, then type 'X' -> "Xabc".
+        form.on_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        form.on_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE));
+        assert_eq!(form.name, "Xabc");
+        assert_eq!(form.cursor, 1);
+    }
+
+    #[test]
+    fn backspace_deletes_before_cursor_not_tail() {
+        let mut form = HostForm::new_add(vec![]);
+        for c in "abc".chars() {
+            form.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        // cursor at end (3). Left twice -> cursor 1. Backspace deletes 'a' -> "bc".
+        form.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        form.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        form.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(form.name, "bc");
+        assert_eq!(form.cursor, 0);
+    }
+
+    #[test]
+    fn right_arrow_clamps_to_value_length() {
+        let mut form = HostForm::new_add(vec![]);
+        for c in "ab".chars() {
+            form.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        // cursor at end (2). Right must not overshoot.
+        form.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(form.cursor, 2);
+    }
+
+    #[test]
+    fn home_and_end_jump_cursor() {
+        let mut form = HostForm::new_add(vec![]);
+        for c in "abc".chars() {
+            form.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        form.on_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(form.cursor, 0);
+        form.on_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(form.cursor, 3);
+    }
+
+    #[test]
+    fn ctrl_a_and_ctrl_e_alias_home_and_end() {
+        let mut form = HostForm::new_add(vec![]);
+        for c in "abc".chars() {
+            form.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        form.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(form.cursor, 0);
+        form.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert_eq!(form.cursor, 3);
+    }
+
+    #[test]
+    fn move_focus_resets_cursor_to_new_field_end() {
+        let mut form = HostForm::new_add(vec![]);
+        for c in "web".chars() {
+            form.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        // Tab to Host (empty field) and back to Name — cursor must land on Name's end.
+        form.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        form.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
+        assert_eq!(form.cursor, 3);
+    }
+
+    #[test]
+    fn left_right_still_cycle_on_auth_row_not_move_text_cursor() {
+        let mut form = HostForm::new_add(vec![]);
+        // Focus Auth, then Left must cycle (to Reference) — cursor stays 0 (chooser).
+        form.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // Name -> Host
+        form.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // Host -> Port
+        form.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // Port -> Auth
+        // sanity: focus is Auth
+        assert_eq!(form.focus, Field::Auth);
+        form.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert!(matches!(form.auth_choice, AuthChoice::Reference { .. }));
     }
 }
