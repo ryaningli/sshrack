@@ -27,7 +27,7 @@ use super::super::intent::Outcome;
 use super::super::theme;
 use super::{
     AuthChoice, AuthKind, CredPicker, Field, HOST_VALUE_COL, PickerOutcome, SaveError,
-    SecretChoice, backspace_at, insert_char_at, validate, value_spans,
+    SecretChoice, backspace_at, bracketed, insert_char_at, validate, value_spans,
 };
 use crate::tui::fit::truncate_cells;
 use sshrack_core::config::schema::{Auth, CredentialBody, Host};
@@ -770,11 +770,10 @@ impl HostForm {
             Field::User => (self.user.clone(), Some("root (default)")),
             Field::Auth => {
                 let v = match &self.auth_choice {
-                    AuthChoice::Independent => "Independent".to_string(),
-                    AuthChoice::Reference { idx } => match self.credential_names.get(*idx) {
-                        Some(name) => format!("Reference: {name}"),
-                        None => "Reference: <none defined>".to_string(),
-                    },
+                    AuthChoice::Independent => bracketed("Independent"),
+                    // The Credential row below already shows the chosen name, so
+                    // Auth only shows the mode (no ": <name>" suffix).
+                    AuthChoice::Reference { .. } => bracketed("Reference"),
                 };
                 let ph = match self.auth_choice {
                     AuthChoice::Independent => Some("<- -> cycle to Reference"),
@@ -800,7 +799,7 @@ impl HostForm {
                 (v, ph)
             }
             Field::Secret => {
-                let v = self.secret_kind.label().to_string();
+                let v = bracketed(self.secret_kind.label());
                 let ph = match self.secret_kind {
                     SecretChoice::None => Some("<- -> cycle: Password / IdentityKey / None"),
                     SecretChoice::Password => Some("type the password below"),
@@ -1744,5 +1743,35 @@ mod tests {
         assert_eq!(form.focus, Field::Auth);
         form.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
         assert!(matches!(form.auth_choice, AuthChoice::Reference { .. }));
+    }
+
+    // ---- row_value_and_placeholder: chooser values are bracketed (Task 6: RED -> GREEN) ----
+
+    #[test]
+    fn auth_reference_value_drops_credential_name_and_is_bracketed() {
+        // The dedicated Credential row below already shows the chosen name, so
+        // the Auth row only shows the bracketed mode — no ": <name>" suffix.
+        let mut form = HostForm::new_add(vec![]);
+        form.credential_names = vec!["srv-cred".to_string()];
+        form.auth_choice = AuthChoice::Reference { idx: 0 };
+        let (value, _placeholder) = form.row_value_and_placeholder(Field::Auth);
+        assert_eq!(value, "< Reference >");
+    }
+
+    #[test]
+    fn auth_independent_value_is_bracketed() {
+        let mut form = HostForm::new_add(vec![]);
+        form.auth_choice = AuthChoice::Independent;
+        let (value, _placeholder) = form.row_value_and_placeholder(Field::Auth);
+        assert_eq!(value, "< Independent >");
+    }
+
+    #[test]
+    fn secret_value_is_bracketed() {
+        let mut form = HostForm::new_add(vec![]);
+        form.auth_choice = AuthChoice::Independent;
+        form.secret_kind = SecretChoice::Password;
+        let (value, _placeholder) = form.row_value_and_placeholder(Field::Secret);
+        assert_eq!(value, "< Password >");
     }
 }

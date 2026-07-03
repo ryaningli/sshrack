@@ -347,6 +347,15 @@ pub(super) fn value_spans(value: &str, placeholder: Option<&str>) -> Vec<Span<'s
     }
 }
 
+/// Wrap a cycleable chooser's label in `< Label >` so the angle brackets
+/// signal to the user that the value can be switched left/right. Used by the
+/// Auth (Independent/Reference) and Secret (None/Password/IdentityKey) rows in
+/// both forms. The caller passes the bare one-word label ([`SecretChoice::label`]
+/// or a fixed `"Independent"` / `"Reference"`); this adds the brackets.
+pub(super) fn bracketed(label: &str) -> String {
+    format!("< {label} >")
+}
+
 /// Column where the editable value begins within a rendered field row:
 /// `"▶ " (2) + right-aligned label + ": " (2)`. Host labels are padded to 9
 /// (the longest host label is `Credential` = 9); credential-wizard labels stay
@@ -580,5 +589,27 @@ mod cursor_edit_tests {
         let cur = backspace_at(&mut s, 1);
         assert_eq!(s, "文");
         assert_eq!(cur, 0);
+    }
+}
+
+#[cfg(test)]
+mod bracket_tests {
+    //! Tests for the `bracketed` chooser-label wrapper. The Auth (Independent /
+    //! Reference) and Secret (None / Password / IdentityKey) rows both render
+    //! their current value as `< Label >` so the angle brackets signal that the
+    //! value can be switched left/right.
+    use super::bracketed;
+
+    #[test]
+    fn bracketed_wraps_label_with_spaced_angle_brackets() {
+        assert_eq!(bracketed("Independent"), "< Independent >");
+        assert_eq!(bracketed("Password"), "< Password >");
+    }
+
+    #[test]
+    fn bracketed_empty_is_two_spaces() {
+        // format!("< {label} >") with an empty label leaves two spaces between
+        // the brackets. Pinned so a future refactor doesn't accidentally trim.
+        assert_eq!(bracketed(""), "<  >");
     }
 }

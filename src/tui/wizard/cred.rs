@@ -21,8 +21,8 @@ use zeroize::Zeroizing;
 use super::super::intent::Outcome;
 use super::super::theme;
 use super::{
-    CRED_VALUE_COL, CredField, CredSaveError, SecretChoice, backspace_at, insert_char_at,
-    validate_cred, value_spans,
+    CRED_VALUE_COL, CredField, CredSaveError, SecretChoice, backspace_at, bracketed,
+    insert_char_at, validate_cred, value_spans,
 };
 use crate::tui::fit::truncate_cells;
 use sshrack_core::config::schema::{Credential, CredentialBody};
@@ -539,7 +539,7 @@ impl CredForm {
             CredField::User => (self.user.clone(), Some("e.g. deploy")),
             CredField::Identity => (self.identity.clone(), Some("path to a private key")),
             CredField::SecretKind => {
-                let v = self.secret_kind.label().to_string();
+                let v = bracketed(self.secret_kind.label());
                 let ph = match self.secret_kind {
                     SecretChoice::None => Some("<- -> cycle: Password / IdentityKey / None"),
                     SecretChoice::Password => Some("type the password below"),
@@ -1200,5 +1200,15 @@ mod tests {
         let reachable = form.reachable_fields();
         assert!(reachable.contains(&CredField::Password));
         assert!(!reachable.contains(&CredField::Identity));
+    }
+
+    // ---- row_value_and_placeholder: secret-kind value is bracketed (Task 6: RED -> GREEN) ----
+
+    #[test]
+    fn secretkind_value_is_bracketed() {
+        let mut form = CredForm::new_add();
+        form.secret_kind = SecretChoice::IdentityKey;
+        let (value, _placeholder) = form.row_value_and_placeholder(CredField::SecretKind);
+        assert_eq!(value, "< IdentityKey >");
     }
 }
