@@ -35,8 +35,10 @@ pub fn count_label(matched: usize, total: usize) -> String {
 
 /// Render the search input as a bordered box: `❯ <query>` on the left, the
 /// [`count_label`] right-aligned, both inside a 3-row bordered band (top border,
-/// one content row, bottom border). The terminal cursor is placed right after
-/// the query. `matched` is the filtered (post-query) list length, `total` the
+/// one content row, bottom border). When `show_cursor` is true the terminal
+/// cursor is placed right after the query; when false it is suppressed (used
+/// when an overlay owns the screen, so the panel does not fight the overlay's
+/// cursor). `matched` is the filtered (post-query) list length, `total` the
 /// full list length. Callers give this a `Length(3)` band.
 pub fn draw_search_box(
     frame: &mut Frame,
