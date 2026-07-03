@@ -314,6 +314,7 @@ impl Launcher {
     /// under the marker. There is no dark-background selection bar — the
     /// marker + bold is the whole signal, matching the wizard's focused-field
     /// marker.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_in_shell(
         &self,
         frame: &mut Frame,
@@ -322,6 +323,7 @@ impl Launcher {
         frecency: &Frecency,
         credentials: &[Credential],
         status: &Status,
+        show_cursor: bool,
     ) {
         let [search_band, list_area, status_area] = Layout::vertical([
             Constraint::Length(3),
@@ -336,6 +338,7 @@ impl Launcher {
             &self.query,
             self.ranked.len(),
             hosts.len(),
+            show_cursor,
         );
 
         self.draw_list(frame, list_area, hosts, frecency, credentials);
@@ -843,6 +846,7 @@ mod tests {
                 &frecency,
                 &empty_creds(),
                 &crate::tui::intent::Status::empty(),
+                true,
             );
         })
         .unwrap();
@@ -891,6 +895,7 @@ mod tests {
                 &frecency,
                 &empty_creds(),
                 &crate::tui::intent::Status::empty(),
+                true,
             );
         })
         .unwrap();

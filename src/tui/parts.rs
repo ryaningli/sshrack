@@ -38,7 +38,14 @@ pub fn count_label(matched: usize, total: usize) -> String {
 /// one content row, bottom border). The terminal cursor is placed right after
 /// the query. `matched` is the filtered (post-query) list length, `total` the
 /// full list length. Callers give this a `Length(3)` band.
-pub fn draw_search_box(frame: &mut Frame, area: Rect, query: &str, matched: usize, total: usize) {
+pub fn draw_search_box(
+    frame: &mut Frame,
+    area: Rect,
+    query: &str,
+    matched: usize,
+    total: usize,
+    show_cursor: bool,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::new().dim())
@@ -65,11 +72,17 @@ pub fn draw_search_box(frame: &mut Frame, area: Rect, query: &str, matched: usiz
         count_area,
     );
 
-    // The terminal cursor sits right after the 2-cell `❯ ` prefix, inside the
-    // box's content row. `inner` is already inset by border + padding.
-    let cursor_x = inner.x + 2 + query.chars().count() as u16;
-    let max_x = inner.x + inner.width.saturating_sub(1);
-    frame.set_cursor_position((cursor_x.min(max_x), inner.y));
+    // Only place the terminal cursor when no overlay is open. When an overlay
+    // owns the screen (e.g. a wizard focused on a chooser row that has no text
+    // cursor), the search box must stay silent — otherwise its cursor from
+    // earlier in the same frame bleeds through the overlay.
+    if show_cursor {
+        // The terminal cursor sits right after the 2-cell `❯ ` prefix, inside
+        // the box's content row. `inner` is already inset by border + padding.
+        let cursor_x = inner.x + 2 + query.chars().count() as u16;
+        let max_x = inner.x + inner.width.saturating_sub(1);
+        frame.set_cursor_position((cursor_x.min(max_x), inner.y));
+    }
 }
 
 /// Render the consolidated status as the bottom row of a panel's area: a dim
@@ -114,5 +127,46 @@ mod tests {
     fn count_label_shows_zero_when_nothing_matches() {
         // A query that matches nothing still shows 0 over the total.
         assert_eq!(count_label(0, 3), "0/3");
+    }
+}
+
+#[cfg(test)]
+mod search_cursor_tests {
+    use ratatui::{
+        Terminal,
+        backend::{Backend, TestBackend},
+    };
+
+    use super::draw_search_box;
+
+    /// When the shell renders under an overlay, the search box must NOT place the
+    /// terminal cursor (otherwise it bleeds through the overlay, which owns the
+    /// cursor whenever a chooser — non-text — row is focused). Comparing a
+    /// `show_cursor=true` draw against a `show_cursor=false` draw and asserting
+    /// the cursor y differs is robust to `TestBackend`'s default cursor position.
+    #[test]
+    fn show_cursor_false_does_not_place_cursor_where_true_does() {
+        let mut on = Terminal::new(TestBackend::new(60, 6)).unwrap();
+        on.draw(|f| draw_search_box(f, f.area(), "abc", 1, 2, true))
+            .unwrap();
+        let on_y = on
+            .backend_mut()
+            .get_cursor_position()
+            .map(|p| p.y)
+            .unwrap_or(0);
+
+        let mut off = Terminal::new(TestBackend::new(60, 6)).unwrap();
+        off.draw(|f| draw_search_box(f, f.area(), "abc", 1, 2, false))
+            .unwrap();
+        let off_y = off
+            .backend_mut()
+            .get_cursor_position()
+            .map(|p| p.y)
+            .unwrap_or(0);
+
+        assert_ne!(
+            on_y, off_y,
+            "show_cursor=false must NOT place the cursor where show_cursor=true does"
+        );
     }
 }

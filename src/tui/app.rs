@@ -880,12 +880,14 @@ impl App {
                 &self.frecency,
                 &self.config.credentials,
                 &self.status,
+                self.overlay.is_none(),
             ),
             Tab::Credentials => self.cred_panel.draw_in_shell(
                 frame,
                 panel_area,
                 &self.config.credentials,
                 &self.status,
+                self.overlay.is_none(),
             ),
             Tab::Settings => self.settings_panel.draw_in_shell(
                 frame,

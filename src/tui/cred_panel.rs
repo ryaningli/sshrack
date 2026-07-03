@@ -172,6 +172,7 @@ impl CredPanel {
         area: ratatui::layout::Rect,
         creds: &[Credential],
         status: &Status,
+        show_cursor: bool,
     ) {
         let [search_band, list_area, status_area] = Layout::vertical([
             Constraint::Length(3),
@@ -186,6 +187,7 @@ impl CredPanel {
             &self.query,
             self.ranked.len(),
             creds.len(),
+            show_cursor,
         );
 
         self.draw_list(frame, list_area, creds);
@@ -584,7 +586,7 @@ mod tests {
                 crate::tui::tab::Tab::Credentials,
                 &[("Enter", "edit"), ("^A", "add")],
             );
-            p.draw_in_shell(f, area, &creds, &crate::tui::intent::Status::empty());
+            p.draw_in_shell(f, area, &creds, &crate::tui::intent::Status::empty(), true);
         })
         .unwrap();
 
