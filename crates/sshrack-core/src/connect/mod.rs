@@ -107,6 +107,121 @@ fn write_password_file(pw: &Zeroizing<String>) -> Result<PathBuf, SshrackError> 
     Ok(path)
 }
 
+/// Temp files holding a pasted identity key, written so `ssh -i` can read them.
+/// `Drop` best-effort deletes both files so the plaintext does not outlive the
+/// ssh process. The private key is `0600`; the certificate sits beside it as
+/// `<private>-cert.pub` (the OpenSSH auto-load convention). The paths embed the
+/// pid + nanos so concurrent connections never collide.
+///
+/// Built by the connect orchestration from [`crate::credential::InlineKeyMaterial`]
+/// when a host's key source is inline (pasted). The caller fills
+/// [`crate::credential::ResolvedAuth::key_path`] with [`KeyArtifact::private_path`]
+/// so argv assembly points `ssh -i` at the temp file, then holds the artifact
+/// across `launch` so `Drop` runs only after ssh exits.
+pub struct KeyArtifact {
+    private: PathBuf,
+    cert: Option<PathBuf>,
+}
+
+impl KeyArtifact {
+    /// Write `private` (and an optional `certificate`) to fresh `0600` temp
+    /// files in the std temp dir. Returns the artifact; dropping it removes the
+    /// files. The private path is what the caller passes to `ssh -i`.
+    pub fn write(
+        private: &Zeroizing<String>,
+        certificate: Option<&Zeroizing<String>>,
+    ) -> Result<Self, SshrackError> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let private_path =
+            std::env::temp_dir().join(format!("sshrack-key-{}-{}.pem", std::process::id(), nanos,));
+        let private_err = |source: std::io::Error| SshrackError::AskpassWrite {
+            path: private_path.clone(),
+            source,
+        };
+        // Atomic create_new + 0600: no window where the file exists with
+        // umask-permitted perms, and no clobbering an existing file.
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&private_path)
+            .map_err(private_err)?;
+        f.write_all(private.as_bytes()).map_err(|e| {
+            // Best-effort cleanup so a partial private file never survives.
+            let _ = std::fs::remove_file(&private_path);
+            private_err(e)
+        })?;
+
+        // Certificate, if any: write beside the private key as <name>-cert.pub
+        // so `ssh -i <private>` auto-loads it. Same 0600 perms — the cert is
+        // sensitive (it identifies the holder) even though it is public-signed.
+        let cert_path = if let Some(cert) = certificate {
+            let cert_name = private_path
+                .file_name()
+                .map(std::ffi::OsStr::to_string_lossy)
+                .map(|s| format!("{s}-cert.pub"))
+                .unwrap_or_else(|| "sshrack-key-cert.pub".to_string());
+            let cp = private_path.with_file_name(cert_name);
+            let cert_err = |source: std::io::Error| SshrackError::AskpassWrite {
+                path: cp.clone(),
+                source,
+            };
+            let mut cf = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&cp)
+                .map_err(|e| {
+                    // Roll back the private file so a cert-open failure does not
+                    // leave an orphaned private key on disk.
+                    let _ = std::fs::remove_file(&private_path);
+                    SshrackError::AskpassWrite {
+                        path: cp.clone(),
+                        source: e,
+                    }
+                })?;
+            cf.write_all(cert.as_bytes()).map_err(|e| {
+                let _ = std::fs::remove_file(&private_path);
+                let _ = std::fs::remove_file(&cp);
+                cert_err(e)
+            })?;
+            Some(cp)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            private: private_path,
+            cert: cert_path,
+        })
+    }
+
+    /// The path to pass to `ssh -i`. The certificate (if any) lives beside it
+    /// as `<private>-cert.pub` and is auto-loaded by ssh.
+    pub fn private_path(&self) -> &Path {
+        &self.private
+    }
+}
+
+impl Drop for KeyArtifact {
+    fn drop(&mut self) {
+        // Best-effort: a failed removal (e.g. tmp cleared mid-flight) is
+        // swallowed so Drop never panics. Both files are wiped so neither the
+        // private key nor the certificate outlives the connection.
+        let _ = std::fs::remove_file(&self.private);
+        if let Some(c) = &self.cert {
+            let _ = std::fs::remove_file(c);
+        }
+    }
+}
+
 /// Run `argv` to completion. stdio is INHERITED — ssh talks straight to the
 /// user's terminal; we are not in the data path. Password delivery depends on
 /// `source` (see the [module docs](self)): `Inline` writes a 0600 temp file,
@@ -211,5 +326,75 @@ mod tests {
         let back = std::fs::read_to_string(&path).unwrap();
         assert_eq!(back, "s3cret");
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- Task 3: KeyArtifact materialization for inline identity keys ----
+
+    #[test]
+    fn key_artifact_writes_private_and_cert_siblings_then_cleanup_removes_both() {
+        // ssh -i <private> auto-loads <private>-cert.pub, so the cert must sit
+        // beside the private key with that exact suffix. Drop must remove both
+        // temp files so the plaintext does not outlive the connection.
+        use std::cell::RefCell;
+        let priv_text = Zeroizing::new("PRIVATE-KEY-TEXT".into());
+        let cert_text = Zeroizing::new("CERTIFICATE-TEXT".into());
+        let paths: RefCell<Vec<std::path::PathBuf>> = RefCell::new(vec![]);
+        {
+            let a = KeyArtifact::write(&priv_text, Some(&cert_text)).unwrap();
+            let p = a.private_path().to_path_buf();
+            assert!(p.exists(), "private key temp file must exist at {p:?}");
+            let cert_sibling = p.with_file_name(format!(
+                "{}-cert.pub",
+                p.file_name()
+                    .expect("invariant: temp path always has a file name")
+                    .to_string_lossy()
+            ));
+            assert!(
+                cert_sibling.exists(),
+                "cert sibling must exist at {cert_sibling:?}"
+            );
+            *paths.borrow_mut() = vec![p, cert_sibling];
+            // Files carry the material exactly.
+            assert_eq!(
+                std::fs::read_to_string(&paths.borrow()[0]).unwrap(),
+                "PRIVATE-KEY-TEXT"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&paths.borrow()[1]).unwrap(),
+                "CERTIFICATE-TEXT"
+            );
+        }
+        // After Drop (scope exit), both temp files are gone.
+        for p in paths.borrow().iter() {
+            assert!(!p.exists(), "temp file {p:?} should be removed after drop");
+        }
+    }
+
+    #[test]
+    fn key_artifact_private_only_when_no_certificate() {
+        // No certificate: only the private temp file is created, and Drop
+        // removes just that one.
+        let priv_text = Zeroizing::new("ONLY-KEY".into());
+        let path = {
+            let a = KeyArtifact::write(&priv_text, None).unwrap();
+            a.private_path().to_path_buf()
+        };
+        assert!(
+            !path.exists(),
+            "private temp file should be removed after drop"
+        );
+    }
+
+    #[test]
+    fn key_artifact_private_file_is_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let priv_text = Zeroizing::new("K".into());
+        let a = KeyArtifact::write(&priv_text, None).unwrap();
+        let mode = std::fs::metadata(a.private_path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }

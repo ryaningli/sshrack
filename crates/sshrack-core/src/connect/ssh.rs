@@ -79,6 +79,7 @@ mod tests {
             user: "deploy".into(),
             key_path: Some(PathBuf::from("~/.ssh/id_ed25519")),
             password: PasswordSource::None,
+            inline_key: None,
         }
     }
 
