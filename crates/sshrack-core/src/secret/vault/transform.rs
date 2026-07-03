@@ -208,15 +208,17 @@ impl<'a> SecretOwner<'a> {
     }
 }
 
-/// Re-host every stored password into `target`. For each body that carries a
-/// password, extract its plaintext — inline plaintext, an inline `Encrypted`
+/// Re-host every stored secret into `target`. For each body that carries a
+/// secret, extract its plaintext — inline plaintext, an inline `Encrypted`
 /// secret decrypted with `source_vault_key`, or a `keyring = true` marker body
 /// fetched from the OS keyring — then re-seal it for the target mode and clean
 /// up the source representation (deleting the keyring entry when leaving
-/// keyring mode). Bodies without a password are skipped. Returns the count
-/// migrated.
+/// keyring mode). Both `body.password` and the inline key's `private_key` /
+/// `certificate` are re-sealed; path keys and default bodies are skipped.
+/// Returns the count of bodies migrated (a body counts once if any of its
+/// secrets was re-sealed).
 ///
-/// Representation-driven (reads each body's `password`/`keyring`), not
+/// Representation-driven (reads each body's `password`/`key`/`keyring`), not
 /// mode-driven, so it is self-healing across mixed states and handles every
 /// source→target edge uniformly. `source_vault_key` decrypts Encrypted source
 /// bodies; `target_vault_key` encrypts when the target is vault. An Encrypted
@@ -268,12 +270,40 @@ pub fn migrate(
     Ok(n)
 }
 
-/// Migrate one body's password into `target`. Returns `true` if the body had a
-/// password (counted), `false` if it was skipped. See [`migrate`].
+/// Migrate one body's secrets (password and/or inline key) into `target`.
+/// Returns `true` if the body carried any re-sealable secret (counted once),
+/// `false` if it was skipped (path key, default body). See [`migrate`].
 ///
 /// `owner` selects the keyring account (kind + id) and carries the name label
 /// attached to a decryption failure (never the secret).
 fn migrate_body(
+    body: &mut CredentialBody,
+    owner: &SecretOwner<'_>,
+    target: &SecretStore,
+    source_vault_key: Option<&VaultKey>,
+    target_vault_key: Option<&VaultKey>,
+    backend: &dyn SecretBackend,
+) -> Result<bool, SshrackError> {
+    // Re-seal the password (if any) and the inline key (if any) independently.
+    // A body counts once if either path actually re-sealed a secret: per
+    // CredentialBody::validate password and key are mutually exclusive, so at
+    // most one arm returns true in a valid config.
+    let pw = migrate_body_password(
+        body,
+        owner,
+        target,
+        source_vault_key,
+        target_vault_key,
+        backend,
+    )?;
+    let key = migrate_body_inline_key(body, owner, target, source_vault_key, target_vault_key)?;
+    Ok(pw || key)
+}
+
+/// Re-host the body's `password` (or keyring-marker password) into `target`.
+/// Returns `true` if the body had a password (counted), `false` if not. See
+/// [`migrate_body`].
+fn migrate_body_password(
     body: &mut CredentialBody,
     owner: &SecretOwner<'_>,
     target: &SecretStore,
@@ -315,6 +345,99 @@ fn migrate_body(
         let _ = backend.delete(owner.kind, &owner.id);
     }
     Ok(true)
+}
+
+/// Re-host an inline key's `private_key` and `certificate` into `target`,
+/// mirroring [`migrate_body_password`]'s per-target re-sealing. Returns `true`
+/// if the body carried an inline key (counted), `false` for path keys / no key.
+///
+/// Path keys ([`KeySource::Path`]) are filesystem locations, not secret
+/// material — they pass through untouched. Keyring targets never reach here in
+/// a valid config: [`CredentialBody::validate`] rejects an inline key under
+/// keyring storage. Defensively, this helper leaves the inline key unchanged
+/// rather than crash if that invariant is somehow violated.
+fn migrate_body_inline_key(
+    body: &mut CredentialBody,
+    owner: &SecretOwner<'_>,
+    target: &SecretStore,
+    source_vault_key: Option<&VaultKey>,
+    target_vault_key: Option<&VaultKey>,
+) -> Result<bool, SshrackError> {
+    let Some(KeySource::Inline(ik)) = &mut body.key else {
+        // Path key or no key: not secret material to migrate.
+        return Ok(false);
+    };
+    // Inline key text cannot live in the OS keyring in this MVP (validate
+    // rejects it), so a keyring target has no re-seal to perform. Defend in
+    // depth by leaving the material untouched rather than crashing; the body
+    // still counts as "had an inline key" so a caller monitoring the count
+    // sees something happened.
+    if matches!(target, SecretStore::Keyring) {
+        return Ok(true);
+    }
+    ik.private_key = re_seal_inline_secret(
+        ik.private_key.take(),
+        target,
+        source_vault_key,
+        target_vault_key,
+        owner,
+    )?;
+    ik.certificate = re_seal_inline_secret(
+        ik.certificate.take(),
+        target,
+        source_vault_key,
+        target_vault_key,
+        owner,
+    )?;
+    Ok(true)
+}
+
+/// Re-seal one inline-key [`Secret`] (private_key or certificate) per `target`.
+/// Mirrors the password arm of [`migrate_body_password`]:
+/// - `Plain` under plaintext target → stays `Plain`.
+/// - `Plain` under vault target → `Encrypted` under `target_vault_key`.
+/// - `Encrypted` → decrypt with `source_vault_key` first, then re-seal per
+///   target (plaintext → `Plain`; vault → `Encrypted` under the target key).
+/// - `None` → stays `None`.
+///
+/// `owner.name_label` tags a decryption failure (never the secret). The
+/// Keyring arm is unreachable in valid configs ([`migrate_body_inline_key`]
+/// short-circuits); it returns the plaintext untouched as the least-bad
+/// defensive fallback.
+fn re_seal_inline_secret(
+    secret: Option<Secret>,
+    target: &SecretStore,
+    source_vault_key: Option<&VaultKey>,
+    target_vault_key: Option<&VaultKey>,
+    owner: &SecretOwner<'_>,
+) -> Result<Option<Secret>, SshrackError> {
+    let Some(secret) = secret else {
+        return Ok(None);
+    };
+    let plain = match secret {
+        Secret::Plain(p) => Zeroizing::new(p),
+        Secret::Encrypted(enc) => {
+            // crypto::decrypt fails with a fieldless DecryptError; attach the
+            // name and discard crypto detail (no decryption oracle).
+            let key = source_vault_key.ok_or(SshrackError::VaultLocked)?;
+            crypto::decrypt(&enc, key).map_err(|_| SshrackError::DecryptionFailed {
+                name: owner.name_label.to_string(),
+            })?
+        }
+    };
+    let resealed = match target {
+        SecretStore::Plaintext => Secret::Plain(plain.to_string()),
+        SecretStore::Vault { .. } => {
+            let key = target_vault_key.ok_or(SshrackError::VaultLocked)?;
+            Secret::Encrypted(crypto::encrypt(plain.as_bytes(), key)?)
+        }
+        SecretStore::Keyring => {
+            // Unreachable: migrate_body_inline_key short-circuits on Keyring
+            // targets. Keep the plaintext rather than crash.
+            Secret::Plain(plain.to_string())
+        }
+    };
+    Ok(Some(resealed))
 }
 
 /// Extract a body's password as wiped plaintext, from whichever representation
@@ -668,6 +791,192 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "entry keyed by id must be gone after leaving keyring"
+        );
+    }
+
+    // ---- migrate: inline identity keys are re-sealed across mode switches ----
+    //
+    // A pre-existing gap: migrate_body re-sealed only body.password, so an
+    // inline key saved earlier under plaintext mode was NOT encrypted when the
+    // user later ran `store use vault` / `store rekey`. These tests lock the
+    // fix: both private_key and certificate re-seal across plaintext <-> vault.
+
+    /// Build a credential body that carries an inline key with plaintext
+    /// private_key + certificate. Mirrors `plain_body` for the inline-key path.
+    fn inline_plain_body(user: &str, priv_text: &str, cert_text: Option<&str>) -> CredentialBody {
+        let cert = cert_text.map(|c| Secret::Plain(c.to_string()));
+        CredentialBody::new(user).with_inline_key(Secret::Plain(priv_text.to_string()), cert)
+    }
+
+    #[test]
+    fn migrate_plaintext_to_vault_encrypts_inline_key() {
+        // plaintext cfg + an inline-key body (private_key + certificate both
+        // Plain); migrate to vault with a target key; assert BOTH become
+        // Encrypted and the plaintext strings are absent from the body's TOML.
+        let mut cfg = SshrackConfig {
+            credentials: vec![Credential {
+                id: ulid::Ulid::new(),
+                name: "ik-p2v".into(),
+                body: inline_plain_body("u", "PRIVATE-KEY-TEXT", Some("CERTIFICATE-TEXT")),
+            }],
+            ..SshrackConfig::default()
+        };
+        let backend = crate::secret::test_doubles::FakeBackend::new();
+        let n = migrate(&mut cfg, &vault_target(), None, Some(&KEY.into()), &backend).unwrap();
+        assert_eq!(n, 1, "inline-key body must count as migrated once");
+        let ik = match &cfg.credentials[0].body.key {
+            Some(KeySource::Inline(ik)) => ik,
+            other => panic!("expected Inline, got {other:?}"),
+        };
+        assert!(
+            ik.private_key.as_ref().is_some_and(Secret::is_encrypted),
+            "private_key must be Encrypted after migrate to vault"
+        );
+        assert!(
+            ik.certificate.as_ref().is_some_and(Secret::is_encrypted),
+            "certificate must be Encrypted after migrate to vault"
+        );
+        // Belt-and-suspenders: the plaintext must not appear in the serialized
+        // body (the on-disk shape under vault mode).
+        let body_toml = toml::to_string(&cfg.credentials[0].body).unwrap();
+        assert!(
+            !body_toml.contains("PRIVATE-KEY-TEXT"),
+            "private key plaintext leaked into TOML: {body_toml}"
+        );
+        assert!(
+            !body_toml.contains("CERTIFICATE-TEXT"),
+            "certificate plaintext leaked into TOML: {body_toml}"
+        );
+    }
+
+    #[test]
+    fn migrate_vault_to_plaintext_decrypts_inline_key() {
+        // vault cfg with an Encrypted inline key + source key; migrate to
+        // plaintext; assert BOTH become Plain and round-trip to the originals.
+        // Build the encrypted form by first migrating from plaintext, so the
+        // source representation matches what `store use vault` would produce.
+        let mut cfg = SshrackConfig {
+            credentials: vec![Credential {
+                id: ulid::Ulid::new(),
+                name: "ik-v2p".into(),
+                body: inline_plain_body("u", "ORIG-PRIVATE", Some("ORIG-CERT")),
+            }],
+            ..SshrackConfig::default()
+        };
+        let backend = crate::secret::test_doubles::FakeBackend::new();
+        // Seal into vault first.
+        migrate(&mut cfg, &vault_target(), None, Some(&KEY.into()), &backend).unwrap();
+        // Sanity: it is now encrypted (the bug being fixed would have left it Plain).
+        if let Some(KeySource::Inline(ik)) = &cfg.credentials[0].body.key {
+            assert!(
+                ik.private_key.as_ref().is_some_and(Secret::is_encrypted),
+                "precondition: private_key must be encrypted after seal"
+            );
+        } else {
+            panic!("expected Inline after seal");
+        }
+        // Now migrate back to plaintext with the source key.
+        let n = migrate(
+            &mut cfg,
+            &SecretStore::Plaintext,
+            Some(&KEY.into()),
+            None,
+            &backend,
+        )
+        .unwrap();
+        assert_eq!(n, 1, "inline-key body must count as migrated once");
+        let ik = match &cfg.credentials[0].body.key {
+            Some(KeySource::Inline(ik)) => ik,
+            other => panic!("expected Inline, got {other:?}"),
+        };
+        assert_eq!(
+            ik.private_key.as_ref().and_then(Secret::as_plain),
+            Some("ORIG-PRIVATE"),
+            "private_key must round-trip to the original plaintext"
+        );
+        assert_eq!(
+            ik.certificate.as_ref().and_then(Secret::as_plain),
+            Some("ORIG-CERT"),
+            "certificate must round-trip to the original plaintext"
+        );
+    }
+
+    #[test]
+    fn migrate_vault_to_vault_rekeys_inline_key_under_new_key() {
+        // `store rekey` migrates vault -> vault under a new key. Inline key
+        // material must be decrypted with the source key and re-encrypted under
+        // the target key, mirroring the password path. Verifies that BOTH
+        // secrets follow the source-key -> target-key rewrap.
+        let source_key: VaultKey = Zeroizing::new(KEY);
+        let target_key: VaultKey = Zeroizing::new([7u8; 32]);
+        // Seed: plaintext inline key.
+        let mut cfg = SshrackConfig {
+            credentials: vec![Credential {
+                id: ulid::Ulid::new(),
+                name: "ik-rekey".into(),
+                body: inline_plain_body("u", "REKEY-PRIVATE", Some("REKEY-CERT")),
+            }],
+            ..SshrackConfig::default()
+        };
+        let backend = crate::secret::test_doubles::FakeBackend::new();
+        // Seal under the source key.
+        migrate(&mut cfg, &vault_target(), None, Some(&source_key), &backend).unwrap();
+        // Rekey: vault -> vault with source -> target.
+        let n = migrate(
+            &mut cfg,
+            &vault_target(),
+            Some(&source_key),
+            Some(&target_key),
+            &backend,
+        )
+        .unwrap();
+        assert_eq!(n, 1, "inline-key body must count as rekeyed");
+        let ik = match &cfg.credentials[0].body.key {
+            Some(KeySource::Inline(ik)) => ik,
+            other => panic!("expected Inline, got {other:?}"),
+        };
+        // Decrypt with the TARGET key proves the rewrap landed under the new key.
+        if let Some(Secret::Encrypted(enc)) = &ik.private_key {
+            let plain = crypto::decrypt(enc, &target_key).unwrap();
+            assert_eq!(plain.as_str(), "REKEY-PRIVATE");
+        } else {
+            panic!("private_key must remain Encrypted after rekey");
+        }
+        if let Some(Secret::Encrypted(enc)) = &ik.certificate {
+            let plain = crypto::decrypt(enc, &target_key).unwrap();
+            assert_eq!(plain.as_str(), "REKEY-CERT");
+        } else {
+            panic!("certificate must remain Encrypted after rekey");
+        }
+    }
+
+    #[test]
+    fn migrate_skips_path_key_body_without_touching_the_path() {
+        // A path-key body (key = "/k") is not secret material — migrate must
+        // skip it (count 0) and leave the path verbatim. Guards against an
+        // over-eager fix that re-seals path keys.
+        let mut cfg = SshrackConfig {
+            credentials: vec![Credential {
+                id: ulid::Ulid::new(),
+                name: "path-only".into(),
+                body: CredentialBody::new("u").with_key("/k"),
+            }],
+            ..SshrackConfig::default()
+        };
+        let backend = crate::secret::test_doubles::FakeBackend::new();
+        assert_eq!(
+            migrate(&mut cfg, &vault_target(), None, Some(&KEY.into()), &backend).unwrap(),
+            0,
+            "path-key body must not count as migrated"
+        );
+        assert_eq!(
+            cfg.credentials[0]
+                .body
+                .key
+                .as_ref()
+                .and_then(KeySource::as_path),
+            Some(std::path::Path::new("/k")),
+            "path key must be unchanged"
         );
     }
 }
