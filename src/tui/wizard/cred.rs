@@ -28,6 +28,17 @@ use crate::tui::fit::truncate_cells;
 use ratatui_textarea::{Input, Key, TextArea};
 use sshrack_core::config::schema::{Credential, CredentialBody, KeySource};
 
+/// Height of the multiline editor block expanded below the field list when a
+/// paste field ([`CredField::InlinePrivate`] / [`CredField::InlineCert`]) is
+/// focused. [`CredForm::body_rows`] grows by this many rows while a textarea
+/// owns focus so the dialog box always fits the expanded block, and
+/// [`CredForm::draw_in_dialog`] reserves a [`Layout`] segment of this height
+/// (0 when no textarea is focused) right below the single-line field rows for
+/// the focused [`TextArea`] to render into. The editor block is a separate
+/// area from the field list, so [`crate::tui::fit::focus_window`] (which
+/// operates on the list only) never scrolls it out of view.
+pub(crate) const TEXTAREA_H: u16 = 5;
+
 /// The credential form's editable state. The password is held as a
 /// [`Zeroizing<String>`] so the plaintext is wiped on drop; it is rendered
 /// masked (`•`) and never placed in errors or logs. The wizard builds this
@@ -674,35 +685,69 @@ impl CredForm {
         }
     }
 
-    /// Render the field rows + error/hint lines into `body` (the rect a
+    /// Render the field rows + (when a paste field is focused) the multiline
+    /// editor block + error/hint lines into `body` (the rect a
     /// [`crate::tui::dialog::draw_dialog`] hands the form). No outer border —
     /// the dialog already drew the chrome.
+    ///
+    /// The body is split into four vertical segments: `list_area` holds the
+    /// single-line field rows (Length = visible row count), `editor_area` holds
+    /// the focused [`TextArea`] (Length [`TEXTAREA_H`] when a paste field is
+    /// focused, else Length 0), and `error_area` / `hint_area` are the fixed
+    /// 1-row tail. The field list and the editor block are separate areas, so
+    /// [`crate::tui::fit::focus_window`] (which windows only the list) can never
+    /// scroll the editor out of view. The [`TextArea`] draws its own cursor, so
+    /// [`Frame::set_cursor_position`] is NOT called for the paste fields —
+    /// [`cursor_target`](Self::cursor_target) already returns `None` for them,
+    /// and the guard below skips them.
     pub fn draw_in_dialog(&self, frame: &mut Frame, body: ratatui::layout::Rect) {
         let reachable = self.reachable_fields();
         let total = reachable.len();
         // The fields area is `body.height` minus the error(1) + hint(1) rows
-        // rendered below. When the terminal is too short to fit every field,
-        // `focus_window` picks the viewport that keeps the focused one visible.
-        let fields_h = body.height.saturating_sub(2) as usize;
+        // and the multiline editor block (TEXTAREA_H when a paste field is
+        // focused) rendered below the field list. When the terminal is too
+        // short to fit every field, `focus_window` picks the viewport that
+        // keeps the focused one visible.
+        let needs_block = matches!(self.focus, CredField::InlinePrivate | CredField::InlineCert);
+        let editor_h = if needs_block { TEXTAREA_H } else { 0 };
+        let fields_h = body.height.saturating_sub(2 + editor_h) as usize;
         let win = crate::tui::fit::focus_window(total, self.focus_idx(), fields_h);
         let rows: Vec<Line> = reachable[win.clone()]
             .iter()
             .map(|f| self.render_row(*f, body.width))
             .collect();
 
-        // Fields area is `Fill(1)` so it absorbs the slack between the
-        // top-aligned field rows and the error/hint rows pinned to the body's
-        // bottom. This keeps the error line + field-specific hint at a FIXED y
-        // (just above the dialog footer) regardless of how many fields are
-        // reachable — the dialog box is a stable container, content flows in it.
-        let [fields_area, error_area, hint_area] = Layout::vertical([
-            Constraint::Fill(1),
+        // 4-split: the single-line field list, then the multiline editor block
+        // (0-height when no textarea is focused), then the 1-row error and
+        // hint lines pinned to the body's bottom. `list_area` is `Length` of
+        // the rendered row count so it tracks the focus-following viewport
+        // exactly; `editor_area` collapses to 0 when no paste field owns
+        // focus, so the list + error + hint sit exactly where the prior
+        // 3-split placed them.
+        let [list_area, editor_area, error_area, hint_area] = Layout::vertical([
+            Constraint::Length(rows.len() as u16),
+            Constraint::Length(editor_h),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
         .areas(body);
 
-        frame.render_widget(Paragraph::new(rows), fields_area);
+        frame.render_widget(Paragraph::new(rows), list_area);
+
+        // When a multiline paste field is focused, render the live TextArea
+        // into the editor block. `&TextArea` implements
+        // `ratatui_core::widgets::Widget` (ratatui-textarea 0.9.2), so a plain
+        // `render_widget(&ta, area)` call draws it — including its own cursor,
+        // which is why we do NOT call `set_cursor_position` for these fields.
+        if needs_block {
+            let ta: &TextArea = match self.focus {
+                CredField::InlinePrivate => &self.inline_private,
+                CredField::InlineCert => &self.inline_cert,
+                // Guarded by `needs_block` above; unreachable in practice.
+                _ => return,
+            };
+            frame.render_widget(ta, editor_area);
+        }
 
         let error_line = if let Some(msg) = &self.core_error {
             Line::from(vec![
@@ -732,15 +777,18 @@ impl CredForm {
         frame.render_widget(Paragraph::new(hint).style(Style::new().dim()), hint_area);
 
         // Place the real terminal cursor on the focused text field (no drawn
-        // glyph — see HostForm::draw_in_dialog). SecretKind is a chooser. The
-        // row index is translated into the viewport so the cursor never points
-        // below the fields area when the list scrolls.
+        // glyph — see HostForm::draw_in_dialog). SecretKind / Source are
+        // choosers; the inline textareas own their own cursors — all three
+        // return `None` from `cursor_target`, so the guard skips them and we
+        // never double-set the cursor over a rendered TextArea. The row index
+        // is translated into the viewport so the cursor never points below the
+        // list area when the list scrolls.
         if let Some((row, offset)) = self.cursor_target() {
             if win.start <= row && row < win.end {
                 let in_win_row = row - win.start;
-                let max_x = fields_area.x + fields_area.width.saturating_sub(1);
-                let x = (fields_area.x + CRED_VALUE_COL + offset as u16).min(max_x);
-                let y = fields_area.y + in_win_row as u16;
+                let max_x = list_area.x + list_area.width.saturating_sub(1);
+                let x = (list_area.x + CRED_VALUE_COL + offset as u16).min(max_x);
+                let y = list_area.y + in_win_row as u16;
                 frame.set_cursor_position((x, y));
             }
         }
@@ -792,14 +840,15 @@ impl CredForm {
         }
     }
 
-    /// Stable body row count the dialog sizes to: the **maximum** reachable
-    /// field count across every (secret, source) state, plus one error row and
-    /// one hint row. Pinned to the worst case on purpose — toggling the Secret
-    /// or Source chooser changes which rows are filled, but the dialog box must
-    /// never resize while the form is open, so the unused slot renders blank
-    /// instead of the border growing/shrinking. The IdentityKey + Inline state
-    /// has the most rows (Name / User / SecretKind / Source / InlinePrivate /
-    /// InlineCert = 6). Consumed by the App overlay layer via
+    /// Body row count the dialog sizes to. **Focus-aware**: the base count is
+    /// the **maximum** reachable field count across every (secret, source)
+    /// state (so toggling the Secret or Source chooser changes which rows are
+    /// filled but never collapses the dialog box), plus one error row and one
+    /// hint row. When a paste field ([`CredField::InlinePrivate`] /
+    /// [`CredField::InlineCert`]) is focused, [`TEXTAREA_H`] extra rows are
+    /// added so the expanded multiline editor block fits inside the border —
+    /// the dialog grows by exactly [`TEXTAREA_H`] on textarea focus and shrinks
+    /// back when focus leaves. Consumed by the App overlay layer via
     /// [`crate::tui::dialog::draw_dialog`].
     pub fn body_rows(&self) -> u16 {
         let max_fields = [
@@ -821,7 +870,13 @@ impl CredForm {
         })
         .max()
         .unwrap_or(0);
-        (max_fields + 2) as u16 // + error row + hint row
+        let textarea_extra =
+            if matches!(self.focus, CredField::InlinePrivate | CredField::InlineCert) {
+                TEXTAREA_H as usize
+            } else {
+                0
+            };
+        (max_fields + textarea_extra + 2) as u16 // + error row + hint row
     }
 
     /// Render one labeled field row, with the focus highlight + placeholder.
@@ -878,31 +933,36 @@ impl CredForm {
             }
             CredField::Source => {
                 // Chooser row: bracketed like SecretKind. The placeholder hints
-                // the cycle direction. (Task 4 may refine the render.)
+                // the cycle direction.
                 let v = bracketed(self.source.label());
                 let ph = Some("<- -> cycle: Path / Inline");
                 (v, ph)
             }
             CredField::InlinePrivate => {
-                // Never echo the pasted key text as the row value (security —
-                // the textarea renders its own buffer in Task 4; for now the
-                // row reads blank with a placeholder). On edit the placeholder
-                // reminds the user the original is preserved when this stays
-                // empty.
-                let ph = if self.editing {
-                    Some("paste a NEW key (blank keeps existing)")
+                // One-line summary of the textarea's content (never echoes the
+                // key text itself): blank → placeholder, non-blank → "N line(s)"
+                // count. The full multiline editor renders in the expanded block
+                // below the field list when this row is focused (see
+                // [`CredForm::draw_in_dialog`]); the summary always occupies the
+                // single-line row regardless of focus.
+                let n = self.inline_private.lines().len();
+                if n == 1 && self.inline_private.lines()[0].is_empty() {
+                    (
+                        String::new(),
+                        Some("paste private key (focus to edit multiline)"),
+                    )
                 } else {
-                    Some("paste the private key")
-                };
-                (String::new(), ph)
+                    (format!("{} line(s) of private key", n), None)
+                }
             }
             CredField::InlineCert => {
-                let ph = if self.editing {
-                    Some("paste a NEW cert (blank keeps existing)")
+                // Companion summary for the optional certificate textarea.
+                let n = self.inline_cert.lines().len();
+                if n == 1 && self.inline_cert.lines()[0].is_empty() {
+                    (String::new(), Some("optional certificate (focus to edit)"))
                 } else {
-                    Some("paste the certificate (optional)")
-                };
-                (String::new(), ph)
+                    (format!("{} line(s) of certificate", n), None)
+                }
             }
             CredField::Password => {
                 // Masked: one bullet per char. Never echo the plaintext.
@@ -1961,5 +2021,68 @@ mod tests {
             dbg.contains("inline_private_lines: 1"),
             "expected 1 line: {dbg}"
         );
+    }
+
+    // ---- Task 4: render the multiline editor block + grow body_rows (RED -> GREEN) ----
+    //
+    // When a paste field (InlinePrivate / InlineCert) is focused, the dialog
+    // expands a TEXTAREA_H-tall editor block right below the field list so the
+    // user can edit the pasted key/cert across many lines. body_rows() must
+    // grow by exactly TEXTAREA_H while the textarea is focused so the dialog
+    // box fits the block; the render must not panic for any (secret, source,
+    // focus) combination.
+
+    #[test]
+    fn draw_in_dialog_renders_without_panic_across_source_and_focus_states() {
+        use crate::tui::dialog::draw_dialog;
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut f = complete_cred_form();
+        let mut term = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        for secret in [
+            SecretChoice::None,
+            SecretChoice::Password,
+            SecretChoice::IdentityKey,
+        ] {
+            for source in [SourceChoice::Path, SourceChoice::Inline] {
+                f.secret_kind = secret;
+                f.source = source;
+                for focus in [
+                    CredField::Name,
+                    CredField::SecretKind,
+                    CredField::Source,
+                    CredField::Identity,
+                    CredField::InlinePrivate,
+                    CredField::InlineCert,
+                ] {
+                    f.focus = focus;
+                    term.draw(|fr| {
+                        let body = draw_dialog(
+                            fr,
+                            &f.title(),
+                            f.body_rows(),
+                            &[("Tab", "field"), ("^S", "save"), ("Esc", "cancel")],
+                        );
+                        f.draw_in_dialog(fr, body);
+                    })
+                    .unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn body_rows_grows_when_a_textarea_is_focused() {
+        let mut f = complete_cred_form();
+        f.secret_kind = SecretChoice::IdentityKey;
+        f.source = SourceChoice::Inline;
+        f.focus = CredField::Name;
+        let collapsed = f.body_rows();
+        f.focus = CredField::InlinePrivate;
+        let expanded = f.body_rows();
+        assert!(
+            expanded > collapsed,
+            "focused textarea must grow the dialog"
+        );
+        assert_eq!(expanded - collapsed, crate::tui::wizard::cred::TEXTAREA_H);
     }
 }
