@@ -63,15 +63,18 @@ pub enum PasteOutcome {
 /// Modal multiline paste popup. `textarea` always starts empty (existing key
 /// text is never echoed). See the module docs for the keymap.
 ///
-/// Derives only `Debug, Clone` — `ratatui_textarea::TextArea` itself does not
-/// implement `PartialEq`/`Eq` (its `Debug` prints the `lines: Vec<String>`
-/// field, which is why the textarea is also excluded from the owning form's
-/// `Debug` by each form's manual impl). Tests assert on [`PasteOutcome`]
-/// (which is `PartialEq`) rather than on `KeyPaste` directly.
+/// `Debug` is hand-written (NOT derived): `ratatui_textarea::TextArea`'s
+/// derived `Debug` prints the `lines: Vec<String>` field, which would leak the
+/// pasted private key / certificate to any `dbg!(popup)` / `format!("{:?}", p)`
+/// call. The manual impl surfaces only `kind` and the textarea's line COUNT —
+/// mirroring the redacting `Debug` impls on `HostForm` and `CredForm`. `Clone`
+/// is derived; `PartialEq`/`Eq` are not available (`TextArea` does not impl
+/// them), so tests assert on [`PasteOutcome`] (which is `PartialEq`) rather
+/// than on `KeyPaste` directly.
 ///
 /// `dead_code`: Tasks 2 & 3 wire this into the cred/host wizards.
 #[allow(dead_code)]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct KeyPaste {
     /// Which slot this popup edits (drives the title + which form field the
     /// `Done` text writes back to).
@@ -79,7 +82,25 @@ pub struct KeyPaste {
     textarea: TextArea<'static>,
 }
 
-/// `dead_code`: Tasks 2 & 3 wire these into the cred/host wizards.
+impl std::fmt::Debug for KeyPaste {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // NEVER surface the textarea directly: its derived Debug prints the
+        // `lines: Vec<String>` field, which would leak the pasted private key
+        // / certificate to any `dbg!(popup)` / `format!("{:?}", p)` call.
+        // Surface ONLY the line count, so a glance at the popup's Debug still
+        // tells you whether the user has pasted anything without ever showing
+        // what. Mirrors the redacting Debug impls on HostForm and CredForm.
+        f.debug_struct("KeyPaste")
+            .field("kind", &self.kind)
+            .field("lines", &self.textarea.lines().len())
+            .finish()
+    }
+}
+
+/// `dead_code`: Tasks 2 & 3 wire these into the cred/host wizards. The allow
+/// lives on the impl (NOT just the struct) because `dead_code` flags each
+/// unused method as a separate item — the struct-level allow does not
+/// propagate to inherent-impl methods.
 #[allow(dead_code)]
 impl KeyPaste {
     /// Open a fresh popup for `kind` with an empty buffer.
@@ -265,5 +286,30 @@ mod tests {
         let backend = TestBackend::new(40, 12); // small terminal — must not panic
         let mut term = Terminal::new(backend).unwrap();
         let _ = term.draw(|f| p.draw_overlay(f));
+    }
+
+    #[test]
+    fn debug_impl_does_not_leak_textarea_contents() {
+        // The hand-written Debug must show only the line COUNT, never the
+        // pasted key text. `format!("{:?}", p)` going to logs/errors must not
+        // leak "SECRET". Mirrors `host_debug_impl_does_not_leak_textarea_contents`.
+        let mut p = KeyPaste::new(PasteKind::Private);
+        for c in "SECRET".chars() {
+            let _ = p.on_key(press(KeyCode::Char(c)));
+        }
+        let dbg = format!("{p:?}");
+        assert!(
+            !dbg.contains("SECRET"),
+            "Debug must not leak textarea contents: {dbg}"
+        );
+        assert!(
+            dbg.contains("lines"),
+            "Debug must surface the line-count field: {dbg}"
+        );
+        assert!(dbg.contains("lines: 1"), "expected 1 line: {dbg}");
+        assert!(
+            dbg.contains("kind"),
+            "Debug must surface the kind field: {dbg}"
+        );
     }
 }
