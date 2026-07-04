@@ -48,6 +48,13 @@ pub use key_paste::{KeyPaste, PasteKind, PasteOutcome};
 /// focused [`TextArea`] to render into. The editor block is a separate area
 /// from the field list, so [`crate::tui::fit::focus_window`] (which operates on
 /// the list only) never scrolls it out of view.
+///
+/// **Currently unused:** both forms moved inline-key editing into the modal
+/// [`KeyPaste`] popup (Task 2 for cred, Task 3 for host), so neither `body_rows`
+/// nor `draw_in_dialog` references this constant anymore. It is retained
+/// temporarily for the Task 4 mod.rs cleanup pass that will remove it; the
+/// `allow(dead_code)` silences the warning in the meantime.
+#[allow(dead_code)]
 pub(crate) const TEXTAREA_H: u16 = 5;
 
 /// Map sshrack's `crossterm` 0.28 [`KeyEvent`] into a [`TextArea`] [`Input`].
