@@ -100,6 +100,14 @@ impl std::fmt::Debug for KeyPaste {
 /// everything else maps its [`KeyCode`] to the textarea's [`Key`] and carries
 /// the ctrl/alt/shift modifiers through.
 ///
+/// **Newline normalization (paste fix):** `Enter`, a bare `Char('\n'/'\r')`,
+/// and the raw-mode `Ctrl+J` stand-in for a pasted LF byte (crossterm 0.28
+/// `parse.rs`, Issue #371) are all re-mapped to a plain modifier-less
+/// `Key::Enter`, so a pasted multi-line key keeps every line instead of
+/// collapsing to one (the textarea's own keymap binds Ctrl+J to
+/// `delete_line_by_head`). See the inline comment at the call site for the
+/// full chain.
+///
 /// Private to this module: the popup is the only consumer of the textarea
 /// bridge now that both forms route inline-key editing through it.
 ///
@@ -118,6 +126,27 @@ fn textarea_input_from(key: KeyEvent) -> Input {
             shift: true,
             ctrl,
             alt,
+        };
+    }
+    // Raw-mode paste fix: a terminal without bracketed paste delivers a pasted
+    // newline as the raw LF byte (0x0A). crossterm 0.28 (parse.rs, Issue #371)
+    // decodes 0x0A in raw mode via the `b'\x01'..=b'\x1A'` arm — i.e. as
+    // Ctrl+J (`KeyCode::Char('j')` + CONTROL) — rather than as Enter. The
+    // textarea's own keymap binds Ctrl+J to `delete_line_by_head`, so without
+    // this rewrite every pasted newline deletes the current line head and a
+    // multi-line paste collapses to its last line. Re-map every newline shape
+    // — Enter, a bare Char('\n'/'\r'), and the Ctrl+J stand-in — to a plain
+    // modifier-less Enter so the textarea inserts a newline (paste-preserving).
+    let is_newline = key.code == KeyCode::Enter
+        || key.code == KeyCode::Char('\n')
+        || key.code == KeyCode::Char('\r')
+        || (ctrl && key.code == KeyCode::Char('j'));
+    if is_newline {
+        return Input {
+            key: Key::Enter,
+            ctrl: false,
+            alt: false,
+            shift: false,
         };
     }
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -358,5 +387,83 @@ mod tests {
             dbg.contains("kind"),
             "Debug must surface the kind field: {dbg}"
         );
+    }
+
+    // ===============================================================
+    // Paste regression: raw-mode terminals without bracketed paste
+    // deliver a pasted newline byte (0x0A) as Ctrl+J, not as Enter.
+    // crossterm 0.28's parse.rs (Issue #371) maps 0x0A via the
+    // `b'\x01'..=b'\x1A'` arm to `KeyCode::Char('j') + CONTROL`. The
+    // textarea's own keymap binds Ctrl+J to `delete_line_by_head`, so a
+    // pasted multi-line key collapsed to its last line (every newline
+    // deleted the line head). The bridge must re-map every newline shape
+    // — Enter, bare Char('\n'/'\r'), and the raw-mode Ctrl+J stand-in — to
+    // a plain Enter so paste preserves every line.
+    // ===============================================================
+
+    #[test]
+    fn ctrl_j_is_treated_as_a_newline_so_paste_keeps_lines() {
+        let mut p = KeyPaste::new(PasteKind::Private);
+        for c in "lineA".chars() {
+            let _ = p.on_key(press(KeyCode::Char(c)));
+        }
+        // A pasted LF byte arrives as Ctrl+J in raw mode (see test doc above).
+        let pasted_newline = KeyEvent::new_with_kind(
+            KeyCode::Char('j'),
+            KeyModifiers::CONTROL,
+            KeyEventKind::Press,
+        );
+        assert!(matches!(p.on_key(pasted_newline), PasteOutcome::Pending));
+        for c in "lineB".chars() {
+            let _ = p.on_key(press(KeyCode::Char(c)));
+        }
+        assert_eq!(
+            p.on_key(press(KeyCode::Esc)),
+            PasteOutcome::Done("lineA\nlineB".into())
+        );
+    }
+
+    #[test]
+    fn textarea_input_from_normalizes_every_newline_shape_to_plain_enter() {
+        // Enter, bare Char('\n'), bare Char('\r'), and raw-mode Ctrl+J must all
+        // become a modifier-less Key::Enter (so the textarea inserts a newline
+        // rather than, in the Ctrl+J case, deleting the line head).
+        let cases = [
+            (
+                "Enter",
+                KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Press),
+            ),
+            (
+                "bare LF",
+                KeyEvent::new_with_kind(
+                    KeyCode::Char('\n'),
+                    KeyModifiers::NONE,
+                    KeyEventKind::Press,
+                ),
+            ),
+            (
+                "bare CR",
+                KeyEvent::new_with_kind(
+                    KeyCode::Char('\r'),
+                    KeyModifiers::NONE,
+                    KeyEventKind::Press,
+                ),
+            ),
+            (
+                "raw-mode Ctrl+J",
+                KeyEvent::new_with_kind(
+                    KeyCode::Char('j'),
+                    KeyModifiers::CONTROL,
+                    KeyEventKind::Press,
+                ),
+            ),
+        ];
+        for (label, ev) in cases {
+            let inp = textarea_input_from(ev);
+            assert_eq!(inp.key, Key::Enter, "{label}: key must normalize to Enter");
+            assert!(!inp.ctrl, "{label}: ctrl must be cleared");
+            assert!(!inp.alt, "{label}: alt must be cleared");
+            assert!(!inp.shift, "{label}: shift must be cleared");
+        }
     }
 }
