@@ -1830,7 +1830,7 @@ mod tests {
     }
 
     #[test]
-    fn inline_source_hides_identity_and_reaches_textareas() {
+    fn inline_source_hides_identity_and_reaches_inline_rows() {
         let mut f = CredForm::new_add();
         f.secret_kind = SecretChoice::IdentityKey;
         f.source = SourceChoice::Inline;

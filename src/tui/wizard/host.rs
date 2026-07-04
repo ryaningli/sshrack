@@ -2658,7 +2658,7 @@ mod tests {
     fn host_body_rows_is_independent_of_inline_field_focus() {
         // body_rows no longer depends on focus (no inline editor block); it is
         // a stable worst-case across every (auth, secret, source) combo. Pins
-        // the removal of the focus-aware TEXTAREA_H growth.
+        // the removal of the focus-aware inline-editor block growth.
         for auth in [AuthChoice::Independent, AuthChoice::Reference { idx: 0 }] {
             for secret in [
                 SecretChoice::None,
