@@ -481,9 +481,11 @@ impl App {
     /// from a unit test without an event source.
     ///
     /// Three layers, evaluated in order:
-    /// 1. **Global** — `Ctrl-C` quits, `F1` toggles the Help overlay. These win
-    ///    over everything (so the user can always quit / read help, even
-    ///    mid-wizard).
+    /// 1. **Global** — `F1` toggles the Help overlay (always reachable, even
+    ///    mid-wizard). `Ctrl-C` is global ONLY from the launcher: with an
+    ///    overlay open it falls through to Layer 2 so the active overlay can
+    ///    cancel/discard (matching each overlay's `Esc` and the KeyPaste
+    ///    popup's "Ctrl-C discard" hint) instead of quitting the whole app.
     /// 2. **Overlay** — when an overlay is open it owns the key. Help dismisses
     ///    on `F1`/`Esc`/`q`; a wizard's `on_key` returns `SaveHost`/`SaveCred`/
     ///    `Cancel`/`Continue`; the store picker delegates to the stashed
@@ -496,13 +498,16 @@ impl App {
     pub fn on_key(&mut self, key: KeyEvent) -> Outcome {
         use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 
-        // Layer 1 — global keys (work with or without an overlay).
-        // Ctrl-C must be EXACTLY Control+c — `contains` would wrongly treat
-        // Ctrl-Shift-C (terminal paste) as quit. Same invariant the launcher
-        // held before the rewrite.
+        // Layer 1 — global keys. F1 is global with or without an overlay
+        // (always reachable). Ctrl-C quits ONLY from the launcher — with an
+        // overlay open it falls through to Layer 2 so the overlay can
+        // cancel/discard rather than bringing down the app. Ctrl-C must be
+        // EXACTLY Control+c — `contains` would wrongly treat Ctrl-Shift-C
+        // (terminal paste) as quit.
         if key.kind == KeyEventKind::Press
             && key.modifiers == KeyModifiers::CONTROL
             && key.code == KeyCode::Char('c')
+            && self.overlay.is_none()
         {
             self.should_quit = true;
             return Outcome::Quit;
@@ -578,11 +583,19 @@ impl App {
     /// by [`on_key`]; this stashes it back unless the outcome is terminal
     /// (`Cancel`/`CloseOverlay`), so the form state survives across keystrokes.
     fn route_overlay(&mut self, key: KeyEvent, ov: Overlay) -> Outcome {
-        use crossterm::event::{KeyCode, KeyEventKind};
+        use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
         match ov {
             Overlay::Help => {
+                // Esc / F1 / q close Help; so does Ctrl-C (Plan B: Ctrl-C
+                // cancels the active overlay rather than quitting — the
+                // launcher's Ctrl-C = quit is gated on `overlay.is_none()`
+                // in Layer 1, so it reaches here with Help open).
+                let ctrl_c = key.kind == KeyEventKind::Press
+                    && key.modifiers == KeyModifiers::CONTROL
+                    && key.code == KeyCode::Char('c');
                 if key.kind == KeyEventKind::Press
-                    && matches!(key.code, KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('q'))
+                    && (matches!(key.code, KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('q'))
+                        || ctrl_c)
                 {
                     return Outcome::CloseOverlay;
                 }
@@ -951,7 +964,7 @@ impl App {
                     frame,
                     &form.title(),
                     form.body_rows(),
-                    &[("Tab", "field"), ("^S", "save"), ("Esc", "cancel")],
+                    &[("Tab", "field"), ("^S", "save"), ("Esc/^C", "cancel")],
                 );
                 form.draw_in_dialog(frame, body);
             }
@@ -960,7 +973,7 @@ impl App {
                     frame,
                     &form.title(),
                     form.body_rows(),
-                    &[("Tab", "field"), ("^S", "save"), ("Esc", "cancel")],
+                    &[("Tab", "field"), ("^S", "save"), ("Esc/^C", "cancel")],
                 );
                 form.draw_in_dialog(frame, body);
             }
@@ -972,7 +985,7 @@ impl App {
                         .as_ref()
                         .expect("invariant: store_view stashed while StorePicker overlay is open")
                         .body_rows(),
-                    &[("↑↓", "select"), ("Enter", "switch"), ("Esc", "cancel")],
+                    &[("↑↓", "select"), ("Enter", "switch"), ("Esc/^C", "cancel")],
                 );
                 self.store_view
                     .as_ref()
@@ -1035,6 +1048,59 @@ mod tests {
         let outcome = app.on_key(press(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(matches!(outcome, Outcome::Quit));
         assert!(app.should_quit, "Ctrl-C should set should_quit");
+    }
+
+    // ===============================================================
+    // Plan B: Ctrl-C cancels the active overlay rather than quitting.
+    // The launcher's Ctrl-C = quit still holds when no overlay is open
+    // (see `ctrl_c_yields_quit` above); with an overlay up, Ctrl-C is
+    // handed to the overlay so it cancels/discards the current layer
+    // instead of bringing down the whole app. Previously Layer 1 quit
+    // won over the overlay, so the wizards'/popup's Ctrl-C → Cancel
+    // code (and the popup's "Ctrl-C discard" hint) were unreachable.
+    // ===============================================================
+
+    #[test]
+    fn ctrl_c_in_host_wizard_cancels_overlay_instead_of_quitting() {
+        let mut app = app_with_host("web");
+        app.open_host_wizard_add();
+        assert!(app.overlay.is_some(), "wizard should be open");
+        let outcome = app.on_key(press(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(
+            matches!(outcome, Outcome::Cancel),
+            "Ctrl-C in a wizard must cancel (expected Outcome::Cancel)"
+        );
+        assert!(app.overlay.is_none(), "Ctrl-C must close the wizard");
+        assert!(
+            !app.should_quit,
+            "Ctrl-C in an overlay must NOT quit the app"
+        );
+    }
+
+    #[test]
+    fn ctrl_c_in_cred_wizard_cancels_overlay_instead_of_quitting() {
+        let mut app = app_with_host("web");
+        app.open_cred_wizard_add();
+        assert!(app.overlay.is_some(), "wizard should be open");
+        let outcome = app.on_key(press(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(matches!(outcome, Outcome::Cancel));
+        assert!(app.overlay.is_none(), "Ctrl-C must close the wizard");
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_c_in_help_overlay_closes_it_instead_of_quitting() {
+        let mut app = app_with_host("web");
+        // F1 opens the Help overlay.
+        let _ = app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
+        assert!(matches!(app.overlay, Some(Overlay::Help)));
+        let outcome = app.on_key(press(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(
+            matches!(outcome, Outcome::CloseOverlay),
+            "Ctrl-C in Help must close it (expected Outcome::CloseOverlay)"
+        );
+        assert!(app.overlay.is_none(), "Ctrl-C must close Help");
+        assert!(!app.should_quit);
     }
 
     #[test]

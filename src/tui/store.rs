@@ -22,7 +22,7 @@
 //!
 //! [`confirm_popup`]: super::prompt::confirm_popup
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -137,6 +137,11 @@ impl StoreView {
     pub fn on_key(&mut self, key: KeyEvent) -> Outcome {
         if key.kind != KeyEventKind::Press {
             return Outcome::Continue;
+        }
+        // Ctrl-C cancels like Esc (Plan B). Exact Control+c so Ctrl-Shift-C
+        // (terminal paste) does not accidentally cancel.
+        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
+            return Outcome::Cancel;
         }
         match key.code {
             KeyCode::Esc => Outcome::Cancel,
@@ -281,6 +286,21 @@ mod tests {
     fn esc_signals_cancel() {
         let mut v = StoreView::new(Some("vault"));
         let outcome = v.on_key(key(KeyCode::Esc));
+        assert!(matches!(outcome, Outcome::Cancel));
+    }
+
+    #[test]
+    fn ctrl_c_signals_cancel_like_esc() {
+        // The `on_key` doc lists Ctrl-C alongside Esc as a Cancel binding; pin
+        // it so the contract holds. Regression: Ctrl-C previously fell through
+        // to the `_ => Continue` arm because only `KeyCode::Esc` was matched.
+        let mut v = StoreView::new(Some("vault"));
+        let ctrl_c = KeyEvent::new_with_kind(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+            KeyEventKind::Press,
+        );
+        let outcome = v.on_key(ctrl_c);
         assert!(matches!(outcome, Outcome::Cancel));
     }
 

@@ -103,7 +103,7 @@ A flagged field is **always** a CLI patch, never a wizard — `host edit x --por
 | `^a` / `^e` / `^d` | add / edit / delete (current tab; delete opens a confirm) |
 | `F1` | help overlay (also closes it) |
 | `Esc` | clear query / close overlay / quit (from launcher) |
-| `^c` | quit |
+| `^c` | cancel active overlay · quit (from launcher) |
 
 The single-char conflict fix: bare `c`, `?`, and `1`/`2`/`3` always reach the active panel's search box (never act as hotkeys). The old `c` add-credential, `Shift-C`/`F2` store-mode switch, and `?` help bindings are gone — use `Ctrl-A`/`Ctrl-S`/`F1` instead.
 
