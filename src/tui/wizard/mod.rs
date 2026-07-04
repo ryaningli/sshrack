@@ -22,10 +22,8 @@
 //! [`Outcome::SaveHost`]: super::intent::Outcome::SaveHost
 //! [`Outcome::SaveCred`]: super::intent::Outcome::SaveCred
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::style::Style;
 use ratatui::text::Span;
-use ratatui_textarea::{Input, Key};
 use sshrack_core::host::validate_name_chars;
 
 pub mod cred;
@@ -37,88 +35,6 @@ pub use cred::CredForm;
 pub use cred_picker::{CredPicker, PickerOutcome};
 pub use host::HostForm;
 pub use key_paste::{KeyPaste, PasteKind, PasteOutcome};
-
-/// Height of the multiline editor block expanded below the field list when a
-/// paste field ([`host::Field::InlinePrivate`] / [`host::Field::InlineCert`],
-/// or [`cred::CredField::InlinePrivate`] / [`cred::CredField::InlineCert`]) is
-/// focused. Each form's `body_rows` grows by this many rows while a textarea
-/// owns focus so the dialog box always fits the expanded block, and each
-/// form's `draw_in_dialog` reserves a [`Layout`] segment of this height (0 when
-/// no textarea is focused) right below the single-line field rows for the
-/// focused [`TextArea`] to render into. The editor block is a separate area
-/// from the field list, so [`crate::tui::fit::focus_window`] (which operates on
-/// the list only) never scrolls it out of view.
-///
-/// **Currently unused:** both forms moved inline-key editing into the modal
-/// [`KeyPaste`] popup (Task 2 for cred, Task 3 for host), so neither `body_rows`
-/// nor `draw_in_dialog` references this constant anymore. It is retained
-/// temporarily for the Task 4 mod.rs cleanup pass that will remove it; the
-/// `allow(dead_code)` silences the warning in the meantime.
-#[allow(dead_code)]
-pub(crate) const TEXTAREA_H: u16 = 5;
-
-/// Map sshrack's `crossterm` 0.28 [`KeyEvent`] into a [`TextArea`] [`Input`].
-///
-/// `ratatui-textarea` 0.9 pulls crossterm 0.29 transitively (via
-/// `ratatui-crossterm`), whose `KeyEvent` is a *different type* than the
-/// crossterm 0.28 `KeyEvent` sshrack uses everywhere else — so
-/// `textarea.input(key)` won't type-check. Building an [`Input`] directly from
-/// the event's components sidesteps the version skew without forcing a
-/// workspace-wide crossterm upgrade. The mapping mirrors the textarea's own
-/// `From<ratatui_crossterm::crossterm::event::KeyEvent>` impl: a key-release
-/// becomes a no-op `Input::default()`; `BackTab` becomes `Tab` + shift;
-/// everything else maps its [`KeyCode`] to the textarea's [`Key`] and carries
-/// the ctrl/alt/shift modifiers through.
-///
-/// Shared by [`CredForm`] and [`HostForm`] so both inline-paste textareas use
-/// one copy of the bridge (DRY, dev-stage rule). Private to `wizard`: only the
-/// two form submodules reach it via `use super::textarea_input_from`.
-///
-/// [`TextArea`]: ratatui_textarea::TextArea
-fn textarea_input_from(key: KeyEvent) -> Input {
-    if key.kind == KeyEventKind::Release {
-        return Input::default();
-    }
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    let alt = key.modifiers.contains(KeyModifiers::ALT);
-    // crossterm reports Shift+Tab as BackTab (no SHIFT in modifiers); surface
-    // it to the textarea as a shifted Tab so its own shortcut logic matches.
-    if key.code == KeyCode::BackTab {
-        return Input {
-            key: Key::Tab,
-            shift: true,
-            ctrl,
-            alt,
-        };
-    }
-    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-    let key_code = match key.code {
-        KeyCode::Char(c) => Key::Char(c),
-        KeyCode::Backspace => Key::Backspace,
-        KeyCode::Enter => Key::Enter,
-        KeyCode::Left => Key::Left,
-        KeyCode::Right => Key::Right,
-        KeyCode::Up => Key::Up,
-        KeyCode::Down => Key::Down,
-        KeyCode::Tab => Key::Tab,
-        KeyCode::Delete => Key::Delete,
-        KeyCode::Home => Key::Home,
-        KeyCode::End => Key::End,
-        KeyCode::PageUp => Key::PageUp,
-        KeyCode::PageDown => Key::PageDown,
-        KeyCode::Esc => Key::Esc,
-        KeyCode::F(n) => Key::F(n),
-        // Insert / Null / any future variant the textarea does not care about:
-        // map to Null, which the textarea treats as a no-op.
-        _ => Key::Null,
-    };
-    Input {
-        key: key_code,
-        ctrl,
-        alt,
-        shift,
-    }
-}
 
 // ===========================================================================
 // Host wizard shared shape
@@ -188,11 +104,14 @@ pub enum Field {
     /// Reachable iff auth == [`AuthChoice::Independent`] AND secret ==
     /// [`SecretChoice::IdentityKey`] (see [`HostForm::field_reachable`]).
     Source,
-    /// Multiline private-key paste (Inline source only). Reachable iff
-    /// Independent + IdentityKey + Inline.
+    /// Inline private-key paste trigger row (Inline source only). Reachable iff
+    /// Independent + IdentityKey + Inline. `Enter` opens the [`KeyPaste`] popup
+    /// (modal); the form row itself holds only the line-count summary.
     InlinePrivate,
-    /// Multiline optional certificate paste (Inline source only). Reachable
-    /// iff Independent + IdentityKey + Inline.
+    /// Inline optional certificate paste trigger row (Inline source only).
+    /// Reachable iff Independent + IdentityKey + Inline. `Enter` opens the
+    /// [`KeyPaste`] popup (modal); the form row itself holds only the
+    /// line-count summary.
     InlineCert,
     Identity,
     Password,
@@ -346,18 +265,19 @@ impl SecretChoice {
 }
 
 /// The identity-key source offered under `Secret = IdentityKey`: a file
-/// `Path` (typed) or pasted `Inline` contents (edited in a multiline area).
-/// Cycled by `←`/`→` on the Source row. Mirrors [`SecretChoice`]'s shape.
-/// Wired into both forms: [`CredForm`] (cred wizard) and [`HostForm`] (host
-/// wizard's Independent branch). The cycling logic is exercised by the unit
-/// tests below and by each form's `on_key` Source-cycle arms.
+/// `Path` (typed) or pasted `Inline` contents (edited in the [`KeyPaste`]
+/// popup). Cycled by `←`/`→` on the Source row. Mirrors [`SecretChoice`]'s
+/// shape. Wired into both forms: [`CredForm`] (cred wizard) and [`HostForm`]
+/// (host wizard's Independent branch). The cycling logic is exercised by the
+/// unit tests below and by each form's `on_key` Source-cycle arms.
 ///
 /// [`CredForm`]: cred::CredForm
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceChoice {
     /// Identity key read from a file path (typed in the Identity row).
     Path,
-    /// Identity key pasted as raw contents (edited in a multiline area).
+    /// Identity key pasted as raw contents (edited in the [`KeyPaste`] popup;
+    /// the form row is a trigger that opens it on `Enter`).
     Inline,
 }
 
@@ -390,11 +310,12 @@ impl SourceChoice {
 }
 
 /// The focused field in the credential form. `Tab`/`↑`/`↓` (and `Enter` to
-/// advance, except inside a multiline textarea where `Enter` inserts a
-/// newline) move through the reachable ones in declaration order; the last
-/// reachable field's `Enter` triggers a save. The secret row is a three-way
-/// mutex gated by [`SecretChoice`]: under [`SecretChoice::None`] both
-/// `Identity` and `Password` (and the Source/Inline rows) are hidden; under
+/// advance, except on the inline-key trigger rows where `Enter` opens the
+/// [`KeyPaste`] popup, inside which `Enter` inserts a newline) move through the
+/// reachable ones in declaration order; the last reachable field's `Enter`
+/// triggers a save. The secret row is a three-way mutex gated by
+/// [`SecretChoice`]: under [`SecretChoice::None`] both `Identity` and
+/// `Password` (and the Source/Inline rows) are hidden; under
 /// [`SecretChoice::IdentityKey`] the `Source` chooser appears, and its current
 /// value (`Path` vs `Inline`) decides whether `Identity` (Path) or
 /// `InlinePrivate`+`InlineCert` (Inline) is reachable; under
@@ -412,10 +333,14 @@ pub enum CredField {
     /// pick the kind, then the source, then fill the slot it exposes.
     /// Reachable iff secret == [`SecretChoice::IdentityKey`].
     Source,
-    /// Multiline private-key paste (Inline source only). Sits below `Source`
-    /// and above `Identity` to mirror the Path/Inline slot layout.
+    /// Inline private-key paste trigger row (Inline source only). Sits below
+    /// `Source` and above `Identity` to mirror the Path/Inline slot layout.
+    /// `Enter` opens the [`KeyPaste`] popup (modal); the form row itself holds
+    /// only the line-count summary.
     InlinePrivate,
-    /// Multiline optional certificate paste (Inline source only).
+    /// Inline optional certificate paste trigger row (Inline source only).
+    /// `Enter` opens the [`KeyPaste`] popup (modal); the form row itself holds
+    /// only the line-count summary.
     InlineCert,
     /// Masked password input; reachable only under [`SecretChoice::Password`].
     Password,

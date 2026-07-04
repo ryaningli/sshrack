@@ -27,7 +27,7 @@ use ratatui::{
     text::Line,
     widgets::{Block, Borders, Clear, Paragraph},
 };
-use ratatui_textarea::TextArea;
+use ratatui_textarea::{Input, Key, TextArea};
 
 /// Which inline-key slot the popup is editing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +87,68 @@ impl std::fmt::Debug for KeyPaste {
     }
 }
 
+/// Map sshrack's `crossterm` 0.28 [`KeyEvent`] into a [`TextArea`] [`Input`].
+///
+/// `ratatui-textarea` 0.9 pulls crossterm 0.29 transitively (via
+/// `ratatui-crossterm`), whose `KeyEvent` is a *different type* than the
+/// crossterm 0.28 `KeyEvent` sshrack uses everywhere else — so
+/// `textarea.input(key)` won't type-check. Building an [`Input`] directly from
+/// the event's components sidesteps the version skew without forcing a
+/// workspace-wide crossterm upgrade. The mapping mirrors the textarea's own
+/// `From<ratatui_crossterm::crossterm::event::KeyEvent>` impl: a key-release
+/// becomes a no-op `Input::default()`; `BackTab` becomes `Tab` + shift;
+/// everything else maps its [`KeyCode`] to the textarea's [`Key`] and carries
+/// the ctrl/alt/shift modifiers through.
+///
+/// Private to this module: the popup is the only consumer of the textarea
+/// bridge now that both forms route inline-key editing through it.
+///
+/// [`TextArea`]: ratatui_textarea::TextArea
+fn textarea_input_from(key: KeyEvent) -> Input {
+    if key.kind == KeyEventKind::Release {
+        return Input::default();
+    }
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    // crossterm reports Shift+Tab as BackTab (no SHIFT in modifiers); surface
+    // it to the textarea as a shifted Tab so its own shortcut logic matches.
+    if key.code == KeyCode::BackTab {
+        return Input {
+            key: Key::Tab,
+            shift: true,
+            ctrl,
+            alt,
+        };
+    }
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let key_code = match key.code {
+        KeyCode::Char(c) => Key::Char(c),
+        KeyCode::Backspace => Key::Backspace,
+        KeyCode::Enter => Key::Enter,
+        KeyCode::Left => Key::Left,
+        KeyCode::Right => Key::Right,
+        KeyCode::Up => Key::Up,
+        KeyCode::Down => Key::Down,
+        KeyCode::Tab => Key::Tab,
+        KeyCode::Delete => Key::Delete,
+        KeyCode::Home => Key::Home,
+        KeyCode::End => Key::End,
+        KeyCode::PageUp => Key::PageUp,
+        KeyCode::PageDown => Key::PageDown,
+        KeyCode::Esc => Key::Esc,
+        KeyCode::F(n) => Key::F(n),
+        // Insert / Null / any future variant the textarea does not care about:
+        // map to Null, which the textarea treats as a no-op.
+        _ => Key::Null,
+    };
+    Input {
+        key: key_code,
+        ctrl,
+        alt,
+        shift,
+    }
+}
+
 impl KeyPaste {
     /// Open a fresh popup for `kind` with an empty buffer.
     pub fn new(kind: PasteKind) -> Self {
@@ -116,7 +178,7 @@ impl KeyPaste {
         }
         // Everything else (incl. Enter → newline, arrows, Backspace, Tab →
         // indent, emacs shortcuts) is owned by the textarea.
-        let _ = self.textarea.input(super::textarea_input_from(key));
+        let _ = self.textarea.input(textarea_input_from(key));
         PasteOutcome::Pending
     }
 

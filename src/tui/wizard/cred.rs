@@ -407,21 +407,25 @@ impl CredForm {
             }
             KeyCode::Enter => {
                 // Trigger rows: InlinePrivate / InlineCert open the paste
-                // popup instead of advancing focus or saving. (Enter inside
-                // the popup inserts a newline; the popup is modal, so this
-                // arm only fires from the field row, never from inside it.)
-                match self.focus {
-                    CredField::InlinePrivate => {
-                        self.key_paste = Some(KeyPaste::new(PasteKind::Private));
-                        self.error = None;
-                        return Outcome::Continue;
-                    }
-                    CredField::InlineCert => {
-                        self.key_paste = Some(KeyPaste::new(PasteKind::Cert));
-                        self.error = None;
-                        return Outcome::Continue;
-                    }
-                    _ => {}
+                // popup instead of advancing focus or saving. Guarded by
+                // reachability so a forced focus onto an inline row under a
+                // non-IdentityKey secret (or the Path source) never opens the
+                // popup — the inline editor is IdentityKey+Inline-only by
+                // contract. (Enter inside the popup inserts a newline; the
+                // popup is modal, so this arm only fires from the field row,
+                // never from inside it.)
+                if matches!(self.focus, CredField::InlinePrivate | CredField::InlineCert)
+                    && Self::field_reachable(self.focus, self.secret_kind, self.source)
+                {
+                    self.key_paste = Some(KeyPaste::new(match self.focus {
+                        CredField::InlinePrivate => PasteKind::Private,
+                        CredField::InlineCert => PasteKind::Cert,
+                        _ => unreachable!(
+                            "invariant: focus is InlinePrivate/InlineCert (guarded above)"
+                        ),
+                    }));
+                    self.error = None;
+                    return Outcome::Continue;
                 }
                 if self.is_last_reachable(self.focus) {
                     self.attempt_save()
@@ -1986,6 +1990,25 @@ mod tests {
     }
 
     #[test]
+    fn enter_on_inline_private_under_none_secret_does_not_open_popup() {
+        // Reachability guard on the Enter trigger: InlinePrivate is unreachable
+        // under SecretChoice::None (the inline editor is IdentityKey+Inline-
+        // only by contract). Even when focus is forced onto the row, Enter
+        // must NOT open the paste popup — symmetric to the host wizard's
+        // Reference-branch isolation guard. Pins the cred wizard's trigger
+        // guard against a regression that would let a forced focus open the
+        // popup from an unreachable state.
+        let mut f = CredForm::new_add();
+        f.secret_kind = SecretChoice::None; // InlinePrivate unreachable
+        f.focus = CredField::InlinePrivate; // forced onto an unreachable row
+        let _ = f.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            f.key_paste.is_none(),
+            "Enter must not open the popup when the row is unreachable"
+        );
+    }
+
+    #[test]
     fn new_edit_path_original_defaults_source_to_path_with_identity_prefilled() {
         // Counterpart to the inline-original test: a Path original defaults
         // Source to Path with the identity field prefilled (the path IS shown,
@@ -2073,9 +2096,9 @@ mod tests {
 
     #[test]
     fn body_rows_is_independent_of_inline_field_focus() {
-        // body_rows no longer depends on focus (no inline editor block); it is
-        // a stable worst-case across every (secret, source) combo. Pins the
-        // removal of the focus-aware TEXTAREA_H growth.
+        // body_rows no longer depends on focus (the multiline editor lives in
+        // the modal KeyPaste popup, not as an in-body block); it is a stable
+        // worst-case across every (secret, source) combo. Pins that contract.
         for secret in [
             SecretChoice::None,
             SecretChoice::Password,
