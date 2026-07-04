@@ -30,10 +30,6 @@ use ratatui::{
 use ratatui_textarea::TextArea;
 
 /// Which inline-key slot the popup is editing.
-///
-/// `dead_code`: Tasks 2 & 3 wire this into `CredForm` / `HostForm`; no
-/// in-crate reader exists yet.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PasteKind {
     /// The required private key.
@@ -43,9 +39,6 @@ pub enum PasteKind {
 }
 
 /// The pure result of [`KeyPaste::on_key`] handling one key.
-///
-/// `dead_code`: see [`PasteKind`] — consumed by Tasks 2 & 3.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PasteOutcome {
     /// `Esc` — close the popup. `text` is the textarea's current contents
@@ -71,9 +64,6 @@ pub enum PasteOutcome {
 /// is derived; `PartialEq`/`Eq` are not available (`TextArea` does not impl
 /// them), so tests assert on [`PasteOutcome`] (which is `PartialEq`) rather
 /// than on `KeyPaste` directly.
-///
-/// `dead_code`: Tasks 2 & 3 wire this into the cred/host wizards.
-#[allow(dead_code)]
 #[derive(Clone)]
 pub struct KeyPaste {
     /// Which slot this popup edits (drives the title + which form field the
@@ -97,11 +87,6 @@ impl std::fmt::Debug for KeyPaste {
     }
 }
 
-/// `dead_code`: Tasks 2 & 3 wire these into the cred/host wizards. The allow
-/// lives on the impl (NOT just the struct) because `dead_code` flags each
-/// unused method as a separate item — the struct-level allow does not
-/// propagate to inherent-impl methods.
-#[allow(dead_code)]
 impl KeyPaste {
     /// Open a fresh popup for `kind` with an empty buffer.
     pub fn new(kind: PasteKind) -> Self {

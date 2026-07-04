@@ -21,12 +21,11 @@ use zeroize::Zeroizing;
 use super::super::intent::Outcome;
 use super::super::theme;
 use super::{
-    CRED_LABEL_WIDTH, CRED_VALUE_COL, CredField, CredSaveError, SecretChoice, SourceChoice,
-    TEXTAREA_H, backspace_at, bracketed, insert_char_at, textarea_input_from, validate_cred,
+    CRED_LABEL_WIDTH, CRED_VALUE_COL, CredField, CredSaveError, KeyPaste, PasteKind, PasteOutcome,
+    SecretChoice, SourceChoice, backspace_at, bracketed, insert_char_at, validate_cred,
     value_spans,
 };
 use crate::tui::fit::truncate_cells;
-use ratatui_textarea::TextArea;
 use sshrack_core::config::schema::{Credential, CredentialBody, KeySource};
 
 /// The credential form's editable state. The password is held as a
@@ -51,22 +50,17 @@ pub struct CredForm {
     /// row. Relevant only under [`SecretChoice::IdentityKey`]; ignored (and
     /// stays [`SourceChoice::Path`]) for Password / None.
     pub source: SourceChoice,
-    /// Multiline private-key paste, edited when the secret choice is
-    /// [`SecretChoice::IdentityKey`] AND the source is [`SourceChoice::Inline`].
-    /// Always empty on edit-entry (the existing key text is NEVER echoed back —
-    /// security; [`CredForm::build_body`] preserves the original on save when
-    /// this stays blank). [`TextArea`] is not [`PartialEq`] and its [`Debug`]
-    /// prints contents, so this field never participates in whole-form equality
-    /// (none exists) and the form's hand-written [`Debug`] shows only its line
-    /// COUNT.
-    ///
-    /// [`PartialEq`]: std::cmp::PartialEq
-    /// [`Debug`]: std::fmt::Debug
-    pub inline_private: TextArea<'static>,
-    /// Multiline optional certificate paste, companion to
-    /// [`CredForm::inline_private`]. Same lifecycle: always empty on
-    /// edit-entry, edited only under Inline source.
-    pub inline_cert: TextArea<'static>,
+    /// Multiline private-key paste buffer, written back from the [`KeyPaste`]
+    /// popup when the user closes it with a non-blank buffer. Always empty on
+    /// edit-entry (the existing key text is NEVER echoed back — security;
+    /// [`CredForm::build_body`] preserves the original on save when this stays
+    /// blank). A plain `String` because the form body no longer renders an
+    /// editor — editing happens only in the popup.
+    pub inline_private: String,
+    /// Multiline optional certificate paste buffer, written back from the
+    /// [`KeyPaste`] popup. Companion to [`CredForm::inline_private`]: same
+    /// lifecycle, always empty on edit-entry, edited only under Inline source.
+    pub inline_cert: String,
     /// The masked password, edited when the secret choice is
     /// [`SecretChoice::Password`]. `Zeroizing` so it is wiped on drop.
     pub password: Zeroizing<String>,
@@ -75,7 +69,7 @@ pub struct CredForm {
     /// Char-index cursor within the focused text field. Reset to the focused
     /// field's end on focus change; clamped on read by [`cursor_target`].
     /// Irrelevant for the Source chooser and the multiline paste fields (the
-    /// [`TextArea`] owns its own cursor).
+    /// [`KeyPaste`] popup owns its own cursor while open).
     pub(super) cursor: usize,
     /// A transient validation error to show under the bad field. Cleared on the
     /// next edit to that field.
@@ -93,12 +87,17 @@ pub struct CredForm {
     /// add mode.
     pub orig_id: Option<Ulid>,
     /// The original body's [`KeySource`] when the credential carried a key at
-    /// edit time. Under the Inline source the textareas start EMPTY (the key
-    /// text is never echoed); [`CredForm::build_body`] re-attaches this
+    /// edit time. Under the Inline source the paste buffers start EMPTY (the
+    /// key text is never echoed); [`CredForm::build_body`] re-attaches this
     /// verbatim when the private field stays blank, so silently dropping it
     /// never destroys the credential's only secret. `None` in add mode and when
     /// the original had no key.
     pub orig_key: Option<KeySource>,
+    /// The modal inline-key paste popup, open while the user edits the
+    /// `InlinePrivate` / `InlineCert` slot. `None` when closed. Routed at the
+    /// top of [`CredForm::on_key`] (modal — swallows every key while open,
+    /// including `Ctrl-S`, like the host wizard's credential picker).
+    pub key_paste: Option<KeyPaste>,
 }
 
 impl std::fmt::Debug for CredForm {
@@ -111,20 +110,19 @@ impl std::fmt::Debug for CredForm {
         // `orig_key` delegates to `KeySource`'s redacting `Debug`, which
         // surfaces the path but redacts inline key text.
         //
-        // The two inline-paste TextAreas are NEVER surfaced directly:
-        // `TextArea`'s derived `Debug` prints the `lines: Vec<String>` field,
-        // which would leak the pasted private key / certificate to any
-        // `dbg!(form)` / `format!("{form:?}")` call. Surface ONLY their line
-        // count, so a glance at the form's Debug still tells you whether the
-        // user has pasted anything without ever showing what.
+        // The two inline-paste buffers are NEVER surfaced directly: a raw
+        // `String` Debug would print the pasted private key / certificate to
+        // any `dbg!(form)` / `format!("{form:?}")` call. Surface ONLY their
+        // line count, so a glance at the form's Debug still tells you whether
+        // the user has pasted anything without ever showing what.
         f.debug_struct("CredForm")
             .field("name", &self.name)
             .field("user", &self.user)
             .field("identity", &self.identity)
             .field("secret_kind", &self.secret_kind)
             .field("source", &self.source)
-            .field("inline_private_lines", &self.inline_private.lines().len())
-            .field("inline_cert_lines", &self.inline_cert.lines().len())
+            .field("inline_private_lines", &self.inline_private.lines().count())
+            .field("inline_cert_lines", &self.inline_cert.lines().count())
             .field("password", &"<redacted>")
             .field("focus", &self.focus)
             .field("error", &self.error)
@@ -146,8 +144,8 @@ impl CredForm {
             identity: String::new(),
             secret_kind: SecretChoice::None,
             source: SourceChoice::Path,
-            inline_private: TextArea::default(),
-            inline_cert: TextArea::default(),
+            inline_private: String::new(),
+            inline_cert: String::new(),
             password: Zeroizing::new(String::new()),
             focus: CredField::Name,
             cursor: 0,
@@ -156,6 +154,7 @@ impl CredForm {
             editing: false,
             orig_id: None,
             orig_key: None,
+            key_paste: None,
         };
         form.cursor = form.focused_text_len();
         form
@@ -171,14 +170,14 @@ impl CredForm {
     /// **Source + identity prefill.** Under a `Key` body the source chooser
     /// opens reflecting the original: [`SourceChoice::Path`] with `identity`
     /// prefilled from the path, or [`SourceChoice::Inline`] with `identity`
-    /// left blank (the key text is NEVER echoed into a textarea — security).
-    /// The original [`KeySource`] is carried as `orig_key` regardless, so
-    /// [`build_body`](Self::build_body) can re-attach an inline original
-    /// verbatim when the user does not paste a new key — silently dropping it
-    /// would destroy the credential's only secret. The two inline textareas
-    /// always start EMPTY on edit entry, even when the original was inline
-    /// material; the user pastes a NEW key to replace it, or leaves the
-    /// private field blank to keep the original.
+    /// left blank (the key text is NEVER echoed into the paste buffer —
+    /// security). The original [`KeySource`] is carried as `orig_key`
+    /// regardless, so [`build_body`](Self::build_body) can re-attach an inline
+    /// original verbatim when the user does not paste a new key — silently
+    /// dropping it would destroy the credential's only secret. The two inline
+    /// buffers always start EMPTY on edit entry, even when the original was
+    /// inline material; the user pastes a NEW key (via the [`KeyPaste`] popup)
+    /// to replace it, or leaves the private field blank to keep the original.
     pub fn new_edit(cred: &Credential) -> Self {
         use sshrack_core::config::schema::SecretKind;
         let body = &cred.body;
@@ -208,12 +207,12 @@ impl CredForm {
             identity,
             secret_kind,
             source,
-            // Inline textareas ALWAYS start empty on edit entry. An inline
+            // Inline buffers ALWAYS start empty on edit entry. An inline
             // original's key text is never echoed back (security); the user
             // pastes a new key to replace it, or leaves the private field
             // blank so build_body re-attaches the original.
-            inline_private: TextArea::default(),
-            inline_cert: TextArea::default(),
+            inline_private: String::new(),
+            inline_cert: String::new(),
             // Never carry the existing plaintext into the form: a password is
             // not echoed back. The user re-types to set a new one; leaving the
             // field empty on a Password-kind edit keeps the existing secret
@@ -226,6 +225,7 @@ impl CredForm {
             editing: true,
             orig_id: Some(cred.id),
             orig_key,
+            key_paste: None,
         };
         form.cursor = form.focused_text_len();
         form
@@ -327,59 +327,54 @@ impl CredForm {
     ///   on text fields; clamped to the field's char length.
     /// - `Tab` / `↓` → next field; `Shift-Tab` / `↑` → previous field.
     /// - `Enter` → next field, or — on the last reachable field — attempt save;
-    ///   on validation error set `error` and move focus to the bad field.
-    ///   Inside an inline textarea, `Enter` instead inserts a newline (the
-    ///   textarea owns multiline editing; see the guard below).
+    ///   on validation error set `error` and move focus to the bad field. On
+    ///   the inline-key rows (`InlinePrivate` / `InlineCert`) `Enter` instead
+    ///   opens the [`KeyPaste`] popup (modal — see the route at the top).
     /// - `Ctrl-S` → attempt save from any field.
     /// - `←`/`→` on the secret row → cycle secret kind.
     /// - `←`/`→` on the Source row (IdentityKey only) → cycle Path / Inline.
-    /// - When an inline textarea (`InlinePrivate` / `InlineCert`) is focused,
-    ///   every text-editing key is forwarded to the textarea so it owns its
-    ///   cursor / newlines / backspace. Navigation (`Tab` / `BackTab` / `↑` /
-    ///   `↓`), save (`Ctrl-S`), and cancel (`Esc` / `Ctrl-C`) still navigate /
-    ///   act globally — only text-editing keys are captured.
-    /// - `Esc` / `Ctrl-C` → cancel back.
+    /// - While the [`KeyPaste`] popup is open every key is routed into it
+    ///   (modal — it swallows `Ctrl-S`, `Tab`, etc.); close it with `Esc`
+    ///   (writes the buffer back when non-blank) or `Ctrl-C` (discard) before
+    ///   the form sees another key.
+    /// - `Esc` / `Ctrl-C` → cancel back (when no popup is open).
     pub fn on_key(&mut self, key: KeyEvent) -> Outcome {
         if key.kind != KeyEventKind::Press {
             return Outcome::Continue;
         }
         // Any keystroke clears a stale core-level error.
         self.core_error = None;
+
+        // An open paste popup is modal: route every key into it before the
+        // form. `take()` so we can write back to `key_paste` / the inline
+        // buffers without a borrow conflict; on Pending the still-open popup
+        // goes back. Done writes the buffer back only when non-blank (a blank
+        // buffer preserves the field — and the original key on edit); Cancel
+        // discards. Swallows every key while open, incl Ctrl-S — close
+        // (Esc/Ctrl-C) before ^s can save.
+        if let Some(mut paste) = self.key_paste.take() {
+            let kind = paste.kind;
+            match paste.on_key(key) {
+                PasteOutcome::Done(text) => {
+                    if !text.trim().is_empty() {
+                        match kind {
+                            PasteKind::Private => self.inline_private = text,
+                            PasteKind::Cert => self.inline_cert = text,
+                        }
+                    }
+                }
+                PasteOutcome::Cancel => {}
+                PasteOutcome::Pending => self.key_paste = Some(paste),
+            }
+            self.error = None;
+            return Outcome::Continue;
+        }
+
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let ctrl_c_only = key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c');
 
         if ctrl_c_only {
             return Outcome::Cancel;
-        }
-
-        // Inline-paste textareas: the focused TextArea owns all text-editing
-        // (chars, Enter→newline, Backspace, arrows, Home/End, and its own
-        // Emacs-style Ctrl shortcuts). A bare Enter therefore inserts a newline
-        // at the textarea cursor instead of advancing to the next field.
-        // Navigation (Tab / BackTab / Up / Down), cancel (Esc), and save
-        // (Ctrl-S) bypass this guard so they keep working as field navigation
-        // and global actions. (Ctrl-C was already handled above.) The textarea
-        // returns whether it modified the buffer; we ignore that — we always
-        // `Continue` because there is nothing else to do for a captured key.
-        if matches!(self.focus, CredField::InlinePrivate | CredField::InlineCert)
-            && !matches!(
-                key.code,
-                KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down | KeyCode::Esc
-            )
-            && !(ctrl && key.code == KeyCode::Char('s'))
-        {
-            match self.focus {
-                CredField::InlinePrivate => {
-                    self.inline_private.input(textarea_input_from(key));
-                }
-                CredField::InlineCert => {
-                    self.inline_cert.input(textarea_input_from(key));
-                }
-                // Guard above restricts to these two variants; the unreachable
-                // arms keep the match exhaustive without a wider `_ =>`.
-                _ => {}
-            }
-            return Outcome::Continue;
         }
 
         match key.code {
@@ -411,10 +406,23 @@ impl CredForm {
                 Outcome::Continue
             }
             KeyCode::Enter => {
-                // The inline textareas never reach this arm: the guard above
-                // captures Enter (and every other text-editing key) when one is
-                // focused, so Enter there inserts a newline in the textarea.
-                // For the chooser/text fields, Enter advances or saves.
+                // Trigger rows: InlinePrivate / InlineCert open the paste
+                // popup instead of advancing focus or saving. (Enter inside
+                // the popup inserts a newline; the popup is modal, so this
+                // arm only fires from the field row, never from inside it.)
+                match self.focus {
+                    CredField::InlinePrivate => {
+                        self.key_paste = Some(KeyPaste::new(PasteKind::Private));
+                        self.error = None;
+                        return Outcome::Continue;
+                    }
+                    CredField::InlineCert => {
+                        self.key_paste = Some(KeyPaste::new(PasteKind::Cert));
+                        self.error = None;
+                        return Outcome::Continue;
+                    }
+                    _ => {}
+                }
                 if self.is_last_reachable(self.focus) {
                     self.attempt_save()
                 } else {
@@ -456,8 +464,9 @@ impl CredForm {
             }
             // Text fields: ←/→ move the in-field cursor; Home/End jump.
             // (The SecretKind and Source chooser rows are handled by the arms
-            // above. The inline textareas never reach here: the guard above
-            // captures all their text-editing keys, including ←/→.)
+            // above. The inline-key rows never reach here for cursor editing:
+            // they open the KeyPaste popup on Enter, and ←/→ on them is a
+            // no-op cursor move on a non-text field — harmless.)
             KeyCode::Left if !ctrl => {
                 self.cursor = self.cursor.saturating_sub(1);
                 Outcome::Continue
@@ -491,11 +500,11 @@ impl CredForm {
     /// Insert `c` at the in-field cursor (advancing it one past the inserted
     /// char). The SecretKind and Source choosers are driven by ←/→; the
     /// Password field only accepts input when secret_kind is Password. The
-    /// inline textareas are NEVER edited through this char-based path —
-    /// [`on_key`](Self::on_key)'s textarea guard forwards the original
-    /// `KeyEvent` to `TextArea::input` (which owns the cursor / newlines) — so
-    /// those arms are no-ops here, reached only if a future caller bypasses the
-    /// guard.
+    /// inline-key rows (InlinePrivate / InlineCert) are NEVER edited through
+    /// this char-based path — [`on_key`](Self::on_key) opens the [`KeyPaste`]
+    /// popup on `Enter`, and the popup owns the multiline editing — so those
+    /// arms are no-ops here, reached only if a future caller bypasses the
+    /// popup.
     fn edit_focused_insert(&mut self, c: char) {
         match self.focus {
             CredField::Name => self.cursor = insert_char_at(&mut self.name, self.cursor, c),
@@ -509,8 +518,8 @@ impl CredForm {
             }
             CredField::Password => {}
             // No char-based text entry on these rows: Source is a ←/→ chooser;
-            // InlinePrivate / InlineCert are edited via `TextArea::input` from
-            // `on_key`'s textarea guard, which never calls this function.
+            // InlinePrivate / InlineCert are edited via the KeyPaste popup
+            // (opened on Enter in `on_key`), which never calls this function.
             CredField::Source | CredField::InlinePrivate | CredField::InlineCert => {}
         }
         if Some(self.focus) == self.error.map(CredSaveError::field) {
@@ -520,9 +529,8 @@ impl CredForm {
 
     /// Delete the char immediately before the in-field cursor (mirror of
     /// [`edit_focused_insert`]). No-op when the cursor is already at the start.
-    /// As with [`edit_focused_insert`], the inline textareas handle backspace
-    /// themselves via `TextArea::input`; their arms here are unreachable
-    /// no-ops.
+    /// As with [`edit_focused_insert`], the inline-key rows handle editing via
+    /// the [`KeyPaste`] popup; their arms here are unreachable no-ops.
     fn edit_focused_backspace(&mut self) {
         match self.focus {
             CredField::Name => self.cursor = backspace_at(&mut self.name, self.cursor),
@@ -533,7 +541,8 @@ impl CredForm {
                 self.cursor = backspace_at(&mut self.password, self.cursor)
             }
             CredField::Password => {}
-            // See `edit_focused_insert`: textareas own their own backspace.
+            // See `edit_focused_insert`: the inline-key rows edit via the
+            // KeyPaste popup, not char-by-char.
             CredField::Source | CredField::InlinePrivate | CredField::InlineCert => {}
         }
         if Some(self.focus) == self.error.map(CredSaveError::field) {
@@ -564,12 +573,12 @@ impl CredForm {
     ///   original → preserve that inline material verbatim (data safety — never
     ///   destroy the credential's only secret just because the path field is
     ///   empty); blank with no inline original → no key.
-    /// - **Inline** — the private textarea's joined lines become an inline key
-    ///   via [`CredentialBody::with_inline_key`], with the cert textarea
-    ///   attached only when non-empty. A blank private field on edit preserves
-    ///   the original inline material verbatim (the textareas are NEVER
-    ///   prefilled with key text on edit-entry — security; this rule is the
-    ///   only thing standing between the user and silently losing their key).
+    /// - **Inline** — the private buffer becomes an inline key via
+    ///   [`CredentialBody::with_inline_key`], with the cert buffer attached
+    ///   only when non-empty. A blank private field on edit preserves the
+    ///   original inline material verbatim (the buffer is NEVER prefilled with
+    ///   key text on edit-entry — security; this rule is the only thing
+    ///   standing between the user and silently losing their key).
     ///
     /// [`Secret::Plain`]: sshrack_core::config::schema::Secret::Plain
     pub fn build_body(&self) -> CredentialBody {
@@ -598,8 +607,8 @@ impl CredForm {
                         }
                     }
                     SourceChoice::Inline => {
-                        let private = self.inline_private.lines().join("\n");
-                        let cert = self.inline_cert.lines().join("\n");
+                        let private = self.inline_private.clone();
+                        let cert = self.inline_cert.clone();
                         if !private.trim().is_empty() {
                             let cert_sec = (!cert.trim().is_empty()).then_some(Secret::Plain(cert));
                             body = body.with_inline_key(Secret::Plain(private), cert_sec);
@@ -617,73 +626,45 @@ impl CredForm {
         }
     }
 
-    /// Render the field rows + (when a paste field is focused) the multiline
-    /// editor block + error/hint lines into `body` (the rect a
-    /// [`crate::tui::dialog::draw_dialog`] hands the form). No outer border —
+    /// Render the field rows + error/hint lines into `body` (the rect a
+    /// [`crate::tui::dialog::draw_dialog`] hands the form), then — when the
+    /// [`KeyPaste`] popup is open — paint it over the form. No outer border —
     /// the dialog already drew the chrome.
     ///
-    /// The body is split into four vertical segments: `list_area` holds the
-    /// single-line field rows (Length = visible row count), `editor_area` holds
-    /// the focused [`TextArea`] (Length [`TEXTAREA_H`] when a paste field is
-    /// focused, else Length 0), and `error_area` / `hint_area` are the fixed
-    /// 1-row tail. The field list and the editor block are separate areas, so
-    /// [`crate::tui::fit::focus_window`] (which windows only the list) can never
-    /// scroll the editor out of view. The [`TextArea`] draws its own cursor, so
-    /// [`Frame::set_cursor_position`] is NOT called for the paste fields —
-    /// [`cursor_target`](Self::cursor_target) already returns `None` for them,
-    /// and the guard below skips them.
+    /// The body is split into three vertical segments: `list_area` holds the
+    /// single-line field rows (Length = visible row count), and `error_area`
+    /// / `hint_area` are the fixed 1-row tail. The inline-key rows
+    /// (`InlinePrivate` / `InlineCert`) are NOT edited in-place — `Enter`
+    /// opens the [`KeyPaste`] popup, which is painted last so it sits on top
+    /// of the form (modal). [`crate::tui::fit::focus_window`] windows only the
+    /// list, so it never scrolls the error/hint rows out of view.
+    /// [`Frame::set_cursor_position`] is NOT called for the inline-key rows —
+    /// [`cursor_target`](Self::cursor_target) returns `None` for them, and the
+    /// popup owns its own cursor while open.
     pub fn draw_in_dialog(&self, frame: &mut Frame, body: ratatui::layout::Rect) {
         let reachable = self.reachable_fields();
         let total = reachable.len();
-        // The fields area is `body.height` minus the error(1) + hint(1) rows
-        // and the multiline editor block (TEXTAREA_H when a paste field is
-        // focused) rendered below the field list. When the terminal is too
-        // short to fit every field, `focus_window` picks the viewport that
-        // keeps the focused one visible.
-        let needs_block = matches!(self.focus, CredField::InlinePrivate | CredField::InlineCert);
-        let editor_h = if needs_block { TEXTAREA_H } else { 0 };
-        let fields_h = body.height.saturating_sub(2 + editor_h) as usize;
+        // The fields area is `body.height` minus the error(1) + hint(1) rows.
+        // When the terminal is too short to fit every field, `focus_window`
+        // picks the viewport that keeps the focused one visible.
+        let fields_h = body.height.saturating_sub(2) as usize;
         let win = crate::tui::fit::focus_window(total, self.focus_idx(), fields_h);
         let rows: Vec<Line> = reachable[win.clone()]
             .iter()
             .map(|f| self.render_row(*f, body.width))
             .collect();
 
-        // 4-split: the single-line field list, then the multiline editor block
-        // (0-height when no textarea is focused), then the 1-row error and
-        // hint lines pinned to the body's bottom. `list_area` is `Length` of
-        // the rendered row count so it tracks the focus-following viewport
-        // exactly; `editor_area` collapses to 0 when no paste field owns
-        // focus, so the list + error + hint sit exactly where the prior
-        // 3-split placed them.
-        let [list_area, editor_area, error_area, hint_area] = Layout::vertical([
+        // 3-split: the single-line field list, then the 1-row error and hint
+        // lines pinned to the body's bottom. `list_area` is `Length` of the
+        // rendered row count so it tracks the focus-following viewport exactly.
+        let [list_area, error_area, hint_area] = Layout::vertical([
             Constraint::Length(rows.len() as u16),
-            Constraint::Length(editor_h),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
         .areas(body);
 
         frame.render_widget(Paragraph::new(rows), list_area);
-
-        // When a multiline paste field is focused, render the live TextArea
-        // into the editor block. `&TextArea` implements
-        // `ratatui_core::widgets::Widget` (ratatui-textarea 0.9.2), so a plain
-        // `render_widget(&ta, area)` call draws it — including its own cursor,
-        // which is why we do NOT call `set_cursor_position` for these fields.
-        if needs_block {
-            let ta: &TextArea = match self.focus {
-                CredField::InlinePrivate => &self.inline_private,
-                CredField::InlineCert => &self.inline_cert,
-                // Guarded by `needs_block` above; unreachable in practice.
-                // A silent `return` here would mask a future invariant break AND
-                // skip the error/hint row rendering below, so panic loudly.
-                _ => unreachable!(
-                    "invariant: focus is InlinePrivate/InlineCert (guarded by needs_block)"
-                ),
-            };
-            frame.render_widget(ta, editor_area);
-        }
 
         let error_line = if let Some(msg) = &self.core_error {
             Line::from(vec![
@@ -706,7 +687,7 @@ impl CredForm {
         } else if self.focus == CredField::Source {
             "  <- -> cycle source"
         } else if matches!(self.focus, CredField::InlinePrivate | CredField::InlineCert) {
-            "  Enter=newline  Tab=next field"
+            "  Enter edit multiline"
         } else {
             "  up/down next field"
         };
@@ -714,11 +695,11 @@ impl CredForm {
 
         // Place the real terminal cursor on the focused text field (no drawn
         // glyph — see HostForm::draw_in_dialog). SecretKind / Source are
-        // choosers; the inline textareas own their own cursors — all three
-        // return `None` from `cursor_target`, so the guard skips them and we
-        // never double-set the cursor over a rendered TextArea. The row index
-        // is translated into the viewport so the cursor never points below the
-        // list area when the list scrolls.
+        // choosers; the inline-key rows return `None` (the KeyPaste popup owns
+        // its own cursor while open) — so the guard skips them and we never
+        // double-set the cursor over the popup. The row index is translated
+        // into the viewport so the cursor never points below the list area
+        // when the list scrolls.
         if let Some((row, offset)) = self.cursor_target() {
             if win.start <= row && row < win.end {
                 let in_win_row = row - win.start;
@@ -728,12 +709,20 @@ impl CredForm {
                 frame.set_cursor_position((x, y));
             }
         }
+
+        // If the inline-key paste popup is open, paint it over the wizard.
+        // Drawn last so it sits on top, and after the wizard's own cursor
+        // placement so the popup's cursor wins. Mirrors HostForm's
+        // cred_picker overlay.
+        if let Some(paste) = &self.key_paste {
+            paste.draw_overlay(frame);
+        }
     }
 
     /// Char count of the currently focused text field. Returns 0 for the
     /// SecretKind and Source chooser rows (no in-field cursor) and for the
-    /// inline textareas (the [`TextArea`] owns its own cursor, so this form
-    /// cursor is irrelevant for them).
+    /// inline-key rows (the [`KeyPaste`] popup owns its own cursor while open,
+    /// so this form cursor is irrelevant for them).
     fn focused_text_len(&self) -> usize {
         match self.focus {
             CredField::Name => self.name.chars().count(),
@@ -747,12 +736,12 @@ impl CredForm {
 
     /// The `(row, value_offset)` where the terminal cursor should sit for the
     /// focused field, or `None` for the SecretKind / Source choosers and the
-    /// inline textareas. `row` is the index into the reachable rendered rows;
+    /// inline-key rows. `row` is the index into the reachable rendered rows;
     /// `offset` is the stored char-index cursor, clamped to the field's current
     /// length. Pure; consumed by [`CredForm::draw_in_dialog`] to call
-    /// `Frame::set_cursor_position`. The inline textareas return `None` because
-    /// [`TextArea`] positions its own cursor internally; the Source row is a
-    /// chooser like SecretKind.
+    /// `Frame::set_cursor_position`. The inline-key rows return `None` because
+    /// the [`KeyPaste`] popup positions its own cursor internally while open;
+    /// the Source row is a chooser like SecretKind.
     fn cursor_target(&self) -> Option<(usize, usize)> {
         let row = self.focus_idx();
         let offset = match self.focus {
@@ -776,43 +765,31 @@ impl CredForm {
         }
     }
 
-    /// Body row count the dialog sizes to. **Focus-aware**: the base count is
-    /// the **maximum** reachable field count across every (secret, source)
-    /// state (so toggling the Secret or Source chooser changes which rows are
-    /// filled but never collapses the dialog box), plus one error row and one
-    /// hint row. When a paste field ([`CredField::InlinePrivate`] /
-    /// [`CredField::InlineCert`]) is focused, [`TEXTAREA_H`] extra rows are
-    /// added so the expanded multiline editor block fits inside the border —
-    /// the dialog grows by exactly [`TEXTAREA_H`] on textarea focus and shrinks
-    /// back when focus leaves. Consumed by the App overlay layer via
-    /// [`crate::tui::dialog::draw_dialog`].
+    /// Body row count the dialog sizes to. The count is the **maximum**
+    /// reachable field count across every (secret, source) state (so toggling
+    /// the Secret or Source chooser changes which rows are filled but never
+    /// collapses the dialog box), plus one error row and one hint row. It is
+    /// NOT focus-aware: the inline-key rows edit in the [`KeyPaste`] popup (a
+    /// modal overlay), so the body never expands an editor block — the dialog
+    /// stays a stable height while the form is open. Consumed by the App
+    /// overlay layer via [`crate::tui::dialog::draw_dialog`].
     pub fn body_rows(&self) -> u16 {
-        let max_fields = [
+        let mut max_fields = 0usize;
+        for secret in [
             SecretChoice::None,
             SecretChoice::Password,
             SecretChoice::IdentityKey,
-        ]
-        .iter()
-        .flat_map(|&secret| {
-            [SourceChoice::Path, SourceChoice::Inline]
-                .iter()
-                .map(move |&source| (secret, source))
-        })
-        .map(|(secret, source)| {
-            CredField::ORDER
-                .iter()
-                .filter(|&&f| Self::field_reachable(f, secret, source))
-                .count()
-        })
-        .max()
-        .unwrap_or(0);
-        let textarea_extra =
-            if matches!(self.focus, CredField::InlinePrivate | CredField::InlineCert) {
-                TEXTAREA_H as usize
-            } else {
-                0
-            };
-        (max_fields + textarea_extra + 2) as u16 // + error row + hint row
+        ] {
+            for source in [SourceChoice::Path, SourceChoice::Inline] {
+                let n = CredField::ORDER
+                    .iter()
+                    .copied()
+                    .filter(|&f| Self::field_reachable(f, secret, source))
+                    .count();
+                max_fields = max_fields.max(n);
+            }
+        }
+        (max_fields + 2) as u16 // + error row + hint row
     }
 
     /// Render one labeled field row, with the focus highlight + placeholder.
@@ -875,29 +852,32 @@ impl CredForm {
                 (v, ph)
             }
             CredField::InlinePrivate => {
-                // One-line summary of the textarea's content (never echoes the
-                // key text itself): blank → placeholder, non-blank → "N line(s)"
-                // count. The full multiline editor renders in the expanded block
-                // below the field list when this row is focused (see
-                // [`CredForm::draw_in_dialog`]); the summary always occupies the
-                // single-line row regardless of focus.
-                let n = self.inline_private.lines().len();
-                if n == 1 && self.inline_private.lines()[0].is_empty() {
-                    (
-                        String::new(),
-                        Some("paste private key (focus to edit multiline)"),
-                    )
+                // One-line summary of the buffer (never echoes key text):
+                // blank → placeholder, non-blank → "N line(s)" count. The
+                // full editor opens as a popup on Enter (see `on_key`).
+                if self.inline_private.trim().is_empty() {
+                    (String::new(), Some("paste private key (Enter to edit)"))
                 } else {
-                    (format!("{} line(s) of private key", n), None)
+                    (
+                        format!(
+                            "{} line(s) of private key",
+                            self.inline_private.lines().count()
+                        ),
+                        None,
+                    )
                 }
             }
             CredField::InlineCert => {
-                // Companion summary for the optional certificate textarea.
-                let n = self.inline_cert.lines().len();
-                if n == 1 && self.inline_cert.lines()[0].is_empty() {
-                    (String::new(), Some("optional certificate (focus to edit)"))
+                if self.inline_cert.trim().is_empty() {
+                    (String::new(), Some("optional certificate (Enter to edit)"))
                 } else {
-                    (format!("{} line(s) of certificate", n), None)
+                    (
+                        format!(
+                            "{} line(s) of certificate",
+                            self.inline_cert.lines().count()
+                        ),
+                        None,
+                    )
                 }
             }
             CredField::Password => {
@@ -1337,8 +1317,8 @@ mod tests {
         let mut f = complete_cred_form();
         f.secret_kind = SecretChoice::IdentityKey;
         f.source = SourceChoice::Inline;
-        f.inline_private = TextArea::new(vec!["PRIVATE-KEY-TEXT".into()]);
-        f.inline_cert = TextArea::new(vec!["CERT-TEXT".into()]);
+        f.inline_private = "PRIVATE-KEY-TEXT".to_string();
+        f.inline_cert = "CERT-TEXT".to_string();
         let b = f.build_body();
         assert_eq!(b.secret_kind(), SecretKind::Key);
         match b.key {
@@ -1356,7 +1336,7 @@ mod tests {
         let mut f = complete_cred_form();
         f.secret_kind = SecretChoice::IdentityKey;
         f.source = SourceChoice::Inline;
-        f.inline_private = TextArea::new(vec!["line1".into(), "line2".into(), "line3".into()]);
+        f.inline_private = "line1\nline2\nline3".to_string();
         let b = f.build_body();
         let plain = match b.key {
             Some(KeySource::Inline(ik)) => ik.private_key.unwrap().as_plain().unwrap().to_string(),
@@ -1372,7 +1352,7 @@ mod tests {
         f.editing = true;
         f.secret_kind = SecretChoice::IdentityKey;
         f.source = SourceChoice::Inline;
-        f.inline_private = TextArea::default(); // empty — user did not re-paste
+        f.inline_private = String::new(); // empty — user did not re-paste
         f.orig_key = Some(KeySource::Inline(InlineKey {
             private_key: Some(Secret::Plain("ORIGINAL".into())),
             certificate: None,
@@ -1633,22 +1613,18 @@ mod tests {
         );
     }
 
-    // ---- small-terminal viewport: textarea-focused render must not panic ----
+    // ---- small-terminal viewport: popup-overlay render must not panic ----
 
     #[test]
-    fn draw_in_dialog_renders_textarea_focus_without_panic_on_short_terminal() {
-        // Behavior pin for the `fields_h = body.height.saturating_sub(2 + editor_h)`
-        // viewport adjustment above (the multiline paste fields). The existing
-        // short-terminal test focuses Password where `editor_h == 0`, and the
-        // render-smoke runs at 100x40 where everything fits — so neither
-        // exercises the `editor_h == TEXTAREA_H` branch on a body too short to
-        // hold `2 + editor_h`. On a height-11 terminal the dialog body collapses
-        // to ~3 rows, so `body.height - (2 + TEXTAREA_H)` would UNDERFLOW without
-        // the `saturating_sub`. If that `saturating_sub` is ever reverted to a
-        // plain subtraction, this test panics in debug (subtract-with-overflow)
-        // and turns the silent regression visible. We cover both paste fields
-        // (InlinePrivate, InlineCert) so the `needs_block` match — and its
-        // `unreachable!` guard — is exercised on each.
+    fn draw_in_dialog_renders_popup_overlay_without_panic_on_short_terminal() {
+        // Behavior pin for the popup-overlay render path. The body is now a
+        // stable 3-split (list/error/hint) regardless of focus, and the
+        // multiline editor lives in the modal KeyPaste popup painted on top.
+        // On a height-11 terminal the dialog body collapses to ~3 rows, so the
+        // `fields_h = body.height.saturating_sub(2)` viewport adjustment must
+        // not underflow and the popup's centered_rect must still fit. We cover
+        // both inline-key fields with the popup open and closed so both the
+        // overlay branch and the plain 3-split branch render without panic.
         use crate::tui::dialog::draw_dialog;
         use ratatui::{Terminal, backend::TestBackend};
 
@@ -1658,9 +1634,8 @@ mod tests {
 
         for focus in [CredField::InlinePrivate, CredField::InlineCert] {
             form.focus = focus;
-            // Sanity: the textarea block really is in play for this focus.
-            assert!(form.body_rows() >= TEXTAREA_H + 2);
-
+            // Popup closed: plain 3-split render on a short terminal.
+            form.key_paste = None;
             let mut term = Terminal::new(TestBackend::new(60, 11)).unwrap();
             term.draw(|f| {
                 let body = draw_dialog(
@@ -1672,8 +1647,23 @@ mod tests {
                 form.draw_in_dialog(f, body);
             })
             .unwrap();
-            // No panic, no underflow — the viewport collapsed to an empty range
-            // and the textarea block rendered into whatever area was left.
+            // Popup open: the overlay is painted on top via centered_rect —
+            // must not panic even when the terminal is shorter than the popup.
+            form.key_paste = Some(KeyPaste::new(match focus {
+                CredField::InlinePrivate => PasteKind::Private,
+                CredField::InlineCert => PasteKind::Cert,
+                _ => unreachable!("focus is one of the two inline rows"),
+            }));
+            term.draw(|f| {
+                let body = draw_dialog(
+                    f,
+                    &form.title(),
+                    form.body_rows(),
+                    &[("Tab", "field"), ("^S", "save"), ("Esc", "cancel")],
+                );
+                form.draw_in_dialog(f, body);
+            })
+            .unwrap();
         }
     }
 
@@ -1857,21 +1847,105 @@ mod tests {
     }
 
     #[test]
-    fn typing_into_inline_private_goes_to_the_textarea() {
+    fn enter_on_inline_private_opens_popup_and_esc_writes_back() {
         let mut f = CredForm::new_add();
         f.secret_kind = SecretChoice::IdentityKey;
         f.source = SourceChoice::Inline;
         f.focus = CredField::InlinePrivate;
+        // Enter opens the popup.
+        let _ = f.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(f.key_paste.is_some());
+        // Typing goes into the popup, not the form field.
         for c in "PRIVATE-KEY-TEXT".chars() {
-            f.on_key(press(KeyCode::Char(c), KeyModifiers::NONE));
+            let _ = f.on_key(press(KeyCode::Char(c), KeyModifiers::NONE));
         }
-        assert_eq!(f.inline_private.lines().join("\n"), "PRIVATE-KEY-TEXT");
+        assert!(f.inline_private.is_empty());
+        // Esc closes and writes the non-blank buffer back.
+        let _ = f.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(f.key_paste.is_none());
+        assert_eq!(f.inline_private, "PRIVATE-KEY-TEXT");
     }
 
     #[test]
-    fn new_edit_inline_original_defaults_source_to_inline_with_empty_textarea() {
+    fn ctrl_c_inside_popup_discards_without_writing_back() {
+        let mut f = CredForm::new_add();
+        f.secret_kind = SecretChoice::IdentityKey;
+        f.source = SourceChoice::Inline;
+        f.focus = CredField::InlineCert;
+        let _ = f.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
+        for c in "ab".chars() {
+            let _ = f.on_key(press(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        // Ctrl-C discards.
+        let _ = f.on_key(press(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(f.key_paste.is_none());
+        assert!(
+            f.inline_cert.is_empty(),
+            "discard leaves the field unchanged"
+        );
+    }
+
+    #[test]
+    fn blank_popup_esc_does_not_write_back() {
+        let mut f = CredForm::new_add();
+        f.secret_kind = SecretChoice::IdentityKey;
+        f.source = SourceChoice::Inline;
+        f.focus = CredField::InlinePrivate;
+        let _ = f.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
+        // Esc with no typing → blank Done → field stays empty.
+        let _ = f.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(f.inline_private.is_empty());
+    }
+
+    #[test]
+    fn enter_inside_popup_inserts_newline_instead_of_closing() {
+        // Enter inside the popup must insert a newline (multiline editing),
+        // not close the popup or advance focus. After typing "line1", Enter,
+        // "line2", Esc closes and the buffer has two lines.
+        let mut f = CredForm::new_add();
+        f.secret_kind = SecretChoice::IdentityKey;
+        f.source = SourceChoice::Inline;
+        f.focus = CredField::InlinePrivate;
+        let _ = f.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(f.key_paste.is_some());
+        for c in "line1".chars() {
+            let _ = f.on_key(press(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        // Enter inside the popup → still open (Pending).
+        let _ = f.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            f.key_paste.is_some(),
+            "Enter inside popup must not close it"
+        );
+        for c in "line2".chars() {
+            let _ = f.on_key(press(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let _ = f.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(f.inline_private, "line1\nline2");
+    }
+
+    #[test]
+    fn backspace_inside_popup_deletes_within_the_buffer() {
+        // Backspace inside the popup deletes inside the popup's buffer; it does
+        // NOT call the form's char-based `backspace_at` helper. Type "abc",
+        // backspace once, Esc → "ab".
+        let mut f = CredForm::new_add();
+        f.secret_kind = SecretChoice::IdentityKey;
+        f.source = SourceChoice::Inline;
+        f.focus = CredField::InlineCert;
+        let _ = f.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
+        for c in "abc".chars() {
+            let _ = f.on_key(press(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let _ = f.on_key(press(KeyCode::Backspace, KeyModifiers::NONE));
+        let _ = f.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(f.inline_cert, "ab");
+    }
+
+    #[test]
+    fn new_edit_inline_original_defaults_source_to_inline_with_empty_buffer() {
         // Editing an inline-key owner: Source defaults to Inline, but the key
-        // text is NEVER echoed into the textarea (security). build_body must
+        // text is NEVER echoed into the buffer (security). build_body must
         // preserve the original on save when the private field stays blank.
         use sshrack_core::config::schema::{KeySource, Secret};
         let cred = Credential {
@@ -1883,43 +1957,14 @@ mod tests {
         let f = CredForm::new_edit(&cred);
         assert_eq!(f.secret_kind, SecretChoice::IdentityKey);
         assert_eq!(f.source, SourceChoice::Inline);
-        assert!(
-            f.inline_private.lines().join("\n").is_empty(),
-            "key text must NOT echo"
-        );
+        assert!(f.inline_private.is_empty(), "key text must NOT echo");
         assert!(matches!(f.orig_key, Some(KeySource::Inline(_))));
     }
 
     #[test]
-    fn enter_inside_textarea_inserts_newline_instead_of_advancing_field() {
-        // A bare Enter in a multiline paste field must insert a newline at the
-        // textarea cursor (the textarea's default mapping), NOT advance focus
-        // to the next reachable field. Tab still navigates between fields.
-        let mut f = CredForm::new_add();
-        f.secret_kind = SecretChoice::IdentityKey;
-        f.source = SourceChoice::Inline;
-        f.focus = CredField::InlinePrivate;
-        // Type "line1", press Enter, type "line2".
-        for c in "line1".chars() {
-            f.on_key(press(KeyCode::Char(c), KeyModifiers::NONE));
-        }
-        let focus_before = f.focus;
-        f.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
-        // Focus must NOT have advanced.
-        assert_eq!(
-            f.focus, focus_before,
-            "Enter must not advance focus in a textarea"
-        );
-        for c in "line2".chars() {
-            f.on_key(press(KeyCode::Char(c), KeyModifiers::NONE));
-        }
-        assert_eq!(f.inline_private.lines().join("\n"), "line1\nline2");
-    }
-
-    #[test]
-    fn tab_and_arrows_navigate_between_textareas_and_out() {
-        // Tab / Up / Down bypass the textarea-input guard, so they still
-        // navigate between the inline textareas and out to the Source row.
+    fn tab_and_arrows_navigate_between_inline_rows_and_out() {
+        // Tab / Up / Down navigate between the inline-key rows and out to the
+        // Source row (the popup is closed, so these are form-level navigations).
         // Pins the navigation matrix under IdentityKey + Inline: the reachable
         // cycle is Name→User→SecretKind→Source→InlinePrivate→InlineCert→wrap.
         let mut f = CredForm::new_add();
@@ -1941,23 +1986,6 @@ mod tests {
     }
 
     #[test]
-    fn backspace_inside_textarea_deletes_within_the_textarea() {
-        // Backspace is forwarded to the textarea (it owns its own cursor), so
-        // it deletes inside the pasted buffer rather than calling the form's
-        // char-based `backspace_at` helper (which would be a no-op on a
-        // textarea anyway). Type "abc", backspace once → "ab".
-        let mut f = CredForm::new_add();
-        f.secret_kind = SecretChoice::IdentityKey;
-        f.source = SourceChoice::Inline;
-        f.focus = CredField::InlineCert;
-        for c in "abc".chars() {
-            f.on_key(press(KeyCode::Char(c), KeyModifiers::NONE));
-        }
-        f.on_key(press(KeyCode::Backspace, KeyModifiers::NONE));
-        assert_eq!(f.inline_cert.lines().join("\n"), "ab");
-    }
-
-    #[test]
     fn new_edit_path_original_defaults_source_to_path_with_identity_prefilled() {
         // Counterpart to the inline-original test: a Path original defaults
         // Source to Path with the identity field prefilled (the path IS shown,
@@ -1975,24 +2003,18 @@ mod tests {
     }
 
     #[test]
-    fn debug_impl_does_not_leak_textarea_contents() {
+    fn debug_impl_does_not_leak_inline_buffer_contents() {
         // The hand-written Debug must show only the line COUNT, never the
         // pasted key text. `format!("{:?}", form)` going to logs/errors must
         // not leak "PRIVATE-SECRET".
         let mut f = CredForm::new_add();
         f.secret_kind = SecretChoice::IdentityKey;
         f.source = SourceChoice::Inline;
-        f.focus = CredField::InlinePrivate;
-        for c in "PRIVATE-SECRET-TEXT".chars() {
-            f.inline_private.input(textarea_input_from(press(
-                KeyCode::Char(c),
-                KeyModifiers::NONE,
-            )));
-        }
+        f.inline_private = "PRIVATE-SECRET-TEXT".to_string();
         let dbg = format!("{f:?}");
         assert!(
             !dbg.contains("PRIVATE-SECRET-TEXT"),
-            "Debug must not leak textarea contents: {dbg}"
+            "Debug must not leak inline buffer contents: {dbg}"
         );
         assert!(
             dbg.contains("inline_private_lines"),
@@ -2004,14 +2026,12 @@ mod tests {
         );
     }
 
-    // ---- Task 4: render the multiline editor block + grow body_rows (RED -> GREEN) ----
+    // ---- popup overlay render: draw_in_dialog must not panic for any state ----
     //
-    // When a paste field (InlinePrivate / InlineCert) is focused, the dialog
-    // expands a TEXTAREA_H-tall editor block right below the field list so the
-    // user can edit the pasted key/cert across many lines. body_rows() must
-    // grow by exactly TEXTAREA_H while the textarea is focused so the dialog
-    // box fits the block; the render must not panic for any (secret, source,
-    // focus) combination.
+    // The inline-key rows are edited in the KeyPaste popup (a modal overlay);
+    // the form body itself is a stable 3-split (list/error/hint) regardless of
+    // focus. The render must not panic for any (secret, source, focus)
+    // combination, and body_rows must be focus-independent.
 
     #[test]
     fn draw_in_dialog_renders_without_panic_across_source_and_focus_states() {
@@ -2052,18 +2072,28 @@ mod tests {
     }
 
     #[test]
-    fn body_rows_grows_when_a_textarea_is_focused() {
-        let mut f = complete_cred_form();
-        f.secret_kind = SecretChoice::IdentityKey;
-        f.source = SourceChoice::Inline;
-        f.focus = CredField::Name;
-        let collapsed = f.body_rows();
-        f.focus = CredField::InlinePrivate;
-        let expanded = f.body_rows();
-        assert!(
-            expanded > collapsed,
-            "focused textarea must grow the dialog"
-        );
-        assert_eq!(expanded - collapsed, crate::tui::wizard::TEXTAREA_H);
+    fn body_rows_is_independent_of_inline_field_focus() {
+        // body_rows no longer depends on focus (no inline editor block); it is
+        // a stable worst-case across every (secret, source) combo. Pins the
+        // removal of the focus-aware TEXTAREA_H growth.
+        for secret in [
+            SecretChoice::None,
+            SecretChoice::Password,
+            SecretChoice::IdentityKey,
+        ] {
+            for source in [SourceChoice::Path, SourceChoice::Inline] {
+                let mut f = CredForm::new_add();
+                f.secret_kind = secret;
+                f.source = source;
+                f.focus = CredField::Name;
+                let baseline = f.body_rows();
+                f.focus = CredField::InlinePrivate;
+                assert_eq!(
+                    f.body_rows(),
+                    baseline,
+                    "focus-independent for {secret:?}/{source:?}"
+                );
+            }
+        }
     }
 }

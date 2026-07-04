@@ -36,10 +36,6 @@ pub mod key_paste;
 pub use cred::CredForm;
 pub use cred_picker::{CredPicker, PickerOutcome};
 pub use host::HostForm;
-// Tasks 2 & 3 will wire `KeyPaste` into `CredForm` / `HostForm`; until then no
-// in-crate consumer names these types, so silence the unused-import lint on the
-// re-export (the types themselves are exercised by `key_paste`'s own tests).
-#[allow(unused_imports)]
 pub use key_paste::{KeyPaste, PasteKind, PasteOutcome};
 
 /// Height of the multiline editor block expanded below the field list when a
