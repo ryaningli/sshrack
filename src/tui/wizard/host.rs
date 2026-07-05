@@ -20,8 +20,8 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Layout},
-    style::{Modifier, Style},
+    layout::{Constraint, Layout},
+    style::Style,
     text::{Line, Span},
     widgets::Paragraph,
 };
@@ -31,12 +31,11 @@ use zeroize::Zeroizing;
 use super::super::intent::Outcome;
 use super::super::theme;
 use super::{
-    AuthChoice, AuthKind, CredPicker, Field, HOST_LABEL_WIDTH, HOST_VALUE_COL, KeyPaste, PasteKind,
-    PasteOutcome, PickerOutcome, SaveError, SecretChoice, SourceChoice, backspace_at, bracketed,
-    insert_char_at, validate, value_spans,
+    AuthChoice, AuthKind, CredPicker, Field, FieldKind, HOST_LABEL_WIDTH, HOST_VALUE_COL, KeyPaste,
+    PasteKind, PasteOutcome, PickerOutcome, SaveError, SecretChoice, SourceChoice, backspace_at,
+    bracketed, insert_char_at, render_field_row, validate,
 };
 use crate::tui::file_picker::{FilePicker, FilePickerOutcome};
-use crate::tui::fit::truncate_cells;
 use sshrack_core::config::schema::{Auth, CredentialBody, Host, KeySource};
 use sshrack_core::dirsource::LocalDirSource;
 
@@ -1146,32 +1145,40 @@ impl HostForm {
     /// [`truncate_cells`] and ends in `…` instead of running past the border.
     /// Truncation is display-only — the cursor offset in [`cursor_target`]
     /// still uses the stored value's char count.
+    /// The interaction type of `field`, which drives its affordance suffix in
+    /// [`render_row`]. Text/password/switch self-describe; trigger rows
+    /// (Identity file-picker, Credential fuzzy-picker) carry `▸`, and inline
+    /// paste rows carry `¶ ▸`. Credential only advertises the pick affordance
+    /// when at least one credential exists to pick — otherwise `Enter` opens an
+    /// empty picker and the `▸` would promise an action that yields nothing.
+    fn field_kind(&self, field: Field) -> FieldKind {
+        match field {
+            Field::Name | Field::Host | Field::Port | Field::User => FieldKind::Text,
+            Field::Password => FieldKind::Password,
+            Field::Auth | Field::Secret | Field::Source => FieldKind::Switch,
+            Field::Identity => FieldKind::Trigger,
+            Field::InlinePrivate | Field::InlineCert => FieldKind::MultilineTrigger,
+            Field::Credential => {
+                if self.credential_names.is_empty() {
+                    FieldKind::Text
+                } else {
+                    FieldKind::Trigger
+                }
+            }
+        }
+    }
+
     fn render_row(&self, field: Field, row_width: u16) -> Line<'static> {
-        let label = field.label();
-        let focused = self.focus == field;
-        let cursor = if focused { "▶ " } else { "  " };
-        let label_span = Span::styled(
-            format!(
-                "{cursor}{label:>WIDTH$}: ",
-                WIDTH = HOST_LABEL_WIDTH as usize
-            ),
-            if focused {
-                theme::accent().add_modifier(Modifier::BOLD)
-            } else {
-                Style::new().dim()
-            },
-        );
-
-        let (value_str, placeholder) = self.row_value_and_placeholder(field);
-        // Truncate the displayed text (value, else placeholder) to the cells
-        // right of the label so it never overflows the dialog border.
-        let avail = row_width.saturating_sub(HOST_VALUE_COL) as usize;
-        let trunc_value = truncate_cells(&value_str, avail);
-        let trunc_ph = placeholder.map(|p| truncate_cells(p, avail));
-
-        let mut spans = vec![label_span];
-        spans.extend(value_spans(&trunc_value, trunc_ph.as_deref()));
-        Line::from(spans).alignment(Alignment::Left)
+        let (value, placeholder) = self.row_value_and_placeholder(field);
+        render_field_row(
+            field.label(),
+            self.focus == field,
+            &value,
+            placeholder,
+            self.field_kind(field),
+            HOST_LABEL_WIDTH,
+            row_width,
+        )
     }
 
     /// The editable value and its dim placeholder for `field`.
@@ -1221,7 +1228,7 @@ impl HostForm {
                 let ph = if self.credential_names.is_empty() {
                     Some("no credentials defined — add one with the cred wizard")
                 } else {
-                    Some("<- -> cycle  ·  Enter pick")
+                    Some("pick a credential")
                 };
                 (v, ph)
             }
@@ -1246,7 +1253,7 @@ impl HostForm {
                 // blank → placeholder, non-blank → "N line(s)" count. The
                 // full editor opens as a popup on Enter (see `on_key`).
                 if self.inline_private.trim().is_empty() {
-                    (String::new(), Some("paste private key (Enter to edit)"))
+                    (String::new(), Some("paste private key"))
                 } else {
                     (
                         format!(
@@ -1259,7 +1266,7 @@ impl HostForm {
             }
             Field::InlineCert => {
                 if self.inline_cert.trim().is_empty() {
-                    (String::new(), Some("optional certificate (Enter to edit)"))
+                    (String::new(), Some("optional certificate"))
                 } else {
                     (
                         format!(
@@ -1274,7 +1281,7 @@ impl HostForm {
                 // Trigger row: shows the selected path (if any) or a browse hint.
                 // The path is filled by the file picker, never typed.
                 if self.identity.is_empty() {
-                    (String::new(), Some("Enter to browse for a private key"))
+                    (String::new(), Some("browse for a private key"))
                 } else {
                     (self.identity.clone(), Some("Enter to re-browse"))
                 }
@@ -2911,5 +2918,37 @@ mod tests {
             );
             form.draw_in_dialog(f, body);
         });
+    }
+
+    #[test]
+    fn host_field_kind_maps_each_field_to_its_affordance() {
+        // `field_kind` does not depend on auth_choice, so a default form is
+        // enough. `FieldKind` is in scope unqualified via the test module's
+        // `use super::*;` (host.rs imports it from `super`).
+        let mut f = HostForm::new_add(vec![]);
+        assert_eq!(f.field_kind(Field::Name), FieldKind::Text);
+        assert_eq!(f.field_kind(Field::Host), FieldKind::Text);
+        assert_eq!(f.field_kind(Field::Port), FieldKind::Text);
+        assert_eq!(f.field_kind(Field::User), FieldKind::Text);
+        assert_eq!(f.field_kind(Field::Auth), FieldKind::Switch);
+        assert_eq!(f.field_kind(Field::Secret), FieldKind::Switch);
+        assert_eq!(f.field_kind(Field::Source), FieldKind::Switch);
+        assert_eq!(f.field_kind(Field::Identity), FieldKind::Trigger);
+        assert_eq!(
+            f.field_kind(Field::InlinePrivate),
+            FieldKind::MultilineTrigger
+        );
+        assert_eq!(f.field_kind(Field::InlineCert), FieldKind::MultilineTrigger);
+        assert_eq!(f.field_kind(Field::Password), FieldKind::Password);
+        // No credentials defined → Credential offers nothing to pick → Text.
+        assert_eq!(
+            f.field_kind(Field::Credential),
+            FieldKind::Text,
+            "no creds → no pick affordance"
+        );
+
+        // With a credential defined, Credential advertises the pick trigger.
+        f.credential_names = vec!["srv".to_string()];
+        assert_eq!(f.field_kind(Field::Credential), FieldKind::Trigger);
     }
 }

@@ -22,8 +22,15 @@
 //! [`Outcome::SaveHost`]: super::intent::Outcome::SaveHost
 //! [`Outcome::SaveCred`]: super::intent::Outcome::SaveCred
 
+use ratatui::layout::Alignment;
+use ratatui::style::Modifier;
 use ratatui::style::Style;
+use ratatui::text::Line;
 use ratatui::text::Span;
+use unicode_width::UnicodeWidthStr;
+
+use crate::tui::fit::truncate_cells;
+use crate::tui::theme;
 use sshrack_core::host::validate_name_chars;
 
 pub mod cred;
@@ -438,6 +445,126 @@ pub fn validate_cred(form: &CredForm) -> Result<(), CredSaveError> {
 // Shared render helpers (cross-form)
 // ===========================================================================
 
+// ===========================================================================
+// Field-type affordance (shared row renderer)
+// ============================================================================
+
+/// How a wizard field is interacted with, independent of which form owns it.
+/// Drives the type-affordance suffix appended by [`render_field_row`] so every
+/// field — host or credential — renders through one path and reads the same:
+///
+/// - [`FieldKind::Text`] / [`FieldKind::Password`]: the terminal cursor (and,
+///   for passwords, the `•••` mask) already self-describe "type here".
+/// - [`FieldKind::Switch`]: the `< … >` brackets ([`bracketed`]) already
+///   self-describe "cycle ←/→".
+/// - [`FieldKind::Trigger`]: `Enter` opens a modal (file picker / fuzzy
+///   credential picker). The ` ▸` suffix ([`TRIGGER_GLYPH`], accent)
+///   advertises that — empty or filled.
+/// - [`FieldKind::MultilineTrigger`]: `Enter` opens a multiline editor for
+///   secret content never echoed inline. The ` ¶ ▸` suffix ([`MULTILINE_PARA`]
+///   dim pilcrow + [`TRIGGER_GLYPH`] accent) says "hidden multi-line content
+///   lives here; Enter to open".
+///
+/// The suffix lives at the right edge of the value column and is always
+/// rendered when it fits, so a row's interaction type is visible at a glance
+/// without focusing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FieldKind {
+    Text,
+    Password,
+    Switch,
+    Trigger,
+    MultilineTrigger,
+}
+
+/// The triangle half of a trigger suffix: a leading space + a small accent
+/// triangle (`U+25B8`). Means "Enter opens a modal". Reused as the trailing
+/// half of the multiline-trigger suffix.
+const TRIGGER_GLYPH: &str = " \u{25B8}";
+
+/// The pilcrow half of the multiline-trigger suffix: a leading space + a dim
+/// pilcrow (`U+00B6`). Means "hidden multi-line content lives here".
+const MULTILINE_PARA: &str = " \u{00B6}";
+
+/// Display-cell width a `kind`'s suffix consumes, so the renderer can reserve
+/// exact space before truncating the value (the glyph is never clipped).
+/// Derived from the same constants [`affordance_suffix`] builds its spans
+/// from — single source of truth, pinned in sync by the
+/// `affordance_suffix_glyphs_match_width` test.
+pub(super) fn affordance_suffix_width(kind: FieldKind) -> usize {
+    match kind {
+        FieldKind::Text | FieldKind::Password | FieldKind::Switch => 0,
+        FieldKind::Trigger => UnicodeWidthStr::width(TRIGGER_GLYPH),
+        FieldKind::MultilineTrigger => {
+            UnicodeWidthStr::width(MULTILINE_PARA) + UnicodeWidthStr::width(TRIGGER_GLYPH)
+        }
+    }
+}
+
+/// The styled suffix spans for a field kind (empty vec for text/password/
+/// switch). Built from [`TRIGGER_GLYPH`] / [`MULTILINE_PARA`] so
+/// [`affordance_suffix_width`] and the rendered spans can never disagree.
+pub(super) fn affordance_suffix(kind: FieldKind) -> Vec<Span<'static>> {
+    match kind {
+        FieldKind::Text | FieldKind::Password | FieldKind::Switch => Vec::new(),
+        FieldKind::Trigger => vec![Span::styled(TRIGGER_GLYPH.to_string(), theme::accent())],
+        FieldKind::MultilineTrigger => vec![
+            Span::styled(MULTILINE_PARA.to_string(), Style::new().dim()),
+            Span::styled(TRIGGER_GLYPH.to_string(), theme::accent()),
+        ],
+    }
+}
+
+/// Column where the editable value begins within a rendered field row:
+/// `"▶ "/"  " (2) + right-aligned label + ": " (2)`. A `const fn` so the
+/// per-form value-column constants below derive from one definition.
+pub(super) const fn value_col_offset(label_width: u16) -> u16 {
+    2 + label_width + 2
+}
+
+/// Render one wizard field row through the single shared path: focus marker +
+/// right-aligned label + value (or dim placeholder) + type-affordance suffix.
+/// Pure; consumed by both [`HostForm::render_row`] and [`CredForm::render_row`]
+/// so every field — host or credential — looks identical in shape; only the
+/// label width, value/placeholder, and [`FieldKind`] differ.
+///
+/// The suffix width is reserved *before* truncating the value/placeholder, so
+/// the glyph is always the last thing rendered and is never clipped by a long
+/// value or a narrow terminal.
+///
+/// [`HostForm::render_row`]: host::HostForm::render_row
+/// [`CredForm::render_row`]: cred::CredForm::render_row
+pub(super) fn render_field_row(
+    label: &str,
+    focused: bool,
+    value: &str,
+    placeholder: Option<&str>,
+    kind: FieldKind,
+    label_width: u16,
+    row_width: u16,
+) -> Line<'static> {
+    let cursor = if focused { "▶ " } else { "  " };
+    let label_span = Span::styled(
+        format!("{cursor}{label:>WIDTH$}: ", WIDTH = label_width as usize),
+        if focused {
+            theme::accent().add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().dim()
+        },
+    );
+
+    let suffix = affordance_suffix(kind);
+    let value_col = (row_width.saturating_sub(value_col_offset(label_width))) as usize;
+    let avail_for_value = value_col.saturating_sub(affordance_suffix_width(kind));
+    let trunc_value = truncate_cells(value, avail_for_value);
+    let trunc_ph = placeholder.map(|p| truncate_cells(p, avail_for_value));
+
+    let mut spans = vec![label_span];
+    spans.extend(value_spans(&trunc_value, trunc_ph.as_deref()));
+    spans.extend(suffix);
+    Line::from(spans).alignment(Alignment::Left)
+}
+
 /// Build the value-area spans for one field row. Shared by [`HostForm`] and
 /// [`CredForm`] so both render the empty state identically.
 ///
@@ -481,11 +608,11 @@ pub(super) const CRED_LABEL_WIDTH: u16 = 8;
 /// [`HOST_LABEL_WIDTH`] so the value column tracks the longest host label
 /// (`Credential` = 10). Used by each form's `draw` to place the terminal
 /// cursor and to truncate over-wide values.
-pub(super) const HOST_VALUE_COL: u16 = 2 + HOST_LABEL_WIDTH + 2;
+pub(super) const HOST_VALUE_COL: u16 = value_col_offset(HOST_LABEL_WIDTH);
 
 /// Credential-wizard counterpart of [`HOST_VALUE_COL`], derived from
 /// [`CRED_LABEL_WIDTH`].
-pub(super) const CRED_VALUE_COL: u16 = 2 + CRED_LABEL_WIDTH + 2;
+pub(super) const CRED_VALUE_COL: u16 = value_col_offset(CRED_LABEL_WIDTH);
 
 // ===========================================================================
 // Cursor-edit helpers
@@ -704,6 +831,166 @@ mod tests {
             .expect("InlinePrivate in ORDER");
         assert!(src < id, "Source must render above Identity");
         assert!(src < privk, "Source must render above InlinePrivate");
+    }
+
+    // ---- field-type affordance suffix (shared render primitive) ----
+
+    #[test]
+    fn affordance_suffix_width_matches_kind() {
+        assert_eq!(affordance_suffix_width(FieldKind::Text), 0);
+        assert_eq!(affordance_suffix_width(FieldKind::Password), 0);
+        assert_eq!(affordance_suffix_width(FieldKind::Switch), 0);
+        assert_eq!(affordance_suffix_width(FieldKind::Trigger), 2);
+        assert_eq!(affordance_suffix_width(FieldKind::MultilineTrigger), 4);
+    }
+
+    #[test]
+    fn affordance_suffix_glyphs_match_width() {
+        // The rendered spans (concatenated) must equal the width function's
+        // accounting — single source of truth (the consts), no desync.
+        fn concat(spans: &[Span<'_>]) -> String {
+            spans.iter().map(|s| s.content.as_ref()).collect()
+        }
+        assert_eq!(concat(&affordance_suffix(FieldKind::Text)), "");
+        assert_eq!(concat(&affordance_suffix(FieldKind::Password)), "");
+        assert_eq!(concat(&affordance_suffix(FieldKind::Switch)), "");
+        assert_eq!(concat(&affordance_suffix(FieldKind::Trigger)), " ▸");
+        assert_eq!(
+            concat(&affordance_suffix(FieldKind::MultilineTrigger)),
+            " ¶ ▸"
+        );
+        // and that concatenated cell-width == affordance_suffix_width
+        assert_eq!(
+            unicode_width::UnicodeWidthStr::width(
+                concat(&affordance_suffix(FieldKind::Trigger)).as_str()
+            ),
+            affordance_suffix_width(FieldKind::Trigger)
+        );
+        assert_eq!(
+            unicode_width::UnicodeWidthStr::width(
+                concat(&affordance_suffix(FieldKind::MultilineTrigger)).as_str()
+            ),
+            affordance_suffix_width(FieldKind::MultilineTrigger)
+        );
+    }
+
+    #[test]
+    fn value_col_offset_is_marker_plus_label_plus_colon() {
+        assert_eq!(value_col_offset(0), 4);
+        assert_eq!(value_col_offset(HOST_LABEL_WIDTH), HOST_VALUE_COL);
+        assert_eq!(value_col_offset(CRED_LABEL_WIDTH), CRED_VALUE_COL);
+    }
+
+    #[test]
+    fn render_field_row_text_has_no_suffix() {
+        let line = render_field_row(
+            "Name",
+            true,
+            "web",
+            None,
+            FieldKind::Text,
+            HOST_LABEL_WIDTH,
+            60,
+        );
+        // label span + value span only; no affordance suffix appended.
+        assert_eq!(line.spans.len(), 2);
+        assert_eq!(line.spans[1].content.as_ref(), "web");
+    }
+
+    #[test]
+    fn render_field_row_switch_has_no_suffix() {
+        // Switches self-describe via < … >; the suffix is empty for them.
+        let line = render_field_row(
+            "Auth",
+            true,
+            "< Independent >",
+            None,
+            FieldKind::Switch,
+            HOST_LABEL_WIDTH,
+            60,
+        );
+        let last: &str = line
+            .spans
+            .last()
+            .expect("at least the value span")
+            .content
+            .as_ref();
+        assert_eq!(last, "< Independent >");
+    }
+
+    #[test]
+    fn render_field_row_trigger_appends_accent_triangle() {
+        let line = render_field_row(
+            "Identity",
+            false,
+            "/home/me/.ssh/id_ed25519",
+            None,
+            FieldKind::Trigger,
+            HOST_LABEL_WIDTH,
+            60,
+        );
+        let last = line.spans.last().expect("suffix present");
+        assert_eq!(last.content.as_ref(), " ▸");
+    }
+
+    #[test]
+    fn render_field_row_multiline_appends_pilcrow_then_triangle() {
+        let line = render_field_row(
+            "Privkey",
+            false,
+            "5 lines",
+            None,
+            FieldKind::MultilineTrigger,
+            HOST_LABEL_WIDTH,
+            60,
+        );
+        let spans = &line.spans;
+        // last two spans are " ¶" (dim) and " ▸" (accent), in that order.
+        assert_eq!(spans[spans.len() - 2].content.as_ref(), " ¶");
+        assert_eq!(spans[spans.len() - 1].content.as_ref(), " ▸");
+    }
+
+    #[test]
+    fn render_field_row_trigger_empty_value_still_shows_suffix_after_placeholder() {
+        // Empty value + a placeholder: the suffix follows the dim placeholder,
+        // advertising "this dim row IS interactive — Enter opens a modal".
+        let line = render_field_row(
+            "Identity",
+            false,
+            "",
+            Some("browse for a private key"),
+            FieldKind::Trigger,
+            HOST_LABEL_WIDTH,
+            60,
+        );
+        let last = line.spans.last().expect("suffix present");
+        assert_eq!(last.content.as_ref(), " ▸");
+    }
+
+    #[test]
+    fn render_field_row_reserves_suffix_so_long_value_truncates_not_the_glyph() {
+        // Tight row_width so the value must truncate; the glyph must survive and
+        // the line must never overflow row_width.
+        let row_width: u16 = 22; // value_col_offset(10) = 14 → value_col = 8
+        let line = render_field_row(
+            "Identity",
+            false,
+            "/home/ryan/.ssh/id_ed25519", // 24 chars, cannot fit in 8 minus 2 suffix
+            None,
+            FieldKind::Trigger,
+            HOST_LABEL_WIDTH,
+            row_width,
+        );
+        let width = line.width();
+        assert!(
+            width <= row_width as usize,
+            "line must not overflow the row: {width} > {row_width}"
+        );
+        assert_eq!(
+            line.spans.last().expect("suffix present").content.as_ref(),
+            " ▸",
+            "glyph must survive value truncation"
+        );
     }
 }
 
