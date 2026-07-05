@@ -1138,13 +1138,6 @@ impl HostForm {
         (max_fields + 2) as u16 // + error row + hint row
     }
 
-    /// Render one labeled field row, with the focus highlight + placeholder.
-    /// `row_width` is the available cells for the whole row (the dialog body
-    /// width); the value column starts at [`HOST_VALUE_COL`] and runs to the
-    /// right edge, so an over-wide value/placeholder is passed through
-    /// [`truncate_cells`] and ends in `…` instead of running past the border.
-    /// Truncation is display-only — the cursor offset in [`cursor_target`]
-    /// still uses the stored value's char count.
     /// The interaction type of `field`, which drives its affordance suffix in
     /// [`render_row`]. Text/password/switch self-describe; trigger rows
     /// (Identity file-picker, Credential fuzzy-picker) carry `▸`, and inline
@@ -1168,6 +1161,9 @@ impl HostForm {
         }
     }
 
+    /// Render one labeled field row via the shared [`render_field_row`]
+    /// (focus marker + value/placeholder + type-affordance suffix); see there
+    /// for truncation and suffix-placement details.
     fn render_row(&self, field: Field, row_width: u16) -> Line<'static> {
         let (value, placeholder) = self.row_value_and_placeholder(field);
         render_field_row(
