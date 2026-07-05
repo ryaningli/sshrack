@@ -346,9 +346,8 @@ fn fmt_size_opt(opt: Option<u64>) -> String {
     }
 }
 
-/// Format a known byte count. Pure. Public to the screen via the re-export so
-/// the active-transfer row can format `bytes_done` / `bytes_total` directly.
-pub fn fmt_size(bytes: u64) -> String {
+/// Format a known byte count. Pure.
+fn fmt_size(bytes: u64) -> String {
     const GIB: u64 = 1 << 30;
     const MIB: u64 = 1 << 20;
     const KIB: u64 = 1 << 10;
@@ -365,7 +364,7 @@ pub fn fmt_size(bytes: u64) -> String {
 
 /// Format a transfer rate (bytes/sec) as `<fmt_size>/s`, or `—` when unknown.
 /// Pure.
-pub fn fmt_rate(bps: Option<u64>) -> String {
+fn fmt_rate(bps: Option<u64>) -> String {
     match bps {
         Some(b) => format!("{}/s", fmt_size(b)),
         None => "—".to_string(),
@@ -373,7 +372,7 @@ pub fn fmt_rate(bps: Option<u64>) -> String {
 }
 
 /// Format an ETA (seconds) as `Ns` or `NmNs`, or `—` when unknown. Pure.
-pub fn fmt_eta(secs: Option<u64>) -> String {
+fn fmt_eta(secs: Option<u64>) -> String {
     match secs {
         Some(s) => {
             if s < 60 {
@@ -390,7 +389,7 @@ pub fn fmt_eta(secs: Option<u64>) -> String {
 /// when unknown. UTC is intentional — sftp listings carry server-local time
 /// without a timezone, so a stable UTC label is honest and avoids the
 /// tz-database dependency. Pure.
-pub fn fmt_mtime(t: Option<SystemTime>) -> String {
+fn fmt_mtime(t: Option<SystemTime>) -> String {
     let Some(t) = t else {
         return "?".to_string();
     };

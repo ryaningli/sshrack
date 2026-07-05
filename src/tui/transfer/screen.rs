@@ -37,8 +37,7 @@ use crate::tui::transfer::render;
 ///
 /// Reachability note: Task 8 ships the state + pure render path; Task 9 wires
 /// `on_key` and the `sshrack sftp` event loop, Task 10 wires the worker. Until
-/// those land the screen is constructed only by tests + the
-/// `transfer::touch_for_reachability` symbol mention, so methods that have no
+/// those land the screen is constructed only by tests, so methods that have no
 /// test caller (the setters + private draw helpers) carry scoped
 /// `#[allow(dead_code)]` rather than a blanket module-level allow. Each allow
 /// drops automatically once Task 9/10 starts driving it.
