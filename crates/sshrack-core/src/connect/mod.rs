@@ -36,7 +36,7 @@ pub fn current_exe() -> Result<PathBuf, SshrackError> {
 /// env is set at all: a key-only connection has no account password to inject,
 /// and leaving askpass unset lets ssh prompt at `/dev/tty` for an encrypted
 /// private key's passphrase instead of calling this payload-less helper.
-pub(crate) fn askpass_env_for(
+pub fn askpass_env_for(
     self_exe: &Path,
     source: &PasswordSource,
     pw_file: Option<&Path>,
@@ -82,7 +82,7 @@ pub fn env_for(source: &PasswordSource) -> Vec<(&'static str, String)> {
 /// The path mixes the pid with a nanosecond timestamp so that repeated calls
 /// within one process (e.g. concurrent tests, or future reconnect loops) do
 /// not stomp on each other's file.
-fn write_password_file(pw: &Zeroizing<String>) -> Result<PathBuf, SshrackError> {
+pub fn write_password_file(pw: &Zeroizing<String>) -> Result<PathBuf, SshrackError> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
