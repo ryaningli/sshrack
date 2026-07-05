@@ -1,20 +1,23 @@
-//! Full-screen dual-pane transfer view for `sshrack sftp`: state + layout.
+//! Full-screen dual-pane transfer view for `sshrack sftp`: state + layout +
+//! pure key routing.
 //!
 //! [`TransferScreen`] owns the two [`Pane`]s (local + remote), the focus side,
 //! the in-flight [`Progress`], the pending [`TransferJob`] queue, and the
 //! consolidated [`Status`] line. [`TransferScreen::draw`] lays the screen out
 //! as four vertical bands — title (1) / panes (Fill) / progress+queue panel
 //! (4) / hotkey footer (1) — and delegates the pane-row painting to
-//! [`super::render`].
+//! [`super::render`]. [`TransferScreen::on_key`] is the pure key router; the
+//! queue-advance helpers ([`TransferScreen::next_job`] /
+//! [`TransferScreen::clear_active`]) are the seam Task 10's event loop drives.
 //!
-//! Architectural red line (shared with [`super::pane`]): `draw` performs no
-//! I/O. The screen reads its own state plus the latest worker snapshots
-//! (`active`, `queue`) the loop drained onto it; it never reads the network or
-//! the filesystem. Key handling lands in Task 9 (`on_key`); this is render +
-//! state only.
+//! Architectural red line (shared with [`super::pane`]): `draw`, `on_key`, and
+//! the queue helpers perform no I/O. The screen reads its own state plus the
+//! latest worker snapshots (`active`, `queue`) the loop drained onto it; it
+//! never reads the network or the filesystem. Worker wiring lands in Task 10.
 
 use std::path::PathBuf;
 
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -23,24 +26,55 @@ use ratatui::{
     widgets::Paragraph,
 };
 
-use sshrack_core::connect::sftp::proto::{Progress, TransferJob};
+use sshrack_core::connect::sftp::proto::{Direction, Progress, TransferJob};
 
 use crate::tui::intent::Status;
 use crate::tui::theme;
-use crate::tui::transfer::pane::{Pane, Side};
+use crate::tui::transfer::pane::{Pane, PaneOutcome, Side};
 use crate::tui::transfer::render;
+
+/// Pure intent returned by [`TransferScreen::on_key`]. The screen mutates its
+/// own focus / marks / queue / `pending_list`; this intent tells the
+/// Task-10 event loop what side effect to perform (worker send, popup,
+/// quit). Mirrors [`PaneOutcome`] in shape — enum-rather-than-`Option` so the
+/// loop's match stays exhaustive over the action vocabulary.
+///
+/// Naming: `ScreenOutcome` (not `TransferOutcome`) deliberately, to avoid
+/// collision with [`sshrack_core::connect::sftp::proto::TransferOutcome`], the
+/// worker's per-job result enum (`Ok`/`Cancelled`/`Failed`). The two types
+/// cross paths in the Task-10 loop (which drains `WorkerEvent::Done(proto)`
+/// and routes `screen.on_key()`'s result), so giving them the same name would
+/// force an alias at every import site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenOutcome {
+    /// The key was consumed (or ignored); no side effect is needed. The
+    /// screen's own state already reflects the result (focus flip, cursor
+    /// move, mark toggle, queue append, `pending_list` set).
+    Continue,
+    /// Close the transfer screen and return to the launcher. `Ctrl-C` and
+    /// `Esc` (with no active transfer) emit this.
+    CloseTransfer,
+    /// Cancel the in-flight transfer — the loop sends `WorkerCmd::Cancel`.
+    /// `Esc` with an active transfer emits this.
+    CancelActive,
+    /// One or more jobs were appended to [`TransferScreen::queue`]. The loop
+    /// calls [`TransferScreen::next_job`] to dispatch the first one if no
+    /// transfer is currently active. `Ctrl-Enter` emits this.
+    Enqueue,
+}
 
 /// The full-screen transfer view. Pure state plus a render entry point —
 /// [`TransferScreen::draw`] lays out the screen and delegates pane painting to
-/// [`render::draw_pane`]. Task 9 wires `on_key`; Task 10 wires the worker
-/// handle + overwrite policy onto this struct.
+/// [`render::draw_pane`]. [`TransferScreen::on_key`] is the pure key router;
+/// Task 10 wires the worker handle + overwrite-policy popup onto this struct.
 ///
-/// Reachability note: Task 8 ships the state + pure render path; Task 9 wires
-/// `on_key` and the `sshrack sftp` event loop, Task 10 wires the worker. Until
-/// those land the screen is constructed only by tests, so methods that have no
-/// test caller (the setters + private draw helpers) carry scoped
-/// `#[allow(dead_code)]` rather than a blanket module-level allow. Each allow
-/// drops automatically once Task 9/10 starts driving it.
+/// Reachability note: Task 8 shipped the state + pure render path; Task 9
+/// added the pure `on_key` router + queue-advance helpers; Task 10 wires the
+/// `sshrack sftp` event loop that drives all of it. Until Task 10 lands the
+/// screen is constructed only by tests, so methods that have no test caller
+/// (the setters + private draw helpers + the new key router) carry scoped
+/// `#[allow(dead_code)]` with the Task-10 consumer named in the doc comment —
+/// no blanket module-level allow is in use.
 #[derive(Debug, Clone)]
 pub struct TransferScreen {
     /// The local-filesystem pane. Owns its cwd, entries, query, cursor, marks.
@@ -58,30 +92,41 @@ pub struct TransferScreen {
     /// panel). Carries the same transient one-liner feedback the rest of the
     /// app surfaces via [`Status`].
     pub status: Status,
+    /// The next directory listing the screen wants the worker to fetch, set by
+    /// [`on_key`](Self::on_key) when the focused pane emits `StepInto` /
+    /// `StepUp` / `RequestList`. `None` when no list is pending. The Task-10
+    /// loop reads this after each keypress, dispatches the `WorkerCmd::List`
+    /// (or sync `LocalDirSource::list` for the local side), feeds the result
+    /// back via [`Pane::set_entries`], and clears the field. Pure: setting
+    /// this performs no I/O.
+    pub pending_list: Option<(Side, PathBuf)>,
 }
 
 impl TransferScreen {
     /// Construct a fresh screen with two empty panes at the given cwds, focus
-    /// on Local, no active transfer, an empty queue, and an empty status.
-    /// Pure: no I/O.
+    /// on Local, no active transfer, an empty queue, an empty status, and no
+    /// pending list. Pure: no I/O.
     ///
-    /// Reachability: Task-9 sftp dispatch will construct the live screen; the
-    /// Task-8 render path is exercised by tests only.
-    #[allow(dead_code)]
+    /// Reachability: Task-10 sftp dispatch constructs the live screen; the
+    /// Task-8 render path + Task-9 key router are exercised by tests only.
+    #[allow(dead_code)] // Task 10 wires the sftp subcommand that constructs this.
     #[must_use]
     pub fn new(local_cwd: PathBuf, remote_cwd: PathBuf) -> Self {
         Self {
-            local: Pane::new(Side::Local, local_cwd),
-            remote: Pane::new(Side::Remote, remote_cwd),
+            local: Pane::new(local_cwd),
+            remote: Pane::new(remote_cwd),
             focus: Side::Local,
             active: None,
             queue: Vec::new(),
             status: Status::empty(),
+            pending_list: None,
         }
     }
 
-    /// Set the focused side. Pure setter — Task 9 drives it off `Tab`.
-    #[allow(dead_code)]
+    /// Set the focused side. Pure setter — `on_key` flips focus internally via
+    /// `flip_focus`; this public setter is kept for Task-10 callers that need
+    /// to pin focus on a specific side (e.g. on screen entry).
+    #[allow(dead_code)] // Task 10 may pin focus on screen entry.
     pub fn set_focus(&mut self, side: Side) {
         self.focus = side;
     }
@@ -105,18 +150,218 @@ impl TransferScreen {
         self.queue.push(job);
     }
 
-    /// Mutable accessor for the local pane. The screen never hands out `&mut`
-    /// fields directly in `draw` (which takes `&self`); Task 9's `on_key` uses
-    /// this to route per-pane key handling.
-    #[allow(dead_code)]
+    /// Mutable accessor for the local pane. `on_key` accesses `self.local`
+    /// directly (it lives in the same module); this accessor is kept for
+    /// external Task-10 callers (e.g. the loop feeding a worker `Listing`
+    /// event into the pane).
+    #[allow(dead_code)] // Task 10 wires the sftp event loop that drives this.
     pub fn local_mut(&mut self) -> &mut Pane {
         &mut self.local
     }
 
     /// Mutable accessor for the remote pane. See [`Self::local_mut`].
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Task 10 wires the sftp event loop that drives this.
     pub fn remote_mut(&mut self) -> &mut Pane {
         &mut self.remote
+    }
+
+    /// Pure key router. Mirrors the app's three-layer discipline
+    /// (Press-only): `Tab`/`Shift-Tab` flip focus, `Ctrl-Enter` enqueues the
+    /// focused pane's marked (or selected) entries, `Esc` cancels an active
+    /// transfer or else closes the screen, `Ctrl-C` always closes, and
+    /// everything else delegates to the focused [`Pane::on_key`]. Performs no
+    /// I/O; the returned [`ScreenOutcome`] tells the Task-10 loop what side
+    /// effect to run.
+    ///
+    /// For navigation intents (`StepInto` / `StepUp` / `RequestList`) this
+    /// sets [`pending_list`](Self::pending_list) and returns `Continue` —
+    /// Task 10 reads `pending_list` after each keypress, performs the list
+    /// (sync `LocalDirSource::list` for the local side, `WorkerCmd::List` for
+    /// the remote side), feeds the result back via [`Pane::set_entries`], and
+    /// clears the field.
+    ///
+    /// Reachability: Task 10's sftp event loop calls this on each polled key.
+    #[allow(dead_code)] // Task 10 wires the sftp event loop that drives this.
+    pub fn on_key(&mut self, key: KeyEvent) -> ScreenOutcome {
+        if key.kind != KeyEventKind::Press {
+            return ScreenOutcome::Continue;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            // Tab / Shift-Tab flip focus between the two panes.
+            KeyCode::Tab | KeyCode::BackTab if !ctrl => {
+                self.flip_focus();
+                ScreenOutcome::Continue
+            }
+            // Ctrl-Enter enqueues the focused pane's marked (or selected)
+            // entries as transfer jobs.
+            KeyCode::Enter if ctrl => self.enqueue_from_focused(),
+            // Esc: cancel an active transfer, otherwise close the screen.
+            KeyCode::Esc => {
+                if self.active.is_some() {
+                    ScreenOutcome::CancelActive
+                } else {
+                    ScreenOutcome::CloseTransfer
+                }
+            }
+            // Ctrl-C always closes (matches the rest of the app).
+            KeyCode::Char('c') if ctrl => ScreenOutcome::CloseTransfer,
+            // Everything else (arrows, Space, printable chars, Enter without
+            // Ctrl, Backspace) delegates to the focused pane.
+            _ => self.route_to_focused(key),
+        }
+    }
+
+    /// Flip `focus` between [`Side::Local`] and [`Side::Remote`]. Pure setter.
+    fn flip_focus(&mut self) {
+        self.focus = match self.focus {
+            Side::Local => Side::Remote,
+            Side::Remote => Side::Local,
+        };
+    }
+
+    /// Delegate a key to the focused pane and translate its [`PaneOutcome`]
+    /// into a [`ScreenOutcome`]. Navigation intents set
+    /// [`pending_list`](Self::pending_list); the rest are pure continue.
+    /// Receives the full [`KeyEvent`] so the pane sees modifiers (Ctrl-P /
+    /// Ctrl-N) intact.
+    fn route_to_focused(&mut self, key: KeyEvent) -> ScreenOutcome {
+        let focus = self.focus;
+        let outcome = match focus {
+            Side::Local => self.local.on_key(key),
+            Side::Remote => self.remote.on_key(key),
+        };
+        match outcome {
+            PaneOutcome::None
+            | PaneOutcome::QueryChanged
+            | PaneOutcome::ToggleMark(_)
+            | PaneOutcome::ActivateSelected => ScreenOutcome::Continue,
+            PaneOutcome::StepInto(path) => {
+                self.pending_list = Some((focus, path));
+                ScreenOutcome::Continue
+            }
+            PaneOutcome::StepUp => {
+                let parent = match focus {
+                    Side::Local => self.local.cwd.parent().map(PathBuf::from),
+                    Side::Remote => self.remote.cwd.parent().map(PathBuf::from),
+                };
+                if let Some(parent) = parent {
+                    self.pending_list = Some((focus, parent));
+                }
+                ScreenOutcome::Continue
+            }
+            PaneOutcome::RequestList(path) => {
+                self.pending_list = Some((focus, path));
+                ScreenOutcome::Continue
+            }
+        }
+    }
+
+    /// Build transfer jobs for the focused pane's marked entries (or, if none
+    /// are marked, the selected entry) and append them to [`queue`](Self::queue).
+    /// Direction is `Upload` when the local pane is focused, `Download` when
+    /// the remote pane is focused. `recursive` tracks `entry.is_dir`;
+    /// `size_total` tracks `entry.size`. Marks are single-shot: they are
+    /// cleared once their entries have been enqueued. Returns `Enqueue` when
+    /// at least one job was queued, otherwise `Continue` (nothing marked, no
+    /// selected entry).
+    ///
+    /// `dst` joins the OTHER pane's cwd with the source entry's file name —
+    /// the natural "drop into the opposite directory" behavior.
+    fn enqueue_from_focused(&mut self) -> ScreenOutcome {
+        let focus = self.focus;
+        let direction = match focus {
+            Side::Local => Direction::Upload,
+            Side::Remote => Direction::Download,
+        };
+        let dst_cwd = match focus {
+            Side::Local => self.remote.cwd.clone(),
+            Side::Remote => self.local.cwd.clone(),
+        };
+
+        // Gather (path, name, is_dir, size) for marked entries — or just the
+        // selected entry when nothing is marked. Owned tuples so the borrow on
+        // the pane ends before we mutate `self.queue`.
+        let mut specs: Vec<(PathBuf, String, bool, Option<u64>)> = Vec::new();
+        {
+            let src = self.focused_pane();
+            if !src.marked.is_empty() {
+                for e in &src.entries {
+                    if src.marked.contains(&e.path) {
+                        specs.push((e.path.clone(), e.name.clone(), e.is_dir, e.size));
+                    }
+                }
+            } else if let Some(sel) = src.selected_entry() {
+                specs.push((sel.path.clone(), sel.name.clone(), sel.is_dir, sel.size));
+            }
+        }
+        if specs.is_empty() {
+            return ScreenOutcome::Continue;
+        }
+
+        // Marks are single-shot per enqueue — clear them now that their entries
+        // are about to be queued.
+        self.focused_pane_mut().marked.clear();
+
+        for (path, name, is_dir, size) in specs {
+            let file_name = path
+                .file_name()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| path.clone());
+            let dst = dst_cwd.join(&file_name);
+            // Dir entries carry a trailing `/` in their display name (matches
+            // `LocalDirSource::list`); strip it for the job's display name.
+            let display_name = name.trim_end_matches('/').to_string();
+            self.queue.push(TransferJob {
+                direction,
+                src: path,
+                dst,
+                name: display_name,
+                size_total: size,
+                recursive: is_dir,
+            });
+        }
+        ScreenOutcome::Enqueue
+    }
+
+    /// Borrow the focused pane immutably.
+    fn focused_pane(&self) -> &Pane {
+        match self.focus {
+            Side::Local => &self.local,
+            Side::Remote => &self.remote,
+        }
+    }
+
+    /// Borrow the focused pane mutably.
+    fn focused_pane_mut(&mut self) -> &mut Pane {
+        match self.focus {
+            Side::Local => &mut self.local,
+            Side::Remote => &mut self.remote,
+        }
+    }
+
+    /// Pop the next queued job (FIFO). The Task-10 loop calls this when
+    /// `active` becomes `None` to dispatch the next transfer; returns `None`
+    /// when the queue is empty. Pure mutator: no I/O.
+    ///
+    /// Reachability: Task 10's loop drives this off `WorkerEvent::Done`.
+    #[allow(dead_code)] // Task 10 wires the sftp event loop that drains this.
+    pub fn next_job(&mut self) -> Option<TransferJob> {
+        if self.queue.is_empty() {
+            None
+        } else {
+            Some(self.queue.remove(0))
+        }
+    }
+
+    /// Clear the in-flight transfer snapshot (`active = None`). The Task-10
+    /// loop calls this after draining a `WorkerEvent::Done` so the next
+    /// keypress / `next_job` sees no active transfer. Pure mutator.
+    ///
+    /// Reachability: Task 10's loop calls this off `WorkerEvent::Done`.
+    #[allow(dead_code)] // Task 10 wires the sftp event loop that drives this.
+    pub fn clear_active(&mut self) {
+        self.active = None;
     }
 
     /// Render the full screen into `area`: title band (1) / panes (Fill) /
@@ -125,8 +370,8 @@ impl TransferScreen {
     /// windowed list via [`render::draw_pane`]. The non-focused pane is dimmed
     /// overall. Pure: no I/O, no env access.
     ///
-    /// Reachability: Task-9 sftp dispatch + event loop drives this; the Task-8
-    /// render path is exercised by the screen tests.
+    /// Reachability: Task-10 sftp dispatch + event loop drives this; the
+    /// Task-8 render path is exercised by the screen tests.
     #[allow(dead_code)]
     pub fn draw(&self, frame: &mut Frame, area: Rect) {
         let [title_area, panes_area, panel_area, footer_area] = Layout::vertical([
@@ -234,231 +479,10 @@ impl TransferScreen {
     }
 }
 
+// Render smoke + on_key routing tests live in a sibling file via `#[path]` so
+// this module stays under the 800-line guideline. The split is mechanical —
+// the tests are inline-equivalent (they reach into `super::*` private items
+// the same way an inline `mod tests` would).
 #[cfg(test)]
-mod tests {
-    //! Render smoke + small-terminal tests for the transfer screen. The screen
-    //! is a thin layer over [`super::render`] and [`super::Pane`], so these
-    //! tests exercise the layout wiring (no panic, no overflow, focused row
-    //! stays in view) rather than re-asserting per-pane painting.
-    use super::*;
-    use ratatui::{Terminal, backend::TestBackend};
-    use sshrack_core::connect::sftp::parse::strip_control_chars;
-    use sshrack_core::connect::sftp::proto::{Direction, Progress, TransferJob};
-    use sshrack_core::dirsource::DirEntry;
-    use std::path::{Path, PathBuf};
-
-    /// Build a `DirEntry` fixture: `name` carries a trailing `/` for dirs
-    /// (matches `LocalDirSource::list`'s decoration); `path` is `parent/name`.
-    fn entry(name: &str, parent: &Path, is_dir: bool) -> DirEntry {
-        let decorated = if is_dir {
-            format!("{name}/")
-        } else {
-            name.to_string()
-        };
-        DirEntry {
-            name: decorated,
-            path: parent.join(name),
-            is_dir,
-            is_symlink: false,
-            size: Some(1024),
-            modified: None,
-        }
-    }
-
-    /// Build a screen with a few entries on each side, a marked local file, an
-    /// active upload, and one queued download — the rendering smoke case.
-    fn canned_screen() -> TransferScreen {
-        let local_cwd = PathBuf::from("/home/local");
-        let remote_cwd = PathBuf::from("/srv/remote");
-        let mut screen = TransferScreen::new(local_cwd.clone(), remote_cwd.clone());
-        screen.local.set_entries(vec![
-            entry("alpha.txt", &local_cwd, false),
-            entry("beta.txt", &local_cwd, false),
-            entry("docs", &local_cwd, true),
-        ]);
-        screen.remote.set_entries(vec![
-            entry("server.log", &remote_cwd, false),
-            entry("cache", &remote_cwd, true),
-        ]);
-        // Mark one local file.
-        screen.local.marked.insert(local_cwd.join("alpha.txt"));
-        // Active upload.
-        screen.active = Some(Progress {
-            name: "alpha.txt".into(),
-            direction: Direction::Upload,
-            bytes_done: 256,
-            bytes_total: Some(1024),
-            rate_bps: Some(128),
-            eta_secs: Some(6),
-        });
-        // One queued job.
-        screen.queue.push(TransferJob {
-            direction: Direction::Download,
-            src: remote_cwd.join("server.log"),
-            dst: local_cwd.join("server.log"),
-            name: "server.log".into(),
-            size_total: Some(2048),
-            recursive: false,
-        });
-        screen
-    }
-
-    /// Human-readable dump of a ratatui buffer (one line per row) for substring
-    /// assertions in render tests.
-    fn buffer_view(buf: &ratatui::buffer::Buffer) -> String {
-        let area = buf.area;
-        let mut out = String::with_capacity((area.width as usize + 1) * area.height as usize);
-        for row in 0..area.height {
-            for col in 0..area.width {
-                let cell = buf.cell((col, row));
-                out.push_str(cell.map(|c| c.symbol()).unwrap_or(" "));
-            }
-            out.push('\n');
-        }
-        out
-    }
-
-    #[test]
-    fn draw_renders_without_panic_or_overflow() {
-        let backend = TestBackend::new(80, 24);
-        let mut term = Terminal::new(backend).expect("test backend");
-        let screen = canned_screen();
-        let res = term.draw(|f| screen.draw(f, f.area()));
-        assert!(res.is_ok(), "draw returned error: {:?}", res.err());
-    }
-
-    #[test]
-    fn draw_paints_title_panes_progress_and_footer() {
-        let backend = TestBackend::new(80, 24);
-        let mut term = Terminal::new(backend).expect("test backend");
-        let screen = canned_screen();
-        term.draw(|f| screen.draw(f, f.area())).expect("draw");
-        let view = buffer_view(term.backend().buffer());
-
-        // Title band: brand + sftp.
-        assert!(view.contains("sshrack"), "brand missing: {view}");
-        assert!(view.contains("sftp"), "sftp label missing: {view}");
-
-        // Both pane cwds are rendered.
-        assert!(
-            view.contains("local") || view.contains("/home/local"),
-            "local cwd missing: {view}"
-        );
-        assert!(
-            view.contains("remote") || view.contains("/srv/remote"),
-            "remote cwd missing: {view}"
-        );
-
-        // The marked file is flagged with `●` and the active transfer's name
-        // shows up in the progress panel.
-        assert!(view.contains('●'), "mark glyph missing: {view}");
-        assert!(view.contains("alpha.txt"), "active name missing: {view}");
-        // Queue row.
-        assert!(view.contains("queue"), "queue label missing: {view}");
-
-        // Footer hotkeys.
-        assert!(view.contains("Tab"), "footer Tab missing: {view}");
-        assert!(view.contains("Space"), "footer Space missing: {view}");
-        assert!(view.contains("^⏎"), "footer ^⏎ missing: {view}");
-
-        // No leak of fake control chars from `strip_control_chars` use — feed a
-        // malicious name through and assert it shows up cleaned. Re-renders on
-        // a fresh screen so the assertion reads cleanly.
-        let local_cwd = PathBuf::from("/x");
-        let mut evil = TransferScreen::new(local_cwd.clone(), PathBuf::from("/y"));
-        evil.local.set_entries(vec![DirEntry {
-            name: "foo\x1b[2Jbar".into(),
-            path: local_cwd.join("foo\x1b[2Jbar"),
-            is_dir: false,
-            is_symlink: false,
-            size: None,
-            modified: None,
-        }]);
-        let mut term2 = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
-        term2.draw(|f| evil.draw(f, f.area())).expect("draw");
-        let view2 = buffer_view(term2.backend().buffer());
-        assert!(!view2.contains('\u{1b}'), "ESC leaked into render: {view2}");
-        // strip_control_chars is the source of the `?` replacement; touch it so
-        // the import stays meaningful in this test.
-        assert_eq!(strip_control_chars("a\x1bb"), "a?b");
-    }
-
-    #[test]
-    fn draw_shows_no_transfer_in_flight_when_idle() {
-        let backend = TestBackend::new(70, 20);
-        let mut term = Terminal::new(backend).expect("test backend");
-        let mut screen = canned_screen();
-        screen.active = None;
-        term.draw(|f| screen.draw(f, f.area())).expect("draw");
-        let view = buffer_view(term.backend().buffer());
-        assert!(
-            view.contains("no transfer in flight"),
-            "idle progress row missing: {view}"
-        );
-    }
-
-    #[test]
-    fn draw_handles_unknown_total_without_gauge_panic() {
-        // `bytes_total` = None must render the "transferred…" form without a
-        // Gauge (a missing percent would have panicked `Gauge::percent`).
-        let backend = TestBackend::new(70, 20);
-        let mut term = Terminal::new(backend).expect("test backend");
-        let mut screen = canned_screen();
-        screen.active = Some(Progress {
-            name: "stream.bin".into(),
-            direction: Direction::Download,
-            bytes_done: 4096,
-            bytes_total: None,
-            rate_bps: None,
-            eta_secs: None,
-        });
-        let res = term.draw(|f| screen.draw(f, f.area()));
-        assert!(res.is_ok(), "draw returned error: {:?}", res.err());
-        let view = buffer_view(term.backend().buffer());
-        assert!(
-            view.contains("stream.bin") && view.contains("transferred"),
-            "unknown-total row missing: {view}"
-        );
-    }
-
-    /// Small-terminal pin: on a 60×12 backend with focus on the remote pane's
-    /// last entry, the focused entry's name must appear in the rendered buffer
-    /// (i.e. the focus-following window scrolled it into view, not off-screen).
-    /// Mirrors the wizard's small-terminal cursor-on-screen test.
-    #[test]
-    fn draw_keeps_focused_row_visible_on_small_terminal() {
-        let local_cwd = PathBuf::from("/local");
-        let remote_cwd = PathBuf::from("/remote");
-        let mut screen = TransferScreen::new(local_cwd.clone(), remote_cwd.clone());
-        // Lots of remote entries so the cursor sits at the tail of a long list.
-        let remote_entries: Vec<DirEntry> = (0..30)
-            .map(|i| entry(&format!("r{i:02}.dat"), &remote_cwd, false))
-            .collect();
-        screen.remote.set_entries(remote_entries);
-        // Move the remote cursor to the last entry.
-        for _ in 0..29 {
-            screen.remote.selected = (screen.remote.selected + 1) % 30;
-        }
-        assert_eq!(screen.remote.selected, 29);
-        screen.focus = Side::Remote;
-        // Sanity: `selected_entry` agrees the cursor is on r29.
-        assert_eq!(
-            screen
-                .remote
-                .selected_entry()
-                .map(|e| e.name.clone())
-                .as_deref(),
-            Some("r29.dat")
-        );
-
-        let backend = TestBackend::new(60, 12);
-        let mut term = Terminal::new(backend).expect("test backend");
-        term.draw(|f| screen.draw(f, f.area())).expect("draw");
-
-        let view = buffer_view(term.backend().buffer());
-        assert!(
-            view.contains("r29.dat"),
-            "focused entry name not visible on 60x12: {view}"
-        );
-    }
-}
+#[path = "screen_tests.rs"]
+mod tests;
