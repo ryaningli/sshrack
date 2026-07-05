@@ -173,6 +173,18 @@ pub enum Command {
         args: Vec<String>,
     },
 
+    /// Interactive SFTP transfer screen: `sshrack sftp <name>`. Opens the
+    /// dual-pane view (system `sftp` over ControlMaster). Non-interactive
+    /// transfer remains `sshrack scp`.
+    Sftp {
+        /// Per-connection flags given after the `sftp` token (overlay the
+        /// top-level ones); must precede the name.
+        #[command(flatten)]
+        opts: ConnectOptions,
+        /// Host name to open the transfer screen for (required).
+        name: String,
+    },
+
     /// Manage configured hosts (`add`/`ls`/`show`/`edit`/`rm`/`cp`).
     Host {
         #[command(subcommand)]
@@ -702,6 +714,18 @@ mod tests {
         ])
         .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    // `sshrack sftp <name>` parses to Command::Sftp with the host name. A bare
+    // `sshrack sftp` is a clap usage error (name: String is non-optional).
+
+    #[test]
+    fn sftp_parses_name_positional() {
+        let cli = Cli::try_parse_from(["sshrack", "sftp", "web1"]).unwrap();
+        match cli.cmd {
+            Some(Command::Sftp { name, .. }) => assert_eq!(name, "web1"),
+            other => panic!("expected Command::Sftp, got {other:?}"),
+        }
     }
 
     // M2: --credential is Reference auth; the inline-import flags

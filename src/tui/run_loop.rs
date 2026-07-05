@@ -81,7 +81,33 @@ pub fn run_loop(
     handle: TerminalHandle,
     data_dir: Option<&std::path::Path>,
 ) -> Option<ConnectRequest> {
+    // First-tick guard: `sshrack sftp <name>` (and any future entry route that
+    // pre-resolves a host id in `tui::run`) stashes the id on
+    // `app.pending_transfer`. Drain it on the FIRST iteration, BEFORE the
+    // initial draw, so the user lands in the transfer screen directly rather
+    // than seeing the launcher flash for one frame. This mirrors the
+    // `Outcome::OpenTransfer` arm below without polluting `App::on_key` with a
+    // phantom outcome (the launcher never produced a key event).
+    let mut first_tick = true;
     loop {
+        if first_tick {
+            first_tick = false;
+            if let Some(host_id) = app.pending_transfer.take() {
+                match open_transfer(host_id, app, handle.clone(), data_dir) {
+                    Ok(()) => {}
+                    Err(SshrackError::Interrupted) => {
+                        // Defensive: open_transfer only interrupts on a popup
+                        // cancel, and the entry path has no popups before the
+                        // first tick. Treat like the launcher Ctrl-T path:
+                        // return to the launcher with no status write.
+                    }
+                    Err(e) => {
+                        app.set_status_error(format!("sftp open failed: {e}"));
+                    }
+                }
+            }
+        }
+
         // Borrow ONLY for the draw, then release before any key read or side
         // effect. A popup re-borrows via the weak handle and must not collide.
         {

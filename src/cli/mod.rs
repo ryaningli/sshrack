@@ -26,6 +26,13 @@ pub fn run(cli: &Cli) -> i32 {
         }
         Some(Command::Ssh { .. }) | Some(Command::Connect(_)) => cmd::connect::run(cli),
         Some(Command::Scp { .. }) => cmd::scp::run(cli),
+        // Unreachable: `route_is_tui` routes every Sftp arm to the TUI before
+        // this function is called. Surface a clean internal error rather than
+        // silently dropping on the floor if that invariant ever breaks.
+        Some(Command::Sftp { .. }) => {
+            eprintln!("sshrack: internal error: sftp arm reached the CLI dispatcher");
+            exit_code::USAGE
+        }
         Some(Command::Host { action }) => cmd::host::run(cli, action),
         Some(Command::Cred { action }) => cmd::cred::run(cli, action),
         Some(Command::Store { action }) => cmd::store::run(cli, action),

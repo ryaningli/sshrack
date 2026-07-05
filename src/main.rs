@@ -96,7 +96,13 @@ fn run_main() -> i32 {
             }
             Err(e) => {
                 eprintln!("{e}");
-                exit_code::CONNECT
+                // A missing host name (e.g. `sshrack sftp nope`) surfaces as
+                // NOT_FOUND, mirroring the CLI's connect path. Other TUI setup
+                // failures stay CONNECT.
+                match &e {
+                    sshrack_core::error::SshrackError::HostNotFound { .. } => exit_code::NOT_FOUND,
+                    _ => exit_code::CONNECT,
+                }
             }
         };
     }
@@ -132,6 +138,10 @@ fn route_is_tui(cli: &cli::Cli) -> bool {
         None => matches!(cli.format, cli::args::OutputFormat::Text),
         Some(Command::Host { action }) => host_add_or_edit_is_empty(action),
         Some(Command::Cred { action }) => cred_add_or_edit_is_empty(action),
+        // `sshrack sftp <name>` opens the TUI transfer screen directly (the
+        // dual-pane view is interactive-only). Non-interactive transfer stays
+        // on `sshrack scp` (CLI).
+        Some(Command::Sftp { .. }) => true,
         _ => false,
     }
 }
@@ -676,5 +686,17 @@ mod tests {
     fn connect_shorthand_is_cli() {
         let cmd = Command::Connect(vec!["web1".into(), "echo".into(), "hi".into()]);
         assert!(!route_is_tui(&cli_with_cmd(Some(cmd))));
+    }
+
+    #[test]
+    fn sftp_routes_to_tui() {
+        // `sshrack sftp <name>` opens the interactive transfer screen, so it
+        // routes to the TUI. `name` is required (clap rejects a bare sftp), so
+        // every Sftp arm reaching here carries a name.
+        let cmd = Command::Sftp {
+            opts: crate::cli::args::ConnectOptions::default(),
+            name: "web1".into(),
+        };
+        assert!(route_is_tui(&cli_with_cmd(Some(cmd))));
     }
 }

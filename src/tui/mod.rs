@@ -22,6 +22,7 @@ use sshrack_core::config::schema::SecretStore;
 use sshrack_core::config::store as config_store;
 use sshrack_core::error::SshrackError;
 use sshrack_core::frecency;
+use sshrack_core::host;
 use sshrack_core::secret::{OsKeyring, SecretBackend};
 use ulid::Ulid;
 
@@ -145,17 +146,42 @@ pub fn run(cli: &Cli) -> Result<Option<ConnectRequest>, SshrackError> {
         .map(|c| (c.id, c.name.clone()))
         .collect();
 
+    // Resolve entry mode + do any name→id resolution BEFORE entering the
+    // alternate screen. `sshrack sftp <name>` resolves the host name here; an
+    // unknown name returns HostNotFound before the screen flip so the user
+    // sees the error on their normal terminal (and `main` maps it to
+    // exit_code::NOT_FOUND, mirroring the CLI connect path).
+    let entry_mode = entry_mode_from_cmd(cli.cmd.as_ref());
+    let pending_transfer_id = match &entry_mode {
+        EntryMode::Transfer { name } => {
+            let host = cfg
+                .find_host_by_name(name)
+                .ok_or_else(|| host::host_not_found(&cfg, name))?;
+            Some(host.id)
+        }
+        _ => None,
+    };
+
     let app = App::new(cfg, config_path, frecency, credential_names);
 
     let guard = TerminalGuard::enter()?;
     let mut app = app;
+    // Hand off the entry-routed transfer id (if any). The first tick of
+    // run_loop drains this and opens the transfer screen directly, mirroring
+    // an `Outcome::OpenTransfer` without polluting `App::on_key` with a
+    // phantom outcome.
+    if let Some(id) = pending_transfer_id {
+        app.pending_transfer = Some(id);
+    }
     // Entry routing: which view opens first depends on the subcommand that
     // routed us here. `route_is_tui` already guaranteed one of: bare, empty
-    // `host add|edit`, or empty `cred add|edit`. Mirror that user intent by
-    // opening the matching wizard up front (otherwise the launcher opens, the
-    // user has to press ^a/^e/c, and `sshrack cred add` would surprise them by
-    // landing on the host list).
-    app.apply_entry_mode(entry_mode_from_cmd(cli.cmd.as_ref()));
+    // `host add|edit`, empty `cred add|edit`, or `sftp <name>`. Mirror that
+    // user intent by opening the matching wizard up front (otherwise the
+    // launcher opens, the user has to press ^a/^e/c, and `sshrack cred add`
+    // would surprise them by landing on the host list). For `Transfer` the
+    // tab landing is applied here; the actual screen open happens via
+    // `pending_transfer` in run_loop.
+    app.apply_entry_mode(entry_mode);
     // A weak handle the prompt layer (vault popup, host-key popup) upgrades to
     // borrow the terminal for rendering. Cloned from the guard so it goes dead
     // the moment the guard drops (RAII restore), never keeping the Tui alive.
@@ -175,15 +201,20 @@ pub fn run(cli: &Cli) -> Result<Option<ConnectRequest>, SshrackError> {
 
 /// Which view the TUI should open first, derived from the subcommand that
 /// routed it here. `route_is_tui` already filtered to bare / empty-add /
-/// empty-edit, so this only needs to distinguish those. Each variant also
-/// carries the tab the shell should land on so [`App::apply_entry_mode`] can
-/// set `active_tab` before opening the overlay (Task 11 routing contract).
+/// empty-edit / `sftp <name>`, so this only needs to distinguish those. Each
+/// variant also carries the tab the shell should land on so
+/// [`App::apply_entry_mode`] can set `active_tab` before opening the overlay
+/// (Task 11 routing contract).
 ///
 /// - `None` (bare `sshrack`) → Hosts tab, no overlay.
 /// - `host add` (empty) → Hosts tab + host add wizard; `host edit <name>`
 ///   (empty) → Hosts tab + host edit wizard.
 /// - `cred add` (empty) → Credentials tab + cred add wizard; `cred edit <name>`
 ///   (empty) → Credentials tab + cred edit wizard.
+/// - `sftp <name>` → Hosts tab; the transfer screen opens on the first
+///   `run_loop` tick via `App::pending_transfer` (resolved to a host id in
+///   [`run`] before the alternate screen, so an unknown name errors out on the
+///   normal terminal with `exit_code::NOT_FOUND`).
 pub(super) enum EntryMode {
     /// Bare `sshrack` — open the host launcher.
     Launcher,
@@ -193,6 +224,11 @@ pub(super) enum EntryMode {
     /// Empty `cred add` (add wizard) or `cred edit <name>` (edit wizard). Lands
     /// on the Credentials tab.
     CredWizard { edit_name: Option<String> },
+    /// `sshrack sftp <name>` — open the transfer screen for the named host on
+    /// the first `run_loop` tick. The name was already resolved to a host id
+    /// in [`run`] (before the alternate screen); this variant carries the name
+    /// only for documentation — the id lives on `App::pending_transfer`.
+    Transfer { name: String },
 }
 
 impl EntryMode {
@@ -203,7 +239,9 @@ impl EntryMode {
     pub(super) fn target_tab(&self) -> tab::Tab {
         use tab::Tab;
         match self {
-            EntryMode::Launcher | EntryMode::HostWizard { .. } => Tab::Hosts,
+            EntryMode::Launcher | EntryMode::HostWizard { .. } | EntryMode::Transfer { .. } => {
+                Tab::Hosts
+            }
             EntryMode::CredWizard { .. } => Tab::Credentials,
         }
     }
@@ -211,7 +249,7 @@ impl EntryMode {
 
 /// Map the parsed CLI command to an [`EntryMode`]. Only the
 /// [`route_is_tui`]-true shapes reach here, so the default is the launcher and
-/// every other arm is one of the empty add/edit shapes.
+/// every other arm is one of the empty add/edit shapes or `sftp <name>`.
 ///
 /// [`route_is_tui`]: crate::route_is_tui
 fn entry_mode_from_cmd(cmd: Option<&Command>) -> EntryMode {
@@ -233,6 +271,7 @@ fn entry_mode_from_cmd(cmd: Option<&Command>) -> EntryMode {
             },
             _ => EntryMode::Launcher,
         },
+        Command::Sftp { name, .. } => EntryMode::Transfer { name: name.clone() },
         _ => EntryMode::Launcher,
     }
 }
@@ -354,6 +393,29 @@ mod tests {
         assert_eq!(
             auto_default_store_mode(true, true),
             Some(SecretStore::Keyring)
+        );
+    }
+
+    // `sshrack sftp <name>` maps to EntryMode::Transfer, which lands on the
+    // Hosts tab. The host name is resolved to an id in `run` before the
+    // alternate screen (a missing name returns HostNotFound + exit NOT_FOUND);
+    // `entry_mode_from_cmd` only carries the name for documentation.
+
+    #[test]
+    fn sftp_maps_to_transfer_entry_mode_on_hosts_tab() {
+        let cmd = Command::Sftp {
+            opts: crate::cli::args::ConnectOptions::default(),
+            name: "web1".into(),
+        };
+        let mode = entry_mode_from_cmd(Some(&cmd));
+        assert!(matches!(
+            &mode,
+            EntryMode::Transfer { name } if name == "web1"
+        ));
+        assert_eq!(
+            mode.target_tab(),
+            Tab::Hosts,
+            "sftp entry lands on the Hosts tab (transfer opens over it)"
         );
     }
 

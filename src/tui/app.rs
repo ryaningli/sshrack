@@ -434,6 +434,10 @@ impl App {
                     self.select_cred_by_name(&name);
                 }
             }
+            // No-op: the host id was already resolved in `tui::run` and stashed
+            // on `pending_transfer`. The first `run_loop` tick opens the
+            // transfer screen from there; this arm just lands the tab.
+            super::EntryMode::Transfer { .. } => {}
         }
     }
 
