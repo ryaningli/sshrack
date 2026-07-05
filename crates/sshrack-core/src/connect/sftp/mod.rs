@@ -29,3 +29,9 @@ pub use argv::{
 
 pub mod parse;
 pub use parse::{RawLsEntry, parse_ls_line, parse_ls_listing, strip_control_chars, to_dir_entries};
+
+pub mod proto;
+pub use proto::{
+    DirEntry, Direction, OverwritePolicy, Progress, TransferJob, TransferOutcome, WorkerCmd,
+    WorkerEvent, get_batch, list_batch, progress_snapshot, put_batch, pwd_batch,
+};
