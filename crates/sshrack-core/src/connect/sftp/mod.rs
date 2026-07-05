@@ -26,3 +26,6 @@ pub use argv::{
     control_check_argv, control_exit_argv, control_socket_path, master_argv, runtime_dir,
     sftp_batch_argv, sftp_target, shell_quote,
 };
+
+pub mod parse;
+pub use parse::{RawLsEntry, parse_ls_line, parse_ls_listing, strip_control_chars, to_dir_entries};
