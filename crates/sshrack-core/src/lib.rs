@@ -16,6 +16,7 @@ pub mod fsutil;
 pub mod host;
 pub mod hostkey;
 pub mod id;
+pub mod keydetect;
 pub mod pathutil;
 pub mod secret;
 pub mod suggest;
