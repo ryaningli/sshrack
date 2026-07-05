@@ -58,6 +58,11 @@ pub struct FilePicker<S: DirSource + Clone = LocalDirSource> {
     status: Option<String>,
     /// Whether [`ensure_started`] has resolved the start directory yet.
     started: bool,
+    /// Per-directory cursor memory (ranger-style directory history): maps a
+    /// visited dir's absolute path to the absolute path of the entry that was
+    /// selected when we last left it. Snapshot/restored only inside [`load`];
+    /// never persisted, discarded when the picker closes.
+    history: std::collections::HashMap<std::path::PathBuf, std::path::PathBuf>,
 }
 
 impl<S: DirSource + Clone> FilePicker<S> {
@@ -76,6 +81,7 @@ impl<S: DirSource + Clone> FilePicker<S> {
             selected: 0,
             status: None,
             started: false,
+            history: std::collections::HashMap::new(),
         }
     }
 
@@ -103,19 +109,42 @@ impl<S: DirSource + Clone> FilePicker<S> {
         // On failure: `started` stays false, so the next ensure_started retries.
     }
 
-    /// (Re)list `cwd`, reset ranking + cursor + query on success. Returns
-    /// `true` on the `Ok` branch, `false` on `Err`. On error, leaves
-    /// `cwd`/`entries`/`ranked` untouched (they are `None`/empty on the very
-    /// first call, or the previous dir on a failed step_into) and only sets
-    /// `status`. Fs via `source`.
+    /// (Re)list `cwd`, reset ranking + query on success, and remember/restore
+    /// the per-directory cursor (ranger-style history). Returns `true` on the
+    /// `Ok` branch, `false` on `Err`. On error, leaves `cwd`/`entries`/`ranked`
+    /// untouched and only sets `status`. Fs via `source`.
+    ///
+    /// Cursor memory: snapshots the OUTGOING dir's selected-entry path before
+    /// `list` swaps `entries`, then on entry to the INCOMING dir restores the
+    /// remembered cursor by locating that path in `ranked` (first visit → 0).
+    /// `selected` is a ranked index, so the search is over `ranked`, not
+    /// `entries`. A remembered path that no longer exists (dir changed) falls
+    /// back to 0.
     fn load(&mut self, cwd: std::path::PathBuf) -> bool {
+        // Snapshot against the OLD `ranked`/`entries` (before `list` swaps them).
+        let prev_cwd = self.cwd.clone();
+        let prev_cursor = self.selected_entry().map(|e| e.path.clone());
         match self.source.list(&cwd) {
             Ok(entries) => {
-                self.cwd = Some(cwd);
+                if let (Some(prev), Some(cursor)) = (prev_cwd, prev_cursor) {
+                    self.history.insert(prev, cursor);
+                }
+                self.cwd = Some(cwd.clone());
                 self.entries = entries;
                 self.query.clear();
                 self.recompute();
-                self.selected = 0;
+                // Restore the incoming dir's remembered cursor by locating the
+                // remembered entry path in `ranked`; first visit → 0. `selected`
+                // is a ranked index, so search `ranked`, not `entries`.
+                self.selected = self
+                    .history
+                    .get(&cwd)
+                    .and_then(|p| {
+                        self.ranked
+                            .iter()
+                            .position(|&i| self.entries.get(i).is_some_and(|e| &e.path == p))
+                    })
+                    .unwrap_or(0);
                 self.status = None;
                 true
             }
@@ -831,5 +860,178 @@ mod tests {
         assert!(p.started, "second list succeeded → started");
         assert!(p.cwd.is_some(), "cwd populated on retry");
         assert!(p.entries.iter().any(|e| e.name == "id_ed25519"));
+    }
+
+    /// Multi-level fixture: `/A/{B1/, B2/, B3/}` (subdirs), `/A/B2/{f1, f2}`
+    /// (files inside B2), `/A/B1` and `/A/B3` empty. `home` = `/A` so a
+    /// no-hint picker starts in `/A`.
+    fn multi_dir_tree() -> FakeSource {
+        let mut f = FakeSource {
+            home: Some(PathBuf::from("/A")),
+            ..Default::default()
+        };
+        let a = PathBuf::from("/A");
+        let b2 = PathBuf::from("/A/B2");
+        f.dirs.insert(
+            a.clone(),
+            vec![
+                FakeSource::entry("B1", &a, true),
+                FakeSource::entry("B2", &a, true),
+                FakeSource::entry("B3", &a, true),
+            ],
+        );
+        f.dirs.insert(
+            b2.clone(),
+            vec![
+                FakeSource::entry("f1", &b2, false),
+                FakeSource::entry("f2", &b2, false),
+            ],
+        );
+        f.dirs.insert(PathBuf::from("/A/B1"), vec![]);
+        f.dirs.insert(PathBuf::from("/A/B3"), vec![]);
+        f
+    }
+
+    // ---- directory cursor history: re-entering a dir restores the cursor ----
+
+    #[test]
+    fn step_into_and_back_restores_cursor() {
+        let mut p = FilePicker::new("pick", None, multi_dir_tree());
+        p.ensure_started(); // lands in /A
+        // land the cursor on B2 by name (order-agnostic vs the ranker)
+        for _ in 0..p.ranked.len() {
+            if p.selected_entry().is_some_and(|e| e.name == "B2/") {
+                break;
+            }
+            let _ = p.on_key(press(KeyCode::Down));
+        }
+        assert_eq!(
+            p.selected_entry().map(|e| e.name.clone()).as_deref(),
+            Some("B2/"),
+            "sanity: cursor on B2 before entering"
+        );
+        let _ = p.on_key(press(KeyCode::Right)); // enter B2
+        assert_eq!(p.cwd.as_deref(), Some(std::path::Path::new("/A/B2")));
+        let _ = p.on_key(press(KeyCode::Left)); // back to /A
+        assert_eq!(p.cwd.as_deref(), Some(std::path::Path::new("/A")));
+        assert_eq!(
+            p.selected_entry().map(|e| e.name.clone()).as_deref(),
+            Some("B2/"),
+            "re-entering a dir must restore the previous cursor (directory history)"
+        );
+    }
+
+    #[test]
+    fn first_visit_lands_on_first_entry() {
+        let mut p = FilePicker::new("pick", None, multi_dir_tree());
+        p.ensure_started(); // /A, cursor at index 0
+        assert_eq!(p.selected, 0, "initial dir → index 0");
+        // navigate to B2 and enter it (never visited, non-empty).
+        for _ in 0..p.ranked.len() {
+            if p.selected_entry().is_some_and(|e| e.name == "B2/") {
+                break;
+            }
+            let _ = p.on_key(press(KeyCode::Down));
+        }
+        let _ = p.on_key(press(KeyCode::Right)); // enter B2 — first visit
+        assert_eq!(p.cwd.as_deref(), Some(std::path::Path::new("/A/B2")));
+        assert_eq!(
+            p.selected, 0,
+            "first visit to a dir → index 0 (no history yet)"
+        );
+    }
+
+    #[test]
+    fn remembered_cursor_missing_falls_back_to_zero() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        // Stateful source: the FIRST list of /A returns [B1,B2,B3]; after we
+        // enter B2 and come back, the SECOND list of /A returns [B9] only.
+        // The remembered B2 path is now gone → the cursor must fall back to 0.
+        #[derive(Clone)]
+        struct Mutating {
+            a_calls: Arc<AtomicUsize>,
+        }
+        impl DirSource for Mutating {
+            fn list(&self, cwd: &Path) -> Result<Vec<DirEntry>, String> {
+                if cwd == std::path::Path::new("/A") {
+                    let n = self.a_calls.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        Ok(vec![
+                            DirEntry {
+                                name: "B1/".into(),
+                                path: std::path::PathBuf::from("/A/B1"),
+                                is_dir: true,
+                                is_symlink: false,
+                            },
+                            DirEntry {
+                                name: "B2/".into(),
+                                path: std::path::PathBuf::from("/A/B2"),
+                                is_dir: true,
+                                is_symlink: false,
+                            },
+                            DirEntry {
+                                name: "B3/".into(),
+                                path: std::path::PathBuf::from("/A/B3"),
+                                is_dir: true,
+                                is_symlink: false,
+                            },
+                        ])
+                    } else {
+                        Ok(vec![DirEntry {
+                            name: "B9/".into(),
+                            path: std::path::PathBuf::from("/A/B9"),
+                            is_dir: true,
+                            is_symlink: false,
+                        }])
+                    }
+                } else if cwd == std::path::Path::new("/A/B2") {
+                    Ok(vec![DirEntry {
+                        name: "f1".into(),
+                        path: std::path::PathBuf::from("/A/B2/f1"),
+                        is_dir: false,
+                        is_symlink: false,
+                    }])
+                } else {
+                    Ok(vec![])
+                }
+            }
+            fn classify(&self, p: &Path) -> PathKind {
+                match p.to_string_lossy().as_ref() {
+                    "/A" | "/A/B2" => PathKind::Dir,
+                    _ => PathKind::NotFound,
+                }
+            }
+            fn home(&self) -> Option<PathBuf> {
+                Some(std::path::PathBuf::from("/A"))
+            }
+        }
+        let mut p = FilePicker::new(
+            "pick",
+            None,
+            Mutating {
+                a_calls: Arc::new(AtomicUsize::new(0)),
+            },
+        );
+        p.ensure_started(); // /A list #0 → [B1,B2,B3]
+        // move to B2
+        for _ in 0..p.ranked.len() {
+            if p.selected_entry().is_some_and(|e| e.name == "B2/") {
+                break;
+            }
+            let _ = p.on_key(press(KeyCode::Down));
+        }
+        let _ = p.on_key(press(KeyCode::Right)); // enter B2
+        let _ = p.on_key(press(KeyCode::Left)); // back to /A → list #1 → [B9]
+        assert_eq!(
+            p.selected, 0,
+            "remembered cursor gone from new listing → fall back to index 0"
+        );
+        assert_eq!(
+            p.selected_entry().map(|e| e.name.clone()).as_deref(),
+            Some("B9/")
+        );
     }
 }
