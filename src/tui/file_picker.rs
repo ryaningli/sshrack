@@ -222,7 +222,10 @@ impl<S: DirSource + Clone> FilePicker<S> {
                 }
                 FilePickerOutcome::Pending
             }
-            KeyCode::Enter | KeyCode::Right => self.activate_selected(),
+            KeyCode::Enter => self.activate_selected(),
+            // Right is a pure navigation key: enter the dir under the cursor,
+            // or do nothing on a file (Enter is the only select key).
+            KeyCode::Right => self.step_into_selected(),
             KeyCode::Char(c) if !ctrl => {
                 self.query.push(c);
                 self.recompute();
@@ -233,8 +236,21 @@ impl<S: DirSource + Clone> FilePicker<S> {
         }
     }
 
-    /// Resolve an `Enter`/`Right`: a PathLike query resolves via the source; a
-    /// Fuzzy query activates the entry under the cursor (dir -> step in, file ->
+    /// `Right` as a pure navigation key: step into the directory under the
+    /// cursor, or do nothing when the cursor is on a file (files cannot be
+    /// entered — only [`Self::activate_selected`] / `Enter` selects a file).
+    /// Always returns [`FilePickerOutcome::Pending`] (the picker stays open).
+    fn step_into_selected(&mut self) -> FilePickerOutcome {
+        if let Some(entry) = self.selected_entry().cloned() {
+            if entry.is_dir {
+                self.step_into(&entry);
+            }
+        }
+        FilePickerOutcome::Pending
+    }
+
+    /// Resolve an `Enter`: a PathLike query resolves via the source; a Fuzzy
+    /// query activates the entry under the cursor (dir -> step in, file ->
     /// Pick). Sets `status` on a not-found path. Never panics.
     fn activate_selected(&mut self) -> FilePickerOutcome {
         let intent = parse_filter_intent(&self.query);
@@ -576,6 +592,45 @@ mod tests {
         // /h has one entry: .ssh/. Enter on it -> back into /h/.ssh.
         let out = p.on_key(press(KeyCode::Enter));
         assert!(matches!(out, FilePickerOutcome::Pending));
+        assert_eq!(p.cwd.as_deref(), Some(std::path::Path::new("/h/.ssh")));
+    }
+
+    // ---- Right is a pure navigation key: enters a dir, but is a no-op on a
+    //      file (only Enter selects). Guards against the old Enter|Right merge
+    //      that made Right on a file silently Pick it. ----
+
+    #[test]
+    fn right_on_file_is_noop_does_not_pick() {
+        let mut p = FilePicker::new("pick", Some("/h/.ssh/k"), tree());
+        // land the cursor on a file (id_ed25519), same nav as Enter-picks test.
+        while p
+            .ranked
+            .get(p.selected)
+            .is_none_or(|&i| p.entries[i].name != "id_ed25519")
+        {
+            let _ = p.on_key(press(KeyCode::Down));
+            if p.selected == 0 {
+                break;
+            }
+        }
+        let out = p.on_key(press(KeyCode::Right));
+        assert_eq!(
+            out,
+            FilePickerOutcome::Pending,
+            "Right on a file must NOT pick it (Enter is the only select key)"
+        );
+    }
+
+    #[test]
+    fn right_on_dir_still_steps_into_it() {
+        let mut p = FilePicker::new("pick", None, tree());
+        let _ = p.on_key(press(KeyCode::Left)); // /h/.ssh -> /h
+        // /h has one entry: .ssh/ (a dir). Right on it must enter the dir.
+        let out = p.on_key(press(KeyCode::Right));
+        assert!(
+            matches!(out, FilePickerOutcome::Pending),
+            "Right on a dir enters it"
+        );
         assert_eq!(p.cwd.as_deref(), Some(std::path::Path::new("/h/.ssh")));
     }
 
