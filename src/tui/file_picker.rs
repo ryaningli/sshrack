@@ -50,7 +50,7 @@ pub struct FilePicker<S: DirSource + Clone = LocalDirSource> {
     /// Current filter-box text. Drives fuzzy ranking via [`recompute`].
     query: String,
     /// Indices into `entries`, fuzzy-ordered for display. `../` is filtered out
-    /// (Left/Backspace already navigate up — the row is purely visual).
+    /// of this view and never rendered; `Left` / empty-`Backspace` navigate up.
     ranked: Vec<usize>,
     /// Cursor position: index into `ranked`.
     selected: usize,
@@ -90,6 +90,10 @@ impl<S: DirSource + Clone> FilePicker<S> {
         if self.started {
             return;
         }
+        // NOTE: initial-list failure is sticky — `started` stays true so
+        // ensure_started won't retry. Harmless for LocalDirSource (candidates
+        // resolve via `/`); relevant for a future SftpDirSource with transient
+        // errors.
         self.started = true;
         let cwd = self
             .source
@@ -125,15 +129,15 @@ impl<S: DirSource + Clone> FilePicker<S> {
     /// Recompute `ranked` (indices into `entries`) for the current `query` via
     /// the shared nucleo helper (one-field rows, all-zero scores). Pure.
     ///
-    /// Deviation from the task-4 brief: the parent `../` row is dropped from the
-    /// ranked view. The brief's keymap lists `../` as cursor-reachable ("if it's
-    /// a dir (`../` or `is_dir`), step into it"), but with the literal impl
+    /// The `../` entry exists in `entries` (prepended by `LocalDirSource::list`
+    /// when `cwd` has a parent) but is filtered out of `ranked` here, so it is
+    /// never rendered and never cursor-selectable. `Left` and `Backspace` (on an
+    /// empty query) handle up-navigation. Rationale: with the literal impl
     /// `selected = 0` after a `load` lands on `../` (it sorts first by name
     /// asc), so `Enter` on a freshly-entered directory would re-step into the
     /// parent rather than a child — breaking the `enter_on_dir_steps_into_it`
-    /// test. Since `Left` and `Backspace` (on empty query) already navigate up,
-    /// `../` is a pure visual affordance, so excluding it from the ranked view
-    /// is the minimal correct fix and preserves the rest of the keymap.
+    /// test. Excluding it from the ranked view is the minimal correct fix and
+    /// preserves the rest of the keymap.
     fn recompute(&mut self) {
         let rows: Vec<Vec<String>> = self.entries.iter().map(|e| vec![e.name.clone()]).collect();
         let scores = vec![0.0f64; self.entries.len()];
@@ -313,14 +317,15 @@ impl<S: DirSource + Clone> FilePicker<S> {
         ])
         .areas(inner);
 
-        // cwd line, left-truncated (tail wins).
+        // cwd line, left-truncated (tail wins): keep the trailing dir name
+        // (e.g. `…/.ssh`), not the head (`/home/ry…`).
         let cwd_str = self
             .cwd
             .as_deref()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| "/".to_string());
         let avail = inner.width as usize;
-        let shown = crate::tui::fit::truncate_cells(&format!(" {cwd_str}"), avail);
+        let shown = crate::tui::fit::truncate_cells_head(&format!(" {cwd_str}"), avail);
         frame.render_widget(
             Paragraph::new(shown).style(crate::tui::theme::accent()),
             cwd_area,

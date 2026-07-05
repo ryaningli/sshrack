@@ -19,6 +19,9 @@ pub enum FilterIntent {
 
 /// Classify `input`. `~` alone, or any input containing `/`, is [`FilterIntent::PathLike`];
 /// everything else (including empty) is [`FilterIntent::Fuzzy`]. Pure.
+///
+/// Note: the `~user` form classifies as `Fuzzy` (intentional — `expand_tilde`
+/// does not support `~user` either, so this is a harmless fallback).
 pub fn parse_filter_intent(input: &str) -> FilterIntent {
     if input == "~" || input.contains('/') {
         FilterIntent::PathLike(input.trim().to_string())
@@ -177,10 +180,18 @@ mod tests {
     }
 
     #[test]
-    fn start_candidates_dedups_when_parent_equals_dotssh() {
+    fn start_candidates_dedups_when_parent_equals_tilde() {
         // identity "~/x" has parent "~"; after dedup the second "~" is dropped.
         let c = start_candidates(Some("~/x"));
         let tilde_count = c.iter().filter(|s| s.as_str() == "~").count();
         assert_eq!(tilde_count, 1, "consecutive dup ~ collapsed: {c:?}");
+    }
+
+    #[test]
+    fn start_candidates_with_identity_hint_exact_order() {
+        assert_eq!(
+            start_candidates(Some("~/.ssh/id_ed25519")),
+            vec!["~/.ssh".to_string(), "~".to_string(), "/".to_string()]
+        );
     }
 }

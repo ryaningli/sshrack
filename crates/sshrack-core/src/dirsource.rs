@@ -41,9 +41,8 @@ pub struct DirEntry {
 /// Directory-listing + path-classification capability. Implementations: real
 /// local fs ([`LocalDirSource`]), fake (TUI tests), future sftp.
 pub trait DirSource {
-    /// List `cwd`'s entries (the picker prepends `../` itself via
-    /// [`Self::resolve_start`] / its own state; `list` returns cwd's children
-    /// only). IO errors become `Err(message)`.
+    /// List `cwd`'s entries, with a `../` entry prepended at index 0 when `cwd`
+    /// has a parent. IO errors become `Err(message)`.
     fn list(&self, cwd: &Path) -> Result<Vec<DirEntry>, String>;
     /// Classify a single path (dir / file / symlink / not-found). Used by
     /// [`Self::resolve`] and by the picker's start-directory probe.
