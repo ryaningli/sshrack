@@ -10,8 +10,8 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Layout},
-    style::{Modifier, Style},
+    layout::{Constraint, Layout},
+    style::Style,
     text::{Line, Span},
     widgets::Paragraph,
 };
@@ -21,12 +21,11 @@ use zeroize::Zeroizing;
 use super::super::intent::Outcome;
 use super::super::theme;
 use super::{
-    CRED_LABEL_WIDTH, CRED_VALUE_COL, CredField, CredSaveError, KeyPaste, PasteKind, PasteOutcome,
-    SecretChoice, SourceChoice, backspace_at, bracketed, insert_char_at, validate_cred,
-    value_spans,
+    CRED_LABEL_WIDTH, CRED_VALUE_COL, CredField, CredSaveError, FieldKind, KeyPaste, PasteKind,
+    PasteOutcome, SecretChoice, SourceChoice, backspace_at, bracketed, insert_char_at,
+    render_field_row, validate_cred,
 };
 use crate::tui::file_picker::{FilePicker, FilePickerOutcome};
-use crate::tui::fit::truncate_cells;
 use sshrack_core::config::schema::{Credential, CredentialBody, KeySource};
 use sshrack_core::dirsource::LocalDirSource;
 
@@ -877,6 +876,22 @@ impl CredForm {
         (max_fields + 2) as u16 // + error row + hint row
     }
 
+    /// The interaction type of `field`, which drives its affordance suffix in
+    /// [`render_row`]. Mirrors [`HostForm::field_kind`] minus the host-only
+    /// rows. The credential wizard has no Reference/Credential row, so there is
+    /// no "nothing to pick" suppression here.
+    ///
+    /// [`HostForm::field_kind`]: super::host::HostForm::field_kind
+    fn field_kind(&self, field: CredField) -> FieldKind {
+        match field {
+            CredField::Name | CredField::User => FieldKind::Text,
+            CredField::Password => FieldKind::Password,
+            CredField::SecretKind | CredField::Source => FieldKind::Switch,
+            CredField::Identity => FieldKind::Trigger,
+            CredField::InlinePrivate | CredField::InlineCert => FieldKind::MultilineTrigger,
+        }
+    }
+
     /// Render one labeled field row, with the focus highlight + placeholder.
     /// `row_width` is the available cells for the whole row (the dialog body
     /// width); the value column starts at [`CRED_VALUE_COL`] and runs to the
@@ -885,31 +900,16 @@ impl CredForm {
     /// Truncation is display-only — the cursor offset in [`cursor_target`]
     /// still uses the stored value's char count.
     fn render_row(&self, field: CredField, row_width: u16) -> Line<'static> {
-        let label = field.label();
-        let focused = self.focus == field;
-        let cursor = if focused { "▶ " } else { "  " };
-        let label_span = Span::styled(
-            format!(
-                "{cursor}{label:>WIDTH$}: ",
-                WIDTH = CRED_LABEL_WIDTH as usize
-            ),
-            if focused {
-                theme::accent().add_modifier(Modifier::BOLD)
-            } else {
-                Style::new().dim()
-            },
-        );
-
-        let (value_str, placeholder) = self.row_value_and_placeholder(field);
-        // Truncate the displayed text (value, else placeholder) to the cells
-        // right of the label so it never overflows the dialog border.
-        let avail = row_width.saturating_sub(CRED_VALUE_COL) as usize;
-        let trunc_value = truncate_cells(&value_str, avail);
-        let trunc_ph = placeholder.map(|p| truncate_cells(p, avail));
-
-        let mut spans = vec![label_span];
-        spans.extend(value_spans(&trunc_value, trunc_ph.as_deref()));
-        Line::from(spans).alignment(Alignment::Left)
+        let (value, placeholder) = self.row_value_and_placeholder(field);
+        render_field_row(
+            field.label(),
+            self.focus == field,
+            &value,
+            placeholder,
+            self.field_kind(field),
+            CRED_LABEL_WIDTH,
+            row_width,
+        )
     }
 
     fn row_value_and_placeholder(&self, field: CredField) -> (String, Option<&'static str>) {
@@ -923,7 +923,7 @@ impl CredForm {
                 // Trigger row: shows the selected path (if any) or a browse hint.
                 // The path is filled by the file picker, never typed.
                 if self.identity.is_empty() {
-                    (String::new(), Some("Enter to browse for a private key"))
+                    (String::new(), Some("browse for a private key"))
                 } else {
                     (self.identity.clone(), Some("Enter to re-browse"))
                 }
@@ -949,7 +949,7 @@ impl CredForm {
                 // blank → placeholder, non-blank → "N line(s)" count. The
                 // full editor opens as a popup on Enter (see `on_key`).
                 if self.inline_private.trim().is_empty() {
-                    (String::new(), Some("paste private key (Enter to edit)"))
+                    (String::new(), Some("paste private key"))
                 } else {
                     (
                         format!(
@@ -962,7 +962,7 @@ impl CredForm {
             }
             CredField::InlineCert => {
                 if self.inline_cert.trim().is_empty() {
-                    (String::new(), Some("optional certificate (Enter to edit)"))
+                    (String::new(), Some("optional certificate"))
                 } else {
                     (
                         format!(
@@ -2136,6 +2136,29 @@ mod tests {
             dbg.contains("inline_private_lines: 1"),
             "expected 1 line: {dbg}"
         );
+    }
+
+    // ---- Task 2: field_kind maps each credential field to its affordance suffix (RED -> GREEN) ----
+
+    #[test]
+    fn cred_field_kind_maps_each_field_to_its_affordance() {
+        // `FieldKind` is in scope unqualified via the test module's
+        // `use super::*;` (cred.rs imports it from `super`).
+        let f = CredForm::new_add();
+        assert_eq!(f.field_kind(CredField::Name), FieldKind::Text);
+        assert_eq!(f.field_kind(CredField::User), FieldKind::Text);
+        assert_eq!(f.field_kind(CredField::SecretKind), FieldKind::Switch);
+        assert_eq!(f.field_kind(CredField::Source), FieldKind::Switch);
+        assert_eq!(f.field_kind(CredField::Identity), FieldKind::Trigger);
+        assert_eq!(
+            f.field_kind(CredField::InlinePrivate),
+            FieldKind::MultilineTrigger
+        );
+        assert_eq!(
+            f.field_kind(CredField::InlineCert),
+            FieldKind::MultilineTrigger
+        );
+        assert_eq!(f.field_kind(CredField::Password), FieldKind::Password);
     }
 
     // ---- popup overlay render: draw_in_dialog must not panic for any state ----
