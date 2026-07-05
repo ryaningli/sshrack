@@ -25,10 +25,10 @@
 //! ## Testability
 //!
 //! The thread + spawn paths are not unit-testable without a real sshd, so only
-//! the pure pieces are unit-tested ([`parse_remote_home`],
-//! [`parse_size_from_ls`], [`classify_inflight_cmd`]) plus the [`ControlSocket`]
-//! RAII behavior (in [`super`]). A `#[ignore]`'d e2e test lives in
-//! `tests/sftp_e2e.rs` for a future local-sshd run.
+//! the pure pieces are unit-tested (now extracted into [`super::pure`] —
+//! `parse_remote_home`, `parse_size_from_ls`, `classify_inflight_cmd`) plus the
+//! [`ControlSocket`] RAII behavior (in [`super`]). A `#[ignore]`'d e2e test
+//! lives in `tests/sftp_e2e.rs` for a future local-sshd run.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -41,9 +41,12 @@ use crate::config::schema::Host;
 use crate::connect::sftp::proto::{
     Direction, OverwritePolicy, Progress, TransferJob, TransferOutcome, WorkerCmd, WorkerEvent,
 };
+use crate::connect::sftp::pure::{
+    InflightAction, classify_inflight_cmd, parse_remote_home, parse_size_from_ls,
+};
 use crate::connect::sftp::source::{LocalSftpRunner, SftpDirSource, SftpRunner};
 use crate::connect::sftp::{
-    ControlSocket, control_check_argv, control_exit_argv, get_batch, master_argv, parse_ls_line,
+    ControlSocket, control_check_argv, control_exit_argv, get_batch, master_argv,
     progress_snapshot, put_batch, pwd_batch, sftp_batch_argv, sftp_target, shell_quote,
 };
 use crate::connect::ssh::Overrides;
@@ -61,60 +64,6 @@ const HANDSHAKE_POLL: Duration = Duration::from_millis(250);
 
 /// Polling interval during a transfer (size + cancel check).
 const PROGRESS_POLL: Duration = Duration::from_millis(200);
-
-// ---- pure helpers (unit-tested) ----
-
-/// Parse sftp `pwd` stdout to extract the remote working directory. sftp emits
-/// `Remote working directory: <path>`; this returns the first matching line's
-/// path, trimmed. Pure (no I/O).
-pub fn parse_remote_home(stdout: &str) -> Option<PathBuf> {
-    stdout.lines().find_map(|line| {
-        line.strip_prefix("Remote working directory: ")
-            .map(|s| PathBuf::from(s.trim()))
-    })
-}
-
-/// Parse the size field out of a single `ls -l` row (the first non-blank line).
-/// Used by upload progress polling to read the partial remote file size.
-/// Returns `None` when the row is a directory or unparseable. Pure (the `now`
-/// is only used for year inference inside [`parse_ls_line`]; size does not
-/// depend on it).
-pub(crate) fn parse_size_from_ls(stdout: &str, now: SystemTime) -> Option<u64> {
-    let line = stdout.lines().find(|l| !l.trim().is_empty())?;
-    parse_ls_line(line, now)?.size
-}
-
-/// What [`run_transfer`] should do with a command that arrived mid-transfer.
-/// Pure (no I/O) — unit-tested directly via [`classify_inflight_cmd`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InflightAction {
-    /// Keep polling: the command is not meaningful mid-transfer (e.g. an
-    /// unexpected `Transfer` or `List` the UI shouldn't have sent while a
-    /// transfer is in flight).
-    Continue,
-    /// Cancel the in-flight transfer: kill child, reap, remove partial.
-    Cancel,
-    /// Propagate teardown: kill child, reap, remove partial, and tell
-    /// [`worker_loop`] to `break` instead of looping back to `recv()`.
-    Shutdown,
-}
-
-/// Classify a command that arrived while a transfer is in flight. Pure (no
-/// I/O) — the caller ([`run_transfer`]) applies the resulting [`InflightAction`].
-///
-/// `Cancel` cancels the in-flight transfer. `Shutdown` propagates teardown —
-/// this is load-bearing: swallowing `Shutdown` deadlocks `Drop`, which is
-/// `join`-blocked waiting for the worker to exit while still holding `cmd_tx`
-/// (the worker would loop back to `recv()` and block forever on a channel
-/// whose sender is never dropped). Any other command (`Transfer` / `List`
-/// arriving mid-flight) is dropped → [`InflightAction::Continue`].
-fn classify_inflight_cmd(cmd: &WorkerCmd) -> InflightAction {
-    match cmd {
-        WorkerCmd::Cancel => InflightAction::Cancel,
-        WorkerCmd::Shutdown => InflightAction::Shutdown,
-        WorkerCmd::List(_) | WorkerCmd::Transfer(_, _) => InflightAction::Continue,
-    }
-}
 
 // ---- SftpWorker ----
 
@@ -627,113 +576,6 @@ mod tests {
         // make polling 10x more or less aggressive.
         assert_eq!(HANDSHAKE_POLL, Duration::from_millis(250));
         assert_eq!(PROGRESS_POLL, Duration::from_millis(200));
-    }
-
-    // ---- classify_inflight_cmd (the load-bearing Shutdown propagation) ----
-
-    #[test]
-    fn classify_inflight_cmd_shutdown_propagates() {
-        // CRITICAL: Shutdown must map to InflightAction::Shutdown so run_transfer
-        // can break worker_loop instead of looping back to recv(). Swallowing it
-        // (the prior Ok(_) arm) deadlocks Drop: the dropping main thread holds
-        // cmd_tx until join() returns, and join() waits for the worker — which
-        // would block forever in recv() on a sender that is never dropped.
-        assert_eq!(
-            classify_inflight_cmd(&WorkerCmd::Shutdown),
-            InflightAction::Shutdown
-        );
-    }
-
-    #[test]
-    fn classify_inflight_cmd_cancel_cancels() {
-        assert_eq!(
-            classify_inflight_cmd(&WorkerCmd::Cancel),
-            InflightAction::Cancel
-        );
-    }
-
-    #[test]
-    fn classify_inflight_cmd_unexpected_commands_continue() {
-        // Transfer / List arriving mid-transfer are dropped → Continue (the UI
-        // serializes commands and waits for Done before sending the next; an
-        // unexpected mid-flight cmd must NOT kill the child or the partial).
-        assert_eq!(
-            classify_inflight_cmd(&WorkerCmd::List(PathBuf::from("/srv"))),
-            InflightAction::Continue
-        );
-        let job = TransferJob {
-            direction: Direction::Download,
-            src: PathBuf::from("/remote/x"),
-            dst: PathBuf::from("/local/x"),
-            name: "x".into(),
-            size_total: None,
-            recursive: false,
-        };
-        assert_eq!(
-            classify_inflight_cmd(&WorkerCmd::Transfer(job, OverwritePolicy::Overwrite)),
-            InflightAction::Continue
-        );
-    }
-
-    // ---- parse_remote_home ----
-
-    #[test]
-    fn parse_remote_home_extracts_path_from_pwd_line() {
-        let stdout = "Remote working directory: /home/deploy\n";
-        assert_eq!(
-            parse_remote_home(stdout),
-            Some(PathBuf::from("/home/deploy"))
-        );
-    }
-
-    #[test]
-    fn parse_remote_home_handles_trailing_whitespace() {
-        // sftp output on some platforms carries a trailing CR; trim handles it.
-        let stdout = "Remote working directory: /home/u  \r\n";
-        assert_eq!(parse_remote_home(stdout), Some(PathBuf::from("/home/u")));
-    }
-
-    #[test]
-    fn parse_remote_home_finds_first_match_among_other_lines() {
-        // sftp may print other lines (prompt echo, etc.); the parser picks the
-        // one bearing the prefix.
-        let stdout = "sftp> pwd\nRemote working directory: /root\nsftp> quit\n";
-        assert_eq!(parse_remote_home(stdout), Some(PathBuf::from("/root")));
-    }
-
-    #[test]
-    fn parse_remote_home_none_when_no_match() {
-        assert_eq!(parse_remote_home(""), None);
-        assert_eq!(parse_remote_home("some unrelated text\n"), None);
-    }
-
-    // ---- parse_size_from_ls ----
-
-    #[test]
-    fn parse_size_from_ls_extracts_file_size() {
-        let stdout = "-rw-r--r-- 1 user group 1234 Jan 2 03:04 /tmp/file\n";
-        assert_eq!(parse_size_from_ls(stdout, SystemTime::now()), Some(1234));
-    }
-
-    #[test]
-    fn parse_size_from_ls_none_for_directory_row() {
-        // Dirs report None — size polling for a recursive upload dst reports
-        // "unknown" and progress just shows indeterminate.
-        let stdout = "drwxr-xr-x 2 user group 4096 Jan 2 03:04 /tmp/dir\n";
-        assert_eq!(parse_size_from_ls(stdout, SystemTime::now()), None);
-    }
-
-    #[test]
-    fn parse_size_from_ls_none_on_empty_or_unparseable() {
-        assert_eq!(parse_size_from_ls("", SystemTime::now()), None);
-        assert_eq!(parse_size_from_ls("total 8\n", SystemTime::now()), None);
-    }
-
-    #[test]
-    fn parse_size_from_ls_uses_first_non_blank_line() {
-        // A multi-line stdout: the first non-blank row's size wins.
-        let stdout = "\n-rw-r--r-- 1 u g 99 Jan 2 03:04 /a\n-rw-r--r-- 1 u g 1 Jan 2 03:04 /b\n";
-        assert_eq!(parse_size_from_ls(stdout, SystemTime::now()), Some(99));
     }
 
     // ---- remove_partial_dst ----

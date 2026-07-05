@@ -469,14 +469,28 @@ fn drain_transfer_events(app: &mut App, handle: &TerminalHandle) {
                 }
             }
             Side::Remote => {
-                if let Some(worker) = app.transfer_worker.as_ref() {
-                    worker.send(WorkerCmd::List(path.clone()));
-                }
+                // Mirror the local branch: clear marks + query + cursor before
+                // the directory change so the per-directory mark scope
+                // (documented in pane.rs) holds symmetrically on both sides.
+                // Without on_step, a stale filter and stale marks survive into
+                // the new remote dir and reappear on navigating back.
+                let prev_cwd = app
+                    .transfer
+                    .as_ref()
+                    .map(|s| s.remote.cwd.clone())
+                    .unwrap_or_else(|| path.clone());
+                let is_step = prev_cwd.parent() == Some(&path) || prev_cwd != path;
                 if let Some(screen) = app.transfer.as_mut() {
+                    if is_step {
+                        screen.remote.on_step();
+                    }
                     // Optimistically update cwd so the next render shows the
                     // path the user navigated into while the listing is in
                     // flight; the entries refresh when the Listing event lands.
-                    screen.remote.cwd = path;
+                    screen.remote.cwd = path.clone();
+                }
+                if let Some(worker) = app.transfer_worker.as_ref() {
+                    worker.send(WorkerCmd::List(path));
                 }
             }
         }
@@ -669,7 +683,10 @@ mod tests {
     // ===============================================================
 
     use super::*;
-    use crate::tui::test_support::stdout_tui;
+    use crate::tui::test_support::{app_with_host, stdout_tui};
+    use crate::tui::transfer::pane::Side;
+    use crate::tui::transfer::screen::TransferScreen;
+    use std::path::PathBuf;
 
     #[test]
     fn popup_borrow_after_narrow_draw_borrow_does_not_panic() {
@@ -702,6 +719,62 @@ mod tests {
         // its existence with a live strong ref proves the upgrade path resolves
         // (the bug dead-locked here with a RefMut panic).
         let _ = &provider;
+    }
+
+    // ===============================================================
+    // Remote-pane on_step parity: navigation into a new remote dir must
+    // clear marks + query + cursor exactly like the local branch. The bug
+    // was that the Remote arm set `screen.remote.cwd` + sent `WorkerCmd::List`
+    // but never called `screen.remote.on_step()`, so a prior filter stayed
+    // visible and prior marks persisted in `marked` (reappearing on navigating
+    // back). The pane-level clearing mechanism is covered by pane_tests
+    // (`on_step_clears_marks_query_and_cursor`); this test pins the WIRING —
+    // that drain_transfer_events actually calls on_step on remote navigation.
+    // ===============================================================
+
+    #[test]
+    fn drain_remote_navigation_clears_remote_query_and_marks_like_local() {
+        // Seed a transfer screen whose remote pane carries a query + a mark,
+        // then queue a remote navigation (pending_list). After draining, the
+        // remote query and marks must be cleared (the per-directory scope
+        // documented in pane.rs), matching the local branch's behavior.
+        let mut app = app_with_host("web");
+        let mut screen =
+            TransferScreen::new(PathBuf::from("/local"), PathBuf::from("/remote/start"));
+        screen.remote.query = "stale".to_string();
+        screen
+            .remote
+            .marked
+            .insert(PathBuf::from("/remote/start/file"));
+        // Sanity: the fixtures took.
+        assert!(!screen.remote.query.is_empty());
+        assert_eq!(screen.remote.marked.len(), 1);
+        app.transfer = Some(screen);
+        // Queue a step into a subdirectory of the current remote cwd.
+        app.transfer.as_mut().unwrap().pending_list =
+            Some((Side::Remote, PathBuf::from("/remote/start/sub")));
+
+        // No transfer_worker is set, so the worker.send is a no-op and no
+        // WorkerEvents drain — the navigation arm is the only thing that runs.
+        // The handle is never upgraded on the navigation path.
+        let rc = Rc::new(RefCell::new(stdout_tui()));
+        let handle: TerminalHandle = Rc::downgrade(&rc);
+        drain_transfer_events(&mut app, &handle);
+
+        let screen = app.transfer.as_ref().expect("transfer screen present");
+        assert!(
+            screen.remote.query.is_empty(),
+            "remote query must be cleared on navigation (on_step parity with local)"
+        );
+        assert!(
+            screen.remote.marked.is_empty(),
+            "remote marks must be cleared on navigation (on_step parity with local)"
+        );
+        assert_eq!(
+            screen.remote.cwd,
+            PathBuf::from("/remote/start/sub"),
+            "remote cwd must advance to the navigated path"
+        );
     }
 
     #[test]

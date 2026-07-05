@@ -39,8 +39,11 @@ pub use proto::{
 pub mod source;
 pub use source::{LocalSftpRunner, SftpDirSource, SftpRunner};
 
+pub mod pure;
+pub use pure::parse_remote_home;
+
 pub mod worker;
-pub use worker::{HANDSHAKE_TIMEOUT, SftpWorker, parse_remote_home};
+pub use worker::{HANDSHAKE_TIMEOUT, SftpWorker};
 
 use std::path::{Path, PathBuf};
 

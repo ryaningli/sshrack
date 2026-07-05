@@ -28,9 +28,13 @@ use crate::dirsource::{DirEntry, DirSource, PathKind};
 /// from its own thread; tests inject a fake that returns canned stdout.
 ///
 /// `target` is the `user@host` sftp target string; `sock` is the
-/// already-established `ControlPath`; `batch` is the script body (without
-/// trailing `quit` — the caller adds it). Returns the captured stdout on
-/// success, or `Err(first_useful_stderr_line)` on non-zero exit.
+/// already-established `ControlPath`; `batch` is the full sftp script body,
+/// which the caller is expected to terminate with a trailing `quit` line (every
+/// batch builder in [`super::proto`] — `pwd_batch`, `list_batch`, `get_batch`,
+/// `put_batch` — and the ad-hoc `ls -l`/`rm` batches in `worker.rs` already
+/// include it). Dropping the stdin handle after the write also signals
+/// end-of-batch. Returns the captured stdout on success, or
+/// `Err(first_useful_stderr_line)` on non-zero exit.
 pub trait SftpRunner: Send + Sync {
     /// Run `batch` against the master at `sock`. Returns stdout on success,
     /// `Err("sftp failed: <first non-blank stderr line>")` on non-zero exit.
