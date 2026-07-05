@@ -39,7 +39,8 @@ pub enum FilePickerOutcome {
 /// Modal file picker. Generic over [`DirSource`] so tests inject a fake and a
 /// future sftp source reuses the component. `cwd`/`entries` are `None`/empty
 /// until the lazy [`ensure_started`] resolves the start directory.
-pub struct FilePicker<S: DirSource = LocalDirSource> {
+#[derive(Clone)]
+pub struct FilePicker<S: DirSource + Clone = LocalDirSource> {
     /// Overlay title (rendered by `draw_overlay`).
     title: &'static str,
     /// Injected listing/classification capability.
@@ -66,7 +67,7 @@ pub struct FilePicker<S: DirSource = LocalDirSource> {
     started: bool,
 }
 
-impl<S: DirSource> FilePicker<S> {
+impl<S: DirSource + Clone> FilePicker<S> {
     /// Open a picker. `identity_hint` seeds the start-directory candidates (its
     /// parent dir leads). NO filesystem access — the first listing is lazy.
     #[must_use]
@@ -424,7 +425,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     /// In-memory DirSource: a map of dir-path -> its child entries. No fs.
-    #[derive(Default)]
+    #[derive(Default, Clone)]
     struct FakeSource {
         dirs: HashMap<PathBuf, Vec<DirEntry>>,
         home: Option<PathBuf>,
@@ -521,6 +522,7 @@ mod tests {
     #[test]
     fn new_does_not_touch_fs() {
         // A FakeSource that PANICS on list/classify proves new() is fs-free.
+        #[derive(Clone)]
         struct Panic;
         impl DirSource for Panic {
             fn list(&self, _: &Path) -> Result<Vec<DirEntry>, String> {
@@ -645,6 +647,7 @@ mod tests {
 
     #[test]
     fn esc_cancels_without_touching_fs() {
+        #[derive(Clone)]
         struct Panic;
         impl DirSource for Panic {
             fn list(&self, _: &Path) -> Result<Vec<DirEntry>, String> {

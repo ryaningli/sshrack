@@ -35,8 +35,10 @@ use super::{
     PasteOutcome, PickerOutcome, SaveError, SecretChoice, SourceChoice, backspace_at, bracketed,
     insert_char_at, validate, value_spans,
 };
+use crate::tui::file_picker::{FilePicker, FilePickerOutcome};
 use crate::tui::fit::truncate_cells;
 use sshrack_core::config::schema::{Auth, CredentialBody, Host, KeySource};
+use sshrack_core::dirsource::LocalDirSource;
 
 /// The host form's editable state. All text fields are owned `String`s; the
 /// password is `Zeroizing` so it is wiped on drop. The wizard builds this empty
@@ -124,6 +126,14 @@ pub struct HostForm {
     /// top of [`HostForm::on_key`] (modal — swallows every key while open,
     /// including `Ctrl-S`, like the cred picker above it).
     pub key_paste: Option<KeyPaste>,
+    /// Modal file picker for the Identity path (Path source). `None` when
+    /// closed. Routed at the top of [`HostForm::on_key`] (modal — swallows
+    /// every key while open, incl `Ctrl-S`, like the cred picker / paste
+    /// popup). The picker is a reusable component ([`crate::tui::file_picker`])
+    /// that does NOT import this module; it returns the chosen absolute path
+    /// via [`FilePickerOutcome::Pick`]. Directory listing is injected via
+    /// [`LocalDirSource`] now; a future `SftpDirSource` reuses the picker.
+    pub file_picker: Option<FilePicker<LocalDirSource>>,
 }
 
 impl std::fmt::Debug for HostForm {
@@ -159,6 +169,7 @@ impl std::fmt::Debug for HostForm {
             .field("cred_picker", &self.cred_picker)
             .field("credential_names", &self.credential_names)
             .field("orig_key", &self.orig_key)
+            .field("file_picker", &self.file_picker.is_some())
             .finish()
     }
 }
@@ -189,6 +200,7 @@ impl HostForm {
             cred_picker: None,
             orig_key: None,
             key_paste: None,
+            file_picker: None,
         };
         form.cursor = form.focused_text_len();
         form
@@ -290,6 +302,7 @@ impl HostForm {
             cred_picker: None,
             orig_key,
             key_paste: None,
+            file_picker: None,
         };
         form.cursor = form.focused_text_len();
         form
@@ -625,6 +638,23 @@ impl HostForm {
             return Outcome::Continue;
         }
 
+        // An open file picker is modal (same shape as the cred picker / paste
+        // popup above): route every key into it before the form. Pick writes the
+        // chosen absolute path back to `identity` and closes; Cancel just closes.
+        // Swallows every key while open, incl Ctrl-S.
+        if let Some(mut picker) = self.file_picker.take() {
+            match picker.on_key(key) {
+                FilePickerOutcome::Pick(abs) => {
+                    self.identity = abs.to_string_lossy().into_owned();
+                    self.cursor = 0;
+                }
+                FilePickerOutcome::Cancel => {}
+                FilePickerOutcome::Pending => self.file_picker = Some(picker),
+            }
+            self.error = None;
+            return Outcome::Continue;
+        }
+
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let ctrl_c_only = key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c');
 
@@ -682,6 +712,34 @@ impl HostForm {
                         // Guarded by the matches! above.
                         _ => unreachable!("invariant: focus is InlinePrivate/InlineCert"),
                     }));
+                    self.error = None;
+                    return Outcome::Continue;
+                }
+                // Identity row is a trigger (Path source): Enter opens the file
+                // picker. Guarded by reachability so it only opens when the
+                // Identity path-slot is actually present (Independent +
+                // IdentityKey + Path). The picker is modal; Enter inside it
+                // activates a selection (handled by the modal route above).
+                if self.focus == Field::Identity
+                    && Self::field_reachable(
+                        self.focus,
+                        &self.auth_choice,
+                        self.secret_kind,
+                        self.source,
+                    )
+                {
+                    let mut picker = FilePicker::new(
+                        " pick a private key ",
+                        Some(self.identity.as_str()),
+                        LocalDirSource::new(),
+                    );
+                    // Front-load the lazy listing so the first render shows
+                    // content instead of an empty frame. `new` stays fs-free;
+                    // only `ensure_started` touches the (injected) source. The
+                    // start candidates fall back to `~`/`/`, so this is also
+                    // listable on CI where the identity hint is empty.
+                    picker.ensure_started();
+                    self.file_picker = Some(picker);
                     self.error = None;
                     return Outcome::Continue;
                 }
@@ -800,19 +858,20 @@ impl HostForm {
                 }
             }
             Field::User => self.cursor = insert_char_at(&mut self.user, self.cursor, c),
-            Field::Identity => self.cursor = insert_char_at(&mut self.identity, self.cursor, c),
             Field::Password if self.secret_kind == SecretChoice::Password => {
                 self.cursor = insert_char_at(&mut self.password, self.cursor, c)
             }
             // No char-based text entry on these rows: Auth / Credential / Secret
             // / Source are ←/→ choosers (Credential also takes Enter for the
             // picker); InlinePrivate / InlineCert are edited via the KeyPaste
-            // popup (opened on Enter in `on_key`), which never calls this
-            // function.
+            // popup (opened on Enter in `on_key`); Identity is a trigger row
+            // (Enter opens the FilePicker overlay, which writes the chosen
+            // path back). None of these ever call this char-based path.
             Field::Auth
             | Field::Credential
             | Field::Secret
             | Field::Source
+            | Field::Identity
             | Field::InlinePrivate
             | Field::InlineCert
             | Field::Password => {}
@@ -832,16 +891,16 @@ impl HostForm {
             Field::Host => self.cursor = backspace_at(&mut self.host_addr, self.cursor),
             Field::Port => self.cursor = backspace_at(&mut self.port, self.cursor),
             Field::User => self.cursor = backspace_at(&mut self.user, self.cursor),
-            Field::Identity => self.cursor = backspace_at(&mut self.identity, self.cursor),
             Field::Password if self.secret_kind == SecretChoice::Password => {
                 self.cursor = backspace_at(&mut self.password, self.cursor)
             }
             // See `edit_focused_insert`: the inline-key rows edit via the
-            // KeyPaste popup, not char-by-char.
+            // KeyPaste popup, not char-by-char; Identity edits via the FilePicker.
             Field::Auth
             | Field::Credential
             | Field::Secret
             | Field::Source
+            | Field::Identity
             | Field::InlinePrivate
             | Field::InlineCert
             | Field::Password => {}
@@ -879,6 +938,7 @@ impl HostForm {
             Field::Secret => "  <- -> cycle None/Password/IdentityKey",
             Field::Source => "  <- -> cycle Path/Inline",
             Field::InlinePrivate | Field::InlineCert => "  Enter edit multiline",
+            Field::Identity => "  Enter browse files",
             _ => "  up/down next field",
         }
     }
@@ -975,6 +1035,14 @@ impl HostForm {
         if let Some(paste) = &self.key_paste {
             paste.draw_overlay(frame);
         }
+
+        // If the file picker is open, paint it over the wizard (last, so it
+        // sits on top of the form and any other overlay; only one is open at a
+        // time — the picker opens from the Identity row, the cred picker from
+        // the Credential row, the paste popup from the Inline rows).
+        if let Some(picker) = &self.file_picker {
+            picker.draw_overlay(frame);
+        }
     }
 
     /// Char count of the currently focused text field. Returns 0 for the Auth /
@@ -987,12 +1055,17 @@ impl HostForm {
             Field::Host => self.host_addr.chars().count(),
             Field::Port => self.port.chars().count(),
             Field::User => self.user.chars().count(),
-            Field::Identity => self.identity.chars().count(),
             Field::Password => self.password.chars().count(),
-            Field::Auth | Field::Credential | Field::Secret => 0,
-            // Source is a chooser (no in-field cursor); the inline-key rows
-            // return 0 (the KeyPaste popup owns its own cursor while open).
-            Field::Source | Field::InlinePrivate | Field::InlineCert => 0,
+            // Identity is a trigger row (Enter opens the FilePicker overlay);
+            // no in-field cursor. Source/Auth/Credential/Secret are choosers;
+            // InlinePrivate/InlineCert edit via the KeyPaste popup.
+            Field::Auth
+            | Field::Credential
+            | Field::Secret
+            | Field::Source
+            | Field::Identity
+            | Field::InlinePrivate
+            | Field::InlineCert => 0,
         }
     }
 
@@ -1012,10 +1085,18 @@ impl HostForm {
             Field::Host => self.cursor.min(self.host_addr.chars().count()),
             Field::Port => self.cursor.min(self.port.chars().count()),
             Field::User => self.cursor.min(self.user.chars().count()),
-            Field::Identity => self.cursor.min(self.identity.chars().count()),
             Field::Password => self.cursor.min(self.password.chars().count()),
-            Field::Auth | Field::Credential | Field::Secret => return None,
-            Field::Source | Field::InlinePrivate | Field::InlineCert => return None,
+            // Identity is a trigger row (Enter opens the FilePicker overlay, no
+            // in-field cursor — same shape as Credential); Source/Auth/Secret
+            // are choosers; InlinePrivate/InlineCert's cursor lives in the
+            // KeyPaste popup.
+            Field::Auth
+            | Field::Credential
+            | Field::Secret
+            | Field::Source
+            | Field::Identity
+            | Field::InlinePrivate
+            | Field::InlineCert => return None,
         };
         Some((row, offset))
     }
@@ -1189,7 +1270,15 @@ impl HostForm {
                     )
                 }
             }
-            Field::Identity => (self.identity.clone(), Some("path to a private key")),
+            Field::Identity => {
+                // Trigger row: shows the selected path (if any) or a browse hint.
+                // The path is filled by the file picker, never typed.
+                if self.identity.is_empty() {
+                    (String::new(), Some("Enter to browse for a private key"))
+                } else {
+                    (self.identity.clone(), Some("Enter to re-browse"))
+                }
+            }
             Field::Password => {
                 // Masked: one bullet per char. Never echo the plaintext.
                 let masked: String =
@@ -1286,15 +1375,17 @@ mod tests {
     }
 
     #[test]
-    fn host_cursor_target_identity_offsets_path() {
+    fn host_cursor_target_identity_is_none_trigger_row() {
+        // Task 6: Identity is now a trigger row (Enter opens the FilePicker
+        // overlay), so it has no in-field cursor — `cursor_target` returns
+        // `None` just like the Credential / Auth / Secret choosers. The
+        // selected path is filled by the picker, never typed char-by-char.
         let mut f = blank_form();
         f.secret_kind = SecretChoice::IdentityKey;
         f.focus = Field::Identity;
         f.identity = "/k/id".into();
         f.cursor = f.focused_text_len();
-        // Independent + IdentityKey + Path: Name(0)/Host(1)/Port(2)/Auth(3)/
-        // User(4)/Secret(5)/Source(6)/Identity(7).
-        assert_eq!(f.cursor_target(), Some((7, 5)));
+        assert_eq!(f.cursor_target(), None);
     }
 
     // ---- validate (TDD: RED → GREEN) ----
@@ -2747,5 +2838,78 @@ mod tests {
         f.focus = Field::InlinePrivate;
         let _ = f.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
         assert!(f.key_paste.is_none());
+    }
+
+    // ---- Task 6: Identity row becomes a trigger row -> opens FilePicker (RED -> GREEN) ----
+    //
+    // The Identity path-slot (Independent + IdentityKey + Path) is no longer
+    // typed in place. It is a trigger row like Credential / InlinePrivate:
+    // Enter opens the modal FilePicker overlay, which returns an absolute path
+    // the form writes back into `identity`. Printable chars / Backspace are
+    // no-ops on the row; the cursor never lands on it (cursor_target returns
+    // None), so only the picker can change `identity`.
+
+    #[test]
+    fn enter_on_identity_opens_file_picker() {
+        // Independent + IdentityKey + Path -> Identity is reachable.
+        let mut form = HostForm::new_add(vec![]);
+        form.auth_choice = AuthChoice::Independent;
+        form.secret_kind = SecretChoice::IdentityKey;
+        form.source = SourceChoice::Path;
+        form.focus = Field::Identity;
+        assert!(form.file_picker.is_none());
+        let _ = form.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            form.file_picker.is_some(),
+            "Enter on Identity opens the picker"
+        );
+    }
+
+    #[test]
+    fn typing_on_identity_is_a_noop_it_is_a_trigger_row() {
+        let mut form = HostForm::new_add(vec![]);
+        form.auth_choice = AuthChoice::Independent;
+        form.secret_kind = SecretChoice::IdentityKey;
+        form.source = SourceChoice::Path;
+        form.focus = Field::Identity;
+        for c in "abc".chars() {
+            let _ = form.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert!(
+            form.identity.is_empty(),
+            "Identity must not accept in-place typing"
+        );
+    }
+
+    #[test]
+    fn enter_on_identity_under_reference_does_not_open_picker() {
+        // Identity is unreachable under Reference; Enter must not open it.
+        let mut form = HostForm::new_add(vec!["ops".into()]);
+        form.auth_choice = AuthChoice::Reference { idx: 0 };
+        form.focus = Field::Identity; // forced (unreachable) focus
+        let _ = form.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(form.file_picker.is_none());
+    }
+
+    #[test]
+    fn draw_in_dialog_with_open_picker_renders_without_panic() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut form = HostForm::new_add(vec![]);
+        form.auth_choice = AuthChoice::Independent;
+        form.secret_kind = SecretChoice::IdentityKey;
+        form.source = SourceChoice::Path;
+        form.focus = Field::Identity;
+        let _ = form.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let _ = term.draw(|f| {
+            let body = crate::tui::dialog::draw_dialog(
+                f,
+                &form.title(),
+                form.body_rows(),
+                &[("Tab", "field"), ("^S", "save"), ("Esc", "cancel")],
+            );
+            form.draw_in_dialog(f, body);
+        });
     }
 }
