@@ -11,13 +11,6 @@
 //! [`new`]: FilePicker::new
 //! [`ensure_started`]: FilePicker::ensure_started
 
-// Staged module: the state machine + tests land in Task 4; Tasks 6/7 wire it
-// into the host/credential wizards and Task 5 fills in `draw_overlay`. Until
-// then no non-test code constructs `FilePicker`, so the binary build would
-// emit dead-code warnings for the whole public surface. Suppress at the module
-// level rather than per-item so the staging line is documented in one place.
-#![allow(dead_code)]
-
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
 
