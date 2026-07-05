@@ -892,13 +892,9 @@ impl CredForm {
         }
     }
 
-    /// Render one labeled field row, with the focus highlight + placeholder.
-    /// `row_width` is the available cells for the whole row (the dialog body
-    /// width); the value column starts at [`CRED_VALUE_COL`] and runs to the
-    /// right edge, so an over-wide value/placeholder is passed through
-    /// [`truncate_cells`] and ends in `…` instead of running past the border.
-    /// Truncation is display-only — the cursor offset in [`cursor_target`]
-    /// still uses the stored value's char count.
+    /// Render one labeled field row by delegating to [`render_field_row`] with
+    /// this form's [`field_kind`](CredForm::field_kind) and [`CRED_LABEL_WIDTH`];
+    /// see there for truncation and type-affordance-suffix placement.
     fn render_row(&self, field: CredField, row_width: u16) -> Line<'static> {
         let (value, placeholder) = self.row_value_and_placeholder(field);
         render_field_row(
