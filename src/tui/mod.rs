@@ -46,6 +46,7 @@ pub mod store;
 pub mod tab;
 pub mod term;
 pub mod theme;
+pub mod transfer;
 pub mod wizard;
 
 #[cfg(test)]
