@@ -24,6 +24,34 @@ pub struct Overrides {
     pub ad_hoc: bool,
 }
 
+/// The ssh connection options shared by the interactive `ssh` argv and the
+/// SFTP master/sftp argv: `-l <user> -p <port> (-i <key>)?`. Pure.
+///
+/// `resolved` supplies the auth identity (user, key). `host` supplies the
+/// network endpoint (`port`). Overrides win over both. The identity is
+/// `override > resolved.key_path` (ssh-agent covers the rest); absent when
+/// neither is set.
+pub fn connect_opts(resolved: &ResolvedAuth, host: &Host, overrides: &Overrides) -> Vec<String> {
+    let mut opts: Vec<String> = Vec::new();
+
+    let user = overrides.user.as_deref().unwrap_or(&resolved.user);
+    opts.push("-l".into());
+    opts.push(user.into());
+
+    let port = overrides.port.unwrap_or(host.port);
+    opts.push("-p".into());
+    opts.push(port.to_string());
+
+    // Identity: explicit override > resolved key. (ssh-agent handles the rest.)
+    let identity = overrides.identity.as_ref().or(resolved.key_path.as_ref());
+    if let Some(k) = identity {
+        opts.push("-i".into());
+        opts.push(k.to_string_lossy().into_owned());
+    }
+
+    opts
+}
+
 /// Assemble the full `ssh` argv.
 ///
 /// `resolved` supplies the auth identity (user, key, password — password is
@@ -36,22 +64,7 @@ pub fn build(
     remote_command: &[String],
 ) -> Vec<String> {
     let mut argv: Vec<String> = vec!["ssh".into()];
-
-    let user = overrides.user.as_deref().unwrap_or(&resolved.user);
-    argv.push("-l".into());
-    argv.push(user.into());
-
-    let port = overrides.port.unwrap_or(host.port);
-    argv.push("-p".into());
-    argv.push(port.to_string());
-
-    // Identity: explicit override > resolved key. (ssh-agent handles the rest.)
-    let identity = overrides.identity.as_ref().or(resolved.key_path.as_ref());
-    if let Some(k) = identity {
-        argv.push("-i".into());
-        argv.push(k.to_string_lossy().into_owned());
-    }
-
+    argv.extend(connect_opts(resolved, host, overrides));
     argv.push(host.host.clone());
     argv.extend_from_slice(remote_command);
     argv
@@ -127,5 +140,64 @@ mod tests {
     fn resolved_user_used_when_no_override() {
         let argv = build(&resolved(), &host(), &Overrides::default(), &[]);
         assert!(argv.contains(&"deploy".to_string()));
+    }
+
+    #[test]
+    fn connect_opts_returns_user_port_identity() {
+        // The shared connection-option tokens reused by the SFTP master argv:
+        // exactly `-l <user> -p <port> -i <key>` in this order, with no `ssh`
+        // prefix and no host/command tail (those are the caller's concern).
+        let opts = connect_opts(&resolved(), &host(), &Overrides::default());
+        assert_eq!(
+            opts,
+            vec![
+                "-l".to_string(),
+                "deploy".to_string(),
+                "-p".to_string(),
+                "2222".to_string(),
+                "-i".to_string(),
+                "~/.ssh/id_ed25519".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn connect_opts_drops_identity_when_neither_override_nor_resolved_key() {
+        // No key path on the resolved auth and no identity override → no -i.
+        let mut r = resolved();
+        r.key_path = None;
+        let opts = connect_opts(&r, &host(), &Overrides::default());
+        assert!(!opts.contains(&"-i".to_string()));
+        assert_eq!(
+            opts,
+            vec![
+                "-l".to_string(),
+                "deploy".to_string(),
+                "-p".to_string(),
+                "2222".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn connect_opts_overrides_win_over_resolved() {
+        let o = Overrides {
+            user: Some("root".into()),
+            port: Some(22000),
+            identity: Some(PathBuf::from("/other-key")),
+            ..Default::default()
+        };
+        let opts = connect_opts(&resolved(), &host(), &o);
+        assert_eq!(
+            opts,
+            vec![
+                "-l".to_string(),
+                "root".to_string(),
+                "-p".to_string(),
+                "22000".to_string(),
+                "-i".to_string(),
+                "/other-key".to_string(),
+            ]
+        );
     }
 }

@@ -4,6 +4,7 @@
 //! in Task 11.
 
 pub mod scp;
+pub mod sftp;
 pub mod ssh;
 
 use std::path::{Path, PathBuf};
@@ -35,7 +36,7 @@ pub fn current_exe() -> Result<PathBuf, SshrackError> {
 /// env is set at all: a key-only connection has no account password to inject,
 /// and leaving askpass unset lets ssh prompt at `/dev/tty` for an encrypted
 /// private key's passphrase instead of calling this payload-less helper.
-fn askpass_env_for(
+pub(crate) fn askpass_env_for(
     self_exe: &Path,
     source: &PasswordSource,
     pw_file: Option<&Path>,
