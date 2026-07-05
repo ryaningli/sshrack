@@ -16,15 +16,6 @@
 //! [`Pane::on_step`] right before [`Pane::set_entries`] when stepping into or
 //! out of a directory, which clears marks (and the query and cursor) so a
 //! stale mark never survives a directory change.
-//!
-//! This module is staged ahead of the transfer screen (a later task wires
-//! `Pane` into the dual-pane UI). Until that screen lands nothing in the binary
-//! references `Pane`, so module-local `dead_code` silencing is needed for the
-//! private helpers. It is scoped to this file so newly-dead code anywhere else
-//! still flags.
-
-// Scoped silence: see the module doc — `Pane` is consumed by a later task.
-#![allow(dead_code)]
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -50,6 +41,13 @@ pub enum Side {
 /// perform (worker List, transfer enqueue, focus switch). Kept enum-shaped (not
 /// `Option<PaneOutcome>`) so the screen's match is exhaustive over the action
 /// vocabulary — adding a new action is a compile error everywhere it matters.
+///
+/// Staging note: [`Pane::on_key`] (Task 9) is the sole producer of these
+/// variants. The Task-8 transfer screen ships render-only, so until Task 9
+/// lands the variants are constructed only inside `on_key` itself (and its
+/// helpers) — none of which the prod binary reaches yet. The scoped allow on
+/// the enum drops automatically once Task 9 wires `on_key` into the screen.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaneOutcome {
     /// The key was consumed (or ignored) but no side effect is needed — the
@@ -95,6 +93,10 @@ pub enum PaneOutcome {
 #[derive(Debug, Clone)]
 pub struct Pane {
     /// Which side this pane drives. Pure label; the pane does not branch on it.
+    /// Read by the Task-9 screen key router; the Task-8 render path does not
+    /// read it (each pane knows its focused/dim state from the screen's
+    /// `focus` field).
+    #[allow(dead_code)]
     pub side: Side,
     /// Absolute current directory. The screen updates this when it acts on a
     /// [`StepInto`](PaneOutcome::StepInto) / [`StepUp`](PaneOutcome::StepUp) /
@@ -125,6 +127,10 @@ impl Pane {
     /// Open a pane at `cwd` with an empty listing. The screen feeds the first
     /// listing via [`set_entries`](Self::set_entries) once it resolves (sync
     /// for local, worker event for remote). Pure: no I/O.
+    ///
+    /// Reachability: Task-8 render path + tests construct panes; the prod
+    /// binary reaches `Pane` only via the Task-9 screen wiring.
+    #[allow(dead_code)]
     #[must_use]
     pub fn new(side: Side, cwd: PathBuf) -> Self {
         Self {
@@ -144,6 +150,10 @@ impl Pane {
     /// [`on_step`](Self::on_step) first when the new listing is for a different
     /// directory (clears marks + query); for an in-place refresh (same dir,
     /// new entries) the screen calls this directly and the query survives.
+    ///
+    /// Reachability: Task-9 screen key routing calls this; the Task-8 render
+    /// path does not (only the marker + tests reach it).
+    #[allow(dead_code)]
     pub fn set_entries(&mut self, entries: Vec<DirEntry>) {
         self.entries = entries;
         self.selected = 0;
@@ -155,6 +165,9 @@ impl Pane {
     /// [`set_entries`](Self::set_entries) when stepping into/up or fulfilling a
     /// [`RequestList`](PaneOutcome::RequestList) — marks do not carry across
     /// directories.
+    ///
+    /// Reachability: Task-9 screen key routing calls this.
+    #[allow(dead_code)]
     pub fn on_step(&mut self) {
         self.marked.clear();
         self.query.clear();
@@ -178,6 +191,11 @@ impl Pane {
     ///   [`QueryChanged`](PaneOutcome::QueryChanged).
     ///
     /// Only reacts to [`KeyEventKind::Press`] (matches every other TUI surface).
+    ///
+    /// Reachability: the Task-9 screen event loop routes keys here; the Task-8
+    /// render-only path never calls it. The scoped allow drops once Task 9
+    /// wires the screen's `on_key`.
+    #[allow(dead_code)]
     pub fn on_key(&mut self, key: KeyEvent) -> PaneOutcome {
         if key.kind != KeyEventKind::Press {
             return PaneOutcome::None;
@@ -241,6 +259,10 @@ impl Pane {
     /// The entry under the cursor, or `None` when the ranked list is empty.
     /// Pure. Pub so the screen can read the activate/transfer target without
     /// re-deriving the ranked → entry mapping.
+    ///
+    /// Reachability: read by the Task-9/10 activate + transfer paths; the
+    /// Task-8 render-only path uses [`Self::entry_at_rank`] instead.
+    #[allow(dead_code)]
     #[must_use]
     pub fn selected_entry(&self) -> Option<&DirEntry> {
         self.ranked
@@ -248,11 +270,32 @@ impl Pane {
             .and_then(|&i| self.entries.get(i))
     }
 
+    /// The number of entries currently surviving the filter (`ranked.len()`).
+    /// The search box renders this as the `matched` half of `matched/total`.
+    /// Pure.
+    #[must_use]
+    pub fn matched_count(&self) -> usize {
+        self.ranked.len()
+    }
+
+    /// The entry at display position `ranked_idx` (0-based), or `None` when the
+    /// index is out of the ranked list. The screen uses this to render each
+    /// visible row without re-deriving the ranked → entry mapping. Pure.
+    #[must_use]
+    pub fn entry_at_rank(&self, ranked_idx: usize) -> Option<&DirEntry> {
+        self.ranked
+            .get(ranked_idx)
+            .and_then(|&i| self.entries.get(i))
+    }
+
     /// Re-rank `entries` for the current `query` via the shared nucleo helper
     /// (one-field rows, all-zero scores). Empty query yields every entry in its
     /// sorted order. Pure: no I/O. Mirrors [`file_picker`]'s `recompute`.
     ///
+    /// Reachability: called by `set_entries` + `on_key`. Both are Task-9 paths.
+    ///
     /// [`file_picker`]: crate::tui::file_picker::FilePicker
+    #[allow(dead_code)]
     fn recompute(&mut self) {
         let rows: Vec<Vec<String>> = self.entries.iter().map(|e| vec![e.name.clone()]).collect();
         let scores = vec![0.0f64; self.entries.len()];
@@ -260,6 +303,9 @@ impl Pane {
     }
 
     /// Clamp the cursor into `ranked` bounds (no-op when empty). Pure.
+    ///
+    /// Reachability: called by `on_key`. Task-9 path.
+    #[allow(dead_code)]
     fn clamp_selected(&mut self) {
         if self.ranked.is_empty() {
             self.selected = 0;
@@ -270,6 +316,9 @@ impl Pane {
 
     /// Move the cursor by `delta` with wrap-around. No-op when ranked is empty.
     /// Pure.
+    ///
+    /// Reachability: called by `on_key`. Task-9 path.
+    #[allow(dead_code)]
     fn move_cursor(&mut self, delta: i32) {
         if self.ranked.is_empty() {
             return;
@@ -282,6 +331,9 @@ impl Pane {
     /// [`StepInto`](PaneOutcome::StepInto), files return
     /// [`ActivateSelected`](PaneOutcome::ActivateSelected). Empty cursor →
     /// [`None`](PaneOutcome::None). Pure.
+    ///
+    /// Reachability: called by `on_key`. Task-9 path.
+    #[allow(dead_code)]
     fn activate_or_step(&mut self) -> PaneOutcome {
         if let Some(entry) = self.selected_entry() {
             if entry.is_dir {
@@ -297,6 +349,9 @@ impl Pane {
     /// cursor entry (dir → [`StepInto`](PaneOutcome::StepInto), file →
     /// [`ActivateSelected`](PaneOutcome::ActivateSelected)). Pure except `HOME`
     /// lookup for `~`.
+    ///
+    /// Reachability: called by `on_key`. Task-9 path.
+    #[allow(dead_code)]
     fn on_enter(&mut self) -> PaneOutcome {
         match parse_filter_intent(&self.query) {
             FilterIntent::PathLike(raw) => match resolve_path_like(&raw, &self.cwd) {
@@ -310,6 +365,9 @@ impl Pane {
     /// `Left` / empty-`Backspace`: emit [`StepUp`](PaneOutcome::StepUp) when
     /// `cwd` has a parent, [`None`](PaneOutcome::None) at `/` (no parent —
     /// stepping up from root is a no-op). Pure.
+    ///
+    /// Reachability: called by `on_key`. Task-9 path.
+    #[allow(dead_code)]
     fn step_up_intent(&self) -> PaneOutcome {
         if self.cwd.parent().is_some() {
             PaneOutcome::StepUp
@@ -321,6 +379,9 @@ impl Pane {
     /// `Space`: toggle the mark on the cursor entry (file or dir). Returns
     /// [`ToggleMark(path)`](PaneOutcome::ToggleMark) and updates `marked`
     /// in-place; [`None`](PaneOutcome::None) when the cursor is empty. Pure.
+    ///
+    /// Reachability: called by `on_key`. Task-9 path.
+    #[allow(dead_code)]
     fn toggle_mark_selected(&mut self) -> PaneOutcome {
         let Some(entry) = self.selected_entry() else {
             return PaneOutcome::None;
@@ -341,6 +402,9 @@ impl Pane {
 ///   resolved without a home).
 /// - An absolute path → used verbatim.
 /// - A relative path → joined onto `cwd`.
+///
+/// Reachability: called by `on_enter` (Task-9 path).
+#[allow(dead_code)]
 fn resolve_path_like(raw: &str, cwd: &Path) -> Option<PathBuf> {
     let trimmed = raw.trim();
     if trimmed.starts_with('~') {
