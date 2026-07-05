@@ -41,8 +41,9 @@ pub struct DirEntry {
 /// Directory-listing + path-classification capability. Implementations: real
 /// local fs ([`LocalDirSource`]), fake (TUI tests), future sftp.
 pub trait DirSource {
-    /// List `cwd`'s entries, with a `../` entry prepended at index 0 when `cwd`
-    /// has a parent. IO errors become `Err(message)`.
+    /// Returns `cwd`'s child entries only (dirs first, then files,
+    /// case-insensitive). The caller navigates up via its own keys. IO errors
+    /// become `Err(message)`.
     fn list(&self, cwd: &Path) -> Result<Vec<DirEntry>, String>;
     /// Classify a single path (dir / file / symlink / not-found). Used by
     /// [`Self::resolve`] and by the picker's start-directory probe.
@@ -120,20 +121,7 @@ impl DirSource for LocalDirSource {
             let raw_name = entry.file_name().to_string_lossy().into_owned();
             items.push((raw_name, path, is_dir, is_symlink));
         }
-        let mut entries = build_entries(items);
-        // Prepend `../` when cwd has a parent so the user can always step up.
-        if cwd.parent().is_some() {
-            entries.insert(
-                0,
-                DirEntry {
-                    name: "../".into(),
-                    path: cwd.parent().unwrap_or(cwd).to_path_buf(),
-                    is_dir: true,
-                    is_symlink: false,
-                },
-            );
-        }
-        Ok(entries)
+        Ok(build_entries(items))
     }
 
     fn classify(&self, path: &Path) -> PathKind {
@@ -171,8 +159,7 @@ fn decorate(raw: &str, is_dir: bool, is_symlink: bool) -> String {
 /// Sort raw `(name, path, is_dir, is_symlink)` items into display order:
 /// directories first, then files; within each group, case-insensitive name asc.
 /// Names are decorated on the way out (dirs get a trailing `/`, symlinks `@`).
-/// Pure (no fs, no cwd knowledge). `LocalDirSource::list` calls this and then
-/// prepends the `../` row.
+/// Pure (no fs, no cwd knowledge). `LocalDirSource::list` calls this directly.
 pub(crate) fn build_entries(items: Vec<(String, PathBuf, bool, bool)>) -> Vec<DirEntry> {
     let mut items = items;
     items.sort_by(|a, b| {
@@ -224,7 +211,7 @@ mod tests {
     }
 
     #[test]
-    fn local_list_prepends_parent_and_decorates() {
+    fn local_list_decorates_entries_sorted() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::create_dir_all(root.join("sub")).unwrap();
@@ -235,14 +222,14 @@ mod tests {
         .unwrap();
         std::fs::write(root.join("readme.txt"), b"hi").unwrap();
         let entries = LocalDirSource::new().list(root).unwrap();
-        assert_eq!(entries[0].name, "../");
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"sub/"));
         assert!(names.contains(&"id_ed25519"));
         assert!(names.contains(&"readme.txt"));
         let sub_i = names.iter().position(|n| *n == "sub/").unwrap();
         let id_i = names.iter().position(|n| *n == "id_ed25519").unwrap();
-        assert!(sub_i < id_i);
+        assert!(sub_i < id_i, "dirs come before files: {names:?}");
+        assert!(!names.contains(&"../"), "no `../` row prepended: {names:?}");
     }
 
     #[test]

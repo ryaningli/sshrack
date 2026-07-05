@@ -6,8 +6,8 @@
 
 use std::path::{Path, PathBuf};
 
-/// What the filter-box input means. A string with a `/` anywhere, or a lone
-/// leading `~`, is treated as a path the user typed/pasted; anything else is a
+/// What the filter-box input means. A string with a `~` prefix OR containing a
+/// `/` anywhere is treated as a path the user typed/pasted; anything else is a
 /// fuzzy filter over the current directory's entries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FilterIntent {
@@ -17,13 +17,17 @@ pub enum FilterIntent {
     PathLike(String),
 }
 
-/// Classify `input`. `~` alone, or any input containing `/`, is [`FilterIntent::PathLike`];
-/// everything else (including empty) is [`FilterIntent::Fuzzy`]. Pure.
+/// Classify `input`. A `~` prefix OR any input containing `/` is
+/// [`FilterIntent::PathLike`]; everything else (including empty) is
+/// [`FilterIntent::Fuzzy`]. Pure.
 ///
-/// Note: the `~user` form classifies as `Fuzzy` (intentional — `expand_tilde`
-/// does not support `~user` either, so this is a harmless fallback).
+/// Note: the `~user` form classifies as `PathLike` (consistent with `~` and
+/// `~/foo`), but [`expand_tilde`] does NOT expand it — it returns the input
+/// as-is, which then classifies as `NotFound`, yielding a clear "no such path:
+/// ~user" status. Supporting `~user`-expansion would require parsing
+/// `/etc/passwd`, which is YAGNI for SSH-key selection.
 pub fn parse_filter_intent(input: &str) -> FilterIntent {
-    if input == "~" || input.contains('/') {
+    if input.starts_with('~') || input.contains('/') {
         FilterIntent::PathLike(input.trim().to_string())
     } else {
         FilterIntent::Fuzzy(input.to_string())
@@ -135,6 +139,23 @@ mod tests {
     fn leading_tilde_alone_is_pathlike() {
         assert!(matches!(
             parse_filter_intent("~"),
+            FilterIntent::PathLike(_)
+        ));
+    }
+
+    #[test]
+    fn leading_tilde_without_slash_is_pathlike() {
+        // `~foo` (~user form) is PathLike, consistent with `~` and `~/foo`.
+        assert!(matches!(
+            parse_filter_intent("~foo"),
+            FilterIntent::PathLike(_)
+        ));
+        assert!(matches!(
+            parse_filter_intent("~"),
+            FilterIntent::PathLike(_)
+        ));
+        assert!(matches!(
+            parse_filter_intent("~/x"),
             FilterIntent::PathLike(_)
         ));
     }

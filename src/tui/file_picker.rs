@@ -44,13 +44,13 @@ pub struct FilePicker<S: DirSource + Clone = LocalDirSource> {
     candidates: Vec<String>,
     /// Absolute current directory. `None` until `ensure_started` resolves it.
     cwd: Option<std::path::PathBuf>,
-    /// Current directory's entries (the parent `../` row is at index 0 when
-    /// `cwd` has a parent). Reset by [`load`].
+    /// Current directory's entries (real children only — dirs first, then
+    /// files). Reset by [`load`].
     entries: Vec<DirEntry>,
     /// Current filter-box text. Drives fuzzy ranking via [`recompute`].
     query: String,
-    /// Indices into `entries`, fuzzy-ordered for display. `../` is filtered out
-    /// of this view and never rendered; `Left` / empty-`Backspace` navigate up.
+    /// Indices into `entries`, fuzzy-ordered for display. `Left` and
+    /// empty-`Backspace` navigate up via [`step_up`].
     ranked: Vec<usize>,
     /// Cursor position: index into `ranked`.
     selected: usize,
@@ -83,27 +83,32 @@ impl<S: DirSource + Clone> FilePicker<S> {
     /// future caller can size the popup; the overlay itself uses a fixed cap.
     pub const VISIBLE_ROWS: usize = 16;
 
-    /// Lazily resolve the start directory and list it. Idempotent. Called at the
-    /// top of [`on_key`] (after Esc/^C) and [`draw_overlay`]. Touches fs via the
-    /// injected source only.
+    /// Lazily resolve the start directory and list it. Idempotent once it
+    /// succeeds. Called at the top of [`on_key`] (after Esc/^C) and
+    /// [`draw_overlay`]. Touches fs via the injected source only.
+    ///
+    /// On an initial list failure `started` stays `false` so the next call
+    /// retries — relevant for a future `SftpDirSource` with transient errors.
     pub fn ensure_started(&mut self) {
         if self.started {
             return;
         }
-        // NOTE: initial-list failure is sticky — `started` stays true so
-        // ensure_started won't retry. Harmless for LocalDirSource (candidates
-        // resolve via `/`); relevant for a future SftpDirSource with transient
-        // errors.
-        self.started = true;
         let cwd = self
             .source
             .resolve_start(&self.candidates)
             .unwrap_or_else(|| std::path::PathBuf::from("/"));
-        self.load(cwd);
+        if self.load(cwd) {
+            self.started = true;
+        }
+        // On failure: `started` stays false, so the next ensure_started retries.
     }
 
-    /// (Re)list `cwd`, reset ranking + cursor + query. Fs via `source`.
-    fn load(&mut self, cwd: std::path::PathBuf) {
+    /// (Re)list `cwd`, reset ranking + cursor + query on success. Returns
+    /// `true` on the `Ok` branch, `false` on `Err`. On error, leaves
+    /// `cwd`/`entries`/`ranked` untouched (they are `None`/empty on the very
+    /// first call, or the previous dir on a failed step_into) and only sets
+    /// `status`. Fs via `source`.
+    fn load(&mut self, cwd: std::path::PathBuf) -> bool {
         match self.source.list(&cwd) {
             Ok(entries) => {
                 self.cwd = Some(cwd);
@@ -112,40 +117,22 @@ impl<S: DirSource + Clone> FilePicker<S> {
                 self.recompute();
                 self.selected = 0;
                 self.status = None;
+                true
             }
             Err(msg) => {
                 self.status = Some(format!("cannot list: {msg}"));
-                // Keep cwd if set; entries unchanged. If this was the very first
-                // load, fall back to "/" so the picker is not stuck empty.
-                if self.cwd.is_none() {
-                    self.cwd = Some(std::path::PathBuf::from("/"));
-                    self.entries.clear();
-                    self.ranked.clear();
-                }
+                false
             }
         }
     }
 
     /// Recompute `ranked` (indices into `entries`) for the current `query` via
-    /// the shared nucleo helper (one-field rows, all-zero scores). Pure.
-    ///
-    /// The `../` entry exists in `entries` (prepended by `LocalDirSource::list`
-    /// when `cwd` has a parent) but is filtered out of `ranked` here, so it is
-    /// never rendered and never cursor-selectable. `Left` and `Backspace` (on an
-    /// empty query) handle up-navigation. Rationale: with the literal impl
-    /// `selected = 0` after a `load` lands on `../` (it sorts first by name
-    /// asc), so `Enter` on a freshly-entered directory would re-step into the
-    /// parent rather than a child — breaking the `enter_on_dir_steps_into_it`
-    /// test. Excluding it from the ranked view is the minimal correct fix and
-    /// preserves the rest of the keymap.
+    /// the shared nucleo helper (one-field rows, all-zero scores). Empty query
+    /// yields all entries in their sorted order. Pure.
     fn recompute(&mut self) {
         let rows: Vec<Vec<String>> = self.entries.iter().map(|e| vec![e.name.clone()]).collect();
         let scores = vec![0.0f64; self.entries.len()];
-        let ranked = crate::tui::panel::rank_by_fields(&rows, &scores, &self.query);
-        self.ranked = ranked
-            .into_iter()
-            .filter(|&i| self.entries.get(i).is_some_and(|e| e.name != "../"))
-            .collect();
+        self.ranked = crate::tui::panel::rank_by_fields(&rows, &scores, &self.query);
     }
 
     /// Clamp the cursor into `ranked` bounds (no-op when empty).
@@ -447,19 +434,7 @@ mod tests {
     }
     impl DirSource for FakeSource {
         fn list(&self, cwd: &Path) -> Result<Vec<DirEntry>, String> {
-            let mut e = self.dirs.get(cwd).cloned().unwrap_or_default();
-            if cwd.parent().is_some() {
-                e.insert(
-                    0,
-                    DirEntry {
-                        name: "../".into(),
-                        path: cwd.parent().unwrap().to_path_buf(),
-                        is_dir: true,
-                        is_symlink: false,
-                    },
-                );
-            }
-            Ok(e)
+            Ok(self.dirs.get(cwd).cloned().unwrap_or_default())
         }
         fn classify(&self, p: &Path) -> PathKind {
             if self.dirs.contains_key(p) {
@@ -751,5 +726,55 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut term = Terminal::new(backend).unwrap();
         let _ = term.draw(|f| p.draw_overlay(f));
+    }
+
+    // ---- M3: ensure_started retries after an initial list failure ----
+
+    #[test]
+    fn ensure_started_retries_after_initial_list_failure() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        #[derive(Clone)]
+        struct Flaky {
+            calls: Arc<AtomicUsize>,
+        }
+        impl DirSource for Flaky {
+            fn list(&self, _: &Path) -> Result<Vec<DirEntry>, String> {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    Err("boom".into())
+                } else {
+                    Ok(vec![DirEntry {
+                        name: "id_ed25519".into(),
+                        path: std::path::PathBuf::from("/h/.ssh/id_ed25519"),
+                        is_dir: false,
+                        is_symlink: false,
+                    }])
+                }
+            }
+            fn classify(&self, _: &Path) -> PathKind {
+                PathKind::Dir
+            } // resolve_start finds a dir
+            fn home(&self) -> Option<PathBuf> {
+                Some(std::path::PathBuf::from("/h"))
+            }
+        }
+        let mut p = FilePicker::new(
+            "pick",
+            None,
+            Flaky {
+                calls: Arc::new(AtomicUsize::new(0)),
+            },
+        );
+        p.ensure_started();
+        assert!(!p.started, "first list failed → not started");
+        assert!(p.cwd.is_none(), "cwd stays None on failure");
+        assert!(p.status.is_some(), "failure surfaced a status");
+        p.ensure_started(); // retry
+        assert!(p.started, "second list succeeded → started");
+        assert!(p.cwd.is_some(), "cwd populated on retry");
+        assert!(p.entries.iter().any(|e| e.name == "id_ed25519"));
     }
 }
