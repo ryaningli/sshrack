@@ -32,6 +32,6 @@ pub use parse::{RawLsEntry, parse_ls_line, parse_ls_listing, strip_control_chars
 
 pub mod proto;
 pub use proto::{
-    DirEntry, Direction, OverwritePolicy, Progress, TransferJob, TransferOutcome, WorkerCmd,
-    WorkerEvent, get_batch, list_batch, progress_snapshot, put_batch, pwd_batch,
+    Direction, OverwritePolicy, Progress, TransferJob, TransferOutcome, WorkerCmd, WorkerEvent,
+    get_batch, list_batch, progress_snapshot, put_batch, pwd_batch,
 };

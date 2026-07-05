@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::connect::sftp::shell_quote;
+use crate::dirsource::DirEntry;
 
 // ---- Direction ----
 
@@ -88,17 +89,6 @@ pub enum TransferOutcome {
     Failed(String),
 }
 
-// ---- DirEntry ----
-
-/// A single directory entry returned by `sftp ls -l`.
-#[derive(Debug, Clone)]
-pub struct DirEntry {
-    pub name: String,
-    pub is_dir: bool,
-    pub size: u64,
-    pub modified: Option<String>,
-}
-
 // ---- batch builders ----
 
 /// Build an `ls -l` batch script for listing a remote directory.
@@ -112,22 +102,26 @@ pub fn pwd_batch() -> String {
 }
 
 /// Build a `get` batch script for downloading a file/directory.
+///
+/// Recursive transfers use `get -R` (uppercase `R`, after the command name) —
+/// that is OpenSSH `sftp`'s recursive flag for the interactive/batch `get`/`put`
+/// commands; `-r` is not a valid sftp command and would be rejected in batch mode.
 pub fn get_batch(src: &Path, dst: &Path, recursive: bool) -> String {
-    let flag = if recursive { "-r " } else { "" };
+    let flag = if recursive { " -R" } else { "" };
     format!(
-        "{}get {} {}\nquit\n",
-        flag,
+        "get{flag} {} {}\nquit\n",
         shell_quote(&src.to_string_lossy()),
         shell_quote(&dst.to_string_lossy())
     )
 }
 
 /// Build a `put` batch script for uploading a file/directory.
+///
+/// See [`get_batch`]: recursive transfers use `put -R`.
 pub fn put_batch(src: &Path, dst: &Path, recursive: bool) -> String {
-    let flag = if recursive { "-r " } else { "" };
+    let flag = if recursive { " -R" } else { "" };
     format!(
-        "{}put {} {}\nquit\n",
-        flag,
+        "put{flag} {} {}\nquit\n",
         shell_quote(&src.to_string_lossy()),
         shell_quote(&dst.to_string_lossy())
     )
@@ -193,18 +187,19 @@ mod tests {
     // ---- list_batch ----
 
     #[test]
-    fn list_batch_contains_ls_and_quit() {
-        let batch = list_batch(Path::new("/remote/path"));
-        assert!(batch.contains("ls -l"), "batch must contain 'ls -l'");
-        assert!(batch.contains("quit"), "batch must end with 'quit'");
+    fn list_batch_exact_string_plain_path() {
+        // Exact composed string — locked so flag placement / quoting can't drift.
+        assert_eq!(
+            list_batch(Path::new("/remote/path")),
+            format!("ls -l {}\nquit\n", shell_quote("/remote/path"))
+        );
     }
 
     #[test]
-    fn list_batch_quotes_path() {
-        let batch = list_batch(Path::new("/path with spaces"));
-        assert!(
-            batch.contains("\"/path with spaces\""),
-            "path must be shell-quoted"
+    fn list_batch_exact_string_path_with_spaces() {
+        assert_eq!(
+            list_batch(Path::new("/path with spaces")),
+            format!("ls -l {}\nquit\n", shell_quote("/path with spaces"))
         );
     }
 
@@ -212,87 +207,114 @@ mod tests {
 
     #[test]
     fn pwd_batch_is_pwd_and_quit() {
-        let batch = pwd_batch();
-        assert_eq!(batch, "pwd\nquit\n");
+        assert_eq!(pwd_batch(), "pwd\nquit\n");
     }
 
     // ---- get_batch ----
 
     #[test]
-    fn get_batch_non_recursive() {
-        let batch = get_batch(
-            Path::new("/remote/file.txt"),
-            Path::new("/local/file.txt"),
-            false,
+    fn get_batch_non_recursive_exact() {
+        assert_eq!(
+            get_batch(
+                Path::new("/remote/file.txt"),
+                Path::new("/local/file.txt"),
+                false,
+            ),
+            format!(
+                "get {} {}\nquit\n",
+                shell_quote("/remote/file.txt"),
+                shell_quote("/local/file.txt")
+            )
         );
-        assert!(batch.contains("get "), "batch must contain 'get'");
-        assert!(
-            !batch.contains("-r"),
-            "non-recursive batch must not contain '-r'"
-        );
-        assert!(batch.contains("quit"), "batch must end with 'quit'");
     }
 
     #[test]
-    fn get_batch_recursive() {
+    fn get_batch_recursive_exact_uppercase_r_after_command() {
+        // Recursive flag is uppercase -R AFTER the command name, not "-r" before.
         let batch = get_batch(Path::new("/remote/dir"), Path::new("/local/dir"), true);
-        assert!(batch.contains("get "), "batch must contain 'get'");
-        assert!(batch.contains("-r"), "recursive batch must contain '-r'");
-        assert!(batch.contains("quit"), "batch must end with 'quit'");
+        assert_eq!(
+            batch,
+            format!(
+                "get -R {} {}\nquit\n",
+                shell_quote("/remote/dir"),
+                shell_quote("/local/dir")
+            )
+        );
+        // Negative guards — these two bugs shipped once; lock them out.
+        assert!(
+            !batch.starts_with("-R "),
+            "recursive flag must not precede the command name"
+        );
+        assert!(
+            !batch.contains(" -r "),
+            "recursive flag must be uppercase -R, not lowercase -r"
+        );
     }
 
     #[test]
-    fn get_batch_quotes_both_paths() {
-        let batch = get_batch(
-            Path::new("/path with spaces"),
-            Path::new("/local path"),
-            false,
-        );
-        assert!(
-            batch.contains("\"/path with spaces\""),
-            "src must be shell-quoted"
-        );
-        assert!(
-            batch.contains("\"/local path\""),
-            "dst must be shell-quoted"
+    fn get_batch_quotes_both_paths_exact() {
+        assert_eq!(
+            get_batch(
+                Path::new("/path with spaces"),
+                Path::new("/local path"),
+                false,
+            ),
+            format!(
+                "get {} {}\nquit\n",
+                shell_quote("/path with spaces"),
+                shell_quote("/local path")
+            )
         );
     }
 
     // ---- put_batch ----
 
     #[test]
-    fn put_batch_non_recursive() {
-        let batch = put_batch(
-            Path::new("/local/file.txt"),
-            Path::new("/remote/file.txt"),
-            false,
+    fn put_batch_non_recursive_exact() {
+        assert_eq!(
+            put_batch(
+                Path::new("/local/file.txt"),
+                Path::new("/remote/file.txt"),
+                false,
+            ),
+            format!(
+                "put {} {}\nquit\n",
+                shell_quote("/local/file.txt"),
+                shell_quote("/remote/file.txt")
+            )
         );
-        assert!(batch.contains("put "), "batch must contain 'put'");
-        assert!(
-            !batch.contains("-r"),
-            "non-recursive batch must not contain '-r'"
-        );
-        assert!(batch.contains("quit"), "batch must end with 'quit'");
     }
 
     #[test]
-    fn put_batch_recursive() {
+    fn put_batch_recursive_exact_uppercase_r_after_command() {
         let batch = put_batch(Path::new("/local/dir"), Path::new("/remote/dir"), true);
-        assert!(batch.contains("put "), "batch must contain 'put'");
-        assert!(batch.contains("-r"), "recursive batch must contain '-r'");
-        assert!(batch.contains("quit"), "batch must end with 'quit'");
+        assert_eq!(
+            batch,
+            format!(
+                "put -R {} {}\nquit\n",
+                shell_quote("/local/dir"),
+                shell_quote("/remote/dir")
+            )
+        );
+        assert!(
+            !batch.starts_with("-R "),
+            "recursive flag must not precede the command name"
+        );
+        assert!(
+            !batch.contains(" -r "),
+            "recursive flag must be uppercase -R, not lowercase -r"
+        );
     }
 
     #[test]
-    fn put_batch_quotes_both_paths() {
-        let batch = put_batch(Path::new("/local path"), Path::new("/remote path"), false);
-        assert!(
-            batch.contains("\"/local path\""),
-            "src must be shell-quoted"
-        );
-        assert!(
-            batch.contains("\"/remote path\""),
-            "dst must be shell-quoted"
+    fn put_batch_quotes_both_paths_exact() {
+        assert_eq!(
+            put_batch(Path::new("/local path"), Path::new("/remote path"), false,),
+            format!(
+                "put {} {}\nquit\n",
+                shell_quote("/local path"),
+                shell_quote("/remote path")
+            )
         );
     }
 
