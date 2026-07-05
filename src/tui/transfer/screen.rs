@@ -26,7 +26,7 @@ use ratatui::{
     widgets::Paragraph,
 };
 
-use sshrack_core::connect::sftp::proto::{Direction, Progress, TransferJob};
+use sshrack_core::connect::sftp::proto::{Direction, OverwritePolicy, Progress, TransferJob};
 
 use crate::tui::intent::Status;
 use crate::tui::theme;
@@ -100,6 +100,12 @@ pub struct TransferScreen {
     /// back via [`Pane::set_entries`], and clears the field. Pure: setting
     /// this performs no I/O.
     pub pending_list: Option<(Side, PathBuf)>,
+    /// The user's batch-level overwrite answer, set by the Task-10 loop after
+    /// the first overwrite popup (`OverwriteAll` / `SkipAll` apply to the rest
+    /// of the batch). `None` until the first conflict resolves; per-job
+    /// [`decide`](super::overwrite::decide) calls read this so a single popup
+    /// governs a whole queued batch. Pure: setting this performs no I/O.
+    pub overwrite_policy: Option<OverwritePolicy>,
 }
 
 impl TransferScreen {
@@ -107,9 +113,9 @@ impl TransferScreen {
     /// on Local, no active transfer, an empty queue, an empty status, and no
     /// pending list. Pure: no I/O.
     ///
-    /// Reachability: Task-10 sftp dispatch constructs the live screen; the
-    /// Task-8 render path + Task-9 key router are exercised by tests only.
-    #[allow(dead_code)] // Task 10 wires the sftp subcommand that constructs this.
+    /// Reachability: Task-10 sftp dispatch constructs the live screen via
+    /// [`crate::tui::transfer::open::open_transfer`]; the Task-8 render path
+    /// + Task-9 key router are also exercised by tests.
     #[must_use]
     pub fn new(local_cwd: PathBuf, remote_cwd: PathBuf) -> Self {
         Self {
@@ -120,47 +126,50 @@ impl TransferScreen {
             queue: Vec::new(),
             status: Status::empty(),
             pending_list: None,
+            overwrite_policy: None,
         }
     }
 
     /// Set the focused side. Pure setter — `on_key` flips focus internally via
-    /// `flip_focus`; this public setter is kept for Task-10 callers that need
-    /// to pin focus on a specific side (e.g. on screen entry).
-    #[allow(dead_code)] // Task 10 may pin focus on screen entry.
+    /// `flip_focus`; this public setter is kept for callers that need to pin
+    /// focus on a specific side. No Task-10 caller does (the screen opens with
+    /// Local focus by default); Task-11's `sshrack sftp` direct-entry path
+    /// (e.g. opening on Remote focus when invoked with a remote path) will.
+    #[allow(dead_code)] // Task-11 sshrack sftp direct-entry path will pin focus.
     pub fn set_focus(&mut self, side: Side) {
         self.focus = side;
     }
 
     /// Replace the in-flight transfer snapshot (or clear it with `None`).
-    /// Pure setter — Task 10 drives it from drained worker events.
-    #[allow(dead_code)]
+    /// Pure setter — the loop drives it from drained worker events.
     pub fn set_active(&mut self, progress: Option<Progress>) {
         self.active = progress;
     }
 
     /// Replace the consolidated status. Pure setter.
-    #[allow(dead_code)]
     pub fn set_status(&mut self, status: Status) {
         self.status = status;
     }
 
-    /// Append a transfer job to the queue. Pure mutator — Task 10 enqueues.
-    #[allow(dead_code)]
+    /// Append a transfer job to the queue. Pure mutator — kept for callers
+    /// that build a job outside the normal `Ctrl-Enter` enqueue path. No
+    /// Task-10 caller does (the in-TUI enqueue route is `Ctrl-Enter` →
+    /// `enqueue_from_focused`); Task-11's `sshrack scp`-style direct transfer
+    /// (CLI flag that pre-queues a job before opening the screen) will.
+    #[allow(dead_code)] // Task-11 sshrack scp-style direct transfer will enqueue via this.
     pub fn push_queue(&mut self, job: TransferJob) {
         self.queue.push(job);
     }
 
     /// Mutable accessor for the local pane. `on_key` accesses `self.local`
-    /// directly (it lives in the same module); this accessor is kept for
-    /// external Task-10 callers (e.g. the loop feeding a worker `Listing`
-    /// event into the pane).
-    #[allow(dead_code)] // Task 10 wires the sftp event loop that drives this.
+    /// directly (it lives in the same module); this accessor is for external
+    /// callers (the loop feeding a worker `Listing` event into the pane, and
+    /// `LocalDirSource`-fed listings on navigation).
     pub fn local_mut(&mut self) -> &mut Pane {
         &mut self.local
     }
 
     /// Mutable accessor for the remote pane. See [`Self::local_mut`].
-    #[allow(dead_code)] // Task 10 wires the sftp event loop that drives this.
     pub fn remote_mut(&mut self) -> &mut Pane {
         &mut self.remote
     }
@@ -180,8 +189,8 @@ impl TransferScreen {
     /// the remote side), feeds the result back via [`Pane::set_entries`], and
     /// clears the field.
     ///
-    /// Reachability: Task 10's sftp event loop calls this on each polled key.
-    #[allow(dead_code)] // Task 10 wires the sftp event loop that drives this.
+    /// Reachability: Task 10's sftp event loop calls this on each polled key
+    /// via [`App::route_transfer`](crate::tui::app::App::route_transfer).
     pub fn on_key(&mut self, key: KeyEvent) -> ScreenOutcome {
         if key.kind != KeyEventKind::Press {
             return ScreenOutcome::Continue;
@@ -345,7 +354,6 @@ impl TransferScreen {
     /// when the queue is empty. Pure mutator: no I/O.
     ///
     /// Reachability: Task 10's loop drives this off `WorkerEvent::Done`.
-    #[allow(dead_code)] // Task 10 wires the sftp event loop that drains this.
     pub fn next_job(&mut self) -> Option<TransferJob> {
         if self.queue.is_empty() {
             None
@@ -359,7 +367,6 @@ impl TransferScreen {
     /// keypress / `next_job` sees no active transfer. Pure mutator.
     ///
     /// Reachability: Task 10's loop calls this off `WorkerEvent::Done`.
-    #[allow(dead_code)] // Task 10 wires the sftp event loop that drives this.
     pub fn clear_active(&mut self) {
         self.active = None;
     }
@@ -370,9 +377,8 @@ impl TransferScreen {
     /// windowed list via [`render::draw_pane`]. The non-focused pane is dimmed
     /// overall. Pure: no I/O, no env access.
     ///
-    /// Reachability: Task-10 sftp dispatch + event loop drives this; the
-    /// Task-8 render path is exercised by the screen tests.
-    #[allow(dead_code)]
+    /// Reachability: Task-10's transfer dispatch + event loop drives this via
+    /// [`App::draw`](crate::tui::app::App::draw) when `App::transfer` is set.
     pub fn draw(&self, frame: &mut Frame, area: Rect) {
         let [title_area, panes_area, panel_area, footer_area] = Layout::vertical([
             Constraint::Length(1),

@@ -17,7 +17,6 @@ use sshrack_core::connect::sftp::proto::OverwritePolicy;
 ///
 /// Reachability: Task 10's sftp event loop consumes this (the overwrite popup
 /// + the batch loop call `decide` before each transfer).
-#[allow(dead_code)] // Task 10 wires the sftp event loop + popup that consume this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverwriteChoice {
     /// Overwrite this one destination. Emitted by `Overwrite` and `OverwriteAll`
@@ -59,7 +58,6 @@ pub enum OverwriteChoice {
 /// not change the result. It is part of the signature so callers and tests
 /// document the no-conflict case explicitly.
 /// Reachability: Task 10's sftp event loop + overwrite popup call this.
-#[allow(dead_code)] // Task 10 wires the caller (popup + batch loop).
 #[must_use]
 pub fn decide(policy: OverwritePolicy, _dest_exists: bool) -> OverwriteChoice {
     match policy {

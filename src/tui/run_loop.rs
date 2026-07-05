@@ -35,6 +35,11 @@ use super::persist::{
 };
 use super::prompt::TuiPassphrase;
 use super::term::{TerminalHandle, Tui};
+use super::transfer::open::open_transfer;
+use super::transfer::overwrite;
+use super::transfer::pane::Side;
+use sshrack_core::connect::sftp::SftpWorker;
+use sshrack_core::connect::sftp::proto::{TransferOutcome, WorkerCmd, WorkerEvent};
 
 /// Blocking event loop. Renders `app`, polls crossterm for key events, and
 /// dispatches each key through [`App::on_key`]. Returns `Some(req)` when the
@@ -317,12 +322,309 @@ pub fn run_loop(
                         }
                     }
                 }
+                Outcome::OpenTransfer => {
+                    // Pure intent: Ctrl-T on Hosts tab with a host selected.
+                    // Run open_transfer (vault unlock, host-key, worker spawn,
+                    // screen seed). A cancel inside a popup surfaces as
+                    // Interrupted → return to the launcher (no status write);
+                    // any other error surfaces in the status line and also
+                    // returns to the launcher.
+                    let Some(host_id) = app.pending_transfer.take() else {
+                        // No id: defensive — Ctrl-T hit no host.
+                        continue;
+                    };
+                    match open_transfer(host_id, app, handle.clone(), data_dir) {
+                        Ok(()) => {}
+                        Err(SshrackError::Interrupted) => {
+                            // User cancelled a popup (Esc/Ctrl-C). Return to the
+                            // launcher, NOT an exit. No status write — the popup
+                            // dismissing is the feedback.
+                        }
+                        Err(e) => {
+                            app.set_status_error(format!("sftp open failed: {e}"));
+                        }
+                    }
+                }
+                Outcome::CloseTransfer => {
+                    // The transfer screen signaled close (Esc with no active
+                    // transfer, or Ctrl-C). Drop the screen + worker + inline-
+                    // key artifact together so the worker's Drop tears down the
+                    // master ssh -N (RAII) and the temp files are removed. No
+                    // status write — the screen closing is the feedback.
+                    app.close_transfer();
+                }
             }
+        }
+
+        // Per-tick worker drain — runs AFTER key handling each iteration when a
+        // transfer session is open. The 250 ms poll window above already paces
+        // this loop; we drain every pending event each tick so a fast worker
+        // (small file, quick listing) does not stall one tick behind reality.
+        // Borrows `app` mutably ONLY in this block; the draw borrow at the top
+        // of the next iteration is released before any popup re-borrows.
+        if app.transfer_worker.is_some() {
+            drain_transfer_events(app, &handle);
         }
 
         if app.should_quit {
             return None;
         }
+    }
+}
+
+/// Drain pending SFTP worker events into the transfer screen + handle the
+/// screen's navigation/transfer intents. Called once per loop iteration AFTER
+/// key handling when a transfer session is open. Pure-I/O: reads
+/// `WorkerEvent`s via [`SftpWorker::try_event`], feeds them into the screen,
+/// and pushes `WorkerCmd`s in response to the screen's `pending_*` flags.
+///
+/// # Local-pane listings (synchronous)
+///
+/// The local pane's `pending_list` resolves inline via
+/// [`LocalDirSource::list`][sshrack_core::dirsource::LocalDirSource] (the local
+/// filesystem is fast and the listing is small). The remote pane's
+/// `pending_list` becomes a `WorkerCmd::List` and resolves asynchronously via a
+/// future `WorkerEvent::Listing`.
+///
+/// # Overwrite popup (MVP)
+///
+/// Before dispatching a download whose destination exists, if no batch policy
+/// is set yet (`screen.overwrite_policy is None`), drive a `confirm_popup`. On
+/// Yes → set `OverwriteAll`; on No → set `SkipAll`. The per-job
+/// [`overwrite::decide`] then resolves each subsequent conflict from the batch
+/// policy. Upload-overwrite is deferred (a remote check needs another sftp
+/// round-trip); uploads always use [`OverwritePolicy::Overwrite`] for now.
+///
+/// # Borrow shape
+///
+/// Borrows `app` mutably for the whole call. The terminal is borrowed (for a
+/// popup) only when an overwrite confirm runs, and only via the weak `handle`
+/// — consistent with the rest of the loop's popup paths (no `RefCell` collision
+/// because run_loop's draw `RefMut` is already released by this point).
+fn drain_transfer_events(app: &mut App, handle: &TerminalHandle) {
+    use sshrack_core::dirsource::{DirSource, LocalDirSource};
+
+    // 1. Take the screen's pending_list (set by on_key on navigation). One
+    //    value at a time — if the user navigated both panes, only the most
+    //    recent navigation's path is held. Dispatch on Side:
+    //      Local  → list inline (fs is fast) and feed the pane now;
+    //      Remote → send WorkerCmd::List; the result lands async next tick.
+    let pending = app.transfer.as_ref().and_then(|s| s.pending_list.clone());
+    if let Some((side, path)) = pending {
+        // Clear the request first so a future keypress does not re-fire the
+        // same listing.
+        if let Some(screen) = app.transfer.as_mut() {
+            screen.pending_list = None;
+        }
+        match side {
+            Side::Local => {
+                // Walk the parent on a step-up so the cursor lands on the dir
+                // we just left (matches the file_picker convention).
+                let prev_cwd = app
+                    .transfer
+                    .as_ref()
+                    .map(|s| s.local.cwd.clone())
+                    .unwrap_or_else(|| path.clone());
+                let is_step = prev_cwd.parent() == Some(&path) || prev_cwd != path;
+                if let Some(screen) = app.transfer.as_mut() {
+                    if is_step {
+                        screen.local.on_step();
+                    }
+                    screen.local.cwd = path.clone();
+                }
+                let listing = LocalDirSource::new().list(&path);
+                if let Some(screen) = app.transfer.as_mut() {
+                    match listing {
+                        Ok(entries) => screen.local_mut().set_entries(entries),
+                        Err(msg) => screen.set_status(super::intent::Status::error(format!(
+                            "local list failed: {msg}"
+                        ))),
+                    }
+                }
+            }
+            Side::Remote => {
+                if let Some(worker) = app.transfer_worker.as_ref() {
+                    worker.send(WorkerCmd::List(path.clone()));
+                }
+                if let Some(screen) = app.transfer.as_mut() {
+                    // Optimistically update cwd so the next render shows the
+                    // path the user navigated into while the listing is in
+                    // flight; the entries refresh when the Listing event lands.
+                    screen.remote.cwd = path;
+                }
+            }
+        }
+    }
+
+    // 3. Drain worker events. Each transfer_worker is Some here (the caller
+    //    gated on that). Loop until try_event returns None so a fast worker
+    //    does not stall a tick behind reality.
+    let mut maybe_failed_msg: Option<String> = None;
+    let mut maybe_done_advance = false;
+    while let Some(ev) = app.transfer_worker.as_ref().and_then(SftpWorker::try_event) {
+        match ev {
+            WorkerEvent::Listing(cwd, res) => {
+                if let Some(screen) = app.transfer.as_mut() {
+                    match res {
+                        Ok(entries) => {
+                            // The user may have navigated further by the time
+                            // this listing lands — only feed it back when its
+                            // cwd still matches the pane's cwd.
+                            let still_current = screen.remote.cwd == cwd;
+                            if still_current {
+                                screen.remote_mut().set_entries(entries);
+                            }
+                        }
+                        Err(msg) => screen.set_status(super::intent::Status::error(format!(
+                            "remote list failed: {msg}"
+                        ))),
+                    }
+                }
+            }
+            WorkerEvent::Progress(p) => {
+                if let Some(screen) = app.transfer.as_mut() {
+                    screen.set_active(Some(p));
+                }
+            }
+            WorkerEvent::Done(outcome) => {
+                if let Some(screen) = app.transfer.as_mut() {
+                    screen.clear_active();
+                }
+                match outcome {
+                    TransferOutcome::Ok | TransferOutcome::Cancelled => {
+                        // Ready for the next queued job (if any). Dispatch is
+                        // done after the drain loop so a pending_cancel that
+                        // arrived mid-event is honored first.
+                        maybe_done_advance = true;
+                    }
+                    TransferOutcome::Failed(msg) => {
+                        maybe_failed_msg = Some(msg);
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Honor pending_cancel from ScreenOutcome::CancelActive. Sent AFTER the
+    //    drain so an inflight Done + a user Esc race resolves to "cancel the
+    //    next thing" rather than "drop a stale cancel".
+    if app.take_pending_cancel() {
+        if let Some(worker) = app.transfer_worker.as_ref() {
+            worker.send(WorkerCmd::Cancel);
+        }
+    }
+
+    // 5. Dispatch the next queued job (if any). Triggered by either a
+    //    ScreenOutcome::Enqueue with nothing in flight (pending_advance) or a
+    //    Done on the previous job with a non-empty queue (maybe_done_advance).
+    let should_advance = app.take_pending_advance() || maybe_done_advance;
+    if should_advance {
+        dispatch_next_job(app, handle);
+    }
+
+    // 6. Surface a Failed message AFTER dispatching so an overwrite-popup skip
+    //    followed by an immediate retry of the next queued job reads cleanly.
+    if let Some(msg) = maybe_failed_msg {
+        if let Some(screen) = app.transfer.as_mut() {
+            screen.set_status(super::intent::Status::error(format!(
+                "transfer failed: {msg}"
+            )));
+        }
+    }
+}
+
+/// Pop the next queued job (if any) and send it to the worker, resolving an
+/// overwrite conflict via a confirm popup the first time one is encountered in
+/// this batch. No-op when the queue is empty.
+fn dispatch_next_job(app: &mut App, handle: &TerminalHandle) {
+    use super::transfer::overwrite::OverwriteChoice;
+    use sshrack_core::connect::sftp::proto::{Direction, OverwritePolicy};
+
+    // Pop the next job from the screen's queue. The job leaves the queue here;
+    // if we end up not sending it (skip / cancel) the queue still advances
+    // because the worker short-circuits Skip/SkipAll to `Done(Ok)` (or we drop
+    // the queue on a cancel).
+    let (job, batch_policy_in) = match app.transfer.as_mut() {
+        Some(screen) => match screen.next_job() {
+            Some(job) => (job, screen.overwrite_policy),
+            None => return,
+        },
+        None => return,
+    };
+
+    // Overwrite resolution. Downloads check the local destination (a real fs
+    // call); uploads skip the remote-exists check for MVP (a remote check needs
+    // another sftp round-trip, deferred to Task 11). When the popup fires, it
+    // produces an `OverwriteChoice` directly (OverwriteAll / SkipAll / Cancel);
+    // the per-job table `overwrite::decide` then converts a settled batch
+    // policy into the per-job action.
+    let dest_exists = matches!(job.direction, Direction::Download) && job.dst.exists();
+    let policy = if dest_exists && batch_policy_in.is_none() {
+        // First conflict in the batch + no batch policy yet → popup. The popup
+        // owns the terminal; we MUST NOT hold a borrow of `app.transfer` across
+        // it, so the popup decision is computed standalone.
+        let prompt = format!("overwrite '{}' at {}?", job.name, job.dst.display());
+        let provider = TuiPassphrase::new(handle.clone());
+        let popup_choice = match provider.confirm(&prompt) {
+            Ok(true) => OverwriteChoice::OverwriteAll,
+            Ok(false) => OverwriteChoice::SkipAll,
+            Err(SshrackError::Interrupted) => OverwriteChoice::Cancel,
+            Err(e) => {
+                // Surface the popup error in the status line, then default to
+                // SkipAll so a transient popup failure does not clobber an
+                // existing local file.
+                if let Some(screen) = app.transfer.as_mut() {
+                    screen.set_status(super::intent::Status::error(format!(
+                        "overwrite popup failed: {e}"
+                    )));
+                }
+                OverwriteChoice::SkipAll
+            }
+        };
+        match popup_choice {
+            OverwriteChoice::OverwriteAll => {
+                if let Some(screen) = app.transfer.as_mut() {
+                    screen.overwrite_policy = Some(OverwritePolicy::OverwriteAll);
+                }
+                OverwritePolicy::OverwriteAll
+            }
+            OverwriteChoice::SkipAll => {
+                if let Some(screen) = app.transfer.as_mut() {
+                    screen.overwrite_policy = Some(OverwritePolicy::SkipAll);
+                }
+                OverwritePolicy::SkipAll
+            }
+            OverwriteChoice::Cancel => {
+                // Popup Esc (Ctrl-C). Stop the whole batch: clear the queue and
+                // drop the in-hand job so neither this nor any subsequent
+                // enqueued job runs. The user can re-enqueue after navigating
+                // around the conflict.
+                if let Some(screen) = app.transfer.as_mut() {
+                    screen.queue.clear();
+                    screen.set_status(super::intent::Status::info(
+                        "transfer batch cancelled".to_string(),
+                    ));
+                }
+                return;
+            }
+            // `decide` flattens Overwrite/Skip; the popup never returns these
+            // single-shot forms (it always answers for the rest of the batch).
+            OverwriteChoice::Overwrite | OverwriteChoice::Skip => OverwritePolicy::Overwrite,
+        }
+    } else {
+        // No conflict, OR a batch policy is already set. Use it as-is; the
+        // per-job decision table just confirms the action.
+        batch_policy_in.unwrap_or(OverwritePolicy::Overwrite)
+    };
+
+    // Per-job decision table. Live mainly so the policy → action map stays
+    // unit-pinned (and so future per-job logic — e.g. cancel-on-Cancel — has a
+    // single decision site). The worker honors Skip/SkipAll by short-circuiting
+    // to `Done(Ok)`, so we always send the job; the queue advances either way.
+    let _per_job = overwrite::decide(policy, dest_exists);
+
+    if let Some(worker) = app.transfer_worker.as_ref() {
+        worker.send(WorkerCmd::Transfer(job, policy));
     }
 }
 

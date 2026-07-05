@@ -238,6 +238,13 @@ pub enum SshrackError {
     /// here would duplicate it (`io error: boom: boom`).
     #[error("io error")]
     Io(#[from] std::io::Error),
+
+    /// The SFTP worker failed to open: the master `ssh -N` spawn failed, the
+    /// handshake timed out, or the worker thread could not be spawned. `detail`
+    /// is the worker's human-readable failure string; it never carries a secret
+    /// (the worker never puts passwords in error messages).
+    #[error("sftp open failed: {detail}")]
+    SftpOpenFailed { detail: String },
 }
 
 impl SshrackError {

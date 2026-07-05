@@ -13,27 +13,18 @@
 //! [`screen::TransferScreen::on_key`] is the pure key router; Task 10 wires the
 //! worker and the `sshrack sftp` event loop.
 //!
-//! Staging note: Task 8 shipped the pure render path; Task 9 added the pure
-//! `on_key` router + queue-advance helpers; Task 10 wires the worker and the
-//! live event loop. Until Task 10 lands the screen is constructed only by
-//! tests, so methods/fields with no test caller carry scoped
-//! `#[allow(dead_code)]` with the Task-10 consumer named in the doc comment —
-//! no blanket module-level allow is in use.
+//! Task 10 wires the live paths: [`open::open_transfer`] mirrors
+//! `connect_host`'s auth/hostkey steps then opens the SFTP worker and seeds a
+//! fresh `TransferScreen`; the TUI's `run_loop` drains worker events each 250 ms
+//! tick. The pure pieces (screen, pane, overwrite) are still unit-tested
+//! without a terminal or network; the real-worker path (master open, live
+//! transfer) is a manual smoke for Task 12.
 //!
 //! [`Progress`]: sshrack_core::connect::sftp::proto::Progress
 //! [`Status`]: crate::tui::intent::Status
 
+pub mod open;
 pub mod overwrite;
 pub mod pane;
 pub mod render;
 pub mod screen;
-
-/// Re-exported so the Task-10 sftp event loop can match on it after calling
-/// `TransferScreen::on_key` without reaching into the `screen` submodule.
-#[allow(dead_code, unused_imports)] // Task 10 wires the sftp event loop that consumes this.
-pub use screen::ScreenOutcome;
-
-// No further re-exports yet: TransferScreen / Pane / PaneOutcome live under
-// `screen::` / `pane::` and the rest of the binary has not been wired to
-// dispatch `sshrack sftp` (Task 10). Broader re-exports here would just trip
-// unused-import warnings in the prod binary.

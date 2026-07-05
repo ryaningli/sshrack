@@ -11,6 +11,8 @@
 use crossterm::event::KeyEvent;
 use ratatui::Frame;
 use sshrack_core::config::schema::SshrackConfig;
+use sshrack_core::connect::KeyArtifact;
+use sshrack_core::connect::sftp::SftpWorker;
 use sshrack_core::frecency::Frecency;
 use std::path::PathBuf;
 use ulid::Ulid;
@@ -25,6 +27,7 @@ use super::settings::SettingsPanel;
 use super::shell::draw_shell;
 use super::store::StoreView;
 use super::tab::{Tab, TabKey, tab_key_decision};
+use super::transfer::screen::{ScreenOutcome, TransferScreen};
 use super::wizard::{CredForm, HostForm};
 
 /// TUI application state. The shell (brand + tab bar + footer) is always on
@@ -102,6 +105,42 @@ pub struct App {
     /// sizes — so the tail stays reachable on short terminals. The renderer
     /// re-clamps the offset to the real body height each frame.
     pub(super) help_scroll: u16,
+    /// The full-screen dual-pane transfer view, when `sshrack sftp` is active.
+    /// When `Some`, [`App::on_key`] routes every key to it via
+    /// [`App::route_transfer`] and [`App::draw`] renders it full-screen instead
+    /// of the shell. Owned here (not as an `Overlay`) so it gets the whole
+    /// frame and so its lifetime is decoupled from the one-at-a-time overlay
+    /// stack. Set by [`super::transfer::open::open_transfer`]; cleared (along
+    /// with `transfer_worker` and `transfer_key_artifact`) on
+    /// [`Outcome::CloseTransfer`].
+    pub(crate) transfer: Option<TransferScreen>,
+    /// The SFTP worker handle that backs the transfer screen. The worker's
+    /// `Drop` runs `ssh -O exit` + kills the master `ssh -N` + removes the
+    /// socket/pw files, so dropping this field is the RAII teardown. `None`
+    /// outside a transfer session.
+    pub(crate) transfer_worker: Option<SftpWorker>,
+    /// Inline-key temp files for the master `ssh -N` of the active transfer
+    /// session. The artifact's `Drop` removes the temp private/cert files; the
+    /// master needs them for its whole lifetime, so the artifact is held here
+    /// (NOT dropped at the end of `open_transfer`) and dropped when the screen
+    /// closes alongside the worker. `None` for path-key / no-key hosts and
+    /// outside a transfer session.
+    pub(crate) transfer_key_artifact: Option<KeyArtifact>,
+    /// The host id the launcher signaled for an sftp open (Ctrl-T on Hosts tab
+    /// with a host selected). The loop reads (and clears) this to run
+    /// [`super::transfer::open::open_transfer`]. Mirrors `pending_connect`.
+    pub(super) pending_transfer: Option<Ulid>,
+    /// Set by [`App::route_transfer`] when the screen signals
+    /// [`ScreenOutcome::CancelActive`]. The loop reads (and clears) this and
+    /// sends `WorkerCmd::Cancel` to the worker. Pure-intent bridge: `on_key`
+    /// does no I/O.
+    pending_cancel: bool,
+    /// Set by [`App::route_transfer`] when the screen signals
+    /// [`ScreenOutcome::Enqueue`] and there is no transfer in flight (so the
+    /// loop should immediately dispatch the next job). Also set by the loop's
+    /// `Done` handler when the queue is non-empty. The loop reads (and clears)
+    /// this and calls `TransferScreen::next_job` → `WorkerCmd::Transfer`.
+    pending_advance: bool,
 }
 
 /// A synthetic `Enter` Press event, used by [`App::primary_action`] to drive
@@ -143,6 +182,12 @@ impl App {
             pending_delete: None,
             pending_delete_cred: None,
             help_scroll: 0,
+            transfer: None,
+            transfer_worker: None,
+            transfer_key_artifact: None,
+            pending_transfer: None,
+            pending_cancel: false,
+            pending_advance: false,
         }
     }
 
@@ -476,6 +521,42 @@ impl App {
         &mut self.cred_panel
     }
 
+    /// The pending-transfer host id set by `Ctrl-T` on the launcher. The loop
+    /// reads (and clears) this to run `open_transfer`. Exposed for tests that
+    /// drive the open intent directly.
+    #[cfg(test)]
+    pub fn pending_transfer(&self) -> Option<Ulid> {
+        self.pending_transfer
+    }
+
+    /// Take the pending-cancel flag. Returns `true` when the loop should send
+    /// `WorkerCmd::Cancel` to the worker this tick.
+    pub fn take_pending_cancel(&mut self) -> bool {
+        std::mem::take(&mut self.pending_cancel)
+    }
+
+    /// Take the pending-advance flag. Returns `true` when the loop should call
+    /// `TransferScreen::next_job` and dispatch the result this tick (set either
+    /// by `ScreenOutcome::Enqueue` with nothing in flight, or by the loop's own
+    /// `Done` handler when the queue is non-empty).
+    pub fn take_pending_advance(&mut self) -> bool {
+        std::mem::take(&mut self.pending_advance)
+    }
+
+    /// Close the transfer screen and tear down its worker + inline-key
+    /// artifact. Called by the loop's `CloseTransfer` arm. Dropping the worker
+    /// runs its `Drop` (`ssh -O exit` + kill master + remove socket/pw files);
+    /// dropping the `KeyArtifact` removes the inline-key temp files. All three
+    /// must drop together so the master never outlives the temp files it
+    /// points `ssh -i` at.
+    pub fn close_transfer(&mut self) {
+        self.transfer = None;
+        self.transfer_worker = None;
+        self.transfer_key_artifact = None;
+        self.pending_cancel = false;
+        self.pending_advance = false;
+    }
+
     /// Pure: decide what should happen next for a given key. Performs **no**
     /// I/O — no reads, no writes, no terminal access — so it is safe to call
     /// from a unit test without an event source.
@@ -498,6 +579,16 @@ impl App {
     pub fn on_key(&mut self, key: KeyEvent) -> Outcome {
         use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 
+        // Layer 0 — the transfer screen, when open, owns every key. The shell's
+        // global keys (Ctrl-C quit, F1 help, Tab cycle) do NOT fire from the
+        // transfer screen: its own on_key handles Tab (focus flip), Esc
+        // (cancel-or-close), and Ctrl-C (close). Take the screen out of self
+        // so we can borrow the rest of App mutably inside route_transfer, then
+        // stash it back unless the outcome is terminal (CloseTransfer).
+        if let Some(screen) = self.transfer.take() {
+            return self.route_transfer(key, screen);
+        }
+
         // Layer 1 — global keys. F1 is global with or without an overlay
         // (always reachable). Ctrl-C quits ONLY from the launcher — with an
         // overlay open it falls through to Layer 2 so the overlay can
@@ -511,6 +602,26 @@ impl App {
         {
             self.should_quit = true;
             return Outcome::Quit;
+        }
+        // Ctrl-T — open the sftp transfer screen. Reachable ONLY from the Hosts
+        // tab with no overlay and a host under the launcher cursor (mirrors the
+        // ConnectRequested/Enter gate). No-op if a transfer is already open
+        // (defensive — Layer 0 already routed the key into the screen).
+        if key.kind == KeyEventKind::Press
+            && key.modifiers == KeyModifiers::CONTROL
+            && key.code == KeyCode::Char('t')
+            && self.overlay.is_none()
+            && self.transfer.is_none()
+            && matches!(self.active_tab, Tab::Hosts)
+        {
+            if let Some(h) = self.launcher.selected_host(&self.config.hosts) {
+                self.pending_transfer = Some(h.id);
+                return Outcome::OpenTransfer;
+            }
+            // No host selected: silent no-op. The launcher already shows an
+            // empty-state when there are no hosts, so a status line would be
+            // redundant noise.
+            return Outcome::Continue;
         }
         if key.kind == KeyEventKind::Press && key.modifiers.is_empty() && key.code == KeyCode::F(1)
         {
@@ -646,6 +757,48 @@ impl App {
                     self.overlay = Some(Overlay::StorePicker);
                 }
                 out
+            }
+        }
+    }
+
+    /// Layer 0: route a key into the open transfer screen. The screen was
+    /// `take()`n by [`on_key`][Self::on_key]; this stashes it back unless the
+    /// outcome is terminal (`CloseTransfer`), so its state survives across
+    /// keystrokes. Maps the screen's [`ScreenOutcome`] into the loop-level
+    /// [`Outcome`], setting the `pending_*` flags the loop drains.
+    ///
+    /// The transfer screen owns every key in this layer: Tab flips focus, Esc
+    /// cancels an in-flight transfer or closes the screen, Ctrl-C always
+    /// closes, and the rest route into the focused pane (arrows, Space, etc.).
+    /// The shell's global Ctrl-C/F1/Tab do NOT fire while the transfer screen
+    /// is open.
+    fn route_transfer(&mut self, key: KeyEvent, mut screen: TransferScreen) -> Outcome {
+        let out = screen.on_key(key);
+        match out {
+            ScreenOutcome::Continue => {
+                self.transfer = Some(screen);
+                Outcome::Continue
+            }
+            ScreenOutcome::Enqueue => {
+                // New jobs queued. If nothing is in flight, tell the loop to
+                // dispatch the next job immediately; otherwise the loop's
+                // `Done` handler will pick the queue up when the active
+                // transfer finishes.
+                if screen.active.is_none() {
+                    self.pending_advance = true;
+                }
+                self.transfer = Some(screen);
+                Outcome::Continue
+            }
+            ScreenOutcome::CancelActive => {
+                self.pending_cancel = true;
+                self.transfer = Some(screen);
+                Outcome::Continue
+            }
+            ScreenOutcome::CloseTransfer => {
+                // Terminal: do NOT stash the screen back. The loop's
+                // CloseTransfer arm drops the worker + key artifact alongside.
+                Outcome::CloseTransfer
             }
         }
     }
@@ -890,9 +1043,17 @@ impl App {
     }
 
     /// Render current state to the frame. Only writes to the frame (no stdout
-    /// access of its own). Draws the three-band shell, the active panel into the
-    /// middle band, and the overlay (if any) on top.
+    /// access of its own). When the transfer screen is open it owns the whole
+    /// frame; otherwise the three-band shell is drawn, the active panel into
+    /// the middle band, and the overlay (if any) on top.
     pub fn draw(&self, frame: &mut Frame) {
+        // Layer 0: the transfer screen, when open, replaces the shell entirely.
+        // No brand/tab bar/footer — the screen has its own title and hotkey
+        // footer bands.
+        if let Some(screen) = self.transfer.as_ref() {
+            screen.draw(frame, frame.area());
+            return;
+        }
         let area = frame.area();
         let footer = self.footer_hints();
         let panel_area = draw_shell(frame, area, self.active_tab, &footer);
@@ -2271,5 +2432,203 @@ mod tests {
         app.apply_entry_mode(super::super::EntryMode::Launcher);
         assert_eq!(app.active_tab(), super::super::tab::Tab::Hosts);
         assert!(app.overlay().is_none(), "bare entry should open no overlay");
+    }
+
+    // ===============================================================
+    // Task 10: sftp transfer screen wiring. The screen is a full-screen
+    // App view (not an Overlay) — when `App::transfer` is Some it owns every
+    // key and the shell's global Ctrl-C/F1 do NOT fire. The launcher emits
+    // Outcome::OpenTransfer on Ctrl-T (Hosts tab, host selected); the loop
+    // runs open_transfer and assigns App::transfer + App::transfer_worker.
+    // ===============================================================
+
+    use crate::tui::transfer::pane::Side;
+    use crate::tui::transfer::screen::TransferScreen;
+
+    /// Build a hand-constructed TransferScreen for routing tests. Two empty
+    /// panes at canned cwds; we do not need entries to assert focus flips.
+    fn canned_transfer_screen() -> TransferScreen {
+        TransferScreen::new(
+            std::path::PathBuf::from("/local"),
+            std::path::PathBuf::from("/remote"),
+        )
+    }
+
+    #[test]
+    fn transfer_open_routes_tab_to_screen_and_flips_focus() {
+        // When App::transfer is Some, a Tab keystroke must reach the screen
+        // (focus flips Local → Remote) and must NOT fall through to the
+        // shell's tab-cycle (which would have switched the active tab).
+        let mut app = app_with_host("web");
+        let expected_tab = app.active_tab();
+        app.transfer = Some(canned_transfer_screen());
+        assert_eq!(app.transfer.as_ref().unwrap().focus, Side::Local);
+        let out = app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+        // The screen's on_key returns Continue for Tab; route_transfer maps
+        // Continue → Continue.
+        assert!(
+            matches!(out, Outcome::Continue),
+            "Tab on transfer screen should map to Continue"
+        );
+        // Focus flipped inside the screen.
+        assert_eq!(
+            app.transfer.as_ref().unwrap().focus,
+            Side::Remote,
+            "Tab must flip focus Local → Remote inside the transfer screen"
+        );
+        // The shell's active_tab is untouched (the global Tab-cycle did NOT
+        // fire from inside the transfer screen).
+        assert_eq!(
+            app.active_tab(),
+            expected_tab,
+            "Tab inside transfer screen must NOT cycle the shell tab"
+        );
+    }
+
+    #[test]
+    fn transfer_open_does_not_trigger_global_ctrl_c_quit() {
+        // The shell's global Ctrl-C = quit (Layer 1) MUST NOT fire when the
+        // transfer screen is open: the screen owns Ctrl-C (it closes the
+        // transfer view via ScreenOutcome::CloseTransfer).
+        let mut app = app_with_host("web");
+        app.transfer = Some(canned_transfer_screen());
+        let out = app.on_key(press(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(
+            matches!(out, Outcome::CloseTransfer),
+            "Ctrl-C inside the transfer screen must CloseTransfer"
+        );
+        assert!(
+            !app.should_quit,
+            "Ctrl-C inside transfer screen must NOT set should_quit"
+        );
+        // route_transfer drops the screen on CloseTransfer (the loop drops the
+        // worker in its CloseTransfer arm).
+        assert!(
+            app.transfer.is_none(),
+            "CloseTransfer must drop the screen back at the launcher"
+        );
+    }
+
+    #[test]
+    fn transfer_open_does_not_trigger_global_esc_quit() {
+        // Esc with no active transfer inside the screen = CloseTransfer; it
+        // must NOT fall through to the launcher's "Esc with empty query =
+        // quit" path.
+        let mut app = app_with_host("web");
+        app.transfer = Some(canned_transfer_screen());
+        let out = app.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            matches!(out, Outcome::CloseTransfer),
+            "Esc (no active transfer) must CloseTransfer"
+        );
+        assert!(!app.should_quit, "Esc inside transfer must NOT quit");
+    }
+
+    #[test]
+    fn ctrl_t_on_hosts_with_host_signals_open_transfer() {
+        // Ctrl-T on the Hosts tab with a host under the cursor sets
+        // pending_transfer to that host's id and returns OpenTransfer. on_key
+        // performs NO I/O — the loop runs open_transfer.
+        let mut app = app_with_host("web");
+        let expected_id = app.config.hosts[0].id;
+        let out = app.on_key(press(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert!(
+            matches!(out, Outcome::OpenTransfer),
+            "Ctrl-T on Hosts with a host must signal OpenTransfer"
+        );
+        assert_eq!(app.pending_transfer(), Some(expected_id));
+        assert!(
+            !app.should_quit,
+            "Ctrl-T must NOT set should_quit (it opens a screen, not a quit)"
+        );
+    }
+
+    #[test]
+    fn ctrl_t_no_op_when_no_host_selected() {
+        // Ctrl-T with no host under the cursor (empty host list) is a silent
+        // no-op: no OpenTransfer, no pending_transfer set.
+        let cfg = SshrackConfig::default();
+        let mut app = App::new(cfg, None, Frecency::default(), HashMap::new());
+        let out = app.on_key(press(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert!(
+            matches!(out, Outcome::Continue),
+            "Ctrl-T with no host must be Continue (silent no-op)"
+        );
+        assert!(app.pending_transfer().is_none());
+    }
+
+    #[test]
+    fn ctrl_t_no_op_when_transfer_already_open() {
+        // If a transfer screen is already open, Ctrl-T reaches the screen
+        // (Layer 0), not the global interceptor. The global Ctrl-T path is
+        // gated on `transfer.is_none()` so it never re-enters OpenTransfer.
+        let mut app = app_with_host("web");
+        app.transfer = Some(canned_transfer_screen());
+        let out = app.on_key(press(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        // The screen's on_key treats Ctrl-T as a generic key (no binding) and
+        // returns Continue via route_to_focused; route_transfer maps
+        // Continue → Continue.
+        assert!(
+            matches!(out, Outcome::Continue),
+            "Ctrl-T inside an open transfer screen must NOT re-open"
+        );
+        assert!(app.pending_transfer().is_none());
+    }
+
+    #[test]
+    fn ctrl_t_no_op_outside_hosts_tab() {
+        // Ctrl-T is reachable ONLY on the Hosts tab. On Credentials / Settings
+        // it is a no-op (does not even reach the panel — `t` would normally
+        // enter the query, but Ctrl-T has the CONTROL modifier so the panel
+        // also ignores it). Pin the gate.
+        let mut app = app_with_credential("ops", "deploy");
+        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE)); // → Credentials
+        let out = app.on_key(press(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert!(
+            matches!(out, Outcome::Continue),
+            "Ctrl-T off the Hosts tab must NOT signal OpenTransfer"
+        );
+        assert!(app.pending_transfer().is_none());
+    }
+
+    #[test]
+    fn ctrl_t_no_op_when_overlay_open() {
+        // Ctrl-T is gated on `overlay.is_none()` so it does not open the
+        // transfer screen on top of an active wizard / Help overlay.
+        let mut app = app_with_host("web");
+        app.open_host_wizard_add();
+        assert!(app.overlay.is_some());
+        let out = app.on_key(press(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        // The wizard's on_key receives Ctrl-T and (having no binding) returns
+        // Continue. Pin that the OpenTransfer path did NOT fire.
+        assert!(
+            app.pending_transfer().is_none(),
+            "Ctrl-T inside an overlay must not set pending_transfer"
+        );
+        // The wizard is still open (we did not close it).
+        assert!(
+            app.overlay.is_some(),
+            "Ctrl-T must not close the active overlay"
+        );
+        let _ = out; // Continue / Cancel / etc. are all acceptable here; the gate is what we pin.
+    }
+
+    #[test]
+    fn close_transfer_clears_screen_and_flags() {
+        // App::close_transfer drops the screen + clears the pending flags so
+        // the next tick does not act on stale intents. (Worker/key-artifact
+        // drop is exercised via the loop's CloseTransfer arm; here we pin the
+        // app-state reset.)
+        let mut app = app_with_host("web");
+        app.transfer = Some(canned_transfer_screen());
+        app.pending_cancel = true;
+        app.pending_advance = true;
+        app.close_transfer();
+        assert!(app.transfer.is_none(), "close_transfer drops the screen");
+        assert!(!app.pending_cancel, "close_transfer clears pending_cancel");
+        assert!(
+            !app.pending_advance,
+            "close_transfer clears pending_advance"
+        );
     }
 }

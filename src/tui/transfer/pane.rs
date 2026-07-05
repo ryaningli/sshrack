@@ -153,7 +153,6 @@ impl Pane {
     /// Live root is Task 10's sftp event loop (calls this after each List
     /// resolves). The Task-9 `TransferScreen::on_key` consumes `Pane::on_key`
     /// but is itself awaiting Task-10 wiring, so the allow is still required.
-    #[allow(dead_code)]
     pub fn set_entries(&mut self, entries: Vec<DirEntry>) {
         self.entries = entries;
         self.selected = 0;
@@ -169,7 +168,6 @@ impl Pane {
     /// Reachability: Task-9 screen key routing calls this.
     /// Live root is Task 10's sftp event loop (calls this before set_entries
     /// when stepping into/up or fulfilling a RequestList).
-    #[allow(dead_code)]
     pub fn on_step(&mut self) {
         self.marked.clear();
         self.query.clear();
@@ -199,7 +197,6 @@ impl Pane {
     /// wires the screen's `on_key`.
     /// Live root is Task 10's sftp event loop, which calls
     /// `TransferScreen::on_key` (Task 9) → this method.
-    #[allow(dead_code)]
     pub fn on_key(&mut self, key: KeyEvent) -> PaneOutcome {
         if key.kind != KeyEventKind::Press {
             return PaneOutcome::None;
@@ -267,7 +264,6 @@ impl Pane {
     /// Reachability: read by the Task-9/10 activate + transfer paths; the
     /// Task-8 render-only path uses [`Self::entry_at_rank`] instead.
     /// Live root is Task 10's loop via `TransferScreen::on_key`'s enqueue path.
-    #[allow(dead_code)]
     #[must_use]
     pub fn selected_entry(&self) -> Option<&DirEntry> {
         self.ranked
@@ -301,7 +297,6 @@ impl Pane {
     ///
     /// [`file_picker`]: crate::tui::file_picker::FilePicker
     /// Live root: `on_key`/`set_entries` → Task 10's loop.
-    #[allow(dead_code)]
     fn recompute(&mut self) {
         let rows: Vec<Vec<String>> = self.entries.iter().map(|e| vec![e.name.clone()]).collect();
         let scores = vec![0.0f64; self.entries.len()];
@@ -312,7 +307,6 @@ impl Pane {
     ///
     /// Reachability: called by `on_key`. Task-9 path.
     /// Live root: `on_key` → Task 10's loop.
-    #[allow(dead_code)]
     fn clamp_selected(&mut self) {
         if self.ranked.is_empty() {
             self.selected = 0;
@@ -326,7 +320,6 @@ impl Pane {
     ///
     /// Reachability: called by `on_key`. Task-9 path.
     /// Live root: `on_key` → Task 10's loop.
-    #[allow(dead_code)]
     fn move_cursor(&mut self, delta: i32) {
         if self.ranked.is_empty() {
             return;
@@ -342,7 +335,6 @@ impl Pane {
     ///
     /// Reachability: called by `on_key`. Task-9 path.
     /// Live root: `on_key`/`on_enter` → Task 10's loop.
-    #[allow(dead_code)]
     fn activate_or_step(&mut self) -> PaneOutcome {
         if let Some(entry) = self.selected_entry() {
             if entry.is_dir {
@@ -361,7 +353,6 @@ impl Pane {
     ///
     /// Reachability: called by `on_key`. Task-9 path.
     /// Live root: `on_key` → Task 10's loop.
-    #[allow(dead_code)]
     fn on_enter(&mut self) -> PaneOutcome {
         match parse_filter_intent(&self.query) {
             FilterIntent::PathLike(raw) => match resolve_path_like(&raw, &self.cwd) {
@@ -378,7 +369,6 @@ impl Pane {
     ///
     /// Reachability: called by `on_key`. Task-9 path.
     /// Live root: `on_key` → Task 10's loop.
-    #[allow(dead_code)]
     fn step_up_intent(&self) -> PaneOutcome {
         if self.cwd.parent().is_some() {
             PaneOutcome::StepUp
@@ -393,7 +383,6 @@ impl Pane {
     ///
     /// Reachability: called by `on_key`. Task-9 path.
     /// Live root: `on_key` → Task 10's loop.
-    #[allow(dead_code)]
     fn toggle_mark_selected(&mut self) -> PaneOutcome {
         let Some(entry) = self.selected_entry() else {
             return PaneOutcome::None;
@@ -417,7 +406,6 @@ impl Pane {
 ///
 /// Reachability: called by `on_enter` (Task-9 path).
 /// Live root: `on_enter` → `on_key` → Task 10's loop.
-#[allow(dead_code)]
 fn resolve_path_like(raw: &str, cwd: &Path) -> Option<PathBuf> {
     let trimmed = raw.trim();
     if trimmed.starts_with('~') {

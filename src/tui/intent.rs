@@ -126,6 +126,28 @@ pub enum Outcome {
     /// Pure intent: close the current overlay (Esc / Ctrl-C inside one). The
     /// loop clears `App::overlay` and surfaces a default status.
     CloseOverlay,
+    /// Pure intent: the user pressed `Ctrl-T` on the Hosts tab with a host
+    /// selected. `on_key` set `App::pending_transfer` to the host's id. The
+    /// event loop reads the id, runs [`crate::tui::transfer::open::open_transfer`]
+    /// (which mirrors `connect_host`'s auth/hostkey steps then opens the
+    /// `SftpWorker`), and assigns `App::transfer` + `App::transfer_worker`. A
+    /// cancel inside a vault/host-key popup surfaces as
+    /// [`SshrackError::Interrupted`] → return to the launcher (no status write).
+    ///
+    /// This variant carries no data because the host id lives on `App` (single
+    /// source of truth, clearable on cancel), mirroring
+    /// [`Outcome::ConnectRequested`].
+    ///
+    /// [`SshrackError::Interrupted`]: sshrack_core::error::SshrackError::Interrupted
+    OpenTransfer,
+    /// Pure intent: the user asked to leave the transfer screen
+    /// (`ScreenOutcome::CloseTransfer` — Esc with no transfer in flight, or
+    /// Ctrl-C inside the transfer screen). The loop drops `App::transfer`,
+    /// `App::transfer_worker`, and `App::transfer_key_artifact` together so the
+    /// worker's `Drop` tears down the master `ssh -N` (RAII) and the inline-key
+    /// temp files are removed. No status write — the screen closing is the
+    /// feedback.
+    CloseTransfer,
 }
 
 /// An overlay layered on top of the shell. The shell keeps rendering behind it
