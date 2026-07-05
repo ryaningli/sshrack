@@ -10,6 +10,16 @@ use std::path::{Path, PathBuf};
 
 use crate::pathutil::{ResolvedPath, expand_tilde};
 
+/// Raw entry tuple for building [`DirEntry`] items.
+type RawEntry = (
+    String,
+    PathBuf,
+    bool,
+    bool,
+    Option<u64>,
+    Option<std::time::SystemTime>,
+);
+
 /// Filesystem classification of one path. `Symlink` is reported independently
 /// of whether its target is a dir or file (the picker annotates with `@`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +46,10 @@ pub struct DirEntry {
     pub is_dir: bool,
     /// Whether the entry itself is a symbolic link.
     pub is_symlink: bool,
+    /// File size in bytes, or `None` when unknown (e.g., for directories).
+    pub size: Option<u64>,
+    /// Last modification time, or `None` when unknown.
+    pub modified: Option<std::time::SystemTime>,
 }
 
 /// Directory-listing + path-classification capability. Implementations: real
@@ -108,7 +122,7 @@ impl LocalDirSource {
 impl DirSource for LocalDirSource {
     fn list(&self, cwd: &Path) -> Result<Vec<DirEntry>, String> {
         let rd = std::fs::read_dir(cwd).map_err(|e| format!("{cwd:?}: {e}"))?;
-        let mut items: Vec<(String, PathBuf, bool, bool)> = Vec::new();
+        let mut items: Vec<RawEntry> = Vec::new();
         for entry in rd.flatten() {
             let path = entry.path();
             let lmeta = std::fs::symlink_metadata(&path).ok();
@@ -119,7 +133,13 @@ impl DirSource for LocalDirSource {
                 .unwrap_or(false);
             let is_dir = fameta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
             let raw_name = entry.file_name().to_string_lossy().into_owned();
-            items.push((raw_name, path, is_dir, is_symlink));
+            let size = if is_dir {
+                None
+            } else {
+                fameta.as_ref().map(|m| m.len())
+            };
+            let modified = fameta.as_ref().and_then(|m| m.modified().ok());
+            items.push((raw_name, path, is_dir, is_symlink, size, modified));
         }
         Ok(build_entries(items))
     }
@@ -156,11 +176,11 @@ fn decorate(raw: &str, is_dir: bool, is_symlink: bool) -> String {
     }
 }
 
-/// Sort raw `(name, path, is_dir, is_symlink)` items into display order:
+/// Sort raw `(name, path, is_dir, is_symlink, size, modified)` items into display order:
 /// directories first, then files; within each group, case-insensitive name asc.
 /// Names are decorated on the way out (dirs get a trailing `/`, symlinks `@`).
 /// Pure (no fs, no cwd knowledge). `LocalDirSource::list` calls this directly.
-pub(crate) fn build_entries(items: Vec<(String, PathBuf, bool, bool)>) -> Vec<DirEntry> {
+pub(crate) fn build_entries(items: Vec<RawEntry>) -> Vec<DirEntry> {
     let mut items = items;
     items.sort_by(|a, b| {
         b.2.cmp(&a.2) // is_dir: true (1) before false (0)
@@ -168,12 +188,16 @@ pub(crate) fn build_entries(items: Vec<(String, PathBuf, bool, bool)>) -> Vec<Di
     });
     items
         .into_iter()
-        .map(|(raw_name, path, is_dir, is_symlink)| DirEntry {
-            name: decorate(&raw_name, is_dir, is_symlink),
-            path,
-            is_dir,
-            is_symlink,
-        })
+        .map(
+            |(raw_name, path, is_dir, is_symlink, size, modified)| DirEntry {
+                name: decorate(&raw_name, is_dir, is_symlink),
+                path,
+                is_dir,
+                is_symlink,
+                size,
+                modified,
+            },
+        )
         .collect()
 }
 
@@ -190,15 +214,33 @@ mod tests {
                 PathBuf::from("/d/zfile.txt"),
                 false,
                 false,
+                None,
+                None,
             ),
-            ("Adir".into(), PathBuf::from("/d/Adir"), true, false),
+            (
+                "Adir".into(),
+                PathBuf::from("/d/Adir"),
+                true,
+                false,
+                None,
+                None,
+            ),
             (
                 "afile.txt".into(),
                 PathBuf::from("/d/afile.txt"),
                 false,
                 false,
+                None,
+                None,
             ),
-            ("Bdir".into(), PathBuf::from("/d/Bdir"), true, false),
+            (
+                "Bdir".into(),
+                PathBuf::from("/d/Bdir"),
+                true,
+                false,
+                None,
+                None,
+            ),
         ];
         let e = build_entries(items);
         let names: Vec<&str> = e.iter().map(|x| x.name.as_str()).collect();
@@ -312,6 +354,19 @@ mod tests {
         assert_eq!(
             s.resolve_start(&["/no/such/a".into(), "/no/such/b".into()]),
             None
+        );
+    }
+
+    #[test]
+    fn local_list_reports_file_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("f"), b"hello").unwrap();
+        let e = LocalDirSource::new().list(tmp.path()).unwrap();
+        let f = e.iter().find(|e| e.name == "f").unwrap();
+        assert_eq!(f.size, Some(5));
+        assert!(
+            f.modified.is_some(),
+            "mtime should be known for a local file"
         );
     }
 }

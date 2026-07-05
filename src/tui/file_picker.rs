@@ -474,6 +474,8 @@ mod tests {
                 path: parent.join(name),
                 is_dir,
                 is_symlink: false,
+                size: None,
+                modified: None,
             }
         }
     }
@@ -529,6 +531,8 @@ mod tests {
                 path: dotssh.clone(),
                 is_dir: true,
                 is_symlink: false,
+                size: None,
+                modified: None,
             }],
         );
         f.dirs.insert(PathBuf::from("/"), vec![]);
@@ -835,6 +839,8 @@ mod tests {
                         path: std::path::PathBuf::from("/h/.ssh/id_ed25519"),
                         is_dir: false,
                         is_symlink: false,
+                        size: None,
+                        modified: None,
                     }])
                 }
             }
@@ -965,18 +971,24 @@ mod tests {
                                 path: std::path::PathBuf::from("/A/B1"),
                                 is_dir: true,
                                 is_symlink: false,
+                                size: None,
+                                modified: None,
                             },
                             DirEntry {
                                 name: "B2/".into(),
                                 path: std::path::PathBuf::from("/A/B2"),
                                 is_dir: true,
                                 is_symlink: false,
+                                size: None,
+                                modified: None,
                             },
                             DirEntry {
                                 name: "B3/".into(),
                                 path: std::path::PathBuf::from("/A/B3"),
                                 is_dir: true,
                                 is_symlink: false,
+                                size: None,
+                                modified: None,
                             },
                         ])
                     } else {
@@ -985,6 +997,8 @@ mod tests {
                             path: std::path::PathBuf::from("/A/B9"),
                             is_dir: true,
                             is_symlink: false,
+                            size: None,
+                            modified: None,
                         }])
                     }
                 } else if cwd == std::path::Path::new("/A/B2") {
@@ -993,6 +1007,8 @@ mod tests {
                         path: std::path::PathBuf::from("/A/B2/f1"),
                         is_dir: false,
                         is_symlink: false,
+                        size: None,
+                        modified: None,
                     }])
                 } else {
                     Ok(vec![])
