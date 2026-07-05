@@ -331,7 +331,7 @@ Define the worker's `mpsc` vocabulary and the pure helpers that build sftp batch
   ) -> (Option<u64>, Option<u64>) // (rate_bps, eta_secs)
   ```
 
-- [ ] **Step 1: Write failing tests (RED).** Pin: `get_batch(false)` contains `get <q(src)> <q(dst)>` and ends with `quit`; `get_batch(true)` adds `-r` recursively; `list_batch` contains `ls -l <q(path)>`; `shell_quote` is applied. Progress: `(0,0,  100,1s, Some(200))` → rate `100`, eta `1`; a non-monotonic sample (cur_done < prev_done) yields rate `None`; `total=None` → eta `None` even with a rate.
+- [ ] **Step 1: Write failing tests (RED).** Pin the EXACT batch string for each variant (use `assert_eq!`, not `contains`, so command structure is locked): `list_batch` == `"ls -l <q(path)>\nquit\n"`; `pwd_batch` == `"pwd\nquit\n"`; `get_batch(false)` == `"get <q(src)> <q(dst)>\nquit\n"`; `get_batch(true)` == `"get -R <q(src)> <q(dst)>\nquit\n"` — the recursive flag is **`-R` (uppercase), AFTER the command** (OpenSSH sftp's form; NOT `-r`, and never before the command, which sftp batch mode rejects). `put_batch` mirrors `get_batch`. Verify `shell_quote` is applied to both operands. Progress: `(0,0,  100,1s, Some(200))` → rate `100`, eta `1`; a non-monotonic sample (cur_done < prev_done) yields rate `None`; `total=None` → eta `None` even with a rate.
 
 - [ ] **Step 2: Implement.** Batch builders use `argv::shell_quote` on operands. `progress_snapshot` guards division-by-zero and clamps. `Progress` is `Default` for convenience.
 
