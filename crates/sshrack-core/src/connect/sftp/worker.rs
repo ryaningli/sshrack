@@ -25,8 +25,8 @@
 //! ## Testability
 //!
 //! The thread + spawn paths are not unit-testable without a real sshd, so only
-//! the pure pieces are unit-tested ([`parse_master_running`],
-//! [`parse_remote_home`], [`parse_size_from_ls`]) plus the [`ControlSocket`]
+//! the pure pieces are unit-tested ([`parse_remote_home`],
+//! [`parse_size_from_ls`], [`classify_inflight_cmd`]) plus the [`ControlSocket`]
 //! RAII behavior (in [`super`]). A `#[ignore]`'d e2e test lives in
 //! `tests/sftp_e2e.rs` for a future local-sshd run.
 
@@ -64,17 +64,6 @@ const PROGRESS_POLL: Duration = Duration::from_millis(200);
 
 // ---- pure helpers (unit-tested) ----
 
-/// Parse `ssh -O check` stdout to detect a live master. OpenSSH prints
-/// `Master running (pid=...)` to stdout when the master is up; this returns
-/// `true` when that marker is present. Pure (no I/O).
-///
-/// Callers should ALSO treat an exit-0 check as ready even when stdout is empty
-/// (some ssh builds route the marker to stderr); the canonical marker is still
-/// accepted here for resilience.
-pub fn parse_master_running(stdout: &str) -> bool {
-    stdout.contains("Master running")
-}
-
 /// Parse sftp `pwd` stdout to extract the remote working directory. sftp emits
 /// `Remote working directory: <path>`; this returns the first matching line's
 /// path, trimmed. Pure (no I/O).
@@ -93,6 +82,38 @@ pub fn parse_remote_home(stdout: &str) -> Option<PathBuf> {
 pub(crate) fn parse_size_from_ls(stdout: &str, now: SystemTime) -> Option<u64> {
     let line = stdout.lines().find(|l| !l.trim().is_empty())?;
     parse_ls_line(line, now)?.size
+}
+
+/// What [`run_transfer`] should do with a command that arrived mid-transfer.
+/// Pure (no I/O) — unit-tested directly via [`classify_inflight_cmd`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InflightAction {
+    /// Keep polling: the command is not meaningful mid-transfer (e.g. an
+    /// unexpected `Transfer` or `List` the UI shouldn't have sent while a
+    /// transfer is in flight).
+    Continue,
+    /// Cancel the in-flight transfer: kill child, reap, remove partial.
+    Cancel,
+    /// Propagate teardown: kill child, reap, remove partial, and tell
+    /// [`worker_loop`] to `break` instead of looping back to `recv()`.
+    Shutdown,
+}
+
+/// Classify a command that arrived while a transfer is in flight. Pure (no
+/// I/O) — the caller ([`run_transfer`]) applies the resulting [`InflightAction`].
+///
+/// `Cancel` cancels the in-flight transfer. `Shutdown` propagates teardown —
+/// this is load-bearing: swallowing `Shutdown` deadlocks `Drop`, which is
+/// `join`-blocked waiting for the worker to exit while still holding `cmd_tx`
+/// (the worker would loop back to `recv()` and block forever on a channel
+/// whose sender is never dropped). Any other command (`Transfer` / `List`
+/// arriving mid-flight) is dropped → [`InflightAction::Continue`].
+fn classify_inflight_cmd(cmd: &WorkerCmd) -> InflightAction {
+    match cmd {
+        WorkerCmd::Cancel => InflightAction::Cancel,
+        WorkerCmd::Shutdown => InflightAction::Shutdown,
+        WorkerCmd::List(_) | WorkerCmd::Transfer(_, _) => InflightAction::Continue,
+    }
 }
 
 // ---- SftpWorker ----
@@ -323,7 +344,14 @@ fn worker_loop(
                 let _ = event_tx.send(WorkerEvent::Listing(cwd, result));
             }
             WorkerCmd::Transfer(job, policy) => {
-                run_transfer(&event_tx, &cmd_rx, &runner, &job, policy, &target, &sock);
+                // `run_transfer` returns `true` when it received `Shutdown`
+                // mid-flight — propagate that so we `break` instead of looping
+                // back to `recv()`. Looping back would deadlock: the dropping
+                // main thread holds `cmd_tx` until `join()` returns, and
+                // `join()` waits for us to exit.
+                if run_transfer(&event_tx, &cmd_rx, &runner, &job, policy, &target, &sock) {
+                    break;
+                }
             }
             WorkerCmd::Cancel => {
                 // No transfer in flight — nothing to cancel. Drop silently.
@@ -337,9 +365,14 @@ fn worker_loop(
 /// running, Done on completion / failure / cancel.
 ///
 /// `cmd_rx` is checked between try_wait polls so `Cancel` lands within
-/// [`PROGRESS_POLL`] ms. Other commands arriving mid-transfer are dropped (the
-/// UI is supposed to serialize commands and wait for `Done` before sending the
-/// next).
+/// [`PROGRESS_POLL`] ms. Other commands arriving mid-transfer are classified
+/// via [`classify_inflight_cmd`]: `Shutdown` propagates (kill + cleanup +
+/// signal), `Cancel` cancels, anything else is dropped.
+///
+/// Returns `true` if `Shutdown` was received mid-transfer, so [`worker_loop`]
+/// `break`s instead of looping back to `recv()` (which would deadlock against
+/// `Drop`'s `join()`). Returns `false` on normal completion / cancel / spawn
+/// failure / channel disconnect.
 fn run_transfer(
     event_tx: &mpsc::Sender<WorkerEvent>,
     cmd_rx: &mpsc::Receiver<WorkerCmd>,
@@ -348,13 +381,13 @@ fn run_transfer(
     policy: OverwritePolicy,
     target: &str,
     sock: &Path,
-) {
+) -> bool {
     // Honor Skip/SkipAll without spawning sftp: the screen already decided via
     // decide() that this conflict should be skipped; the worker trusts the
     // policy. Overwrite/OverwriteAll proceed normally.
     if matches!(policy, OverwritePolicy::Skip | OverwritePolicy::SkipAll) {
         let _ = event_tx.send(WorkerEvent::Done(TransferOutcome::Ok));
-        return;
+        return false;
     }
 
     let batch = match job.direction {
@@ -377,7 +410,7 @@ fn run_transfer(
             let _ = event_tx.send(WorkerEvent::Done(TransferOutcome::Failed(format!(
                 "sftp spawn failed: {e}"
             ))));
-            return;
+            return false;
         }
     };
 
@@ -427,15 +460,15 @@ fn run_transfer(
                         .unwrap_or("sftp failed")
                         .to_string();
                     drop(stderr_bytes);
-                    remove_partial_dst(job);
+                    remove_partial_dst(runner, job, target, sock);
                     let _ = event_tx.send(WorkerEvent::Done(TransferOutcome::Failed(first_line)));
                 }
-                return;
+                return false;
             }
             Ok(None) => {
                 // Still running: poll dst size + emit progress, then check for
-                // Cancel with a short timeout so the loop both paces itself and
-                // stays responsive to cancellation.
+                // a command with a short timeout so the loop both paces itself
+                // and stays responsive to cancellation / shutdown.
                 let bytes_done = poll_dst_size(runner, job, target, sock);
                 let cur_secs = start.elapsed().as_secs();
                 let (rate_bps, eta_secs) =
@@ -452,25 +485,37 @@ fn run_transfer(
                 prev_secs = cur_secs;
 
                 match cmd_rx.recv_timeout(PROGRESS_POLL) {
-                    Ok(WorkerCmd::Cancel) => {
-                        let _ = child.kill();
-                        let _ = child.wait(); // reap
-                        remove_partial_dst(job);
-                        let _ = event_tx.send(WorkerEvent::Done(TransferOutcome::Cancelled));
-                        return;
-                    }
-                    Ok(_) => {
-                        // Unexpected during a transfer (the UI serializes).
-                        // Drop the command and keep polling — do NOT kill the
-                        // child or the partial destination.
-                    }
+                    Ok(cmd) => match classify_inflight_cmd(&cmd) {
+                        InflightAction::Cancel => {
+                            let _ = child.kill();
+                            let _ = child.wait(); // reap
+                            remove_partial_dst(runner, job, target, sock);
+                            let _ = event_tx.send(WorkerEvent::Done(TransferOutcome::Cancelled));
+                            return false;
+                        }
+                        InflightAction::Shutdown => {
+                            // CRITICAL: propagate Shutdown so worker_loop breaks
+                            // instead of looping back to recv(). Kill + reap the
+                            // child + remove the partial so teardown is clean,
+                            // then signal the loop to exit.
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            remove_partial_dst(runner, job, target, sock);
+                            return true;
+                        }
+                        InflightAction::Continue => {
+                            // Unexpected during a transfer (the UI serializes).
+                            // Drop the command and keep polling — do NOT kill
+                            // the child or the partial destination.
+                        }
+                    },
                     Err(RecvTimeoutError::Timeout) => continue,
                     Err(RecvTimeoutError::Disconnected) => {
                         // Main thread is gone. Kill + reap the child so we don't
                         // leave a sftp process behind, then exit the loop.
                         let _ = child.kill();
                         let _ = child.wait();
-                        return;
+                        return false;
                     }
                 }
             }
@@ -478,7 +523,7 @@ fn run_transfer(
                 let _ = event_tx.send(WorkerEvent::Done(TransferOutcome::Failed(format!(
                     "sftp wait failed: {e}"
                 ))));
-                return;
+                return false;
             }
         }
     }
@@ -487,16 +532,32 @@ fn run_transfer(
 // ---- transfer helpers ----
 
 /// Best-effort removal of the partial destination after a failed / cancelled
-/// transfer. For downloads this is a local `remove_file`; for uploads a remote
-/// `rm` would require another sftp spawn (skipped for MVP — the next transfer's
-/// `Overwrite` policy can clean up, and leaving a partial is safer than
-/// accidentally deleting an unrelated same-named file the master might have
-/// already had).
-fn remove_partial_dst(job: &TransferJob) {
-    if matches!(job.direction, Direction::Download) {
-        let _ = std::fs::remove_file(&job.dst);
+/// transfer.
+///
+/// - **Download**: `std::fs::remove_file(&dst)` — local cleanup, cheap.
+/// - **Upload (file)**: spawns an `rm <dst>` sftp batch against the master so a
+///   retry doesn't see a corrupt partial that the UI's `decide()` might Skip
+///   (the stuck-state the plan explicitly calls out — sftp `put` overwrites in
+///   place, leaving a short/corrupt file behind on failure).
+/// - **Upload (recursive dir)**: NOT cleaned up — sftp `rm -r`/`-R` support
+///   varies across OpenSSH versions, so we leave the partial tree in place
+///   rather than risk a half-removed state. The next transfer's `Overwrite`
+///   policy handles re-upload.
+fn remove_partial_dst(runner: &Arc<dyn SftpRunner>, job: &TransferJob, target: &str, sock: &Path) {
+    match job.direction {
+        Direction::Download => {
+            let _ = std::fs::remove_file(&job.dst);
+        }
+        Direction::Upload if !job.recursive => {
+            let batch = format!("rm {}\nquit\n", shell_quote(&job.dst.to_string_lossy()));
+            let _ = runner.run_batch(target, sock, &batch);
+        }
+        Direction::Upload => {
+            // Recursive upload: documented gap (see doc comment). sftp `rm -r`
+            // /`-R` support varies across OpenSSH versions; leaving the partial
+            // tree is safer than a half-removed state.
+        }
     }
-    // Upload: see doc comment — no remote rm for MVP.
 }
 
 /// Poll the destination's current byte size for progress display. Downloads
@@ -524,8 +585,8 @@ fn poll_dst_size(
 }
 
 /// Poll `ssh -O check <target>` until it exits 0 (master up) or the deadline.
-/// Pure-I/O wrapper: the readiness check is itself a process spawn, so this is
-/// not unit-tested (the parsing of its output is, via [`parse_master_running`]).
+/// Pure-I/O wrapper: the readiness check is itself a process spawn (no stdout
+/// parsing — readiness is exit-0 only), so this is not unit-tested.
 fn wait_for_master(target: &str, sock: &Path, deadline: Instant) -> bool {
     loop {
         let argv = control_check_argv(target, sock);
@@ -568,28 +629,50 @@ mod tests {
         assert_eq!(PROGRESS_POLL, Duration::from_millis(200));
     }
 
-    // ---- parse_master_running ----
+    // ---- classify_inflight_cmd (the load-bearing Shutdown propagation) ----
 
     #[test]
-    fn parse_master_running_true_on_canonical_marker() {
-        let stdout = "Master running (pid=12345)\n";
-        assert!(parse_master_running(stdout));
+    fn classify_inflight_cmd_shutdown_propagates() {
+        // CRITICAL: Shutdown must map to InflightAction::Shutdown so run_transfer
+        // can break worker_loop instead of looping back to recv(). Swallowing it
+        // (the prior Ok(_) arm) deadlocks Drop: the dropping main thread holds
+        // cmd_tx until join() returns, and join() waits for the worker — which
+        // would block forever in recv() on a sender that is never dropped.
+        assert_eq!(
+            classify_inflight_cmd(&WorkerCmd::Shutdown),
+            InflightAction::Shutdown
+        );
     }
 
     #[test]
-    fn parse_master_running_false_on_empty_or_error_text() {
-        // Empty stdout (master not up), or stderr text that leaked into stdout,
-        // must not falsely read as ready.
-        assert!(!parse_master_running(""));
-        assert!(!parse_master_running("Control socket connect failed\n"));
+    fn classify_inflight_cmd_cancel_cancels() {
+        assert_eq!(
+            classify_inflight_cmd(&WorkerCmd::Cancel),
+            InflightAction::Cancel
+        );
     }
 
     #[test]
-    fn parse_master_running_false_on_unrelated_master_substring() {
-        // Defensive: the word "master" appearing in some other context (e.g. a
-        // debug line) must not trigger a false positive — we require the exact
-        // "Master running" prefix-with-space.
-        assert!(!parse_master_running("not a master yet\n"));
+    fn classify_inflight_cmd_unexpected_commands_continue() {
+        // Transfer / List arriving mid-transfer are dropped → Continue (the UI
+        // serializes commands and waits for Done before sending the next; an
+        // unexpected mid-flight cmd must NOT kill the child or the partial).
+        assert_eq!(
+            classify_inflight_cmd(&WorkerCmd::List(PathBuf::from("/srv"))),
+            InflightAction::Continue
+        );
+        let job = TransferJob {
+            direction: Direction::Download,
+            src: PathBuf::from("/remote/x"),
+            dst: PathBuf::from("/local/x"),
+            name: "x".into(),
+            size_total: None,
+            recursive: false,
+        };
+        assert_eq!(
+            classify_inflight_cmd(&WorkerCmd::Transfer(job, OverwritePolicy::Overwrite)),
+            InflightAction::Continue
+        );
     }
 
     // ---- parse_remote_home ----
@@ -655,9 +738,29 @@ mod tests {
 
     // ---- remove_partial_dst ----
 
+    /// Captures every `run_batch` call's batch string into the shared buffer.
+    /// The buffer is held outside the runner so the test can inspect it after
+    /// the runner has been coerced to `Arc<dyn SftpRunner>` (which hides the
+    /// concrete field).
+    #[derive(Default)]
+    struct RecordingRunner {
+        batches: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl SftpRunner for RecordingRunner {
+        fn run_batch(&self, _target: &str, _sock: &Path, batch: &str) -> Result<String, String> {
+            self.batches
+                .lock()
+                .expect("invariant: recording lock")
+                .push(batch.to_string());
+            Ok(String::new())
+        }
+    }
+
     #[test]
     fn remove_partial_dst_download_removes_local_file() {
-        // Download partial: a local file at dst is removed.
+        // Download partial: a local file at dst is removed. The runner is not
+        // called for downloads (local fs only) — the recording stays empty.
         let dir = tempfile::tempdir().expect("temp dir");
         let dst = dir.path().join("partial.bin");
         std::fs::write(&dst, b"partial").expect("write");
@@ -670,8 +773,17 @@ mod tests {
             size_total: Some(100),
             recursive: false,
         };
-        remove_partial_dst(&job);
+        let batches = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runner: Arc<dyn SftpRunner> = Arc::new(RecordingRunner {
+            batches: batches.clone(),
+        });
+        remove_partial_dst(&runner, &job, "user@host", Path::new("/tmp/mux.sock"));
         assert!(!dst.exists(), "download partial must be removed");
+        let recorded = batches.lock().expect("invariant: lock").clone();
+        assert!(
+            recorded.is_empty(),
+            "download cleanup must not spawn an sftp batch: {recorded:?}"
+        );
     }
 
     #[test]
@@ -685,13 +797,18 @@ mod tests {
             size_total: Some(100),
             recursive: false,
         };
-        remove_partial_dst(&job); // must not panic
+        let runner: Arc<dyn SftpRunner> = Arc::new(RecordingRunner {
+            batches: Arc::new(std::sync::Mutex::new(Vec::new())),
+        });
+        remove_partial_dst(&runner, &job, "user@host", Path::new("/tmp/mux.sock")); // must not panic
     }
 
     #[test]
-    fn remove_partial_dst_upload_is_a_no_op_for_now() {
-        // Upload partial cleanup is intentionally a no-op for MVP (see doc
-        // comment). This pins that behavior so a future change is deliberate.
+    fn remove_partial_dst_upload_file_issues_rm_batch() {
+        // A failed/cancelled file upload must issue an sftp `rm <dst>` batch so
+        // the corrupt partial is cleaned up before the next attempt (the plan
+        // explicitly calls out the sshelf stuck-state where a partial file
+        // makes decide() pick Skip on retry).
         let job = TransferJob {
             direction: Direction::Upload,
             src: PathBuf::from("/local/file"),
@@ -700,6 +817,55 @@ mod tests {
             size_total: Some(100),
             recursive: false,
         };
-        remove_partial_dst(&job); // no panic, no fs effect
+        let batches = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runner: Arc<dyn SftpRunner> = Arc::new(RecordingRunner {
+            batches: batches.clone(),
+        });
+        remove_partial_dst(&runner, &job, "user@host", Path::new("/tmp/mux.sock"));
+        let recorded = batches.lock().expect("invariant: lock").clone();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "exactly one rm batch must be issued for an upload file partial"
+        );
+        let batch = &recorded[0];
+        assert!(
+            batch.contains("rm "),
+            "batch must contain an `rm` command: {batch}"
+        );
+        assert!(
+            batch.contains(&shell_quote("/remote/file")),
+            "batch must contain the quoted remote dst path: {batch}"
+        );
+        assert!(
+            batch.ends_with("quit\n"),
+            "batch must terminate with quit (sftp batch EOF): {batch}"
+        );
+    }
+
+    #[test]
+    fn remove_partial_dst_upload_recursive_is_documented_gap() {
+        // Recursive upload cleanup is intentionally a no-op (see doc comment):
+        // sftp `rm -r`/`-R` support varies across OpenSSH versions, so we leave
+        // the partial tree rather than risk a half-removed state. Pin the
+        // no-op so a future change is deliberate.
+        let job = TransferJob {
+            direction: Direction::Upload,
+            src: PathBuf::from("/local/dir"),
+            dst: PathBuf::from("/remote/dir"),
+            name: "dir".into(),
+            size_total: None,
+            recursive: true,
+        };
+        let batches = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runner: Arc<dyn SftpRunner> = Arc::new(RecordingRunner {
+            batches: batches.clone(),
+        });
+        remove_partial_dst(&runner, &job, "user@host", Path::new("/tmp/mux.sock"));
+        let recorded = batches.lock().expect("invariant: lock").clone();
+        assert!(
+            recorded.is_empty(),
+            "recursive upload cleanup must be a no-op (documented gap): {recorded:?}"
+        );
     }
 }

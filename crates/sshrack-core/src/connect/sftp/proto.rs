@@ -60,7 +60,6 @@ pub enum WorkerCmd {
 /// Event sent from the SFTP worker to the main thread.
 #[derive(Debug, Clone)]
 pub enum WorkerEvent {
-    Ready(Result<PathBuf, String>), // master up; home path (or error)
     Listing(PathBuf, Result<Vec<DirEntry>, String>), // entries for cwd (or error msg)
     Progress(Progress),
     Done(TransferOutcome),

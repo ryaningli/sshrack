@@ -40,7 +40,7 @@ pub mod source;
 pub use source::{LocalSftpRunner, SftpDirSource, SftpRunner};
 
 pub mod worker;
-pub use worker::{HANDSHAKE_TIMEOUT, SftpWorker, parse_master_running, parse_remote_home};
+pub use worker::{HANDSHAKE_TIMEOUT, SftpWorker, parse_remote_home};
 
 use std::path::{Path, PathBuf};
 

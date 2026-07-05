@@ -38,8 +38,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use sshrack_core::config::schema::{Auth, CredentialBody, Host};
+use sshrack_core::connect::sftp::SftpWorker;
 use sshrack_core::connect::sftp::proto::{Direction, OverwritePolicy, TransferJob, WorkerCmd};
-use sshrack_core::connect::sftp::{SftpWorker, sftp_target};
 use sshrack_core::connect::ssh::Overrides;
 use sshrack_core::credential::{PasswordSource, ResolvedAuth};
 use sshrack_core::id::new_id;
@@ -136,7 +136,6 @@ fn sftp_round_trip_local_sshd() {
         let t = tempfile::tempdir().expect("temp dir");
         t.path().join("hostname.txt")
     };
-    let _ = sftp_target; // smoke: target construction would go here
     worker.send(WorkerCmd::Transfer(
         TransferJob {
             direction: Direction::Download,
