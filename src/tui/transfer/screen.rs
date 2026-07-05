@@ -130,16 +130,6 @@ impl TransferScreen {
         }
     }
 
-    /// Set the focused side. Pure setter — `on_key` flips focus internally via
-    /// `flip_focus`; this public setter is kept for callers that need to pin
-    /// focus on a specific side. No Task-10 caller does (the screen opens with
-    /// Local focus by default); Task-11's `sshrack sftp` direct-entry path
-    /// (e.g. opening on Remote focus when invoked with a remote path) will.
-    #[allow(dead_code)] // Task-11 sshrack sftp direct-entry path will pin focus.
-    pub fn set_focus(&mut self, side: Side) {
-        self.focus = side;
-    }
-
     /// Replace the in-flight transfer snapshot (or clear it with `None`).
     /// Pure setter — the loop drives it from drained worker events.
     pub fn set_active(&mut self, progress: Option<Progress>) {
@@ -149,16 +139,6 @@ impl TransferScreen {
     /// Replace the consolidated status. Pure setter.
     pub fn set_status(&mut self, status: Status) {
         self.status = status;
-    }
-
-    /// Append a transfer job to the queue. Pure mutator — kept for callers
-    /// that build a job outside the normal `Ctrl-Enter` enqueue path. No
-    /// Task-10 caller does (the in-TUI enqueue route is `Ctrl-Enter` →
-    /// `enqueue_from_focused`); Task-11's `sshrack scp`-style direct transfer
-    /// (CLI flag that pre-queues a job before opening the screen) will.
-    #[allow(dead_code)] // Task-11 sshrack scp-style direct transfer will enqueue via this.
-    pub fn push_queue(&mut self, job: TransferJob) {
-        self.queue.push(job);
     }
 
     /// Mutable accessor for the local pane. `on_key` accesses `self.local`
