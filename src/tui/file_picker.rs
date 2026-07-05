@@ -285,9 +285,133 @@ impl<S: DirSource> FilePicker<S> {
         }
     }
 
-    /// (draw_overlay is implemented in Task 5.)
-    pub fn draw_overlay(&self, _frame: &mut Frame) {
-        // Task 5 fills this in.
+    /// Paint the picker as a centered popup over the wizard. Four vertical
+    /// segments: the current dir (left-truncated so the tail survives), a
+    /// focus-following windowed list, the query box, and a hint/status line.
+    /// The real terminal cursor lands at the end of the query. Private-key
+    /// files are highlighted (filename heuristic, plus an on-demand header read
+    /// for visible non-matching names). Rendering only — mutates nothing.
+    pub fn draw_overlay(&self, frame: &mut Frame) {
+        use ratatui::layout::{Alignment, Constraint, Layout};
+        use ratatui::style::{Modifier, Style};
+        use ratatui::text::{Line, Span};
+        use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+        use std::io::{BufRead, BufReader};
+
+        let area = crate::tui::popup::centered_rect(
+            frame.area(),
+            crate::tui::popup::POPUP_WIDTH,
+            crate::tui::popup::POPUP_HEIGHT,
+        );
+        frame.render_widget(Clear, area);
+        let block = Block::new()
+            .borders(Borders::ALL)
+            .title(format!(" {} ", self.title))
+            .title_style(crate::tui::theme::accent().add_modifier(Modifier::BOLD));
+        frame.render_widget(&block, area);
+        let inner = block.inner(area);
+
+        let [cwd_area, list_area, query_area, status_area] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Fill(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .areas(inner);
+
+        // cwd line, left-truncated (tail wins).
+        let cwd_str = self
+            .cwd
+            .as_deref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "/".to_string());
+        let avail = inner.width as usize;
+        let shown = crate::tui::fit::truncate_cells(&format!(" {cwd_str}"), avail);
+        frame.render_widget(
+            Paragraph::new(shown).style(crate::tui::theme::accent()),
+            cwd_area,
+        );
+
+        // windowed, highlighted list.
+        let total = self.ranked.len();
+        let win = crate::tui::fit::focus_window(total, self.selected, Self::VISIBLE_ROWS);
+        let mut lines: Vec<Line> = Vec::new();
+        if self.ranked.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  (empty — type a path with Enter to jump, or Esc to cancel)",
+                Style::new().dim(),
+            )));
+        } else {
+            for i in win.start..win.end {
+                let Some(&idx) = self.ranked.get(i) else {
+                    continue;
+                };
+                let Some(entry) = self.entries.get(idx) else {
+                    continue;
+                };
+                let is_sel = i == self.selected;
+                let marker = if is_sel { "▶ " } else { "  " };
+                let base = if is_sel {
+                    crate::tui::theme::accent().add_modifier(Modifier::BOLD)
+                } else if entry.is_dir {
+                    Style::new().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::new()
+                };
+                let keyish = sshrack_core::keydetect::looks_like_key_filename(
+                    entry.name.trim_end_matches(['/', '@']),
+                ) || {
+                    // On-demand header read for visible non-dir entries only.
+                    !entry.is_dir && {
+                        std::fs::File::open(&entry.path)
+                            .ok()
+                            .and_then(|f| BufReader::new(f).lines().next().and_then(Result::ok))
+                            .map(|l| sshrack_core::keydetect::looks_like_private_key_header(&l))
+                            .unwrap_or(false)
+                    }
+                };
+                let value_style = if keyish {
+                    base.fg(crate::tui::theme::MATCH)
+                } else {
+                    base
+                };
+                let mut spans = vec![Span::styled(marker, base)];
+                spans.extend(crate::tui::panel::highlighted_spans(
+                    &entry.name,
+                    &self.query,
+                    value_style,
+                ));
+                lines.push(Line::from(spans).alignment(Alignment::Left));
+            }
+        }
+        frame.render_widget(Paragraph::new(lines), list_area);
+
+        // query box.
+        let q = Line::from(vec![
+            Span::styled(
+                "> ",
+                crate::tui::theme::accent().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(self.query.clone()),
+            Span::styled("_", Style::new().dim()),
+        ]);
+        frame.render_widget(q, query_area);
+        let qx = query_area.x + 2 + self.query.chars().count() as u16;
+        let max_x = query_area.x + query_area.width.saturating_sub(1);
+        frame.set_cursor_position((qx.min(max_x), query_area.y));
+
+        // status / hint line.
+        let line = match &self.status {
+            Some(msg) => Line::from(vec![
+                Span::styled("  ! ", Style::new().fg(crate::tui::theme::DANGER).bold()),
+                Span::styled(msg.clone(), Style::new().fg(crate::tui::theme::DANGER)),
+            ]),
+            None => Line::from(Span::styled(
+                " type: filter · ↑↓ move · ↵ open/select · ← up · esc clear/cancel",
+                Style::new().dim(),
+            )),
+        };
+        frame.render_widget(line, status_area);
     }
 }
 
@@ -591,5 +715,40 @@ mod tests {
             let _ = p.on_key(press(KeyCode::Down));
         }
         assert!(p.selected < n);
+    }
+
+    // ---- draw_overlay: no-panic render over a TestBackend ----
+
+    #[test]
+    fn draw_overlay_renders_without_panic_default() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut p = FilePicker::new("pick", Some("/h/.ssh/k"), tree());
+        p.ensure_started();
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let _ = term.draw(|f| p.draw_overlay(f));
+    }
+
+    #[test]
+    fn draw_overlay_renders_without_panic_on_tiny_terminal() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut p = FilePicker::new("pick", None, tree());
+        p.ensure_started();
+        let backend = TestBackend::new(30, 8); // too short for the full list
+        let mut term = Terminal::new(backend).unwrap();
+        let _ = term.draw(|f| p.draw_overlay(f));
+    }
+
+    #[test]
+    fn draw_overlay_with_status_line_renders_without_panic() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut p = FilePicker::new("pick", None, tree());
+        for c in "/no/such".chars() {
+            let _ = p.on_key(press(KeyCode::Char(c)));
+        }
+        let _ = p.on_key(press(KeyCode::Enter)); // sets status
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let _ = term.draw(|f| p.draw_overlay(f));
     }
 }
