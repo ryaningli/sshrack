@@ -35,3 +35,6 @@ pub use proto::{
     Direction, OverwritePolicy, Progress, TransferJob, TransferOutcome, WorkerCmd, WorkerEvent,
     get_batch, list_batch, progress_snapshot, put_batch, pwd_batch,
 };
+
+pub mod source;
+pub use source::{LocalSftpRunner, SftpDirSource, SftpRunner};
