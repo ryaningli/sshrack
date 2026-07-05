@@ -10,6 +10,7 @@ pub mod askpass;
 pub mod config;
 pub mod connect;
 pub mod credential;
+pub mod dirsource;
 pub mod error;
 pub mod frecency;
 pub mod fsutil;
