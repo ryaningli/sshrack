@@ -7,8 +7,9 @@
 //! [`DirEntry`] rows via [`dirsource::build_entries`], stripping control chars
 //! on the way so the resulting names are always layout-safe.
 //!
-//! All functions here are pure (the only side effect is reading the system
-//! clock to resolve the year for `Mmm DD HH:MM` timestamps, which ls omits).
+//! All functions here are pure: the caller supplies the reference `now` used
+//! to resolve the year for year-less `Mmm DD HH:MM` timestamps (which ls
+//! omits).
 
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -26,8 +27,9 @@ type RawEntry = (
     Option<SystemTime>,
 );
 
-/// One parsed `ls -l` row. `name` is the raw basename (no decoration); `kind`
-/// is inferred from the mode column's first byte (`d`/`l`/`-`).
+/// One parsed `ls -l` row. `name` is the raw basename (no decoration);
+/// `is_dir`/`is_symlink` are inferred from the mode column's first byte
+/// (`d`/`l`/`-`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawLsEntry {
     /// Raw basename, no trailing `/` or `@` decoration. May contain C0 control
@@ -48,8 +50,13 @@ pub struct RawLsEntry {
 /// rows with fewer than 9 whitespace fields, and device/socket/pipe/fifo entries
 /// (mode first byte not in `-dl`). Names containing spaces are recovered by
 /// taking everything after the 9th field. A trailing ` -> target` on symlinks
-/// is dropped (only the link name is kept). Pure.
-pub fn parse_ls_line(line: &str) -> Option<RawLsEntry> {
+/// is dropped (only the link name is kept).
+///
+/// `now` is the caller-supplied reference time used to resolve the year for
+/// year-less `Mmm DD HH:MM` timestamps: if the candidate falls later than
+/// `now`, the file is treated as last year's (ls only emits the `HH:MM` form
+/// for entries within roughly six months). Pure.
+pub fn parse_ls_line(line: &str, now: SystemTime) -> Option<RawLsEntry> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return None;
@@ -83,7 +90,7 @@ pub fn parse_ls_line(line: &str) -> Option<RawLsEntry> {
     };
 
     // mtime: fields 5 (month), 6 (day), 7 (HH:MM or YYYY).
-    let modified = parse_modified(fields[5], fields[6], fields[7]);
+    let modified = parse_modified(fields[5], fields[6], fields[7], now);
 
     // Name: everything after the 9th field, so internal spaces survive verbatim.
     let name_raw = remainder_from_field(trimmed, 8)?;
@@ -107,19 +114,20 @@ pub fn parse_ls_line(line: &str) -> Option<RawLsEntry> {
 }
 
 /// Parse a full `ls -l` listing into entries, skipping `.`, `..`, and
-/// unparseable lines. Pure.
-pub fn parse_ls_listing(output: &str) -> Vec<RawLsEntry> {
+/// unparseable lines. `now` is threaded into [`parse_ls_line`] for year
+/// inference. Pure.
+pub fn parse_ls_listing(output: &str, now: SystemTime) -> Vec<RawLsEntry> {
     output
         .lines()
-        .filter_map(parse_ls_line)
+        .filter_map(|line| parse_ls_line(line, now))
         .filter(|e| e.name != "." && e.name != "..")
         .collect()
 }
 
 /// Convert parsed rows into display-ready [`DirEntry`] rows: strip control
 /// chars from each name, attach paths under `cwd`, decorate + sort dirs-first
-/// via [`build_entries`]. Pure (modulo the clock read inside `parse_ls_line`,
-/// which has already run by the time rows reach here).
+/// via [`build_entries`]. Pure (takes already-parsed rows; any clock reference
+/// was supplied to [`parse_ls_line`] before rows reached here).
 pub fn to_dir_entries(rows: Vec<RawLsEntry>, cwd: &Path) -> Vec<DirEntry> {
     let items: Vec<RawEntry> = rows
         .into_iter()
@@ -178,24 +186,52 @@ fn remainder_from_field(line: &str, field_idx: usize) -> Option<&str> {
 /// Best-effort parse of the `Mmm DD HH:MM` / `Mmm DD  YYYY` date triple into a
 /// [`SystemTime`]. Returns `None` on any ambiguity (unknown month, non-numeric
 /// fields, impossible ranges, or a pre-epoch result). The column is
-/// informational, never load-bearing. Pure modulo reading the system clock to
-/// resolve the current year for the no-year `HH:MM` form.
-fn parse_modified(month_field: &str, day_field: &str, rest_field: &str) -> Option<SystemTime> {
+/// informational, never load-bearing.
+///
+/// For the year-less `HH:MM` form the year is inferred from the caller-supplied
+/// `now`: if the candidate `SystemTime` falls later than `now`, the file is
+/// treated as last year's (ls only emits the `HH:MM` form for entries within
+/// roughly six months, so a `Dec` line seen in January is last December's).
+/// Pure.
+fn parse_modified(
+    month_field: &str,
+    day_field: &str,
+    rest_field: &str,
+    now: SystemTime,
+) -> Option<SystemTime> {
     let month = month_name_to_num(month_field)?;
     let day: u32 = day_field.parse().ok()?;
-    let (year, hour, minute) = if let Some(idx) = rest_field.find(':') {
-        // `HH:MM` — ls omits the year for recent entries; assume current year.
+    let (year, hour, minute, has_time) = if let Some(idx) = rest_field.find(':') {
+        // `HH:MM` — ls omits the year for recent entries; infer it from `now`.
         let hour: u32 = rest_field[..idx].parse().ok()?;
         let minute: u32 = rest_field[idx + 1..].parse().ok()?;
-        (current_year(), hour, minute)
+        (year_from_now(now), hour, minute, true)
     } else {
         // `YYYY` — explicit year, no time.
         let year: i64 = rest_field.parse().ok()?;
-        (year, 0, 0)
+        (year, 0, 0, false)
     };
     if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 {
         return None;
     }
+    let candidate = compose_system_time(year, month, day, hour, minute)?;
+    if has_time && candidate > now {
+        // The candidate falls in the future relative to `now` — the file is
+        // from last year's December window (the January-seeing-December case).
+        return compose_system_time(year - 1, month, day, hour, minute);
+    }
+    Some(candidate)
+}
+
+/// Compose a [`SystemTime`] from civil date+time components, or `None` on a
+/// pre-epoch result or arithmetic overflow. Pure.
+fn compose_system_time(
+    year: i64,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+) -> Option<SystemTime> {
     let days = days_from_civil(year, month, day);
     let secs = days * 86_400 + i64::from(hour) * 3_600 + i64::from(minute) * 60;
     if secs < 0 {
@@ -204,8 +240,7 @@ fn parse_modified(month_field: &str, day_field: &str, rest_field: &str) -> Optio
     UNIX_EPOCH.checked_add(Duration::from_secs(secs as u64))
 }
 
-/// Map a 3-letter month abbreviation to its 1-based number, or `None`.
-/// Pure.
+/// Map a 3-letter month abbreviation to its 1-based number, or `None`. Pure.
 fn month_name_to_num(s: &str) -> Option<u32> {
     match s {
         "Jan" => Some(1),
@@ -224,11 +259,10 @@ fn month_name_to_num(s: &str) -> Option<u32> {
     }
 }
 
-/// Current Gregorian year in UTC. Reads the system clock solely to resolve the
-/// year for `Mmm DD HH:MM` timestamps (which ls leaves undated). On a clock
-/// failure falls back to 1970 rather than panicking.
-fn current_year() -> i64 {
-    let secs = SystemTime::now()
+/// Gregorian year (UTC) derived from the caller-supplied `now`. Pure (no system
+/// clock is read here; the caller supplies the reference time).
+fn year_from_now(now: SystemTime) -> i64 {
+    let secs = now
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
@@ -269,12 +303,28 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
 
+    /// Fixed reference time for deterministic year inference: 2025-06-15
+    /// 12:00:00 UTC. Mid-year so `Jan`/`Feb` no-year timestamps resolve to
+    /// 2025 without triggering the year-boundary rollback.
+    fn fixed_now() -> SystemTime {
+        let days = u64::try_from(days_from_civil(2025, 6, 15)).unwrap();
+        UNIX_EPOCH + Duration::from_secs(days * 86_400 + 43_200)
+    }
+
+    /// Re-derive the UTC civil year of a [`SystemTime`] for year-inference
+    /// assertions.
+    fn year_of(t: SystemTime) -> i64 {
+        let secs = t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap();
+        let days = i64::try_from(secs / 86_400).unwrap();
+        civil_from_days(days).0
+    }
+
     // ---- parse_ls_line: the core field model ----
 
     #[test]
     fn parse_ls_line_regular_file() {
         let line = "-rw-r--r-- 1 u g 1234 Jan 2 03:04 hello.txt";
-        let e = parse_ls_line(line).expect("regular file row parses");
+        let e = parse_ls_line(line, fixed_now()).expect("regular file row parses");
         assert_eq!(e.name, "hello.txt");
         assert!(!e.is_dir);
         assert!(!e.is_symlink);
@@ -288,7 +338,7 @@ mod tests {
     #[test]
     fn parse_ls_line_directory() {
         let line = "drwxr-xr-x 2 u g 4096 Jan 2 03:04 sub";
-        let e = parse_ls_line(line).expect("directory row parses");
+        let e = parse_ls_line(line, fixed_now()).expect("directory row parses");
         assert_eq!(e.name, "sub");
         assert!(e.is_dir);
         assert!(
@@ -301,7 +351,7 @@ mod tests {
     #[test]
     fn parse_ls_line_symlink_drops_target() {
         let line = "lrwxrwxrwx 1 u g 4 Jan 2 03:04 link -> tgt";
-        let e = parse_ls_line(line).expect("symlink row parses");
+        let e = parse_ls_line(line, fixed_now()).expect("symlink row parses");
         assert!(e.is_symlink);
         assert_eq!(e.name, "link", "only the link name is kept, target dropped");
     }
@@ -311,7 +361,7 @@ mod tests {
         // Defensive: a symlink row that for some reason lacks ` -> ` keeps its
         // whole name rather than being dropped.
         let line = "lrwxrwxrwx 1 u g 4 Jan 2 03:04 orphanlink";
-        let e = parse_ls_line(line).expect("symlink row without arrow still parses");
+        let e = parse_ls_line(line, fixed_now()).expect("symlink row without arrow still parses");
         assert!(e.is_symlink);
         assert_eq!(e.name, "orphanlink");
     }
@@ -319,7 +369,7 @@ mod tests {
     #[test]
     fn parse_ls_line_preserves_single_spaces_in_name() {
         let line = "-rw-r--r-- 1 u g 5 Jan 2 03:04 a name with spaces.txt";
-        let e = parse_ls_line(line).expect("name with spaces parses");
+        let e = parse_ls_line(line, fixed_now()).expect("name with spaces parses");
         assert_eq!(e.name, "a name with spaces.txt");
     }
 
@@ -328,7 +378,7 @@ mod tests {
         // remainder_from_field takes the raw tail, so internal double spacing
         // (which ls emits verbatim) survives.
         let line = "-rw-r--r-- 1 u g 6 Jan 2 03:04 a  b";
-        let e = parse_ls_line(line).expect("name with double spaces parses");
+        let e = parse_ls_line(line, fixed_now()).expect("name with double spaces parses");
         assert_eq!(e.name, "a  b");
     }
 
@@ -336,36 +386,39 @@ mod tests {
 
     #[test]
     fn parse_ls_line_returns_none_for_blank() {
-        assert!(parse_ls_line("").is_none());
-        assert!(parse_ls_line("    ").is_none());
-        assert!(parse_ls_line("\t\n").is_none());
+        let now = fixed_now();
+        assert!(parse_ls_line("", now).is_none());
+        assert!(parse_ls_line("    ", now).is_none());
+        assert!(parse_ls_line("\t\n", now).is_none());
     }
 
     #[test]
     fn parse_ls_line_returns_none_for_total() {
-        assert!(parse_ls_line("total 12").is_none());
+        assert!(parse_ls_line("total 12", fixed_now()).is_none());
     }
 
     #[test]
     fn parse_ls_line_returns_none_for_device_socket_pipe_fifo() {
+        let now = fixed_now();
         // mode first byte not in `-dl` → filtered (b/c/p/s).
-        assert!(parse_ls_line("crw-rw-rw- 1 u g 1,3 Jan 2 03:04 null").is_none());
-        assert!(parse_ls_line("brw-r--r-- 1 u g 1,2 Jan 2 03:04 sda").is_none());
-        assert!(parse_ls_line("prw-r--r-- 1 u g 0 Jan 2 03:04 pipe").is_none());
-        assert!(parse_ls_line("srw-rw-rw- 1 u g 0 Jan 2 03:04 sock").is_none());
+        assert!(parse_ls_line("crw-rw-rw- 1 u g 1,3 Jan 2 03:04 null", now).is_none());
+        assert!(parse_ls_line("brw-r--r-- 1 u g 1,2 Jan 2 03:04 sda", now).is_none());
+        assert!(parse_ls_line("prw-r--r-- 1 u g 0 Jan 2 03:04 pipe", now).is_none());
+        assert!(parse_ls_line("srw-rw-rw- 1 u g 0 Jan 2 03:04 sock", now).is_none());
     }
 
     #[test]
     fn parse_ls_line_returns_none_for_too_few_fields() {
-        assert!(parse_ls_line("drwxr-xr-x 2 u g").is_none());
-        assert!(parse_ls_line("only one").is_none());
+        let now = fixed_now();
+        assert!(parse_ls_line("drwxr-xr-x 2 u g", now).is_none());
+        assert!(parse_ls_line("only one", now).is_none());
     }
 
     #[test]
     fn parse_ls_line_handles_crlf_line() {
         // Some transports tack on a trailing CR; trim() removes it before parse.
         let line = "-rw-r--r-- 1 u g 1234 Jan 2 03:04 hello.txt\r\n";
-        let e = parse_ls_line(line).expect("CRLF-trimmed row parses");
+        let e = parse_ls_line(line, fixed_now()).expect("CRLF-trimmed row parses");
         assert_eq!(e.name, "hello.txt");
     }
 
@@ -374,14 +427,14 @@ mod tests {
     #[test]
     fn parse_ls_line_modified_year_format_is_some() {
         let line = "-rw-r--r-- 1 u g 1234 Jan 2  2020 hello.txt";
-        let e = parse_ls_line(line).expect("row with explicit year parses");
+        let e = parse_ls_line(line, fixed_now()).expect("row with explicit year parses");
         assert!(e.modified.is_some(), "Jan 2 2020 should resolve");
     }
 
     #[test]
     fn parse_ls_line_modified_bad_month_is_none_entry_kept() {
         let line = "-rw-r--r-- 1 u g 1234 Xyz 2 03:04 hello.txt";
-        let e = parse_ls_line(line).expect("entry still parses despite bad month");
+        let e = parse_ls_line(line, fixed_now()).expect("entry still parses despite bad month");
         assert!(e.modified.is_none(), "unknown month → None");
         assert_eq!(e.size, Some(1234));
     }
@@ -389,14 +442,14 @@ mod tests {
     #[test]
     fn parse_ls_line_modified_non_numeric_day_is_none() {
         let line = "-rw-r--r-- 1 u g 1234 Jan ab 03:04 hello.txt";
-        let e = parse_ls_line(line).expect("entry still parses despite bad day");
+        let e = parse_ls_line(line, fixed_now()).expect("entry still parses despite bad day");
         assert!(e.modified.is_none(), "non-numeric day → None");
     }
 
     #[test]
     fn parse_ls_line_modified_impossible_range_is_none() {
         let line = "-rw-r--r-- 1 u g 1234 Jan 32 03:04 hello.txt";
-        let e = parse_ls_line(line).expect("entry still parses despite bad day range");
+        let e = parse_ls_line(line, fixed_now()).expect("entry still parses despite bad day range");
         assert!(e.modified.is_none(), "day=32 is out of range → None");
     }
 
@@ -405,8 +458,42 @@ mod tests {
         // A weird size column (shouldn't happen for files, but be defensive):
         // entry still parses, size is None.
         let line = "-rw-r--r-- 1 u g abc Jan 2 03:04 hello.txt";
-        let e = parse_ls_line(line).expect("entry parses with unparseable size");
+        let e = parse_ls_line(line, fixed_now()).expect("entry parses with unparseable size");
         assert!(e.size.is_none());
+    }
+
+    // ---- year inference (no-year HH:MM form) ----
+
+    #[test]
+    fn parse_ls_line_no_year_timestamp_uses_inferred_year() {
+        // `Jan 2 03:04` with now = 2025-06-15 infers year 2025: the candidate
+        // 2025-01-02 is earlier than `now`, so no rollback fires.
+        let line = "-rw-r--r-- 1 u g 1234 Jan 2 03:04 hello.txt";
+        let e = parse_ls_line(line, fixed_now()).expect("row parses");
+        assert_eq!(
+            year_of(e.modified.expect("modified resolves")),
+            2025,
+            "no-year Jan timestamp with mid-year now resolves to current year"
+        );
+    }
+
+    #[test]
+    fn parse_ls_line_year_rolls_back_when_december_seen_in_january() {
+        // Regression: ls only emits the `HH:MM` form for entries within ~6
+        // months. A `Dec 31 23:59` line parsed with now = 2026-01-01 must land
+        // in the PREVIOUS year (2025-12-31), not 2026-12-31 (which would put
+        // the file ~11 months in the future).
+        let now = {
+            let days = u64::try_from(days_from_civil(2026, 1, 1)).unwrap();
+            UNIX_EPOCH + Duration::from_secs(days * 86_400)
+        };
+        let line = "-rw-r--r-- 1 u g 1234 Dec 31 23:59 old.txt";
+        let e = parse_ls_line(line, now).expect("year-boundary row parses");
+        assert_eq!(
+            year_of(e.modified.expect("modified resolves")),
+            2025,
+            "Dec 31 seen in January must land in the previous year"
+        );
     }
 
     // ---- remainder_from_field ----
@@ -455,7 +542,7 @@ drwxr-xr-x 3 u g 4096 Jan 2 03:04 ..
 -rw-r--r-- 1 u g 5 Jan 2 03:04 keep.txt
 total 12
 ";
-        let rows = parse_ls_listing(listing);
+        let rows = parse_ls_listing(listing, fixed_now());
         let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, vec!["keep.txt"]);
     }
@@ -470,14 +557,14 @@ crw-rw-rw- 1 u g 1,3 Jan 2 03:04 null
 not a real line
 drwxr-xr-x 2 u g 4096 Jan 2 03:04 sub
 ";
-        let rows = parse_ls_listing(listing);
+        let rows = parse_ls_listing(listing, fixed_now());
         let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, vec!["a.txt", "sub"]);
     }
 
     #[test]
     fn parse_ls_listing_empty_input_is_empty() {
-        assert!(parse_ls_listing("").is_empty());
+        assert!(parse_ls_listing("", fixed_now()).is_empty());
     }
 
     // ---- to_dir_entries ----
