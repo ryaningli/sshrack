@@ -442,10 +442,6 @@ pub fn validate_cred(form: &CredForm) -> Result<(), CredSaveError> {
 }
 
 // ===========================================================================
-// Shared render helpers (cross-form)
-// ============================================================================
-
-// ===========================================================================
 // Field-type affordance (shared row renderer)
 // ============================================================================
 
@@ -529,8 +525,7 @@ pub(super) const fn value_col_offset(label_width: u16) -> u16 {
 /// label width, value/placeholder, and [`FieldKind`] differ.
 ///
 /// The suffix width is reserved *before* truncating the value/placeholder, so
-/// the glyph is always the last thing rendered and is never clipped by a long
-/// value or a narrow terminal.
+/// the glyph is always the last thing rendered and is never clipped by a long value.
 ///
 /// [`HostForm::render_row`]: host::HostForm::render_row
 /// [`CredForm::render_row`]: cred::CredForm::render_row
