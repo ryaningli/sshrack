@@ -421,8 +421,8 @@ impl TransferScreen {
     /// Progress + queue panel: a 4-row band. Row 1 holds the active transfer
     /// text plus a `Gauge`, or "no transfer in flight" when idle. Rows 2 and 3
     /// hold the queue count plus the next 1–2 job names (truncated to the panel
-    /// width). Row 4 holds the consolidated status, or a default hotkey hint
-    /// when empty.
+    /// width). Row 4 is the consolidated status line (errors / operation
+    /// feedback), blank when idle — the hotkey reference lives in the footer.
     fn draw_progress_panel(&self, frame: &mut Frame, area: Rect) {
         let [row1, row2, row3, row4] = Layout::vertical([
             Constraint::Length(1),
@@ -443,7 +443,7 @@ impl TransferScreen {
         let q3 = render::queue_second_line(self.queue.get(1), area.width);
         frame.render_widget(Paragraph::new(q3), row3);
 
-        // Row 4: status message or the default hotkey hint.
+        // Row 4: consolidated status (errors / operation feedback); blank when idle.
         let status_line = match &self.status.message {
             Some(msg) => {
                 let style = if self.status.is_error {
@@ -456,10 +456,7 @@ impl TransferScreen {
                     Span::styled(msg.clone(), style),
                 ])
             }
-            None => Line::from(vec![Span::styled(
-                "› press Space to mark, ^S to transfer (Enter on a file)",
-                Style::new().dim(),
-            )]),
+            None => Line::raw(""),
         };
         frame.render_widget(status_line, row4);
     }

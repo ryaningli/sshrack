@@ -140,9 +140,6 @@ pub fn open_transfer(
     // its command queue.
     let local_cwd = std::env::current_dir()?;
     let mut screen = TransferScreen::new(local_cwd.clone(), home.clone());
-    screen.set_status(crate::tui::intent::Status::info(
-        "sftp ready — Tab switches pane, ^S transfers (or Enter on a file)",
-    ));
     worker.send(sshrack_core::connect::sftp::proto::WorkerCmd::List(home));
 
     // Seed the local pane now (the local fs is fast and synchronous) so it is
