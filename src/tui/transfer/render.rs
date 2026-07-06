@@ -360,21 +360,20 @@ pub fn draw_active_transfer(frame: &mut Frame, area: Rect, active: Option<&Progr
 /// on the left, and — when present — the transient status message on the right.
 /// Pure. `width` bounds the message so it can not push the counts off the row.
 ///
-/// `done` counts every finished task (terminal state: `Ok`, `Failed`, or
-/// `Cancelled`) — i.e. `total − queued − in-flight`. `fail` is the subset of
-/// those that failed, surfaced separately (and in `DANGER` red) so a failed
-/// task still advances the `done` numerator: `done 1/1 · fail 1`.
+/// `done` counts successfully completed tasks only (`Done(Ok)`); failed and
+/// cancelled tasks count toward `total` (and `failed`, for failures only) but
+/// NOT toward `done`. This keeps the convention universal: `done` = success,
+/// `fail` = failure, disjoint — and matches the Task-4 queue-overlay header's
+/// `ledger.done_count()`. So a single failed task reads `done 0/1 · fail 1`.
 pub fn summary_line(
     ledger: &crate::tui::transfer::ledger::TransferLedger,
     status: &crate::tui::intent::Status,
     width: u16,
 ) -> Line<'static> {
     let total = ledger.total();
-    let pending = ledger.pending_count();
-    let inflight = if ledger.has_inflight() { 1 } else { 0 };
-    let finished = total.saturating_sub(pending + inflight);
+    let done = ledger.done_count();
     let failed = ledger.failed_count();
-    let counts = format!("done {finished}/{total} · fail {failed}");
+    let counts = format!("done {done}/{total} · fail {failed}");
     let mut spans: Vec<Span> = Vec::new();
     spans.push(Span::styled(
         counts,
@@ -806,7 +805,8 @@ mod summary_tests {
         l.finish_inflight(TransferOutcome::Failed("x".into()));
         let line = summary_line(&l, &Status::empty(), 60);
         let s = line_to_string(&line);
-        assert!(s.contains("1/1"), "{s}");
+        // A failed task is NOT done — done counts Done(Ok) only.
+        assert!(s.contains("0/1"), "a failed task is not 'done': {s}");
         assert!(s.contains("fail 1"), "fail count rendered: {s}");
     }
 
