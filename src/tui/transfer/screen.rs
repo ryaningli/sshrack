@@ -193,10 +193,15 @@ impl TransferScreen {
             return ScreenOutcome::Continue;
         }
         // The queue-manager overlay is modal: when open it owns every key.
-        // (Take/stash — Task 4 immutable form. Task 5 widens `on_key` to
-        // `&mut ledger` and switches to the panic-free `is_some`/`take` form.)
-        if let Some(mut ov) = self.queue_overlay.take() {
-            let out = ov.on_key(key, &self.ledger);
+        // The `is_some` gate proves `take()` yields `Some`, but the compiler
+        // can not see through it, so the `None` arm stays panic-free (no
+        // `unwrap()`) rather than relying on the borrow-proven unreachable.
+        if self.queue_overlay.is_some() {
+            let mut ov = match self.queue_overlay.take() {
+                Some(ov) => ov,
+                None => return ScreenOutcome::Continue,
+            };
+            let out = ov.on_key(key, &mut self.ledger);
             if !ov.closed {
                 self.queue_overlay = Some(ov);
             }

@@ -943,3 +943,128 @@ fn arrow_keys_move_the_overlay_selection() {
         "overlay title missing: {view}"
     );
 }
+
+// ---- ^Q queue-manager overlay (Task 5: retry / remove / cancel / pause) ----
+
+#[test]
+fn overlay_retry_requeues_a_failed_task_and_signals_advance() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let local_cwd = PathBuf::from("/x");
+    let mut screen = TransferScreen::new(local_cwd.clone(), PathBuf::from("/y"));
+    let id = screen.ledger.enqueue(TransferJob {
+        direction: Direction::Download,
+        src: PathBuf::from("/y/a"),
+        dst: local_cwd.join("a"),
+        name: "a".into(),
+        size_total: Some(1),
+        recursive: false,
+    });
+    screen.ledger.next_to_dispatch();
+    screen
+        .ledger
+        .finish_inflight(sshrack_core::connect::sftp::proto::TransferOutcome::Failed(
+            "boom".into(),
+        ));
+    let _ = screen.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)); // open
+    let out = screen.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())); // retry selected
+    assert_eq!(
+        out,
+        ScreenOutcome::Enqueue,
+        "retry must signal advance-if-idle"
+    );
+    assert!(
+        matches!(
+            screen
+                .ledger
+                .tasks
+                .iter()
+                .find(|t| t.id == id)
+                .unwrap()
+                .state,
+            crate::tui::transfer::ledger::TaskState::Queued
+        ),
+        "failed task is queued again"
+    );
+}
+
+#[test]
+fn overlay_remove_drops_a_queued_task() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let local_cwd = PathBuf::from("/x");
+    let mut screen = TransferScreen::new(local_cwd.clone(), PathBuf::from("/y"));
+    screen.ledger.enqueue(TransferJob {
+        direction: Direction::Download,
+        src: PathBuf::from("/y/a"),
+        dst: local_cwd.join("a"),
+        name: "a".into(),
+        size_total: Some(1),
+        recursive: false,
+    });
+    let before = screen.ledger.total();
+    let _ = screen.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+    let out = screen.on_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::empty()));
+    assert_eq!(
+        out,
+        ScreenOutcome::Continue,
+        "remove is a pure ledger mutation"
+    );
+    assert_eq!(screen.ledger.total(), before - 1, "task removed");
+}
+
+#[test]
+fn overlay_cancel_on_inflight_signals_cancel_active() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let local_cwd = PathBuf::from("/x");
+    let mut screen = TransferScreen::new(local_cwd.clone(), PathBuf::from("/y"));
+    screen.ledger.enqueue(TransferJob {
+        direction: Direction::Download,
+        src: PathBuf::from("/y/a"),
+        dst: local_cwd.join("a"),
+        name: "a".into(),
+        size_total: Some(1),
+        recursive: false,
+    });
+    screen.ledger.next_to_dispatch(); // InFlight
+    let _ = screen.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+    let out = screen.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::empty()));
+    assert_eq!(
+        out,
+        ScreenOutcome::CancelActive,
+        "cancel on in-flight must kill the worker"
+    );
+}
+
+#[test]
+fn overlay_pause_toggles_the_ledger_flag() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let local_cwd = PathBuf::from("/x");
+    let mut screen = TransferScreen::new(local_cwd.clone(), PathBuf::from("/y"));
+    let _ = screen.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+    let _ = screen.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::empty()));
+    assert!(screen.ledger.is_paused());
+    let _ = screen.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::empty()));
+    assert!(!screen.ledger.is_paused());
+}
+
+#[test]
+fn overlay_resume_with_pending_and_idle_signals_advance() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let local_cwd = PathBuf::from("/x");
+    let mut screen = TransferScreen::new(local_cwd.clone(), PathBuf::from("/y"));
+    screen.ledger.enqueue(TransferJob {
+        direction: Direction::Download,
+        src: PathBuf::from("/y/a"),
+        dst: local_cwd.join("a"),
+        name: "a".into(),
+        size_total: Some(1),
+        recursive: false,
+    });
+    screen.ledger.set_paused(true);
+    let _ = screen.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+    let out = screen.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::empty())); // resume
+    assert_eq!(
+        out,
+        ScreenOutcome::Enqueue,
+        "resume with pending + idle must advance"
+    );
+}

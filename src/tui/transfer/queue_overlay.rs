@@ -63,8 +63,6 @@ impl QueueOverlay {
 
     /// Clamp the selection to the selectable range (call after the ledger
     /// mutates so a removed row can not leave the cursor out of bounds).
-    /// Task 4 has no mutations, but every `on_key` calls this so Task 5's
-    /// operation arms inherit a always-in-range cursor for free.
     fn clamp(&mut self, ledger: &TransferLedger) {
         let n = selectable(ledger).len();
         if n == 0 {
@@ -74,11 +72,18 @@ impl QueueOverlay {
         }
     }
 
-    /// Modal key router. Returns a [`ScreenOutcome`] for the loop side-effects;
-    /// `Continue` for pure view/nav. Task 4 takes the ledger by shared
-    /// reference (no mutations yet); Task 5 widens it to `&mut` for the
-    /// operation arms.
-    pub fn on_key(&mut self, key: KeyEvent, ledger: &TransferLedger) -> ScreenOutcome {
+    /// Resolve the selected row to its index into `ledger.tasks` (`None` when
+    /// the selectable list is empty). Operations route through this so a
+    /// mutation + re-render can not mis-target a row that shifted.
+    fn selected_task_index(&self, ledger: &TransferLedger) -> Option<usize> {
+        selectable(ledger).get(self.selected).copied()
+    }
+
+    /// Modal key router. Returns a [`ScreenOutcome`] for the loop side-effects:
+    /// `Enqueue` (retry / resume-after-pause) and `CancelActive` (cancel the
+    /// in-flight task) drive the existing `route_transfer` mapping; `Continue`
+    /// for pure view/nav and no-op operations.
+    pub fn on_key(&mut self, key: KeyEvent, ledger: &mut TransferLedger) -> ScreenOutcome {
         if key.kind != KeyEventKind::Press {
             return ScreenOutcome::Continue;
         }
@@ -100,6 +105,55 @@ impl QueueOverlay {
                     self.selected += 1;
                 }
                 ScreenOutcome::Continue
+            }
+            // Retry the selected failed/cancelled task (re-queue in place).
+            KeyCode::Enter | KeyCode::Char('r') => {
+                if let Some(ti) = self.selected_task_index(ledger) {
+                    let id = ledger.tasks[ti].id;
+                    if ledger.retry(id) {
+                        return ScreenOutcome::Enqueue;
+                    }
+                }
+                ScreenOutcome::Continue
+            }
+            // Remove the selected task. An in-flight task is deferred to the
+            // worker-cancel path: the loop kills the worker, and the ledger
+            // task moves to Done(Cancelled) when the `Done` event arrives.
+            KeyCode::Delete | KeyCode::Char('d') => {
+                if let Some(ti) = self.selected_task_index(ledger) {
+                    if matches!(ledger.tasks[ti].state, TaskState::InFlight) {
+                        return ScreenOutcome::CancelActive;
+                    }
+                    let id = ledger.tasks[ti].id;
+                    ledger.remove(id);
+                    self.clamp(ledger);
+                }
+                ScreenOutcome::Continue
+            }
+            // Cancel: only meaningful on the in-flight task. On a queued/done
+            // task it falls through to a plain remove.
+            KeyCode::Char('c') => {
+                if let Some(ti) = self.selected_task_index(ledger) {
+                    if matches!(ledger.tasks[ti].state, TaskState::InFlight) {
+                        return ScreenOutcome::CancelActive;
+                    }
+                    let id = ledger.tasks[ti].id;
+                    ledger.remove(id);
+                    self.clamp(ledger);
+                }
+                ScreenOutcome::Continue
+            }
+            // Toggle the queue-level pause. Resuming a paused queue that has
+            // pending work and nothing in flight must restart dispatch, so
+            // signal Enqueue (the loop's advance-if-idle gate is a no-op when
+            // a transfer is already running).
+            KeyCode::Char('p') => {
+                ledger.toggle_paused();
+                if !ledger.is_paused() && ledger.pending_count() > 0 && !ledger.has_inflight() {
+                    ScreenOutcome::Enqueue
+                } else {
+                    ScreenOutcome::Continue
+                }
             }
             _ => ScreenOutcome::Continue,
         }
@@ -137,7 +191,14 @@ impl QueueOverlay {
             frame,
             &header,
             body_rows,
-            &[("↑↓", "select"), ("Esc", "close")],
+            &[
+                ("↑↓", "select"),
+                ("⏎", "retry"),
+                ("Del", "remove"),
+                ("c", "cancel"),
+                ("p", "pause"),
+                ("Esc", "close"),
+            ],
         );
 
         // Window: keep `selected` in view within `body.height` rows over the
