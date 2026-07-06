@@ -125,16 +125,30 @@ pub fn parse_ls_listing(output: &str, now: SystemTime) -> Vec<RawLsEntry> {
 }
 
 /// Convert parsed rows into display-ready [`DirEntry`] rows: strip control
-/// chars from each name, attach paths under `cwd`, decorate + sort dirs-first
-/// via [`build_entries`]. Pure (takes already-parsed rows; any clock reference
+/// chars from each name, attach paths, decorate + sort dirs-first via
+/// [`build_entries`]. Pure (takes already-parsed rows; any clock reference
 /// was supplied to [`parse_ls_line`] before rows reached here).
+///
+/// Name shape: `sftp ls -l <abs>` emits ABSOLUTE paths in the name column, so
+/// when the cleaned name is absolute we take its basename for display and
+/// keep the absolute path for navigation. A relative name still joins under
+/// `cwd` (servers that list relatively, or future sources).
 pub fn to_dir_entries(rows: Vec<RawLsEntry>, cwd: &Path) -> Vec<DirEntry> {
     let items: Vec<RawEntry> = rows
         .into_iter()
         .map(|r| {
             let clean = strip_control_chars(&r.name);
-            let path = cwd.join(&clean);
-            (clean, path, r.is_dir, r.is_symlink, r.size, r.modified)
+            let (display, path) = if std::path::Path::new(&clean).is_absolute() {
+                let abs = std::path::PathBuf::from(&clean);
+                let base = abs
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or(clean.clone());
+                (base, abs)
+            } else {
+                (clean.clone(), cwd.join(&clean))
+            };
+            (display, path, r.is_dir, r.is_symlink, r.size, r.modified)
         })
         .collect();
     build_entries(items)
@@ -638,6 +652,66 @@ drwxr-xr-x 2 u g 4096 Jan 2 03:04 sub
     #[test]
     fn to_dir_entries_empty_is_empty() {
         assert!(to_dir_entries(Vec::new(), Path::new("/srv")).is_empty());
+    }
+
+    #[test]
+    fn to_dir_entries_strips_absolute_prefix_to_basename() {
+        // sftp `ls -l /srv` emits rows with ABSOLUTE paths in the name column
+        // (because the argument is absolute). The display name must be the
+        // basename; the navigation path stays absolute.
+        let rows = vec![
+            RawLsEntry {
+                name: "/srv/sub".into(),
+                is_dir: true,
+                is_symlink: false,
+                size: None,
+                modified: None,
+            },
+            RawLsEntry {
+                name: "/srv/afile.txt".into(),
+                is_dir: false,
+                is_symlink: false,
+                size: Some(1234),
+                modified: None,
+            },
+        ];
+        let entries = to_dir_entries(rows, Path::new("/srv"));
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["sub/", "afile.txt"],
+            "dirs first, decorated; basename only"
+        );
+        assert_eq!(
+            entries[0].path,
+            PathBuf::from("/srv/sub"),
+            "dir path stays absolute"
+        );
+        let afile = entries
+            .iter()
+            .find(|e| e.name == "afile.txt")
+            .expect("file entry present");
+        assert_eq!(
+            afile.path,
+            PathBuf::from("/srv/afile.txt"),
+            "file path stays absolute"
+        );
+    }
+
+    #[test]
+    fn to_dir_entries_relative_name_still_joins_cwd() {
+        // A relative (basename) name — e.g. a server that lists relatively —
+        // still joins under cwd (the legacy behavior), so both forms work.
+        let rows = vec![RawLsEntry {
+            name: "rel.txt".into(),
+            is_dir: false,
+            is_symlink: false,
+            size: None,
+            modified: None,
+        }];
+        let entries = to_dir_entries(rows, Path::new("/srv"));
+        assert_eq!(entries[0].name, "rel.txt");
+        assert_eq!(entries[0].path, PathBuf::from("/srv/rel.txt"));
     }
 
     // ---- date helper spot checks ----

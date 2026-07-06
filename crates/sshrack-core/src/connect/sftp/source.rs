@@ -200,9 +200,9 @@ mod tests {
         // dirs first, then files, with `/` / `@` decoration, and absolute
         // paths under `cwd`.
         let canned = "\
-drwxr-xr-x 2 u g 4096 Jan 2 03:04 zdir
--rw-r--r-- 1 u g 1234 Jan 2 03:04 afile.txt
-lrwxrwxrwx 1 u g 4 Jan 2 03:04 link -> tgt
+drwxr-xr-x 2 u g 4096 Jan 2 03:04 /srv/zdir
+-rw-r--r-- 1 u g 1234 Jan 2 03:04 /srv/afile.txt
+lrwxrwxrwx 1 u g 4 Jan 2 03:04 /srv/link -> tgt
 ";
         let src = source_with(canned);
         let cwd = Path::new("/srv");
