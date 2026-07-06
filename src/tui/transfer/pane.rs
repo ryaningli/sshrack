@@ -156,11 +156,12 @@ impl Pane {
         }
     }
 
-    /// Replace the listing and re-rank against the current query. Resets the
-    /// cursor to 0. Pure: no I/O. The screen calls
-    /// [`on_step`](Self::on_step) first when the new listing is for a different
-    /// directory (clears marks + query); for an in-place refresh (same dir,
-    /// new entries) the screen calls this directly and the query survives.
+    /// Replace the listing and re-rank against the current query. On a
+    /// directory switch (the screen called [`on_step`](Self::on_step) first)
+    /// restore the NEW cwd's remembered cursor via
+    /// [`cursor_history::remembered_cursor_index`]; on an in-place refresh
+    /// (same dir, new entries — no `on_step`) reset the cursor to 0 and the
+    /// query survives. Pure: no I/O.
     ///
     /// Reachability: Task-9 screen key routing calls this; the Task-8 render
     /// path does not (only the marker + tests reach it).

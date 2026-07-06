@@ -120,10 +120,13 @@ pub fn run_loop(
         }
 
         if !event::poll(Duration::from_millis(250)).unwrap_or(false) {
-            // No key within the poll window — still drain worker events so an
-            // async remote listing (or transfer progress) lands without waiting
-            // for a keypress. drain_transfer_events is a no-op for pending_list
+            // No key within the poll window, or poll itself failed: re-render
+            // and poll again, but still drain worker events first so an async
+            // remote listing (or transfer progress) lands without waiting for
+            // a keypress — drain_transfer_events is a no-op for pending_list
             // when on_key set none, so this only flushes WorkerEvent traffic.
+            // Unwrap_or(false) keeps the loop alive on a transient poll error
+            // instead of unwinding the TUI.
             if app.transfer_worker.is_some() {
                 drain_transfer_events(app, &handle);
             }
