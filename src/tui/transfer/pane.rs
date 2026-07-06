@@ -115,6 +115,18 @@ pub struct Pane {
     /// [`on_step`](Self::on_step). Both files and directories can be marked —
     /// both are transferable (dirs recurse).
     pub marked: HashSet<PathBuf>,
+    /// Per-directory cursor memory (ranger-style history): visited cwd → that
+    /// dir's last-selected entry path. Snapshot in [`on_step`](Self::on_step)
+    /// (the only "leaving this cwd" point), restored in
+    /// [`set_entries`](Self::set_entries) via [`cursor_history`]. Per-pane
+    /// private, so local and remote remember independently.
+    history: std::collections::HashMap<std::path::PathBuf, std::path::PathBuf>,
+    /// Set by [`on_step`](Self::on_step) so the next
+    /// [`set_entries`](Self::set_entries) restores the NEW cwd's remembered
+    /// cursor instead of resetting to 0. Consumed (cleared) by `set_entries`.
+    /// Separates a dir-switch from an in-place refresh (which must NOT move
+    /// the cursor).
+    pending_restore: bool,
     /// Pending-list indicator the screen toggles around `set_entries`. The pane
     /// never mutates this; it is render-only state colocated here so the screen
     /// does not carry a parallel `Side` → bool map.
@@ -138,6 +150,8 @@ impl Pane {
             ranked: Vec::new(),
             selected: 0,
             marked: HashSet::new(),
+            history: std::collections::HashMap::new(),
+            pending_restore: false,
             loading: false,
         }
     }
@@ -155,8 +169,22 @@ impl Pane {
     /// but is itself awaiting Task-10 wiring, so the allow is still required.
     pub fn set_entries(&mut self, entries: Vec<DirEntry>) {
         self.entries = entries;
-        self.selected = 0;
         self.recompute();
+        if self.pending_restore {
+            // Dir switch (on_step ran first): restore the NEW cwd's remembered
+            // cursor by locating it in the just-recomputed `ranked`. First
+            // visit, or a remembered path gone from the listing, falls back to 0.
+            self.selected = crate::tui::cursor_history::remembered_cursor_index(
+                &self.history,
+                &self.cwd,
+                &self.ranked,
+                &self.entries,
+            );
+            self.pending_restore = false;
+        } else {
+            // In-place refresh (same dir, new entries): reset to 0 like before.
+            self.selected = 0;
+        }
     }
 
     /// Reset per-directory state for an upcoming directory change. Clears
@@ -169,9 +197,17 @@ impl Pane {
     /// Live root is Task 10's sftp event loop (calls this before set_entries
     /// when stepping into/up or fulfilling a RequestList).
     pub fn on_step(&mut self) {
+        // Snapshot the OUTGOING cwd's cursor before clearing it, so re-entering
+        // this dir restores it (ranger-style directory history). `cwd` is still
+        // the old one here — the screen updates cwd between on_step and
+        // set_entries.
+        if let Some(cursor) = self.selected_entry().map(|e| e.path.clone()) {
+            self.history.insert(self.cwd.clone(), cursor);
+        }
         self.marked.clear();
         self.query.clear();
         self.selected = 0;
+        self.pending_restore = true;
     }
 
     /// Pure key handler. Mutates only `query` / `selected` / `marked` and

@@ -29,6 +29,7 @@ use ulid::Ulid;
 pub mod app;
 pub mod connect;
 pub mod cred_panel;
+pub mod cursor_history;
 pub mod dialog;
 pub mod file_picker;
 pub mod fit;

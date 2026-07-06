@@ -438,3 +438,87 @@ fn selected_entry_tracks_cursor_after_move() {
         Some("b")
     );
 }
+
+// ---- cursor history: re-entering a dir restores the cursor ----
+
+#[test]
+fn set_entries_without_on_step_resets_cursor_to_zero() {
+    // An in-place refresh (no on_step) must NOT move the cursor based on
+    // history — it resets to 0 like before.
+    let cwd = PathBuf::from("/x");
+    let mut p = Pane::new(cwd.clone());
+    p.set_entries(vec![
+        entry("apple", &cwd, false),
+        entry("banana", &cwd, false),
+    ]);
+    p.selected = 1; // cursor on banana
+    p.set_entries(vec![
+        entry("apple", &cwd, false),
+        entry("banana", &cwd, false),
+        entry("cherry", &cwd, false),
+    ]);
+    assert_eq!(p.selected, 0, "in-place refresh resets cursor to 0");
+}
+
+#[test]
+fn step_into_and_back_restores_cursor() {
+    let a = PathBuf::from("/A");
+    let mut p = Pane::new(a.clone());
+    p.set_entries(vec![
+        entry("B1", &a, true),
+        entry("B2", &a, true),
+        entry("B3", &a, true),
+    ]);
+    // 3 dirs, empty query → ranked = [0,1,2] (B1,B2,B3); land on B2.
+    p.selected = 1;
+    assert_eq!(
+        p.selected_entry().map(|e| e.name.clone()).as_deref(),
+        Some("B2/"),
+        "sanity: cursor on B2 before entering"
+    );
+    // step into B2: snapshot /A → /A/B2, then load /A/B2.
+    p.on_step();
+    let b2 = PathBuf::from("/A/B2");
+    p.cwd = b2.clone();
+    p.set_entries(vec![entry("f1", &b2, false)]);
+    assert_eq!(p.selected, 0, "first visit to /A/B2 lands at 0");
+    // step back to /A: snapshot /A/B2 → f1, then reload /A.
+    p.on_step();
+    p.cwd = a.clone();
+    p.set_entries(vec![
+        entry("B1", &a, true),
+        entry("B2", &a, true),
+        entry("B3", &a, true),
+    ]);
+    assert_eq!(
+        p.selected, 1,
+        "re-entering /A restores the cursor on B2 (directory history)"
+    );
+    assert_eq!(
+        p.selected_entry().map(|e| e.name.clone()).as_deref(),
+        Some("B2/")
+    );
+}
+
+#[test]
+fn remembered_cursor_missing_falls_back_to_zero() {
+    let a = PathBuf::from("/A");
+    let mut p = Pane::new(a.clone());
+    p.set_entries(vec![entry("B2", &a, true)]);
+    p.on_step(); // remember /A → /A/B2
+    let b2 = PathBuf::from("/A/B2");
+    p.cwd = b2.clone();
+    p.set_entries(vec![entry("f1", &b2, false)]);
+    // back to /A, but the new listing no longer contains B2.
+    p.on_step();
+    p.cwd = a.clone();
+    p.set_entries(vec![entry("B9", &a, true)]);
+    assert_eq!(
+        p.selected, 0,
+        "remembered path missing from new listing falls back to 0"
+    );
+    assert_eq!(
+        p.selected_entry().map(|e| e.name.clone()).as_deref(),
+        Some("B9/")
+    );
+}
