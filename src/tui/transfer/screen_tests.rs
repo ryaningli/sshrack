@@ -771,3 +771,12 @@ fn next_job_empty_queue_leaves_last_direction_unchanged() {
     assert!(screen.next_job().is_none());
     assert_eq!(screen.last_direction, Some(Direction::Download));
 }
+
+#[test]
+fn new_screen_remote_title_defaults_to_remote() {
+    // open_transfer overrides this with "<user>@<host>"; the default keeps the
+    // title meaningful in tests (which construct the screen directly) and on
+    // any path that does not set it, so the bordered title is never blank.
+    let s = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
+    assert_eq!(s.remote_title, "remote");
+}

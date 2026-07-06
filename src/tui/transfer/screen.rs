@@ -81,6 +81,11 @@ pub struct TransferScreen {
     pub local: Pane,
     /// The remote (SFTP) pane. Same shape as `local`; entries are worker-fed.
     pub remote: Pane,
+    /// Title for the remote pane's bordered block. Defaults to `"remote"`;
+    /// [`open_transfer`](super::open::open_transfer) sets it to `"<user>@<host>"`
+    /// once auth resolves. The local pane's title is the literal `"local"`
+    /// (passed at the render call site, not stored).
+    pub remote_title: String,
     /// Which pane receives navigation keys. The other pane is rendered dim.
     pub focus: Side,
     /// The in-flight transfer snapshot, or `None` when nothing is running.
@@ -133,6 +138,7 @@ impl TransferScreen {
             active: None,
             queue: Vec::new(),
             status: Status::empty(),
+            remote_title: "remote".to_string(),
             pending_list: None,
             overwrite_policy: None,
             last_direction: None,

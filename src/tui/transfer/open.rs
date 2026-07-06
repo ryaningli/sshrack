@@ -111,6 +111,10 @@ pub fn open_transfer(
     // surface that as Interrupted so run_loop returns the user to the launcher
     // (no status write), NOT the HostKeyNotConfirmed "sftp open failed" path.
     let host_str = resolved_host.host.as_str();
+    // Capture the remote pane title before `resolved_auth` is moved into
+    // SftpWorker::open below — the bordered block renders "<user>@<host>" so
+    // the two panes are visually distinct without reading the cwd line.
+    let remote_title = format!("{}@{}", resolved_auth.user, resolved_host.host);
     let (confirm, interrupted) = host_key_confirm(handle);
     hostkey::run_host_key_flow(host_str, port, confirm)?;
     if interrupted.get() {
@@ -140,6 +144,7 @@ pub fn open_transfer(
     // its command queue.
     let local_cwd = std::env::current_dir()?;
     let mut screen = TransferScreen::new(local_cwd.clone(), home.clone());
+    screen.remote_title = remote_title;
     worker.send(sshrack_core::connect::sftp::proto::WorkerCmd::List(home));
 
     // Seed the local pane now (the local fs is fast and synchronous) so it is
