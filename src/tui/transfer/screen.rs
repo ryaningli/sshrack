@@ -407,8 +407,20 @@ impl TransferScreen {
             Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .areas(panes_area);
 
-        render::draw_pane(frame, local_area, &self.local, self.focus == Side::Local);
-        render::draw_pane(frame, remote_area, &self.remote, self.focus == Side::Remote);
+        render::draw_pane(
+            frame,
+            local_area,
+            &self.local,
+            self.focus == Side::Local,
+            "local",
+        );
+        render::draw_pane(
+            frame,
+            remote_area,
+            &self.remote,
+            self.focus == Side::Remote,
+            &self.remote_title,
+        );
 
         self.draw_progress_panel(frame, panel_area);
         self.draw_footer(frame, footer_area);

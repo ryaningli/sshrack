@@ -16,7 +16,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Gauge, Paragraph},
+    widgets::{Block, Borders, Gauge, Paragraph},
 };
 use sshrack_core::connect::sftp::parse::strip_control_chars;
 use sshrack_core::connect::sftp::proto::{Direction, Progress, TransferJob};
@@ -34,30 +34,45 @@ use crate::tui::transfer::pane::Pane;
 /// / credential panel cap so all three list surfaces line up.
 const NAME_COL_CAP: usize = 24;
 
-/// Paint one pane into `area`: a 1-row cwd line, a 3-row bordered filter box
-/// (`parts::draw_search_box`), and a Fill list windowed by
-/// [`Pane::visible_window`]. Each list row carries a leading mark glyph (`●`
-/// accented when the entry is in `pane.marked`, two spaces otherwise), the
-/// shared [`theme::focus_marker`] for the cursor row, the control-char-stripped
-/// + fuzzy-highlighted name, and a right-aligned dim `<size>  <mtime>` column.
+/// Paint one pane into `area` as a titled bordered block: focus = accent
+/// border + bold title, non-focus = dim border + dim title (mirrors sshelf and
+/// keeps sshrack's dim-the-non-focused-pane language). Inside the block: a
+/// 1-row cwd line, a borderless 1-row filter prompt ([`draw_filter_row`]), and
+/// a Fill list windowed by [`Pane::visible_window`].
 ///
-/// When `focused` is false the entire pane is rendered dim (every span picks up
-/// [`Style::dim`]) and the search box suppresses its terminal cursor so it
-/// cannot bleed through the focused pane's cursor. A `pane.loading` pane shows
-/// "loading…" in place of the list.
-pub fn draw_pane(frame: &mut Frame, area: Rect, pane: &Pane, focused: bool) {
-    let [cwd_area, search_area, list_area] = Layout::vertical([
+/// The filter is a 1-row prompt rather than the shared 3-row bordered
+/// [`parts::draw_search_box`] so the pane has exactly one border (no box-in-box)
+/// and the list loses no vertical room (the border costs 2 rows, the filter
+/// shrinks 3→1, net zero).
+pub fn draw_pane(frame: &mut Frame, area: Rect, pane: &Pane, focused: bool, title: &str) {
+    let border_style = if focused {
+        theme::accent()
+    } else {
+        Style::new().dim()
+    };
+    let title_style = if focused {
+        theme::accent().add_modifier(Modifier::BOLD)
+    } else {
+        Style::new().dim()
+    };
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(Span::styled(format!(" {title} "), title_style));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let [cwd_area, filter_area, list_area] = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Length(3),
+        Constraint::Length(1),
         Constraint::Fill(1),
     ])
-    .areas(area);
+    .areas(inner);
 
     draw_cwd_row(frame, cwd_area, pane, focused);
-
-    parts::draw_search_box(
+    draw_filter_row(
         frame,
-        search_area,
+        filter_area,
         &pane.query,
         pane.matched_count(),
         pane.entries.len(),
@@ -104,6 +119,52 @@ fn draw_cwd_row(frame: &mut Frame, area: Rect, pane: &Pane, focused: bool) {
         ])),
         area,
     );
+}
+
+/// Render the filter row (interior of the bordered pane): a dim `❯ ` prefix +
+/// the query on the left, the right-aligned `matched/total` [`count_label`] on
+/// the right, and — only when `focused` — the terminal cursor right after the
+/// query. Borderless (the pane `Block` already draws the surrounding border).
+fn draw_filter_row(
+    frame: &mut Frame,
+    area: Rect,
+    query: &str,
+    matched: usize,
+    total: usize,
+    focused: bool,
+) {
+    let label = parts::count_label(matched, total);
+    let label_w = label.chars().count() as u16;
+    let [prompt_area, count_area] =
+        Layout::horizontal([Constraint::Fill(1), Constraint::Length(label_w)]).areas(area);
+
+    let query_style = if focused {
+        Style::new()
+    } else {
+        Style::new().dim()
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("❯ ", Style::new().dim()),
+            Span::styled(query.to_string(), query_style),
+        ])),
+        prompt_area,
+    );
+    frame.render_widget(
+        Paragraph::new(label)
+            .alignment(Alignment::Right)
+            .style(Style::new().dim()),
+        count_area,
+    );
+
+    // Place the terminal cursor right after the 2-cell `❯ ` prefix, only on the
+    // focused pane (the non-focused pane must not fight the focused pane's
+    // cursor). Clamp to the row's last cell.
+    if focused {
+        let cursor_x = area.x + 2 + query.chars().count() as u16;
+        let max_x = area.x + area.width.saturating_sub(1);
+        frame.set_cursor_position((cursor_x.min(max_x), area.y));
+    }
 }
 
 /// Render the windowed list: rank-order entries, slice the visible window via
@@ -596,5 +657,39 @@ mod tests {
         let s = format!("{line}");
         assert!(s.contains("2.0K"), "size column missing: {s}");
         assert!(s.contains("2020-01-01"), "mtime column missing: {s}");
+    }
+
+    // ---- draw_pane: titled bordered block, no panic on a short terminal ----
+
+    #[test]
+    fn draw_pane_focused_renders_without_panic_and_keeps_cursor_on_screen() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut pane = Pane::new(std::path::PathBuf::from("/x"));
+        pane.set_entries(vec![
+            entry("alpha.txt", false, Some(1024)),
+            entry("betadir", true, None),
+        ]);
+        let backend = TestBackend::new(40, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw_pane(f, f.area(), &pane, true, "local"))
+            .expect("focused titled pane must render without panic");
+        let pos = term.backend().cursor_position();
+        assert!(
+            pos.x < 40 && pos.y < 12,
+            "focused filter cursor must stay on-screen (got ({},{}))",
+            pos.x,
+            pos.y,
+        );
+    }
+
+    #[test]
+    fn draw_pane_unfocused_renders_without_panic() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut pane = Pane::new(std::path::PathBuf::from("/x"));
+        pane.set_entries(vec![entry("alpha.txt", false, Some(1024))]);
+        let backend = TestBackend::new(40, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw_pane(f, f.area(), &pane, false, "u@h"))
+            .expect("unfocused titled pane must render without panic");
     }
 }
