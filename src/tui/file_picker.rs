@@ -136,15 +136,14 @@ impl<S: DirSource + Clone> FilePicker<S> {
                 // Restore the incoming dir's remembered cursor by locating the
                 // remembered entry path in `ranked`; first visit → 0. `selected`
                 // is a ranked index, so search `ranked`, not `entries`.
-                self.selected = self
-                    .history
-                    .get(&cwd)
-                    .and_then(|p| {
-                        self.ranked
-                            .iter()
-                            .position(|&i| self.entries.get(i).is_some_and(|e| &e.path == p))
-                    })
-                    .unwrap_or(0);
+                // Restore the incoming dir's remembered cursor (first visit →
+                // 0). Shared with transfer::Pane so both browsers stay in sync.
+                self.selected = crate::tui::cursor_history::remembered_cursor_index(
+                    &self.history,
+                    &cwd,
+                    &self.ranked,
+                    &self.entries,
+                );
                 self.status = None;
                 true
             }
