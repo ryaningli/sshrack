@@ -93,33 +93,18 @@ pub fn draw_pane(frame: &mut Frame, area: Rect, pane: &Pane, focused: bool, titl
     draw_pane_list(frame, list_area, pane, focused);
 }
 
-/// Render the cwd row: `❯ ` accented (dim when the pane is not focused), then
-/// the cwd path left-truncated so the trailing dir name survives. The truncate
-/// width is the full pane width minus the `❯ ` prefix so a long cwd never
-/// overflows the row.
+/// Render the cwd row: the cwd path (accent when focused, dim when not),
+/// left-truncated so the trailing dir name survives. No prompt prefix — the
+/// pane's bordered title already identifies the side (`local` / remote name).
 fn draw_cwd_row(frame: &mut Frame, area: Rect, pane: &Pane, focused: bool) {
-    let prefix_style = if focused {
-        theme::accent().add_modifier(Modifier::BOLD)
-    } else {
-        Style::new().dim()
-    };
     let cwd_str = pane.cwd.to_string_lossy();
-    let prefix = "❯ ";
-    let budget = area.width as usize;
-    let avail = budget.saturating_sub(prefix.chars().count());
-    let shown = truncate_cells_head(&cwd_str, avail);
+    let shown = truncate_cells_head(&cwd_str, area.width as usize);
     let style = if focused {
         theme::accent()
     } else {
         Style::new().dim()
     };
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(prefix, prefix_style),
-            Span::styled(shown, style),
-        ])),
-        area,
-    );
+    frame.render_widget(Paragraph::new(Span::styled(shown, style)), area);
 }
 
 /// Render the filter row (interior of the bordered pane): a dim `❯ ` prefix +
