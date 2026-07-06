@@ -337,8 +337,8 @@ pub fn queue_second_line(second: Option<&TransferJob>, width: u16) -> Line<'stat
 
 // ---- format helpers (pure) ----
 
-/// Format a byte count as `B` / `KiB` / `MiB` / `GiB` with one decimal place
-/// once the value reaches the next unit. Pure.
+/// Format a byte count `ls -lh`-style: plain digits under 1K, then `K` / `M`
+/// / `G` (single uppercase letter, 1024-based) with one decimal place. Pure.
 fn fmt_size_opt(opt: Option<u64>) -> String {
     match opt {
         Some(b) => fmt_size(b),
@@ -348,17 +348,17 @@ fn fmt_size_opt(opt: Option<u64>) -> String {
 
 /// Format a known byte count. Pure.
 fn fmt_size(bytes: u64) -> String {
-    const GIB: u64 = 1 << 30;
-    const MIB: u64 = 1 << 20;
-    const KIB: u64 = 1 << 10;
-    if bytes >= GIB {
-        format!("{:.1} GiB", bytes as f64 / GIB as f64)
-    } else if bytes >= MIB {
-        format!("{:.1} MiB", bytes as f64 / MIB as f64)
-    } else if bytes >= KIB {
-        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    const GB: u64 = 1 << 30;
+    const MB: u64 = 1 << 20;
+    const KB: u64 = 1 << 10;
+    if bytes >= GB {
+        format!("{:.1}G", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1}M", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1}K", bytes as f64 / KB as f64)
     } else {
-        format!("{bytes} B")
+        format!("{bytes}")
     }
 }
 
@@ -429,19 +429,21 @@ mod tests {
     // ---- fmt_size ----
 
     #[test]
-    fn fmt_size_bytes_under_1k_is_plain_bytes() {
-        assert_eq!(fmt_size(0), "0 B");
-        assert_eq!(fmt_size(512), "512 B");
-        assert_eq!(fmt_size(1023), "1023 B");
+    fn fmt_size_bytes_under_1k_is_plain_digits() {
+        // ls -lh style: byte counts carry no unit.
+        assert_eq!(fmt_size(0), "0");
+        assert_eq!(fmt_size(512), "512");
+        assert_eq!(fmt_size(1023), "1023");
     }
 
     #[test]
-    fn fmt_size_kib_mib_gib_one_decimal() {
-        assert_eq!(fmt_size(1024), "1.0 KiB");
-        assert_eq!(fmt_size(1536), "1.5 KiB");
-        assert_eq!(fmt_size(1_048_576), "1.0 MiB");
-        assert_eq!(fmt_size(1_073_741_824), "1.0 GiB");
-        assert_eq!(fmt_size(1_500_000_000), "1.4 GiB");
+    fn fmt_size_kmg_one_decimal_ls_lh_style() {
+        // ls -lh style: K/M/G (single uppercase letter), 1024-based, 1 decimal.
+        assert_eq!(fmt_size(1024), "1.0K");
+        assert_eq!(fmt_size(1536), "1.5K");
+        assert_eq!(fmt_size(1_048_576), "1.0M");
+        assert_eq!(fmt_size(1_073_741_824), "1.0G");
+        assert_eq!(fmt_size(1_500_000_000), "1.4G");
     }
 
     // ---- fmt_rate ----
@@ -453,8 +455,8 @@ mod tests {
 
     #[test]
     fn fmt_rate_some_appends_per_sec() {
-        assert_eq!(fmt_rate(Some(1024)), "1.0 KiB/s");
-        assert_eq!(fmt_rate(Some(0)), "0 B/s");
+        assert_eq!(fmt_rate(Some(1024)), "1.0K/s");
+        assert_eq!(fmt_rate(Some(0)), "0/s");
     }
 
     // ---- fmt_eta ----
@@ -592,7 +594,7 @@ mod tests {
         };
         let line = draw_pane_row(&e, "", false, false, true, 12, 50);
         let s = format!("{line}");
-        assert!(s.contains("2.0 KiB"), "size column missing: {s}");
+        assert!(s.contains("2.0K"), "size column missing: {s}");
         assert!(s.contains("2020-01-01"), "mtime column missing: {s}");
     }
 }
