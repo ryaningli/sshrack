@@ -183,8 +183,19 @@ impl TransferScreen {
                 ScreenOutcome::Continue
             }
             // Ctrl-Enter enqueues the focused pane's marked (or selected)
-            // entries as transfer jobs.
+            // entries as transfer jobs. (Legacy alias — many terminals collapse
+            // Ctrl-Enter to a bare Enter, so the footer advertises Ctrl-S below
+            // as the reliable primary trigger. Kept for terminals that deliver
+            // it and for muscle memory.)
             KeyCode::Enter if ctrl => self.enqueue_from_focused(),
+            // Ctrl-S: the primary, footer-advertised transfer trigger. A control
+            // char (0x13), so — unlike Ctrl-Enter — it survives terminal
+            // decoding on every terminal. Transfers the focused pane's marked
+            // (or selected) entries: a file, a dir (recursive), or a marked
+            // batch. Direction follows focus (Local → Upload, Remote → Download).
+            // No clash with the wizards' Ctrl-S = save: those are form overlays,
+            // and this Layer-0 screen owns the key while it is open.
+            KeyCode::Char('s') if ctrl => self.enqueue_from_focused(),
             // Esc: cancel an active transfer, otherwise close the screen.
             KeyCode::Esc => {
                 if self.active.is_some() {
@@ -221,10 +232,15 @@ impl TransferScreen {
             Side::Remote => self.remote.on_key(key),
         };
         match outcome {
-            PaneOutcome::None
-            | PaneOutcome::QueryChanged
-            | PaneOutcome::ToggleMark(_)
-            | PaneOutcome::ActivateSelected => ScreenOutcome::Continue,
+            PaneOutcome::None | PaneOutcome::QueryChanged | PaneOutcome::ToggleMark(_) => {
+                ScreenOutcome::Continue
+            }
+            // Enter / Right on a file activated it — enqueue the focused pane's
+            // marked (or selected) entries. A dir took the StepInto arm above
+            // (Enter on a dir navigates, never transfers — folders transfer via
+            // Ctrl-S), so reaching here means the cursor was on a file (or marks
+            // are present, which take priority).
+            PaneOutcome::ActivateSelected => self.enqueue_from_focused(),
             PaneOutcome::StepInto(path) => {
                 self.pending_list = Some((focus, path));
                 ScreenOutcome::Continue
@@ -430,7 +446,7 @@ impl TransferScreen {
                 ])
             }
             None => Line::from(vec![Span::styled(
-                "› press Space to mark, Ctrl-Enter to transfer",
+                "› press Space to mark, ^S to transfer (Enter on a file)",
                 Style::new().dim(),
             )]),
         };
@@ -446,7 +462,7 @@ impl TransferScreen {
             ("↑↓", "move"),
             ("→", "open"),
             ("Space", "mark"),
-            ("^⏎", "transfer"),
+            ("^S", "transfer"),
             ("Esc", "cancel"),
             ("^C", "close"),
         ];

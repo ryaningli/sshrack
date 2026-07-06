@@ -127,7 +127,7 @@ fn draw_paints_title_panes_progress_and_footer() {
     // Footer hotkeys.
     assert!(view.contains("Tab"), "footer Tab missing: {view}");
     assert!(view.contains("Space"), "footer Space missing: {view}");
-    assert!(view.contains("^⏎"), "footer ^⏎ missing: {view}");
+    assert!(view.contains("^S"), "footer ^S missing: {view}");
 
     // No leak of fake control chars from `strip_control_chars` use — feed a
     // malicious name through and assert it shows up cleaned. Re-renders on
@@ -418,6 +418,150 @@ fn ctrl_enter_enqueues_multiple_marked_files_in_entry_order() {
         "docs second (entry order)"
     );
     assert!(screen.queue[1].recursive, "docs is a dir → recursive");
+}
+
+// ---- on_key: Ctrl-S transfers (reliable primary) + Enter-on-file ----
+//
+// Ctrl-Enter above is the legacy alias; many terminals collapse it to a bare
+// Enter (no modifier), so the footer advertises Ctrl-S as the primary trigger
+// (a control char, always delivered). Plain Enter ALSO enqueues when the cursor
+// is on a file — a convenience. Enter on a dir still steps in (folders transfer
+// via Ctrl-S, never via Enter — guards against accidental recursive uploads).
+
+#[test]
+fn ctrl_s_on_file_enqueues_upload_job() {
+    let local_cwd = PathBuf::from("/l");
+    let remote_cwd = PathBuf::from("/r");
+    let mut screen = TransferScreen::new(local_cwd.clone(), remote_cwd.clone());
+    screen
+        .local
+        .set_entries(vec![entry("alpha.txt", &local_cwd, false)]);
+
+    let out = screen.on_key(press(KeyCode::Char('s'), KeyModifiers::CONTROL));
+    assert_eq!(out, ScreenOutcome::Enqueue, "Ctrl-S on a file → Enqueue");
+    assert_eq!(screen.queue.len(), 1);
+    let job = &screen.queue[0];
+    assert_eq!(job.direction, Direction::Upload, "focus=Local → Upload");
+    assert_eq!(job.src, local_cwd.join("alpha.txt"));
+    assert_eq!(job.dst, remote_cwd.join("alpha.txt"));
+    assert!(!job.recursive, "file → recursive=false");
+}
+
+#[test]
+fn ctrl_s_on_dir_enqueues_recursive_job() {
+    let local_cwd = PathBuf::from("/l");
+    let remote_cwd = PathBuf::from("/r");
+    let mut screen = TransferScreen::new(local_cwd.clone(), remote_cwd.clone());
+    screen
+        .local
+        .set_entries(vec![entry("docs", &local_cwd, true)]);
+
+    let out = screen.on_key(press(KeyCode::Char('s'), KeyModifiers::CONTROL));
+    assert_eq!(out, ScreenOutcome::Enqueue);
+    let job = &screen.queue[0];
+    assert!(job.recursive, "dir via Ctrl-S → recursive=true");
+    assert_eq!(job.src, local_cwd.join("docs"));
+    assert_eq!(job.name, "docs", "trailing slash stripped from name");
+}
+
+#[test]
+fn ctrl_s_focus_remote_enqueues_download_job() {
+    let local_cwd = PathBuf::from("/l");
+    let remote_cwd = PathBuf::from("/r");
+    let mut screen = TransferScreen::new(local_cwd.clone(), remote_cwd.clone());
+    screen.focus = Side::Remote;
+    screen
+        .remote
+        .set_entries(vec![entry("server.log", &remote_cwd, false)]);
+
+    let out = screen.on_key(press(KeyCode::Char('s'), KeyModifiers::CONTROL));
+    assert_eq!(out, ScreenOutcome::Enqueue);
+    assert_eq!(screen.queue[0].direction, Direction::Download);
+    assert_eq!(screen.queue[0].src, remote_cwd.join("server.log"));
+    assert_eq!(screen.queue[0].dst, local_cwd.join("server.log"));
+}
+
+#[test]
+fn ctrl_s_with_marks_enqueues_marked_batch() {
+    // Marks take priority over the cursor for both Ctrl-S and Enter — marking
+    // is the explicit "transfer these" signal. Marks are single-shot.
+    let local_cwd = PathBuf::from("/l");
+    let remote_cwd = PathBuf::from("/r");
+    let mut screen = TransferScreen::new(local_cwd.clone(), remote_cwd.clone());
+    screen.local.set_entries(vec![
+        entry("alpha.txt", &local_cwd, false),
+        entry("beta.txt", &local_cwd, false),
+    ]);
+    screen.local.marked.insert(local_cwd.join("beta.txt"));
+
+    let out = screen.on_key(press(KeyCode::Char('s'), KeyModifiers::CONTROL));
+    assert_eq!(out, ScreenOutcome::Enqueue);
+    assert_eq!(screen.queue.len(), 1, "only the marked entry queued");
+    assert_eq!(screen.queue[0].src, local_cwd.join("beta.txt"));
+    assert!(
+        screen.local.marked.is_empty(),
+        "marks cleared after enqueue"
+    );
+}
+
+#[test]
+fn enter_on_file_enqueues_upload_job() {
+    // Plain Enter (no modifier) on a file under the cursor enqueues it — the
+    // convenience shortcut mirroring Ctrl-S for the single-file case.
+    let local_cwd = PathBuf::from("/l");
+    let remote_cwd = PathBuf::from("/r");
+    let mut screen = TransferScreen::new(local_cwd.clone(), remote_cwd.clone());
+    screen
+        .local
+        .set_entries(vec![entry("alpha.txt", &local_cwd, false)]);
+
+    let out = screen.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(out, ScreenOutcome::Enqueue, "Enter on a file → Enqueue");
+    assert_eq!(screen.queue.len(), 1);
+    assert_eq!(screen.queue[0].src, local_cwd.join("alpha.txt"));
+    assert_eq!(screen.queue[0].direction, Direction::Upload);
+}
+
+#[test]
+fn enter_on_dir_steps_in_and_does_not_enqueue() {
+    // Safety pin: Enter on a dir NAVIGATES (requests a listing), never
+    // transfers — folders transfer via Ctrl-S. Guards against an accidental
+    // recursive upload when the user means to look inside a directory.
+    let local_cwd = PathBuf::from("/l");
+    let mut screen = TransferScreen::new(local_cwd.clone(), PathBuf::from("/r"));
+    screen
+        .local
+        .set_entries(vec![entry("docs", &local_cwd, true)]);
+
+    let out = screen.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(
+        out,
+        ScreenOutcome::Continue,
+        "Enter on a dir navigates, does not enqueue"
+    );
+    assert!(screen.queue.is_empty(), "no job queued for a dir on Enter");
+    assert_eq!(
+        screen.pending_list,
+        Some((Side::Local, local_cwd.join("docs"))),
+        "Enter on a dir requests a listing of that dir"
+    );
+}
+
+#[test]
+fn plain_s_types_into_filter_and_does_not_enqueue() {
+    // Guard the `if ctrl` on the Ctrl-S arm: a bare 's' (no modifier) is a
+    // filter-box character, never a transfer. Without this pin a regression
+    // that drops the guard would silently enqueue on every 's' keystroke.
+    let local_cwd = PathBuf::from("/l");
+    let mut screen = TransferScreen::new(local_cwd.clone(), PathBuf::from("/r"));
+    screen
+        .local
+        .set_entries(vec![entry("alpha.txt", &local_cwd, false)]);
+
+    let out = screen.on_key(press(KeyCode::Char('s'), KeyModifiers::NONE));
+    assert_eq!(out, ScreenOutcome::Continue, "bare 's' is not a transfer");
+    assert_eq!(screen.local.query, "s", "bare 's' reaches the filter box");
+    assert!(screen.queue.is_empty(), "bare 's' must not enqueue");
 }
 
 // ---- on_key: Esc / Ctrl-C ----

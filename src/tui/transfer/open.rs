@@ -141,7 +141,7 @@ pub fn open_transfer(
     let local_cwd = std::env::current_dir()?;
     let mut screen = TransferScreen::new(local_cwd, home.clone());
     screen.set_status(crate::tui::intent::Status::info(
-        "sftp ready — Tab switches pane, Ctrl-Enter transfers",
+        "sftp ready — Tab switches pane, ^S transfers (or Enter on a file)",
     ));
     worker.send(sshrack_core::connect::sftp::proto::WorkerCmd::List(home));
 
