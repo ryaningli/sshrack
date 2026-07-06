@@ -130,8 +130,8 @@ fn draw_paints_title_panes_progress_and_footer() {
     // shows up in the progress panel.
     assert!(view.contains('●'), "mark glyph missing: {view}");
     assert!(view.contains("alpha.txt"), "active name missing: {view}");
-    // Queue row.
-    assert!(view.contains("queue"), "queue label missing: {view}");
+    // Summary row (Task 3 collapsed the 4-row panel into a 2-row band).
+    assert!(view.contains("done"), "summary label missing: {view}");
 
     // Footer hotkeys.
     assert!(view.contains("Tab"), "footer Tab missing: {view}");
@@ -161,7 +161,7 @@ fn draw_paints_title_panes_progress_and_footer() {
 }
 
 #[test]
-fn draw_shows_no_transfer_in_flight_when_idle() {
+fn draw_renders_summary_when_idle() {
     let backend = TestBackend::new(70, 20);
     let mut term = Terminal::new(backend).expect("test backend");
     let mut screen = canned_screen();
@@ -169,12 +169,10 @@ fn draw_shows_no_transfer_in_flight_when_idle() {
     // so the screen is fully idle (no InFlight, no Queued).
     screen.ledger.abort_inflight();
     screen.ledger.clear_queued();
-    term.draw(|f| screen.draw(f, f.area())).expect("draw");
+    let res = term.draw(|f| screen.draw(f, f.area()));
+    assert!(res.is_ok(), "idle draw must not panic: {:?}", res.err());
     let view = buffer_view(term.backend().buffer());
-    assert!(
-        view.contains("no transfer in flight"),
-        "idle progress row missing: {view}"
-    );
+    assert!(view.contains("done"), "summary present when idle: {view}");
 }
 
 #[test]

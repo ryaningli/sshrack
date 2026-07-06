@@ -20,7 +20,7 @@ use ratatui::{
     widgets::{Block, Borders, Gauge, Paragraph},
 };
 use sshrack_core::connect::sftp::parse::strip_control_chars;
-use sshrack_core::connect::sftp::proto::{Direction, Progress, TransferJob};
+use sshrack_core::connect::sftp::proto::{Direction, Progress};
 use sshrack_core::dirsource::DirEntry;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -356,43 +356,51 @@ pub fn draw_active_transfer(frame: &mut Frame, area: Rect, active: Option<&Progr
     }
 }
 
-/// Build the queue-summary line (row 2): `queue: N item(s)` plus the first
-/// queued job's name (truncated to fit `width`). Pure: returns a `Line`.
-pub fn queue_summary_line(count: usize, first: Option<&TransferJob>, width: u16) -> Line<'static> {
-    let noun = if count == 1 { "item" } else { "items" };
-    let header = format!("queue: {count} {noun}");
-    let Some(job) = first else {
-        return Line::from(vec![
-            Span::styled("queue: ", Style::new().dim()),
-            Span::styled(format!("{count} {noun}"), Style::new().dim()),
-        ]);
-    };
-    let used = header.chars().count() + 3; // header + " · "
-    let budget = (width as usize).saturating_sub(used);
-    let name = truncate_cells_head(&job.name, budget);
-    Line::from(vec![
-        Span::styled("queue: ", Style::new().dim()),
-        Span::styled(format!("{count} {noun}"), Style::new()),
-        Span::styled(" · ", Style::new().dim()),
-        Span::styled(name, Style::new().dim()),
-    ])
-}
-
-/// Build the queue's second line (row 3): the second queued job's name
-/// (truncated to `width`), or a blank line when there is no second job. Pure.
-pub fn queue_second_line(second: Option<&TransferJob>, width: u16) -> Line<'static> {
-    match second {
-        Some(job) => {
-            let prefix = "  next: ";
-            let budget = (width as usize).saturating_sub(prefix.chars().count());
-            let name = truncate_cells_head(&job.name, budget);
-            Line::from(vec![
-                Span::styled(prefix, Style::new().dim()),
-                Span::styled(name, Style::new().dim()),
-            ])
-        }
-        None => Line::raw(""),
+/// Build the 2-row status band's summary line: `done X/Y · fail Z [· paused]`
+/// on the left, and — when present — the transient status message on the right.
+/// Pure. `width` bounds the message so it can not push the counts off the row.
+///
+/// `done` counts every finished task (terminal state: `Ok`, `Failed`, or
+/// `Cancelled`) — i.e. `total − queued − in-flight`. `fail` is the subset of
+/// those that failed, surfaced separately (and in `DANGER` red) so a failed
+/// task still advances the `done` numerator: `done 1/1 · fail 1`.
+pub fn summary_line(
+    ledger: &crate::tui::transfer::ledger::TransferLedger,
+    status: &crate::tui::intent::Status,
+    width: u16,
+) -> Line<'static> {
+    let total = ledger.total();
+    let pending = ledger.pending_count();
+    let inflight = if ledger.has_inflight() { 1 } else { 0 };
+    let finished = total.saturating_sub(pending + inflight);
+    let failed = ledger.failed_count();
+    let counts = format!("done {finished}/{total} · fail {failed}");
+    let mut spans: Vec<Span> = Vec::new();
+    spans.push(Span::styled(
+        counts,
+        if failed > 0 {
+            Style::new().fg(crate::tui::theme::DANGER)
+        } else {
+            Style::new()
+        },
+    ));
+    if ledger.is_paused() {
+        spans.push(Span::styled(" · ", Style::new().dim()));
+        spans.push(Span::styled("paused", crate::tui::theme::accent()));
     }
+    if let Some(msg) = &status.message {
+        let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+        let budget = (width as usize).saturating_sub(used + 3); // " · "
+        let trimmed = truncate_cells_head(msg, budget);
+        spans.push(Span::styled(" · ", Style::new().dim()));
+        let style = if status.is_error {
+            Style::new().fg(crate::tui::theme::DANGER)
+        } else {
+            Style::new()
+        };
+        spans.push(Span::styled(trimmed, style));
+    }
+    Line::from(spans)
 }
 
 // ---- format helpers (pure) ----
@@ -745,5 +753,81 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw_pane(f, f.area(), &pane, false, "u@h"))
             .expect("unfocused titled pane must render without panic");
+    }
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use super::*;
+    use crate::tui::intent::Status;
+    use crate::tui::transfer::ledger::TransferLedger;
+    use sshrack_core::connect::sftp::proto::{Direction, TransferJob, TransferOutcome};
+
+    fn job(name: &str, dir: Direction) -> TransferJob {
+        TransferJob {
+            direction: dir,
+            src: format!("/s/{name}").into(),
+            dst: format!("/d/{name}").into(),
+            name: name.into(),
+            size_total: Some(1024),
+            recursive: false,
+        }
+    }
+
+    fn line_to_string(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    #[test]
+    fn summary_line_shows_done_over_total_and_fail() {
+        let mut l = TransferLedger::new();
+        l.enqueue(job("a", Direction::Upload));
+        l.enqueue(job("b", Direction::Upload));
+        l.enqueue(job("c", Direction::Upload));
+        l.next_to_dispatch();
+        l.finish_inflight(TransferOutcome::Ok); // a done
+        let line = summary_line(&l, &Status::empty(), 60);
+        let s = line_to_string(&line);
+        assert!(s.contains("done"), "label present: {s}");
+        assert!(s.contains("1/3"), "done/total: {s}");
+        assert!(s.contains("fail"), "fail label present: {s}");
+        assert!(s.contains("0"), "fail count: {s}");
+    }
+
+    #[test]
+    fn summary_line_shows_failed_count() {
+        let mut l = TransferLedger::new();
+        l.enqueue(job("a", Direction::Upload));
+        l.next_to_dispatch();
+        l.finish_inflight(TransferOutcome::Failed("x".into()));
+        let line = summary_line(&l, &Status::empty(), 60);
+        let s = line_to_string(&line);
+        assert!(s.contains("1/1"), "{s}");
+        assert!(s.contains("fail 1"), "fail count rendered: {s}");
+    }
+
+    #[test]
+    fn summary_line_appends_paused_when_paused() {
+        let mut l = TransferLedger::new();
+        l.enqueue(job("a", Direction::Upload));
+        l.set_paused(true);
+        let line = summary_line(&l, &Status::empty(), 60);
+        let s = line_to_string(&line);
+        assert!(s.contains("paused"), "paused marker: {s}");
+    }
+
+    #[test]
+    fn summary_line_appends_status_message_when_present() {
+        let l = TransferLedger::new();
+        let line = summary_line(&l, &Status::error("transfer failed: boom"), 80);
+        let s = line_to_string(&line);
+        assert!(
+            s.contains("transfer failed: boom"),
+            "status message rendered: {s}"
+        );
     }
 }

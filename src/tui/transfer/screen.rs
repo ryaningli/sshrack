@@ -399,7 +399,7 @@ impl TransferScreen {
     }
 
     /// Render the full screen into `area`: title band (1) / panes (Fill) /
-    /// progress+queue panel (4) / hotkey footer (1). The panes split
+    /// progress+summary panel (2) / hotkey footer (1). The panes split
     /// horizontally 50/50; each pane renders its own cwd row, filter box, and
     /// windowed list via [`render::draw_pane`]. The non-focused pane is dimmed
     /// overall. Pure: no I/O, no env access.
@@ -410,7 +410,7 @@ impl TransferScreen {
         let [title_area, panes_area, panel_area, footer_area] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Fill(1),
-            Constraint::Length(4),
+            Constraint::Length(2),
             Constraint::Length(1),
         ])
         .areas(area);
@@ -450,54 +450,26 @@ impl TransferScreen {
         frame.render_widget(Paragraph::new(line), area);
     }
 
-    /// Progress + queue panel: a 4-row band. Row 1 holds the active transfer
-    /// text plus a `Gauge`, or "no transfer in flight" when idle. Rows 2 and 3
-    /// hold the queue count plus the next 1–2 job names (truncated to the panel
-    /// width). Row 4 is the consolidated status line (errors / operation
-    /// feedback), blank when idle — the hotkey reference lives in the footer.
+    /// Progress + summary panel: a 2-row band. Row 1 holds the active transfer
+    /// text plus a `Gauge` (or the dim "no transfer in flight" placeholder when
+    /// idle). Row 2 is the `done X/Y · fail Z [· paused]` summary with any
+    /// transient status message appended — `summary_line` bounds the message so
+    /// it can not push the counts off the row. The hotkey reference lives in
+    /// the footer.
     fn draw_progress_panel(&self, frame: &mut Frame, area: Rect) {
-        let [row1, row2, row3, row4] = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
-        .areas(area);
+        let [row1, row2] =
+            Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
 
+        // Row 1: the active transfer (blank-looking when idle —
+        // `draw_active_transfer` paints the dim placeholder without a progress
+        // snapshot). Keeps the live progress visible without opening the queue
+        // popup.
         render::draw_active_transfer(frame, row1, self.ledger.active_progress());
 
-        // Pending jobs in FIFO order, for the unchanged 4-row panel (Task 3
-        // replaces this with the 2-row summary).
-        let pending: Vec<&TransferJob> = self
-            .ledger
-            .tasks
-            .iter()
-            .filter(|t| matches!(t.state, crate::tui::transfer::ledger::TaskState::Queued))
-            .map(|t| &t.job)
-            .collect();
-        let q2 = render::queue_summary_line(pending.len(), pending.first().copied(), area.width);
-        frame.render_widget(Paragraph::new(q2), row2);
-
-        // Row 3: second queued name when present, otherwise blank.
-        let q3 = render::queue_second_line(pending.get(1).copied(), area.width);
-        frame.render_widget(Paragraph::new(q3), row3);
-
-        // Row 4: consolidated status (errors / operation feedback); blank when idle.
-        let status_line = match &self.status.message {
-            Some(msg) => {
-                let style = if self.status.is_error {
-                    Style::new().fg(theme::DANGER)
-                } else {
-                    Style::new()
-                };
-                Line::from(vec![
-                    Span::styled("› ", Style::new().dim()),
-                    Span::styled(msg.clone(), style),
-                ])
-            }
-            None => Line::raw(""),
-        };
-        frame.render_widget(status_line, row4);
+        // Row 2: done/total + fail (+ paused) summary, with any transient
+        // status message appended.
+        let line = render::summary_line(&self.ledger, &self.status, area.width);
+        frame.render_widget(Paragraph::new(line), row2);
     }
 
     /// Hotkey footer: one dot-separated hint line. Keys take the accent color;
