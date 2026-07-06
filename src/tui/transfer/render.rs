@@ -224,7 +224,13 @@ fn draw_pane_row(
     name_w: usize,
     width: u16,
 ) -> Line<'static> {
-    let base = if focused_pane {
+    // The focused pane's cursor row highlights the WHOLE row (accent + bold),
+    // matching the identity-key picker — name, size, and mtime read as one
+    // selected row, not just a leading arrow. Other rows stay plain; the
+    // non-focused pane dims everything so it never competes with the highlight.
+    let base = if focused_pane && is_cursor {
+        theme::accent().add_modifier(Modifier::BOLD)
+    } else if focused_pane {
         Style::new()
     } else {
         Style::new().dim()
@@ -266,8 +272,15 @@ fn draw_pane_row(
     let meta = format!("{size_str}  {mtime_str}");
     let used = 2 + 2 + name_w;
     let fill = (width as usize).saturating_sub(used + meta.chars().count());
+    // Meta (size + mtime): dim on plain rows, but on the focused cursor row it
+    // inherits the accent+bold highlight so the whole row reads as one.
+    let meta_style = if focused_pane && is_cursor {
+        base
+    } else {
+        Style::new().dim()
+    };
     spans.push(Span::raw(" ".repeat(fill)));
-    spans.push(Span::styled(meta, Style::new().dim()));
+    spans.push(Span::styled(meta, meta_style));
 
     Line::from(spans)
 }
@@ -643,6 +656,61 @@ mod tests {
         let s = format!("{line}");
         assert!(s.contains("2.0K"), "size column missing: {s}");
         assert!(s.contains("2020-01-01"), "mtime column missing: {s}");
+    }
+
+    #[test]
+    fn draw_pane_row_cursor_highlights_the_whole_row_including_meta() {
+        // Focused + cursor: the whole row is accent+bold — the meta (size+mtime)
+        // span carries BOLD + the accent fg, matching the identity-key picker.
+        // (highlighted_spans preserves the base style on the name spans too.)
+        let e = DirEntry {
+            name: "alpha.txt".into(),
+            path: std::path::PathBuf::from("/x/alpha.txt"),
+            is_dir: false,
+            is_symlink: false,
+            size: Some(2048),
+            modified: Some(UNIX_EPOCH + Duration::from_secs(86_400 * 18_262)),
+        };
+        let line = draw_pane_row(&e, "", true, false, true, 12, 50);
+        let meta_span = line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("2.0K"))
+            .expect("meta span carrying the size");
+        assert!(
+            meta_span.style.add_modifier.contains(Modifier::BOLD),
+            "cursor row meta must be bold (highlighted): {:?}",
+            meta_span.style
+        );
+        assert_eq!(
+            meta_span.style.fg,
+            Some(theme::ACCENT),
+            "cursor row meta must be accent-colored"
+        );
+    }
+
+    #[test]
+    fn draw_pane_row_non_cursor_meta_is_not_bold() {
+        // A non-cursor row's meta stays dim — the highlight is cursor-only.
+        let e = DirEntry {
+            name: "alpha.txt".into(),
+            path: std::path::PathBuf::from("/x/alpha.txt"),
+            is_dir: false,
+            is_symlink: false,
+            size: Some(2048),
+            modified: None,
+        };
+        let line = draw_pane_row(&e, "", false, false, true, 12, 50);
+        let meta_span = line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("2.0K"))
+            .expect("meta span carrying the size");
+        assert!(
+            !meta_span.style.add_modifier.contains(Modifier::BOLD),
+            "non-cursor meta must not be bold: {:?}",
+            meta_span.style
+        );
     }
 
     // ---- draw_pane: titled bordered block, no panic on a short terminal ----
