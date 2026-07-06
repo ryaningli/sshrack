@@ -16,7 +16,7 @@ A background `ssh -N -o ControlMaster=yes` owns one authenticated connection (bu
 
 ## Screen (`tui/transfer/`)
 
-A full-screen `App` view (not an `Overlay`) — two `Pane`s (local | remote), a progress/queue panel, a hotkey footer. Same-name conflicts prompt overwrite/skip/overwrite-all/skip-all (downloads check the local target; uploads overwrite in place — remote-exists check deferred to a later phase).
+A full-screen `App` view (not an `Overlay`) — two `Pane`s (local | remote), a progress/queue panel, a hotkey footer. Each pane is a titled bordered block — `local` / `<user>@<host>` (the remote title is set in `open_transfer` once auth resolves); the focused pane gets an accent border + bold title, the unfocused pane is dimmed. Same-name conflicts prompt overwrite/skip/overwrite-all/skip-all (downloads check the local target; uploads overwrite in place — remote-exists check deferred to a later phase).
 
 ## Decoupling
 
