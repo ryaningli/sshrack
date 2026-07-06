@@ -164,10 +164,12 @@ pub fn open_transfer(
 }
 
 /// Build the remote pane's title: prefer the host's friendly `name`; fall back
-/// to `<user>@<host>` when the host is unnamed (e.g. an ad-hoc host) so the
-/// bordered block never shows an empty title. Pure.
+/// to `<user>@<host>` when there is no real name. A saved host carries a name
+/// distinct from its address; an ad-hoc host (built by `host::resolve_target`'s
+/// `ad_hoc_host`) has `name == address` — no real name — so it shows
+/// `<user>@<host>` to surface the login identity. Pure.
 fn remote_title(name: &str, user: &str, host: &str) -> String {
-    if name.is_empty() {
+    if name.is_empty() || name == host {
         format!("{user}@{host}")
     } else {
         name.to_string()
@@ -214,6 +216,16 @@ mod tests {
         // An ad-hoc / unnamed host falls back to <user>@<host> so the title is
         // never empty.
         assert_eq!(remote_title("", "ryan", "10.0.0.4"), "ryan@10.0.0.4");
+    }
+
+    #[test]
+    fn remote_title_shows_user_at_host_for_an_ad_hoc_address_name() {
+        // An ad-hoc host built by host::resolve_target carries name == address;
+        // the title surfaces the login user (user@ip), not the bare address.
+        assert_eq!(
+            remote_title("192.168.20.18", "yushi", "192.168.20.18"),
+            "yushi@192.168.20.18"
+        );
     }
 
     #[test]
