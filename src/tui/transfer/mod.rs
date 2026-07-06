@@ -23,6 +23,7 @@
 //! [`Progress`]: sshrack_core::connect::sftp::proto::Progress
 //! [`Status`]: crate::tui::intent::Status
 
+pub mod ledger;
 pub mod open;
 pub mod overwrite;
 pub mod pane;
