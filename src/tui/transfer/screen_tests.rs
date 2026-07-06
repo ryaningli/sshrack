@@ -735,3 +735,39 @@ fn non_press_key_returns_continue_and_does_not_mutate() {
     assert_eq!(out, ScreenOutcome::Continue);
     assert_eq!(screen.focus, Side::Local, "release did not flip focus");
 }
+
+// ---- next_job: records direction for post-Done refresh ----
+
+#[test]
+fn next_job_records_direction_for_post_done_refresh() {
+    // next_job stamps the popped job's direction onto last_direction so the
+    // event loop can refresh the destination pane on Done even when no
+    // Progress arrived (a transfer finishing inside the first 200ms poll).
+    let mut screen = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
+    screen.queue.push(TransferJob {
+        direction: Direction::Upload,
+        src: PathBuf::from("/l/a"),
+        dst: PathBuf::from("/r/a"),
+        name: "a".into(),
+        size_total: Some(1),
+        recursive: false,
+    });
+    assert!(screen.last_direction.is_none(), "starts None");
+    let job = screen.next_job().expect("pop one job");
+    assert_eq!(job.direction, Direction::Upload);
+    assert_eq!(
+        screen.last_direction,
+        Some(Direction::Upload),
+        "next_job records the dispatched direction"
+    );
+}
+
+#[test]
+fn next_job_empty_queue_leaves_last_direction_unchanged() {
+    // Popping from an empty queue is a no-op on last_direction (does not
+    // reset a prior value, does not set one).
+    let mut screen = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
+    screen.last_direction = Some(Direction::Download);
+    assert!(screen.next_job().is_none());
+    assert_eq!(screen.last_direction, Some(Direction::Download));
+}

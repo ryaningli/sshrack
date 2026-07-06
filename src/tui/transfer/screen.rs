@@ -106,6 +106,14 @@ pub struct TransferScreen {
     /// [`decide`](super::overwrite::decide) calls read this so a single popup
     /// governs a whole queued batch. Pure: setting this performs no I/O.
     pub overwrite_policy: Option<OverwritePolicy>,
+    /// Direction of the most-recently-dispatched job, set by
+    /// [`next_job`](Self::next_job) when it pops one. Read by the Task-10 loop
+    /// on `WorkerEvent::Done` to refresh the destination pane once a batch
+    /// ends. Unlike `active` (only set once the first `Progress` arrives
+    /// ~200ms in), this is populated at dispatch time so a transfer that
+    /// finishes before any `Progress` still remembers its direction. Pure
+    /// mutator: setting it performs no I/O.
+    pub last_direction: Option<Direction>,
 }
 
 impl TransferScreen {
@@ -127,6 +135,7 @@ impl TransferScreen {
             status: Status::empty(),
             pending_list: None,
             overwrite_policy: None,
+            last_direction: None,
         }
     }
 
@@ -354,7 +363,9 @@ impl TransferScreen {
         if self.queue.is_empty() {
             None
         } else {
-            Some(self.queue.remove(0))
+            let job = self.queue.remove(0);
+            self.last_direction = Some(job.direction);
+            Some(job)
         }
     }
 

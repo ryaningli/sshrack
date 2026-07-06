@@ -39,6 +39,7 @@ use super::transfer::open::open_transfer;
 use super::transfer::overwrite;
 use super::transfer::pane::Side;
 use sshrack_core::connect::sftp::SftpWorker;
+use sshrack_core::connect::sftp::proto::{Direction, TransferOutcome, WorkerCmd, WorkerEvent};
 
 /// How long [`event::poll`] blocks for a key before the loop wakes to drain
 /// SFTP worker events and re-render. crossterm's `poll` watches only the
@@ -48,7 +49,6 @@ use sshrack_core::connect::sftp::SftpWorker;
 /// ~50 ms (snappier than sshelf's 100 ms tick) for negligible CPU: the loop
 /// simply re-polls. Pinned by `tests::event_poll_is_50_ms`.
 const EVENT_POLL: Duration = Duration::from_millis(50);
-use sshrack_core::connect::sftp::proto::{TransferOutcome, WorkerCmd, WorkerEvent};
 
 /// Blocking event loop. Renders `app`, polls crossterm for key events, and
 /// dispatches each key through [`App::on_key`]. Returns `Some(req)` when the
@@ -520,6 +520,10 @@ fn drain_transfer_events(app: &mut App, handle: &TerminalHandle) {
     //    does not stall a tick behind reality.
     let mut maybe_failed_msg: Option<String> = None;
     let mut maybe_done_advance = false;
+    // Destination-pane refresh to run after the drain loop when a Done ends
+    // the batch (Ok/Cancelled + empty queue). Carries the finished direction
+    // so step 7 knows which pane to re-list.
+    let mut pending_refresh: Option<Direction> = None;
     while let Some(ev) = app.transfer_worker.as_ref().and_then(SftpWorker::try_event) {
         match ev {
             WorkerEvent::Listing(cwd, res) => {
@@ -548,6 +552,15 @@ fn drain_transfer_events(app: &mut App, handle: &TerminalHandle) {
             WorkerEvent::Done(outcome) => {
                 if let Some(screen) = app.transfer.as_mut() {
                     screen.clear_active();
+                }
+                // Snapshot the batch state BEFORE dispatch_next_job pops the
+                // next job (which would overwrite last_direction and change
+                // queue emptiness). The refresh fires only when this Done
+                // ends the batch; mid-batch Defers to the final job's Done.
+                let last_direction = app.transfer.as_ref().and_then(|s| s.last_direction);
+                let queue_empty = app.transfer.as_ref().is_none_or(|s| s.queue.is_empty());
+                if let Some(dir) = decide_post_done_refresh(last_direction, queue_empty, &outcome) {
+                    pending_refresh = Some(dir);
                 }
                 match outcome {
                     TransferOutcome::Ok | TransferOutcome::Cancelled => {
@@ -589,6 +602,55 @@ fn drain_transfer_events(app: &mut App, handle: &TerminalHandle) {
                 "transfer failed: {msg}"
             )));
         }
+    }
+
+    // 7. Refresh the destination pane when a batch just finished (decided in
+    //    the Done arm above) so a newly-arrived file is visible without a
+    //    manual reload. Download lands locally (sync list); Upload lands
+    //    remotely (async WorkerCmd::List over the master, drained next tick).
+    if let Some(direction) = pending_refresh {
+        match direction {
+            Direction::Download => {
+                let cwd = app.transfer.as_ref().map(|s| s.local.cwd.clone());
+                if let Some(cwd) = cwd {
+                    let listing = LocalDirSource::new().list(&cwd);
+                    if let Some(screen) = app.transfer.as_mut() {
+                        match listing {
+                            Ok(entries) => screen.local_mut().set_entries(entries),
+                            Err(msg) => screen.set_status(super::intent::Status::error(format!(
+                                "local list failed: {msg}"
+                            ))),
+                        }
+                    }
+                }
+            }
+            Direction::Upload => {
+                let cwd = app.transfer.as_ref().map(|s| s.remote.cwd.clone());
+                if let Some(cwd) = cwd {
+                    if let Some(worker) = app.transfer_worker.as_ref() {
+                        worker.send(WorkerCmd::List(cwd));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Decide whether a `WorkerEvent::Done` should trigger a destination-pane
+/// refresh, and in which direction. Returns `Some(dir)` only when this Done
+/// ENDS the batch — `Ok`/`Cancelled` outcome AND the queue is empty AND the
+/// finished direction is known — so the destination pane re-lists exactly
+/// once (after the last job) instead of once per file. `Failed` never
+/// refreshes (the status line reports the error); a mid-batch Done (queue
+/// still pending) defers the refresh to the final job. Pure.
+fn decide_post_done_refresh(
+    last_direction: Option<Direction>,
+    queue_empty: bool,
+    outcome: &TransferOutcome,
+) -> Option<Direction> {
+    match outcome {
+        TransferOutcome::Ok | TransferOutcome::Cancelled if queue_empty => last_direction,
+        _ => None,
     }
 }
 
@@ -717,6 +779,62 @@ mod tests {
         // negligible CPU (the loop just re-polls). Bump deliberately only if a
         // re-measurement justifies it.
         assert_eq!(EVENT_POLL, Duration::from_millis(50));
+    }
+
+    // ---- decide_post_done_refresh ----
+
+    #[test]
+    fn decide_post_done_refresh_ends_batch_on_ok_with_empty_queue() {
+        assert_eq!(
+            decide_post_done_refresh(Some(Direction::Upload), true, &TransferOutcome::Ok),
+            Some(Direction::Upload)
+        );
+        assert_eq!(
+            decide_post_done_refresh(Some(Direction::Download), true, &TransferOutcome::Ok),
+            Some(Direction::Download)
+        );
+    }
+
+    #[test]
+    fn decide_post_done_refresh_mid_batch_defers() {
+        // A Done with jobs still queued is NOT the batch end — the refresh must
+        // wait for the final job so we don't re-list once per file.
+        assert_eq!(
+            decide_post_done_refresh(Some(Direction::Upload), false, &TransferOutcome::Ok),
+            None
+        );
+    }
+
+    #[test]
+    fn decide_post_done_refresh_failed_never_refreshes() {
+        assert_eq!(
+            decide_post_done_refresh(
+                Some(Direction::Upload),
+                true,
+                &TransferOutcome::Failed("e".into())
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn decide_post_done_refresh_cancelled_ends_batch() {
+        // Cancel also ends the batch when nothing remains — re-list so the
+        // view reflects any partially-transferred state the worker cleaned up.
+        assert_eq!(
+            decide_post_done_refresh(Some(Direction::Download), true, &TransferOutcome::Cancelled),
+            Some(Direction::Download)
+        );
+    }
+
+    #[test]
+    fn decide_post_done_refresh_unknown_direction_yields_none() {
+        // Defensive: no recorded direction (a stray Done with no prior
+        // dispatch) → nothing to refresh.
+        assert_eq!(
+            decide_post_done_refresh(None, true, &TransferOutcome::Ok),
+            None
+        );
     }
 
     #[test]
