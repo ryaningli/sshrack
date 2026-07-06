@@ -25,7 +25,7 @@
 
 use std::path::Path;
 
-use sshrack_core::config::schema::SshrackConfig;
+use sshrack_core::config::schema::{Host, SshrackConfig};
 use sshrack_core::connect::sftp::SftpWorker;
 use sshrack_core::connect::ssh::Overrides;
 use sshrack_core::connect::{self, KeyArtifact};
@@ -34,14 +34,10 @@ use sshrack_core::error::SshrackError;
 use sshrack_core::hostkey;
 use sshrack_core::secret::vault;
 
-use ulid::Ulid;
-
 use crate::tui::TerminalHandle;
 use crate::tui::app::App;
 use crate::tui::prompt::{TuiPassphrase, host_key_confirm};
 use crate::tui::transfer::screen::TransferScreen;
-
-use sshrack_core::error::DidYouMean;
 
 /// Run all pre-open side effects for an sftp session on `host_id` and seed a
 /// fresh [`TransferScreen`] on [`App::transfer`] with the [`SftpWorker`] on
@@ -49,7 +45,10 @@ use sshrack_core::error::DidYouMean;
 /// (auth/hostkey), then opens the worker and seeds the remote pane.
 ///
 /// Side effects, in order:
-/// 1. Look up the host by id (no name to resolve — the launcher picked it).
+/// 1. Carry the resolved `host` — the caller (launcher `Ctrl-T`, or the
+///    `sshrack sftp` entry) already resolved the target (a saved name OR an
+///    ad-hoc literal built by `host::resolve_target`), so there is no id→host
+///    re-lookup here. An ad-hoc host is never in the config.
 /// 2. Vault unlock via [`TuiPassphrase`] (no-op unless vault mode).
 /// 3. Resolve auth → [`credential::PasswordSource`] (dangling ref fails here).
 /// 4. Materialize an inline (pasted) key to a temp file so `ssh -i` can read
@@ -71,26 +70,19 @@ use sshrack_core::error::DidYouMean;
 ///
 /// [`connect_host`]: crate::tui::connect::connect_host
 pub fn open_transfer(
-    host_id: Ulid,
+    host: Host,
     app: &mut App,
     handle: TerminalHandle,
     _data_dir: Option<&Path>,
 ) -> Result<(), SshrackError> {
     let cfg: &SshrackConfig = app.config();
 
-    // ── Step 1: Look up the host by id (launcher already chose it). ──────────
-    let host = cfg
-        .find_host_by_id(&host_id)
-        .ok_or(SshrackError::HostNotFound {
-            name: host_id.to_string(),
-            // See connect_host for the rationale: the id is internal, no
-            // did-you-mean over a bare ULID is useful, and this branch is
-            // unreachable in normal use (the launcher only hands out ids from
-            // the loaded config). An empty hint keeps the message clean.
-            hint: DidYouMean::none(),
-        })?;
+    // ── Step 1: Carry the resolved host. The caller already resolved it (saved
+    // name or ad-hoc literal), so there is no id→host lookup to redo. `port`
+    // is read before `host` moves into `resolved_host` (used by the host-key
+    // flow below). ─────────────────────────────────────────────────────────────
     let port = host.port;
-    let resolved_host = host.clone();
+    let resolved_host = host;
 
     // ── Step 2: Vault unlock (no-op unless vault mode). ──────────────────────
     let passphrase_provider = TuiPassphrase::new(handle.clone());
@@ -198,6 +190,7 @@ mod tests {
     use sshrack_core::connect::ssh::Overrides;
     use sshrack_core::credential;
     use std::path::Path;
+    use ulid::Ulid;
 
     fn host_with_inline_user(name: &str) -> Host {
         Host {

@@ -10,7 +10,7 @@
 
 use crossterm::event::KeyEvent;
 use ratatui::Frame;
-use sshrack_core::config::schema::SshrackConfig;
+use sshrack_core::config::schema::{Host, SshrackConfig};
 use sshrack_core::connect::KeyArtifact;
 use sshrack_core::connect::sftp::SftpWorker;
 use sshrack_core::frecency::Frecency;
@@ -126,10 +126,11 @@ pub struct App {
     /// closes alongside the worker. `None` for path-key / no-key hosts and
     /// outside a transfer session.
     pub(crate) transfer_key_artifact: Option<KeyArtifact>,
-    /// The host id the launcher signaled for an sftp open (Ctrl-T on Hosts tab
-    /// with a host selected). The loop reads (and clears) this to run
     /// [`super::transfer::open::open_transfer`]. Mirrors `pending_connect`.
-    pub(super) pending_transfer: Option<Ulid>,
+    /// Holds the resolved `Host` (a saved host from the launcher, or an ad-hoc
+    /// host built at the `sshrack sftp` entry) — `open_transfer` consumes it
+    /// directly, no id→host re-lookup.
+    pub(super) pending_transfer_host: Option<Host>,
     /// Set by [`App::route_transfer`] when the screen signals
     /// [`ScreenOutcome::CancelActive`]. The loop reads (and clears) this and
     /// sends `WorkerCmd::Cancel` to the worker. Pure-intent bridge: `on_key`
@@ -185,7 +186,7 @@ impl App {
             transfer: None,
             transfer_worker: None,
             transfer_key_artifact: None,
-            pending_transfer: None,
+            pending_transfer_host: None,
             pending_cancel: false,
             pending_advance: false,
         }
@@ -525,12 +526,13 @@ impl App {
         &mut self.cred_panel
     }
 
-    /// The pending-transfer host id set by `Ctrl-T` on the launcher. The loop
-    /// reads (and clears) this to run `open_transfer`. Exposed for tests that
-    /// drive the open intent directly.
+    /// The id of the pending-transfer host set by `Ctrl-T` on the launcher (or
+    /// the `sshrack sftp` entry). The loop reads (and clears) the field to run
+    /// `open_transfer`. Returns the id — not the `Host` — so existing tests that
+    /// drive the open intent keep reading an id.
     #[cfg(test)]
-    pub fn pending_transfer(&self) -> Option<Ulid> {
-        self.pending_transfer
+    pub fn pending_transfer_id(&self) -> Option<Ulid> {
+        self.pending_transfer_host.as_ref().map(|h| h.id)
     }
 
     /// Take the pending-cancel flag. Returns `true` when the loop should send
@@ -619,7 +621,7 @@ impl App {
             && matches!(self.active_tab, Tab::Hosts)
         {
             if let Some(h) = self.launcher.selected_host(&self.config.hosts) {
-                self.pending_transfer = Some(h.id);
+                self.pending_transfer_host = Some(h.clone());
                 return Outcome::OpenTransfer;
             }
             // No host selected: silent no-op. The launcher already shows an
@@ -2540,7 +2542,7 @@ mod tests {
             matches!(out, Outcome::OpenTransfer),
             "Ctrl-T on Hosts with a host must signal OpenTransfer"
         );
-        assert_eq!(app.pending_transfer(), Some(expected_id));
+        assert_eq!(app.pending_transfer_id(), Some(expected_id));
         assert!(
             !app.should_quit,
             "Ctrl-T must NOT set should_quit (it opens a screen, not a quit)"
@@ -2558,7 +2560,7 @@ mod tests {
             matches!(out, Outcome::Continue),
             "Ctrl-T with no host must be Continue (silent no-op)"
         );
-        assert!(app.pending_transfer().is_none());
+        assert!(app.pending_transfer_id().is_none());
     }
 
     #[test]
@@ -2576,7 +2578,7 @@ mod tests {
             matches!(out, Outcome::Continue),
             "Ctrl-T inside an open transfer screen must NOT re-open"
         );
-        assert!(app.pending_transfer().is_none());
+        assert!(app.pending_transfer_id().is_none());
     }
 
     #[test]
@@ -2592,7 +2594,7 @@ mod tests {
             matches!(out, Outcome::Continue),
             "Ctrl-T off the Hosts tab must NOT signal OpenTransfer"
         );
-        assert!(app.pending_transfer().is_none());
+        assert!(app.pending_transfer_id().is_none());
     }
 
     #[test]
@@ -2606,7 +2608,7 @@ mod tests {
         // The wizard's on_key receives Ctrl-T and (having no binding) returns
         // Continue. Pin that the OpenTransfer path did NOT fire.
         assert!(
-            app.pending_transfer().is_none(),
+            app.pending_transfer_id().is_none(),
             "Ctrl-T inside an overlay must not set pending_transfer"
         );
         // The wizard is still open (we did not close it).

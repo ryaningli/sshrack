@@ -153,12 +153,12 @@ pub fn run(cli: &Cli) -> Result<Option<ConnectRequest>, SshrackError> {
     // sees the error on their normal terminal (and `main` maps it to
     // exit_code::NOT_FOUND, mirroring the CLI connect path).
     let entry_mode = entry_mode_from_cmd(cli.cmd.as_ref());
-    let pending_transfer_id = match &entry_mode {
+    let pending_transfer_host = match &entry_mode {
         EntryMode::Transfer { name } => {
             let host = cfg
                 .find_host_by_name(name)
                 .ok_or_else(|| host::host_not_found(&cfg, name))?;
-            Some(host.id)
+            Some(host.clone())
         }
         _ => None,
     };
@@ -171,8 +171,8 @@ pub fn run(cli: &Cli) -> Result<Option<ConnectRequest>, SshrackError> {
     // run_loop drains this and opens the transfer screen directly, mirroring
     // an `Outcome::OpenTransfer` without polluting `App::on_key` with a
     // phantom outcome.
-    if let Some(id) = pending_transfer_id {
-        app.pending_transfer = Some(id);
+    if let Some(h) = pending_transfer_host {
+        app.pending_transfer_host = Some(h);
     }
     // Entry routing: which view opens first depends on the subcommand that
     // routed us here. `route_is_tui` already guaranteed one of: bare, empty
