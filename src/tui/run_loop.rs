@@ -463,18 +463,17 @@ fn drain_transfer_events(app: &mut App, handle: &TerminalHandle) {
         }
         match side {
             Side::Local => {
-                // Walk the parent on a step-up so the cursor lands on the dir
-                // we just left (matches the file_picker convention).
-                let prev_cwd = app
-                    .transfer
-                    .as_ref()
-                    .map(|s| s.local.cwd.clone())
-                    .unwrap_or_else(|| path.clone());
-                let is_step = prev_cwd.parent() == Some(&path) || prev_cwd != path;
+                // pending_list is always user navigation (StepInto / StepUp /
+                // RequestList), so always clear the per-directory query / marks
+                // / cursor via on_step — even when the target IS the current
+                // cwd (a path-like query that re-resolves here). Without this,
+                // a RequestList to the current dir leaves the path text in
+                // `query` and the next recompute fuzzy-filters every entry out
+                // ("no match"). In-place refreshes (post-transfer) do NOT go
+                // through pending_list, so there is no same-dir case here that
+                // needs to preserve the query.
                 if let Some(screen) = app.transfer.as_mut() {
-                    if is_step {
-                        screen.local.on_step();
-                    }
+                    screen.local.on_step();
                     screen.local.cwd = path.clone();
                 }
                 let listing = LocalDirSource::new().list(&path);
@@ -488,24 +487,14 @@ fn drain_transfer_events(app: &mut App, handle: &TerminalHandle) {
                 }
             }
             Side::Remote => {
-                // Mirror the local branch: clear marks + query + cursor before
-                // the directory change so the per-directory mark scope
-                // (documented in pane.rs) holds symmetrically on both sides.
-                // Without on_step, a stale filter and stale marks survive into
-                // the new remote dir and reappear on navigating back.
-                let prev_cwd = app
-                    .transfer
-                    .as_ref()
-                    .map(|s| s.remote.cwd.clone())
-                    .unwrap_or_else(|| path.clone());
-                let is_step = prev_cwd.parent() == Some(&path) || prev_cwd != path;
+                // Same as local: pending_list is always user navigation, so
+                // on_step runs unconditionally — including a RequestList that
+                // re-resolves to the current cwd (see the local arm for why
+                // same-dir must still clear). Optimistically update cwd so the
+                // next render shows the navigated path while the listing is in
+                // flight; entries refresh when the Listing event lands.
                 if let Some(screen) = app.transfer.as_mut() {
-                    if is_step {
-                        screen.remote.on_step();
-                    }
-                    // Optimistically update cwd so the next render shows the
-                    // path the user navigated into while the listing is in
-                    // flight; the entries refresh when the Listing event lands.
+                    screen.remote.on_step();
                     screen.remote.cwd = path.clone();
                 }
                 if let Some(worker) = app.transfer_worker.as_ref() {
@@ -923,6 +912,85 @@ mod tests {
             screen.remote.cwd,
             PathBuf::from("/remote/start/sub"),
             "remote cwd must advance to the navigated path"
+        );
+    }
+
+    // ===============================================================
+    // RequestList to the CURRENT cwd must still clear the query. Regression
+    // for: type the current directory's path into a pane and press Enter
+    // (a path-like query that re-resolves to the cwd). drain used to skip
+    // on_step when `path == prev_cwd`, leaving the path text in `query`; the
+    // stale query then fuzzy-filtered every entry out ("no match"). Navigation
+    // via pending_list is always a user intent to (re)enter a directory, so
+    // on_step must run unconditionally — in-place refreshes (post-transfer)
+    // do NOT go through pending_list. Pinned on the remote arm: no worker is
+    // set, so worker.send is a no-op and the on_step path is all that runs.
+    // ===============================================================
+    #[test]
+    fn drain_request_list_to_current_cwd_clears_query_no_stale_filter() {
+        let mut app = app_with_host("web");
+        let mut screen =
+            TransferScreen::new(PathBuf::from("/local"), PathBuf::from("/remote/here"));
+        screen.remote.query = "/remote/here".to_string();
+        assert!(!screen.remote.query.is_empty(), "fixture: query seeded");
+        app.transfer = Some(screen);
+        // RequestList to the CURRENT cwd (path == prev_cwd) — the bug case.
+        app.transfer.as_mut().unwrap().pending_list =
+            Some((Side::Remote, PathBuf::from("/remote/here")));
+
+        let rc = Rc::new(RefCell::new(stdout_tui()));
+        let handle: TerminalHandle = Rc::downgrade(&rc);
+        drain_transfer_events(&mut app, &handle);
+
+        let screen = app.transfer.as_ref().expect("transfer screen present");
+        assert!(
+            screen.remote.query.is_empty(),
+            "RequestList to current cwd must still clear the query (no stale filter / no match)"
+        );
+    }
+
+    // ===============================================================
+    // Local-pane end-to-end variant of the RequestList-to-current-cwd
+    // regression: the user-reported scenario (type the current dir's path on
+    // the LOCAL pane, press Enter). Uses a real tempdir so the local arm's
+    // LocalDirSource::list + set_entries runs for real; asserts the listed
+    // file STAYS visible instead of being fuzzy-filtered to "no match".
+    // ===============================================================
+    #[test]
+    fn drain_local_request_list_to_current_cwd_keeps_files_visible() {
+        use std::fs;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file_path = dir.path().join("alpha.txt");
+        fs::write(&file_path, b"").expect("write file");
+
+        let mut app = app_with_host("web");
+        let mut screen = TransferScreen::new(dir.path().to_path_buf(), PathBuf::from("/remote"));
+        screen.local.query = dir.path().to_string_lossy().into_owned();
+        assert!(!screen.local.query.is_empty(), "fixture: query seeded");
+        app.transfer = Some(screen);
+        app.transfer.as_mut().unwrap().pending_list = Some((Side::Local, dir.path().to_path_buf()));
+
+        let rc = Rc::new(RefCell::new(stdout_tui()));
+        let handle: TerminalHandle = Rc::downgrade(&rc);
+        drain_transfer_events(&mut app, &handle);
+
+        let screen = app.transfer.as_ref().expect("transfer screen present");
+        assert!(
+            screen.local.query.is_empty(),
+            "RequestList to current cwd must clear the query"
+        );
+        assert!(
+            screen.local.matched_count() > 0,
+            "entries must stay visible (no 'no match'); got {} matched",
+            screen.local.matched_count()
+        );
+        assert!(
+            screen
+                .local
+                .entries
+                .iter()
+                .any(|e| e.name.as_str() == "alpha.txt"),
+            "alpha.txt must be listed"
         );
     }
 
