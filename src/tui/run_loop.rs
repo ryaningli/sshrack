@@ -39,6 +39,15 @@ use super::transfer::open::open_transfer;
 use super::transfer::overwrite;
 use super::transfer::pane::Side;
 use sshrack_core::connect::sftp::SftpWorker;
+
+/// How long [`event::poll`] blocks for a key before the loop wakes to drain
+/// SFTP worker events and re-render. crossterm's `poll` watches only the
+/// terminal fd, so it is NOT woken by the worker's mpsc events — a remote
+/// listing (or a progress tick) can only be observed after this window
+/// expires or a key arrives. 50 ms bounds the worst-case listing lag at
+/// ~50 ms (snappier than sshelf's 100 ms tick) for negligible CPU: the loop
+/// simply re-polls. Pinned by `tests::event_poll_is_50_ms`.
+const EVENT_POLL: Duration = Duration::from_millis(50);
 use sshrack_core::connect::sftp::proto::{TransferOutcome, WorkerCmd, WorkerEvent};
 
 /// Blocking event loop. Renders `app`, polls crossterm for key events, and
@@ -119,7 +128,7 @@ pub fn run_loop(
             }
         }
 
-        if !event::poll(Duration::from_millis(250)).unwrap_or(false) {
+        if !event::poll(EVENT_POLL).unwrap_or(false) {
             // No key within the poll window, or poll itself failed: re-render
             // and poll again, but still drain worker events first so an async
             // remote listing (or transfer progress) lands without waiting for
@@ -393,7 +402,7 @@ pub fn run_loop(
         }
 
         // Per-tick worker drain — runs AFTER key handling each iteration when a
-        // transfer session is open. The 250 ms poll window above already paces
+        // transfer session is open. The EVENT_POLL window above paces
         // this loop; we drain every pending event each tick so a fast worker
         // (small file, quick listing) does not stall one tick behind reality.
         // Borrows `app` mutably ONLY in this block; the draw borrow at the top
@@ -697,6 +706,18 @@ mod tests {
     use crate::tui::transfer::pane::Side;
     use crate::tui::transfer::screen::TransferScreen;
     use std::path::PathBuf;
+
+    #[test]
+    fn event_poll_is_50_ms() {
+        // Pins the UI poll cadence. crossterm's `event::poll` watches only the
+        // terminal fd and is NOT woken by the SFTP worker's mpsc events, so a
+        // remote listing (or a progress tick) can only be drained AFTER this
+        // window expires (or a key arrives). 50 ms bounds the worst-case remote
+        // listing lag at ~50 ms — snappier than sshelf's 100 ms tick — for
+        // negligible CPU (the loop just re-polls). Bump deliberately only if a
+        // re-measurement justifies it.
+        assert_eq!(EVENT_POLL, Duration::from_millis(50));
+    }
 
     #[test]
     fn popup_borrow_after_narrow_draw_borrow_does_not_panic() {
