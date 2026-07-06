@@ -402,6 +402,78 @@ pub fn summary_line(
     Line::from(spans)
 }
 
+/// Render one task as a single popup row: direction glyph + name (left) and a
+/// state/progress label (right). `selected` bolds the name (the popup applies
+/// its own accent to the whole row via the selected row's style). Pure.
+///
+/// The label collapses each [`TaskState`] to a compact suffix: `queued` /
+/// `folder · indeterminate` (queued folders), `<pct>%` or `transferring…`
+/// (in-flight), `done` / `cancelled` / `failed: <excerpt>` (terminal). The
+/// fill between name and label right-aligns the label against `width`.
+pub fn queue_row(
+    task: &crate::tui::transfer::ledger::Task,
+    width: u16,
+    selected: bool,
+) -> Line<'static> {
+    use crate::tui::transfer::ledger::TaskState;
+    use sshrack_core::connect::sftp::proto::TransferOutcome;
+
+    let glyph = match task.job.direction {
+        sshrack_core::connect::sftp::proto::Direction::Upload => "↑",
+        sshrack_core::connect::sftp::proto::Direction::Download => "↓",
+    };
+    let name_style = if selected {
+        Style::new().add_modifier(Modifier::BOLD)
+    } else {
+        Style::new()
+    };
+    let mut spans = vec![
+        Span::raw(" "),
+        Span::styled(glyph, name_style),
+        Span::raw(" "),
+        Span::styled(task.job.name.clone(), name_style),
+    ];
+
+    // Right-aligned state/progress label.
+    let label = match &task.state {
+        TaskState::Queued => {
+            if matches!(task.kind, crate::tui::transfer::ledger::TaskKind::Folder) {
+                "folder · indeterminate".to_string()
+            } else {
+                "queued".to_string()
+            }
+        }
+        TaskState::InFlight => match &task.progress {
+            Some(p) => match p.bytes_total {
+                Some(total) if total > 0 => {
+                    let pct = u16::try_from(p.bytes_done.saturating_mul(100) / total)
+                        .unwrap_or(100)
+                        .min(100);
+                    format!("{pct}%")
+                }
+                _ => "transferring…".to_string(),
+            },
+            None => "starting…".to_string(),
+        },
+        TaskState::Done(TransferOutcome::Ok) => "done".to_string(),
+        TaskState::Done(TransferOutcome::Cancelled) => "cancelled".to_string(),
+        TaskState::Done(TransferOutcome::Failed(msg)) => {
+            format!("failed: {}", truncate_cells_head(msg, 20))
+        }
+    };
+    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    let fill = (width as usize).saturating_sub(used + label.chars().count() + 1);
+    let label_style = match &task.state {
+        TaskState::Done(TransferOutcome::Failed(_)) => Style::new().fg(crate::tui::theme::DANGER),
+        TaskState::Done(TransferOutcome::Ok) => Style::new().dim(),
+        TaskState::Queued => Style::new().dim(),
+        _ => Style::new(),
+    };
+    spans.push(Span::raw(" ".repeat(fill)));
+    spans.push(Span::styled(label, label_style));
+    Line::from(spans)
+}
+
 // ---- format helpers (pure) ----
 
 /// Format a byte count `ls -lh`-style: plain digits under 1K, then `K` / `M`
@@ -829,5 +901,85 @@ mod summary_tests {
             s.contains("transfer failed: boom"),
             "status message rendered: {s}"
         );
+    }
+}
+
+#[cfg(test)]
+mod queue_row_tests {
+    use super::*;
+    use crate::tui::transfer::ledger::{Task, TaskId, TaskKind, TaskState};
+    use sshrack_core::connect::sftp::proto::{Direction, Progress, TransferJob, TransferOutcome};
+
+    fn task(name: &str, state: TaskState, recursive: bool) -> Task {
+        Task {
+            id: TaskId(0),
+            kind: if recursive {
+                TaskKind::Folder
+            } else {
+                TaskKind::File
+            },
+            job: TransferJob {
+                direction: Direction::Upload,
+                src: format!("/s/{name}").into(),
+                dst: format!("/d/{name}").into(),
+                name: name.into(),
+                size_total: Some(100),
+                recursive,
+            },
+            progress: None,
+            state,
+        }
+    }
+
+    fn text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    #[test]
+    fn queue_row_queued_shows_name_and_queued_label() {
+        let t = task("photo.jpg", TaskState::Queued, false);
+        let s = text(&queue_row(&t, 60, false));
+        assert!(s.contains("photo.jpg"), "{s}");
+        assert!(s.contains("queued"), "{s}");
+    }
+
+    #[test]
+    fn queue_row_failed_shows_error_excerpt() {
+        let t = task(
+            "old.log",
+            TaskState::Done(TransferOutcome::Failed("no such file".into())),
+            false,
+        );
+        let s = text(&queue_row(&t, 60, false));
+        assert!(s.contains("old.log"), "{s}");
+        assert!(s.contains("failed"), "{s}");
+        assert!(s.contains("no such file"), "{s}");
+    }
+
+    #[test]
+    fn queue_row_inflight_shows_progress_percent() {
+        let mut t = task("big.tar", TaskState::InFlight, false);
+        t.progress = Some(Progress {
+            name: "big.tar".into(),
+            direction: Direction::Upload,
+            bytes_done: 40,
+            bytes_total: Some(100),
+            rate_bps: Some(5),
+            eta_secs: Some(12),
+        });
+        let s = text(&queue_row(&t, 60, false));
+        assert!(s.contains("big.tar"), "{s}");
+        assert!(s.contains("40%"), "{s}");
+    }
+
+    #[test]
+    fn queue_row_folder_shows_folder_label_when_indeterminate() {
+        let t = task("src/", TaskState::Queued, true);
+        let s = text(&queue_row(&t, 60, false));
+        assert!(s.contains("folder"), "folder label: {s}");
     }
 }

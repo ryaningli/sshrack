@@ -35,6 +35,7 @@ use crate::tui::intent::Status;
 use crate::tui::theme;
 use crate::tui::transfer::ledger::TransferLedger;
 use crate::tui::transfer::pane::{Pane, PaneOutcome, Side};
+use crate::tui::transfer::queue_overlay::QueueOverlay;
 use crate::tui::transfer::render;
 
 /// Pure intent returned by [`TransferScreen::on_key`]. The screen mutates its
@@ -115,6 +116,9 @@ pub struct TransferScreen {
     /// [`decide`](super::overwrite::decide) calls read this so a single popup
     /// governs a whole queued batch. Pure: setting this performs no I/O.
     pub overwrite_policy: Option<OverwritePolicy>,
+    /// The `^Q` queue-manager modal. `None` when closed. Owned here (not as an
+    /// `App::overlay`) because the transfer screen bypasses the overlay stack.
+    pub queue_overlay: Option<QueueOverlay>,
 }
 
 impl TransferScreen {
@@ -136,6 +140,7 @@ impl TransferScreen {
             remote_title: "remote".to_string(),
             pending_list: None,
             overwrite_policy: None,
+            queue_overlay: None,
         }
     }
 
@@ -187,6 +192,16 @@ impl TransferScreen {
         if key.kind != KeyEventKind::Press {
             return ScreenOutcome::Continue;
         }
+        // The queue-manager overlay is modal: when open it owns every key.
+        // (Take/stash — Task 4 immutable form. Task 5 widens `on_key` to
+        // `&mut ledger` and switches to the panic-free `is_some`/`take` form.)
+        if let Some(mut ov) = self.queue_overlay.take() {
+            let out = ov.on_key(key, &self.ledger);
+            if !ov.closed {
+                self.queue_overlay = Some(ov);
+            }
+            return out;
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             // Tab / Shift-Tab flip focus between the two panes.
@@ -218,6 +233,12 @@ impl TransferScreen {
             }
             // Ctrl-C always closes (matches the rest of the app).
             KeyCode::Char('c') if ctrl => ScreenOutcome::CloseTransfer,
+            // Ctrl-Q toggles the queue-manager overlay. (Bare `q`/`Q` stay
+            // bound to the pane search box per the no-bare-hotkey invariant.)
+            KeyCode::Char('q') if ctrl => {
+                self.queue_overlay.get_or_insert(QueueOverlay::new());
+                ScreenOutcome::Continue
+            }
             // Everything else (arrows, Space, printable chars, Enter without
             // Ctrl, Backspace) delegates to the focused pane.
             _ => self.route_to_focused(key),
@@ -438,6 +459,11 @@ impl TransferScreen {
 
         self.draw_progress_panel(frame, panel_area);
         self.draw_footer(frame, footer_area);
+
+        // The queue-manager overlay paints last so it sits above every band.
+        if let Some(ov) = &self.queue_overlay {
+            ov.draw(frame, &self.ledger);
+        }
     }
 
     /// Title band: `sshrack sftp` accented on the left. The brand word goes

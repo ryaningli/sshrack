@@ -27,5 +27,6 @@ pub mod ledger;
 pub mod open;
 pub mod overwrite;
 pub mod pane;
+pub mod queue_overlay;
 pub mod render;
 pub mod screen;
