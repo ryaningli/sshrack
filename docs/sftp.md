@@ -32,3 +32,29 @@ A failed or cancelled transfer removes the partial destination (download: local 
 - SFTP file-management (delete/mkdir/rename/chmod), resume (`reget`/`reput`), directory cache, global shared ControlMaster (connect/scp reuse), concurrent transfers, recursive-dir upload partial cleanup, upload remote-exists overwrite check.
 
 The CLI scripttable-transfer moat (`sshrack scp`) and non-interactive command execution (`sshrack <name> <cmd>`) remain first-class.
+
+## Queue Manager (`^Q`)
+
+The transfer screen is backed by a `TransferLedger` (in `tui/transfer/ledger.rs`) — the single source of truth for every transfer task (queued + in-flight + recent history) and the queue-level pause flag. Concurrency is 1: at most one task is `InFlight` at a time.
+
+**Status band (main screen, 2 rows).** Row 1 is the active transfer (`path  P%  rate  ETA` over a `Gauge`; a dim "no transfer in flight" placeholder when idle). Row 2 is the summary line: `done X/Y · fail Z` tinted danger-red when `Z > 0`, followed by `· paused` (accent) when the queue is paused, followed by any transient status message (truncated to fit). `done` counts `Done(Ok)` only — failed and cancelled tasks count toward `Y` (and `Z` for failures) but never toward `X`, so the two counters stay disjoint.
+
+**Opening the modal.** `Ctrl-Q` (`^Q`) opens the queue-manager overlay (footer-advertised; bare `q`/`Q` stay in the pane search box per the key-binding invariant). The overlay lists every task with per-task state and progress; `Esc` closes it. The overlay's header mirrors the summary band (`done X/Y · fail Z [· paused]`); completed (`Done(Ok)`) tasks fold into a trailing `> N completed` row.
+
+**Row states.** `InFlight` (the active task), `Queued` (waiting — dispatch is FIFO, head first), `Done(Ok)` (completed, folded), `Done(Failed)` (failed), `Done(Cancelled)` (cancelled). Retry targets `Failed` and `Cancelled` only; `Done(Ok)` and non-`Done` tasks are not retryable.
+
+**Operations.**
+
+| Key | Action |
+|---|---|
+| `⏎` / `r` | retry — re-queue the selected `Failed`/`Cancelled` task in place |
+| `Del` / `d` | remove — drop the selected `Queued`/`Done` task (in-flight falls through to cancel) |
+| `c` | cancel — kill the in-flight task (on a queued/done task it falls through to remove) |
+| `p` | pause — toggle the queue-level pause flag |
+
+**Honest scope notes (MVP).**
+
+- **Pause is queue-level, not per-task.** The current file runs to completion (or failure); only subsequent dispatch is gated. Resuming a paused queue with pending work and nothing in flight re-signals dispatch via the loop's idle gate.
+- **Retry re-transfers from byte 0.** sshrack has no `reget`/`reput` (system `sftp` batch mode is append-unaware here), so retry is a fresh transfer, not a resume. The failure-hygiene cleanup already removed the partial destination, so there is no stub to collide with.
+- **Folders are indeterminate.** A recursive folder transfer (`get -R` / `put -R`) is one ledger task with no per-file progress — the gauge reads the whole dir as a single indeterminate unit. Per-file expansion (splitting a folder task into per-file children with real byte progress) is a future phase.
+

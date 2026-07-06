@@ -513,6 +513,7 @@ impl TransferScreen {
             ("→", "open"),
             ("Space", "mark"),
             ("^S", "transfer"),
+            ("^Q", "queue"),
             ("Esc", "cancel"),
             ("^C", "close"),
         ];
