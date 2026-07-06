@@ -1,15 +1,16 @@
 //! Pane-row rendering helpers + format functions for the dual-pane transfer
 //! screen. Pure render — no I/O. [`draw_pane`] paints one side (cwd row, filter
-//! box, windowed list with marked/cursor glyphs and a right-aligned size+mtime
+//! row, windowed list with marked/cursor glyphs and a right-aligned size+mtime
 //! column); the format helpers (`fmt_size`, `fmt_rate`, `fmt_eta`, `fmt_mtime`)
 //! are the unit-testable pure cores of the progress panel's text.
 //!
 //! Style mirror: [`draw_pane`] follows [`crate::tui::launcher::Launcher`] and
-//! [`crate::tui::cred_panel::CredPanel`] — same `theme::focus_marker` selection,
-//! same `parts::draw_search_box`, same fuzzy-highlight via
-//! `panel::highlighted_spans` — so the transfer screen reads as one more panel
-//! of the app, not a separate surface. The non-focused pane is dimmed overall
-//! by applying [`Style::dim`] to every span it paints.
+//! [`crate::tui::cred_panel::CredPanel`] — same `theme::focus_marker` selection
+//! and fuzzy-highlight via `panel::highlighted_spans` — so the transfer screen
+//! reads as one more panel of the app, not a separate surface. Unlike those
+//! panels, each transfer pane is wrapped in a titled bordered block with its
+//! own borderless 1-row filter prompt (`draw_filter_row`). The non-focused
+//! pane is dimmed overall by applying [`Style::dim`] to every span it paints.
 
 use ratatui::{
     Frame,
