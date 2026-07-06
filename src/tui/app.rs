@@ -790,7 +790,7 @@ impl App {
                 // dispatch the next job immediately; otherwise the loop's
                 // `Done` handler will pick the queue up when the active
                 // transfer finishes.
-                if screen.active.is_none() {
+                if !screen.has_inflight() {
                     self.pending_advance = true;
                 }
                 self.transfer = Some(screen);

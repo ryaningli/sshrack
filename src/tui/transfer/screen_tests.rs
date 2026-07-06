@@ -50,8 +50,17 @@ fn canned_screen() -> TransferScreen {
     ]);
     // Mark one local file.
     screen.local.marked.insert(local_cwd.join("alpha.txt"));
-    // Active upload.
-    screen.active = Some(Progress {
+    // Active upload: enqueue + dispatch (InFlight) + progress snapshot.
+    screen.ledger.enqueue(TransferJob {
+        direction: Direction::Upload,
+        src: local_cwd.join("alpha.txt"),
+        dst: remote_cwd.join("alpha.txt"),
+        name: "alpha.txt".into(),
+        size_total: Some(1024),
+        recursive: false,
+    });
+    screen.ledger.next_to_dispatch();
+    screen.ledger.set_inflight_progress(Progress {
         name: "alpha.txt".into(),
         direction: Direction::Upload,
         bytes_done: 256,
@@ -59,8 +68,8 @@ fn canned_screen() -> TransferScreen {
         rate_bps: Some(128),
         eta_secs: Some(6),
     });
-    // One queued job.
-    screen.queue.push(TransferJob {
+    // One queued download.
+    screen.ledger.enqueue(TransferJob {
         direction: Direction::Download,
         src: remote_cwd.join("server.log"),
         dst: local_cwd.join("server.log"),
@@ -156,7 +165,10 @@ fn draw_shows_no_transfer_in_flight_when_idle() {
     let backend = TestBackend::new(70, 20);
     let mut term = Terminal::new(backend).expect("test backend");
     let mut screen = canned_screen();
-    screen.active = None;
+    // canned_screen() has an in-flight upload + a queued download. Drop both
+    // so the screen is fully idle (no InFlight, no Queued).
+    screen.ledger.abort_inflight();
+    screen.ledger.clear_queued();
     term.draw(|f| screen.draw(f, f.area())).expect("draw");
     let view = buffer_view(term.backend().buffer());
     assert!(
@@ -172,7 +184,19 @@ fn draw_handles_unknown_total_without_gauge_panic() {
     let backend = TestBackend::new(70, 20);
     let mut term = Terminal::new(backend).expect("test backend");
     let mut screen = canned_screen();
-    screen.active = Some(Progress {
+    // Replace the in-flight upload with an unknown-total download: abort the
+    // canned upload, then enqueue + dispatch + progress a stream.bin download.
+    screen.ledger.abort_inflight();
+    screen.ledger.enqueue(TransferJob {
+        direction: Direction::Download,
+        src: PathBuf::from("/srv/remote/stream.bin"),
+        dst: PathBuf::from("/home/local/stream.bin"),
+        name: "stream.bin".into(),
+        size_total: None,
+        recursive: false,
+    });
+    screen.ledger.next_to_dispatch();
+    screen.ledger.set_inflight_progress(Progress {
         name: "stream.bin".into(),
         direction: Direction::Download,
         bytes_done: 4096,
@@ -292,8 +316,8 @@ fn ctrl_enter_with_marked_file_enqueues_upload_job() {
 
     let out = screen.on_key(press(KeyCode::Enter, KeyModifiers::CONTROL));
     assert_eq!(out, ScreenOutcome::Enqueue, "marked file → Enqueue");
-    assert_eq!(screen.queue.len(), 1, "exactly one job queued");
-    let job = &screen.queue[0];
+    assert_eq!(screen.ledger.tasks.len(), 1, "exactly one job queued");
+    let job = &screen.ledger.tasks[0].job;
     assert_eq!(job.direction, Direction::Upload, "focus=Local → Upload");
     assert_eq!(job.src, local_cwd.join("alpha.txt"));
     assert_eq!(
@@ -324,8 +348,8 @@ fn ctrl_enter_with_focus_remote_enqueues_download_job() {
 
     let out = screen.on_key(press(KeyCode::Enter, KeyModifiers::CONTROL));
     assert_eq!(out, ScreenOutcome::Enqueue);
-    assert_eq!(screen.queue.len(), 1);
-    let job = &screen.queue[0];
+    assert_eq!(screen.ledger.tasks.len(), 1);
+    let job = &screen.ledger.tasks[0].job;
     assert_eq!(
         job.direction,
         Direction::Download,
@@ -347,8 +371,8 @@ fn ctrl_enter_with_marked_dir_sets_recursive_true() {
 
     let out = screen.on_key(press(KeyCode::Enter, KeyModifiers::CONTROL));
     assert_eq!(out, ScreenOutcome::Enqueue);
-    assert_eq!(screen.queue.len(), 1);
-    let job = &screen.queue[0];
+    assert_eq!(screen.ledger.tasks.len(), 1);
+    let job = &screen.ledger.tasks[0].job;
     assert!(job.recursive, "dir → recursive=true");
     assert_eq!(job.src, local_cwd.join("docs"));
     assert_eq!(job.dst, remote_cwd.join("docs"));
@@ -372,8 +396,8 @@ fn ctrl_enter_with_no_marks_enqueues_selected_file() {
         ScreenOutcome::Enqueue,
         "selected file fallback → Enqueue"
     );
-    assert_eq!(screen.queue.len(), 1);
-    assert_eq!(screen.queue[0].src, local_cwd.join("alpha.txt"));
+    assert_eq!(screen.ledger.tasks.len(), 1);
+    assert_eq!(screen.ledger.tasks[0].job.src, local_cwd.join("alpha.txt"));
 }
 
 #[test]
@@ -386,7 +410,7 @@ fn ctrl_enter_with_empty_pane_returns_continue_and_queues_nothing() {
         ScreenOutcome::Continue,
         "nothing to enqueue → Continue"
     );
-    assert!(screen.queue.is_empty(), "queue still empty");
+    assert!(screen.ledger.tasks.is_empty(), "queue still empty");
 }
 
 #[test]
@@ -406,18 +430,21 @@ fn ctrl_enter_enqueues_multiple_marked_files_in_entry_order() {
 
     let out = screen.on_key(press(KeyCode::Enter, KeyModifiers::CONTROL));
     assert_eq!(out, ScreenOutcome::Enqueue);
-    assert_eq!(screen.queue.len(), 2, "two marked entries queued");
+    assert_eq!(screen.ledger.tasks.len(), 2, "two marked entries queued");
     assert_eq!(
-        screen.queue[0].src,
+        screen.ledger.tasks[0].job.src,
         local_cwd.join("alpha.txt"),
         "alpha first (entry order)"
     );
     assert_eq!(
-        screen.queue[1].src,
+        screen.ledger.tasks[1].job.src,
         local_cwd.join("docs"),
         "docs second (entry order)"
     );
-    assert!(screen.queue[1].recursive, "docs is a dir → recursive");
+    assert!(
+        screen.ledger.tasks[1].job.recursive,
+        "docs is a dir → recursive"
+    );
 }
 
 // ---- on_key: Ctrl-S transfers (reliable primary) + Enter-on-file ----
@@ -439,8 +466,8 @@ fn ctrl_s_on_file_enqueues_upload_job() {
 
     let out = screen.on_key(press(KeyCode::Char('s'), KeyModifiers::CONTROL));
     assert_eq!(out, ScreenOutcome::Enqueue, "Ctrl-S on a file → Enqueue");
-    assert_eq!(screen.queue.len(), 1);
-    let job = &screen.queue[0];
+    assert_eq!(screen.ledger.tasks.len(), 1);
+    let job = &screen.ledger.tasks[0].job;
     assert_eq!(job.direction, Direction::Upload, "focus=Local → Upload");
     assert_eq!(job.src, local_cwd.join("alpha.txt"));
     assert_eq!(job.dst, remote_cwd.join("alpha.txt"));
@@ -458,7 +485,7 @@ fn ctrl_s_on_dir_enqueues_recursive_job() {
 
     let out = screen.on_key(press(KeyCode::Char('s'), KeyModifiers::CONTROL));
     assert_eq!(out, ScreenOutcome::Enqueue);
-    let job = &screen.queue[0];
+    let job = &screen.ledger.tasks[0].job;
     assert!(job.recursive, "dir via Ctrl-S → recursive=true");
     assert_eq!(job.src, local_cwd.join("docs"));
     assert_eq!(job.name, "docs", "trailing slash stripped from name");
@@ -476,9 +503,12 @@ fn ctrl_s_focus_remote_enqueues_download_job() {
 
     let out = screen.on_key(press(KeyCode::Char('s'), KeyModifiers::CONTROL));
     assert_eq!(out, ScreenOutcome::Enqueue);
-    assert_eq!(screen.queue[0].direction, Direction::Download);
-    assert_eq!(screen.queue[0].src, remote_cwd.join("server.log"));
-    assert_eq!(screen.queue[0].dst, local_cwd.join("server.log"));
+    assert_eq!(screen.ledger.tasks[0].job.direction, Direction::Download);
+    assert_eq!(
+        screen.ledger.tasks[0].job.src,
+        remote_cwd.join("server.log")
+    );
+    assert_eq!(screen.ledger.tasks[0].job.dst, local_cwd.join("server.log"));
 }
 
 #[test]
@@ -496,8 +526,8 @@ fn ctrl_s_with_marks_enqueues_marked_batch() {
 
     let out = screen.on_key(press(KeyCode::Char('s'), KeyModifiers::CONTROL));
     assert_eq!(out, ScreenOutcome::Enqueue);
-    assert_eq!(screen.queue.len(), 1, "only the marked entry queued");
-    assert_eq!(screen.queue[0].src, local_cwd.join("beta.txt"));
+    assert_eq!(screen.ledger.tasks.len(), 1, "only the marked entry queued");
+    assert_eq!(screen.ledger.tasks[0].job.src, local_cwd.join("beta.txt"));
     assert!(
         screen.local.marked.is_empty(),
         "marks cleared after enqueue"
@@ -517,9 +547,9 @@ fn enter_on_file_enqueues_upload_job() {
 
     let out = screen.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(out, ScreenOutcome::Enqueue, "Enter on a file → Enqueue");
-    assert_eq!(screen.queue.len(), 1);
-    assert_eq!(screen.queue[0].src, local_cwd.join("alpha.txt"));
-    assert_eq!(screen.queue[0].direction, Direction::Upload);
+    assert_eq!(screen.ledger.tasks.len(), 1);
+    assert_eq!(screen.ledger.tasks[0].job.src, local_cwd.join("alpha.txt"));
+    assert_eq!(screen.ledger.tasks[0].job.direction, Direction::Upload);
 }
 
 #[test]
@@ -539,7 +569,10 @@ fn enter_on_dir_steps_in_and_does_not_enqueue() {
         ScreenOutcome::Continue,
         "Enter on a dir navigates, does not enqueue"
     );
-    assert!(screen.queue.is_empty(), "no job queued for a dir on Enter");
+    assert!(
+        screen.ledger.tasks.is_empty(),
+        "no job queued for a dir on Enter"
+    );
     assert_eq!(
         screen.pending_list,
         Some((Side::Local, local_cwd.join("docs"))),
@@ -561,7 +594,7 @@ fn plain_s_types_into_filter_and_does_not_enqueue() {
     let out = screen.on_key(press(KeyCode::Char('s'), KeyModifiers::NONE));
     assert_eq!(out, ScreenOutcome::Continue, "bare 's' is not a transfer");
     assert_eq!(screen.local.query, "s", "bare 's' reaches the filter box");
-    assert!(screen.queue.is_empty(), "bare 's' must not enqueue");
+    assert!(screen.ledger.tasks.is_empty(), "bare 's' must not enqueue");
 }
 
 // ---- on_key: Esc / Ctrl-C ----
@@ -569,7 +602,17 @@ fn plain_s_types_into_filter_and_does_not_enqueue() {
 #[test]
 fn esc_with_active_transfer_returns_cancel_active() {
     let mut screen = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
-    screen.active = Some(Progress {
+    // Seed an in-flight transfer: enqueue + dispatch + progress snapshot.
+    screen.ledger.enqueue(TransferJob {
+        direction: Direction::Upload,
+        src: PathBuf::from("/l/x"),
+        dst: PathBuf::from("/r/x"),
+        name: "x".into(),
+        size_total: Some(10),
+        recursive: false,
+    });
+    screen.ledger.next_to_dispatch();
+    screen.ledger.set_inflight_progress(Progress {
         name: "x".into(),
         direction: Direction::Upload,
         bytes_done: 0,
@@ -588,7 +631,7 @@ fn esc_with_active_transfer_returns_cancel_active() {
 #[test]
 fn esc_without_active_transfer_returns_close_transfer() {
     let mut screen = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
-    assert!(screen.active.is_none());
+    assert!(!screen.has_inflight());
     let out = screen.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
     assert_eq!(
         out,
@@ -603,7 +646,16 @@ fn ctrl_c_always_returns_close_transfer() {
     let out = screen.on_key(press(KeyCode::Char('c'), KeyModifiers::CONTROL));
     assert_eq!(out, ScreenOutcome::CloseTransfer);
     // Even with an active transfer, Ctrl-C closes (the user wants out).
-    screen.active = Some(Progress {
+    screen.ledger.enqueue(TransferJob {
+        direction: Direction::Upload,
+        src: PathBuf::from("/l/x"),
+        dst: PathBuf::from("/r/x"),
+        name: "x".into(),
+        size_total: Some(10),
+        recursive: false,
+    });
+    screen.ledger.next_to_dispatch();
+    screen.ledger.set_inflight_progress(Progress {
         name: "x".into(),
         direction: Direction::Upload,
         bytes_done: 0,
@@ -672,12 +724,12 @@ fn pending_list_targets_remote_side_when_remote_focused() {
     );
 }
 
-// ---- next_job / clear_active ----
+// ---- next_job / finish_inflight ----
 
 #[test]
 fn next_job_pops_fifo_and_none_when_empty() {
     let mut screen = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
-    screen.queue.push(TransferJob {
+    screen.ledger.enqueue(TransferJob {
         direction: Direction::Upload,
         src: PathBuf::from("/l/a"),
         dst: PathBuf::from("/r/a"),
@@ -685,7 +737,7 @@ fn next_job_pops_fifo_and_none_when_empty() {
         size_total: None,
         recursive: false,
     });
-    screen.queue.push(TransferJob {
+    screen.ledger.enqueue(TransferJob {
         direction: Direction::Upload,
         src: PathBuf::from("/l/b"),
         dst: PathBuf::from("/r/b"),
@@ -711,9 +763,23 @@ fn next_job_pops_fifo_and_none_when_empty() {
 }
 
 #[test]
-fn clear_active_sets_active_to_none() {
+fn finish_inflight_clears_inflight_task() {
+    // Replaces the old clear_active test: the run-loop now calls
+    // finish_inflight(outcome) on WorkerEvent::Done (the outcome is retained
+    // as history). After it, has_inflight() is false and active_progress() is
+    // None.
+    use sshrack_core::connect::sftp::proto::TransferOutcome;
     let mut screen = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
-    screen.active = Some(Progress {
+    screen.ledger.enqueue(TransferJob {
+        direction: Direction::Upload,
+        src: PathBuf::from("/l/x"),
+        dst: PathBuf::from("/r/x"),
+        name: "x".into(),
+        size_total: Some(10),
+        recursive: false,
+    });
+    screen.ledger.next_to_dispatch();
+    screen.ledger.set_inflight_progress(Progress {
         name: "x".into(),
         direction: Direction::Upload,
         bytes_done: 0,
@@ -721,8 +787,13 @@ fn clear_active_sets_active_to_none() {
         rate_bps: None,
         eta_secs: None,
     });
-    screen.clear_active();
-    assert!(screen.active.is_none(), "clear_active wiped the snapshot");
+    assert!(screen.has_inflight());
+    screen.finish_inflight(TransferOutcome::Ok);
+    assert!(!screen.has_inflight(), "finish_inflight cleared the task");
+    assert!(
+        screen.ledger.active_progress().is_none(),
+        "progress snapshot cleared"
+    );
 }
 
 // ---- on_key: non-Press events are ignored ----
@@ -740,11 +811,12 @@ fn non_press_key_returns_continue_and_does_not_mutate() {
 
 #[test]
 fn next_job_records_direction_for_post_done_refresh() {
-    // next_job stamps the popped job's direction onto last_direction so the
-    // event loop can refresh the destination pane on Done even when no
-    // Progress arrived (a transfer finishing inside the first 200ms poll).
+    // next_job marks the dispatched task InFlight; the ledger derives
+    // last_direction() from the InFlight task so the event loop can refresh
+    // the destination pane on Done even when no Progress arrived (a transfer
+    // finishing inside the first 200ms poll).
     let mut screen = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
-    screen.queue.push(TransferJob {
+    screen.ledger.enqueue(TransferJob {
         direction: Direction::Upload,
         src: PathBuf::from("/l/a"),
         dst: PathBuf::from("/r/a"),
@@ -752,11 +824,11 @@ fn next_job_records_direction_for_post_done_refresh() {
         size_total: Some(1),
         recursive: false,
     });
-    assert!(screen.last_direction.is_none(), "starts None");
+    assert!(screen.last_direction().is_none(), "starts None");
     let job = screen.next_job().expect("pop one job");
     assert_eq!(job.direction, Direction::Upload);
     assert_eq!(
-        screen.last_direction,
+        screen.last_direction(),
         Some(Direction::Upload),
         "next_job records the dispatched direction"
     );
@@ -765,11 +837,28 @@ fn next_job_records_direction_for_post_done_refresh() {
 #[test]
 fn next_job_empty_queue_leaves_last_direction_unchanged() {
     // Popping from an empty queue is a no-op on last_direction (does not
-    // reset a prior value, does not set one).
+    // reset a prior value, does not set one). Seed a prior Download by
+    // finishing a Done task, then call next_job on the now-empty queue.
+    use sshrack_core::connect::sftp::proto::TransferOutcome;
     let mut screen = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
-    screen.last_direction = Some(Direction::Download);
+    screen.ledger.enqueue(TransferJob {
+        direction: Direction::Download,
+        src: PathBuf::from("/r/a"),
+        dst: PathBuf::from("/l/a"),
+        name: "a".into(),
+        size_total: Some(1),
+        recursive: false,
+    });
+    screen.ledger.next_to_dispatch();
+    screen.ledger.finish_inflight(TransferOutcome::Ok);
+    assert_eq!(screen.last_direction(), Some(Direction::Download));
+    // Queue is empty (the only task is Done). next_job returns None.
     assert!(screen.next_job().is_none());
-    assert_eq!(screen.last_direction, Some(Direction::Download));
+    assert_eq!(
+        screen.last_direction(),
+        Some(Direction::Download),
+        "prior direction preserved"
+    );
 }
 
 #[test]

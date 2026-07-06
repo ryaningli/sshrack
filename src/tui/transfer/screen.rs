@@ -2,18 +2,19 @@
 //! pure key routing.
 //!
 //! [`TransferScreen`] owns the two [`Pane`]s (local + remote), the focus side,
-//! the in-flight [`Progress`], the pending [`TransferJob`] queue, and the
-//! consolidated [`Status`] line. [`TransferScreen::draw`] lays the screen out
-//! as four vertical bands — title (1) / panes (Fill) / progress+queue panel
-//! (4) / hotkey footer (1) — and delegates the pane-row painting to
-//! [`super::render`]. [`TransferScreen::on_key`] is the pure key router; the
-//! queue-advance helpers ([`TransferScreen::next_job`] /
-//! [`TransferScreen::clear_active`]) are the seam Task 10's event loop drives.
+//! the [`TransferLedger`] (single source of truth for queued / in-flight /
+//! recently-finished tasks), and the consolidated [`Status`] line.
+//! [`TransferScreen::draw`] lays the screen out as four vertical bands — title
+//! (1) / panes (Fill) / progress+queue panel (4) / hotkey footer (1) — and
+//! delegates the pane-row painting to [`super::render`].
+//! [`TransferScreen::on_key`] is the pure key router; the queue-advance
+//! helpers ([`TransferScreen::next_job`] /
+//! [`TransferScreen::finish_inflight`]) are the seam the event loop drives.
 //!
 //! Architectural red line (shared with [`super::pane`]): `draw`, `on_key`, and
 //! the queue helpers perform no I/O. The screen reads its own state plus the
-//! latest worker snapshots (`active`, `queue`) the loop drained onto it; it
-//! never reads the network or the filesystem. Worker wiring lands in Task 10.
+//! latest worker snapshots the loop drained onto the ledger; it never reads
+//! the network or the filesystem.
 
 use std::path::PathBuf;
 
@@ -26,10 +27,13 @@ use ratatui::{
     widgets::Paragraph,
 };
 
-use sshrack_core::connect::sftp::proto::{Direction, OverwritePolicy, Progress, TransferJob};
+use sshrack_core::connect::sftp::proto::{
+    Direction, OverwritePolicy, Progress, TransferJob, TransferOutcome,
+};
 
 use crate::tui::intent::Status;
 use crate::tui::theme;
+use crate::tui::transfer::ledger::TransferLedger;
 use crate::tui::transfer::pane::{Pane, PaneOutcome, Side};
 use crate::tui::transfer::render;
 
@@ -57,9 +61,9 @@ pub enum ScreenOutcome {
     /// Cancel the in-flight transfer — the loop sends `WorkerCmd::Cancel`.
     /// `Esc` with an active transfer emits this.
     CancelActive,
-    /// One or more jobs were appended to [`TransferScreen::queue`]. The loop
-    /// calls [`TransferScreen::next_job`] to dispatch the first one if no
-    /// transfer is currently active. `Ctrl-Enter` emits this.
+    /// One or more jobs were appended to the ledger. The loop calls
+    /// [`TransferScreen::next_job`] to dispatch the first one if no transfer is
+    /// currently in flight. `Ctrl-Enter` emits this.
     Enqueue,
 }
 
@@ -88,11 +92,11 @@ pub struct TransferScreen {
     pub remote_title: String,
     /// Which pane receives navigation keys. The other pane is rendered dim.
     pub focus: Side,
-    /// The in-flight transfer snapshot, or `None` when nothing is running.
-    pub active: Option<Progress>,
-    /// Pending transfers, in take-order. The progress panel renders the count
-    /// and the next 1–2 job names.
-    pub queue: Vec<TransferJob>,
+    /// The transfer ledger: single source of truth for queued / in-flight /
+    /// recently-finished tasks + the queue-level pause flag. Drives both the
+    /// status-bar counters and the queue-manager popup. Mutated by the run-loop
+    /// from drained `WorkerEvent`s.
+    pub ledger: TransferLedger,
     /// The consolidated status line (rendered at the bottom of the progress
     /// panel). Carries the same transient one-liner feedback the rest of the
     /// app surfaces via [`Status`].
@@ -111,14 +115,6 @@ pub struct TransferScreen {
     /// [`decide`](super::overwrite::decide) calls read this so a single popup
     /// governs a whole queued batch. Pure: setting this performs no I/O.
     pub overwrite_policy: Option<OverwritePolicy>,
-    /// Direction of the most-recently-dispatched job, set by
-    /// [`next_job`](Self::next_job) when it pops one. Read by the Task-10 loop
-    /// on `WorkerEvent::Done` to refresh the destination pane once a batch
-    /// ends. Unlike `active` (only set once the first `Progress` arrives
-    /// ~200ms in), this is populated at dispatch time so a transfer that
-    /// finishes before any `Progress` still remembers its direction. Pure
-    /// mutator: setting it performs no I/O.
-    pub last_direction: Option<Direction>,
 }
 
 impl TransferScreen {
@@ -135,20 +131,21 @@ impl TransferScreen {
             local: Pane::new(local_cwd),
             remote: Pane::new(remote_cwd),
             focus: Side::Local,
-            active: None,
-            queue: Vec::new(),
+            ledger: TransferLedger::new(),
             status: Status::empty(),
             remote_title: "remote".to_string(),
             pending_list: None,
             overwrite_policy: None,
-            last_direction: None,
         }
     }
 
-    /// Replace the in-flight transfer snapshot (or clear it with `None`).
-    /// Pure setter — the loop drives it from drained worker events.
+    /// Update the in-flight task's progress snapshot (from
+    /// `WorkerEvent::Progress`). `None` is a no-op (the `Done` arm calls
+    /// [`finish_inflight`](Self::finish_inflight) to clear it).
     pub fn set_active(&mut self, progress: Option<Progress>) {
-        self.active = progress;
+        if let Some(p) = progress {
+            self.ledger.set_inflight_progress(p);
+        }
     }
 
     /// Replace the consolidated status. Pure setter.
@@ -211,9 +208,9 @@ impl TransferScreen {
             // No clash with the wizards' Ctrl-S = save: those are form overlays,
             // and this Layer-0 screen owns the key while it is open.
             KeyCode::Char('s') if ctrl => self.enqueue_from_focused(),
-            // Esc: cancel an active transfer, otherwise close the screen.
+            // Esc: cancel an in-flight transfer, otherwise close the screen.
             KeyCode::Esc => {
-                if self.active.is_some() {
+                if self.has_inflight() {
                     ScreenOutcome::CancelActive
                 } else {
                     ScreenOutcome::CloseTransfer
@@ -278,13 +275,13 @@ impl TransferScreen {
     }
 
     /// Build transfer jobs for the focused pane's marked entries (or, if none
-    /// are marked, the selected entry) and append them to [`queue`](Self::queue).
-    /// Direction is `Upload` when the local pane is focused, `Download` when
-    /// the remote pane is focused. `recursive` tracks `entry.is_dir`;
-    /// `size_total` tracks `entry.size`. Marks are single-shot: they are
-    /// cleared once their entries have been enqueued. Returns `Enqueue` when
-    /// at least one job was queued, otherwise `Continue` (nothing marked, no
-    /// selected entry).
+    /// are marked, the selected entry) and append them to the ledger as
+    /// `Queued` tasks. Direction is `Upload` when the local pane is focused,
+    /// `Download` when the remote pane is focused. `recursive` tracks
+    /// `entry.is_dir`; `size_total` tracks `entry.size`. Marks are single-shot:
+    /// they are cleared once their entries have been enqueued. Returns
+    /// `Enqueue` when at least one job was queued, otherwise `Continue`
+    /// (nothing marked, no selected entry).
     ///
     /// `dst` joins the OTHER pane's cwd with the source entry's file name —
     /// the natural "drop into the opposite directory" behavior.
@@ -332,7 +329,7 @@ impl TransferScreen {
             // Dir entries carry a trailing `/` in their display name (matches
             // `LocalDirSource::list`); strip it for the job's display name.
             let display_name = name.trim_end_matches('/').to_string();
-            self.queue.push(TransferJob {
+            self.ledger.enqueue(TransferJob {
                 direction,
                 src: path,
                 dst,
@@ -360,28 +357,45 @@ impl TransferScreen {
         }
     }
 
-    /// Pop the next queued job (FIFO). The Task-10 loop calls this when
-    /// `active` becomes `None` to dispatch the next transfer; returns `None`
-    /// when the queue is empty. Pure mutator: no I/O.
-    ///
-    /// Reachability: Task 10's loop drives this off `WorkerEvent::Done`.
+    /// Mark the head queued task in-flight and return its job (cloned) so the
+    /// loop can send `WorkerCmd::Transfer`. Returns `None` when the queue is
+    /// empty or paused. Pure mutator: no I/O.
     pub fn next_job(&mut self) -> Option<TransferJob> {
-        if self.queue.is_empty() {
-            None
-        } else {
-            let job = self.queue.remove(0);
-            self.last_direction = Some(job.direction);
-            Some(job)
-        }
+        let id = self.ledger.next_to_dispatch()?;
+        self.ledger.job_for(id)
     }
 
-    /// Clear the in-flight transfer snapshot (`active = None`). The Task-10
-    /// loop calls this after draining a `WorkerEvent::Done` so the next
-    /// keypress / `next_job` sees no active transfer. Pure mutator.
-    ///
-    /// Reachability: Task 10's loop calls this off `WorkerEvent::Done`.
-    pub fn clear_active(&mut self) {
-        self.active = None;
+    /// Mark the in-flight task `Done(outcome)` and clear its progress snapshot.
+    /// Called from the run-loop's `WorkerEvent::Done` arm (replaces the old
+    /// `clear_active` — the outcome is now retained as history).
+    pub fn finish_inflight(&mut self, outcome: TransferOutcome) {
+        self.ledger.finish_inflight(outcome);
+    }
+
+    /// Drop the in-flight task entirely (dispatch aborted before the job was
+    /// sent — the overwrite-popup Cancel path).
+    pub fn abort_inflight(&mut self) {
+        self.ledger.abort_inflight();
+    }
+
+    /// Drop every queued task (overwrite-popup Cancel clears the batch).
+    pub fn clear_queued(&mut self) {
+        self.ledger.clear_queued();
+    }
+
+    /// Whether a transfer is currently in flight.
+    pub fn has_inflight(&self) -> bool {
+        self.ledger.has_inflight()
+    }
+
+    /// Whether any queued task remains (the post-Done refresh gate).
+    pub fn queue_empty(&self) -> bool {
+        self.ledger.queue_empty()
+    }
+
+    /// Direction of the in-flight task, else the most-recently-finished one.
+    pub fn last_direction(&self) -> Option<Direction> {
+        self.ledger.last_direction()
     }
 
     /// Render the full screen into `area`: title band (1) / panes (Fill) /
@@ -450,15 +464,22 @@ impl TransferScreen {
         ])
         .areas(area);
 
-        render::draw_active_transfer(frame, row1, self.active.as_ref());
+        render::draw_active_transfer(frame, row1, self.ledger.active_progress());
 
-        // Row 2: queue count + first queued name (truncated). Empty queue →
-        // a dim "queue: 0 items" so the row stays stable.
-        let q2 = render::queue_summary_line(self.queue.len(), self.queue.first(), area.width);
+        // Pending jobs in FIFO order, for the unchanged 4-row panel (Task 3
+        // replaces this with the 2-row summary).
+        let pending: Vec<&TransferJob> = self
+            .ledger
+            .tasks
+            .iter()
+            .filter(|t| matches!(t.state, crate::tui::transfer::ledger::TaskState::Queued))
+            .map(|t| &t.job)
+            .collect();
+        let q2 = render::queue_summary_line(pending.len(), pending.first().copied(), area.width);
         frame.render_widget(Paragraph::new(q2), row2);
 
         // Row 3: second queued name when present, otherwise blank.
-        let q3 = render::queue_second_line(self.queue.get(1), area.width);
+        let q3 = render::queue_second_line(pending.get(1).copied(), area.width);
         frame.render_widget(Paragraph::new(q3), row3);
 
         // Row 4: consolidated status (errors / operation feedback); blank when idle.

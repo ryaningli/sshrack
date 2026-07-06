@@ -2,24 +2,17 @@
 //! popup and the status-bar counters. UI-side projection of the worker's
 //! `TransferJob` / `Progress` / `TransferOutcome` stream — no I/O, no worker
 //! dependency. Mutated by the run-loop from drained `WorkerEvent`s.
-//!
-//! Reachability: Task 2 wires `TransferScreen` onto this struct. Until then
-//! every public item is test-only, so each carries a scoped
-//! `#[allow(dead_code)]` naming the Task-2 consumer (the established SFTP
-//! staging convention — no blanket module-level allow).
 
 use sshrack_core::connect::sftp::proto::{Direction, Progress, TransferJob, TransferOutcome};
 
 /// Stable id for a task. The popup selects by display index but operations
 /// resolve through this id so a mutation + re-render can not mis-target a row
 /// that shifted.
-#[allow(dead_code)] // Task 2: TransferScreen wiring
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TaskId(pub usize);
 
 /// Display flavor of a task. `Folder` tasks are indeterminate in the MVP
 /// (Phase 2 expands them to per-file tasks).
-#[allow(dead_code)] // Task 2
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskKind {
     File,
@@ -34,8 +27,6 @@ pub enum TaskKind {
 // Task 1's scope forbids editing `crates/sshrack-core/`, and nothing in the
 // plan (tests or later tasks) compares `TaskState` with `==` — every site uses
 // `matches!`. Dropping both derives is the minimal behavior-preserving fix.
-// Task 2 may revisit by adding `PartialEq, Eq` to `TransferOutcome` in core.
-#[allow(dead_code)] // Task 2
 #[derive(Debug, Clone)]
 pub enum TaskState {
     Queued,
@@ -44,10 +35,13 @@ pub enum TaskState {
 }
 
 /// One tracked transfer. `progress` is `Some` only while `InFlight`.
-#[allow(dead_code)] // Task 2
 #[derive(Debug, Clone)]
 pub struct Task {
     pub id: TaskId,
+    /// Display flavor (File/Folder). Read by Task 4's `render::queue_row` to
+    /// label indeterminate folder tasks; until then only constructed, never
+    /// read in production.
+    #[allow(dead_code)] // Task 4 consumer: render::queue_row
     pub kind: TaskKind,
     pub job: TransferJob,
     pub progress: Option<Progress>,
@@ -56,7 +50,6 @@ pub struct Task {
 
 /// The transfer ledger. Owns every task (queued + in-flight + recent history)
 /// and the queue-level pause flag. Counters are derived, never stored.
-#[allow(dead_code)] // Task 2
 #[derive(Debug, Clone, Default)]
 pub struct TransferLedger {
     /// Insertion-ordered. FIFO dispatch walks this for the head `Queued` task.
@@ -65,7 +58,6 @@ pub struct TransferLedger {
     paused: bool,
 }
 
-#[allow(dead_code)] // Task 2
 impl TransferLedger {
     /// Empty ledger, not paused.
     #[must_use]
@@ -162,6 +154,7 @@ impl TransferLedger {
     /// Re-queue a `Done(Failed|Cancelled)` task in place. Returns `true` if the
     /// task was retryable and is now `Queued`. `Done(Ok)` and non-`Done` tasks
     /// are not retryable.
+    #[allow(dead_code)] // Task 5 consumer: queue_overlay retry/remove arms
     pub fn retry(&mut self, id: TaskId) -> bool {
         let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) else {
             return false;
@@ -181,6 +174,7 @@ impl TransferLedger {
     /// Remove a non-`InFlight` task (Queued or Done). `InFlight` tasks are
     /// removed via [`Self::abort_inflight`] (the worker-cancel path), not here.
     /// Returns `true` if a task was removed.
+    #[allow(dead_code)] // Task 5 consumer: queue_overlay retry/remove arms
     pub fn remove(&mut self, id: TaskId) -> bool {
         if self
             .tasks
@@ -207,12 +201,15 @@ impl TransferLedger {
     }
 
     /// Queue-level pause flag.
+    #[allow(dead_code)] // Task 3 consumer: render::summary_line
     pub fn is_paused(&self) -> bool {
         self.paused
     }
+    #[allow(dead_code)] // Task 5 consumer: queue_overlay pause tests
     pub fn set_paused(&mut self, paused: bool) {
         self.paused = paused;
     }
+    #[allow(dead_code)] // Task 5 consumer: queue_overlay pause toggle
     pub fn toggle_paused(&mut self) {
         self.paused = !self.paused;
     }
@@ -220,11 +217,13 @@ impl TransferLedger {
     // ---- derived counters ----
 
     /// Total tasks tracked (queued + in-flight + history).
+    #[allow(dead_code)] // Task 3 consumer: render::summary_line
     pub fn total(&self) -> usize {
         self.tasks.len()
     }
     /// Successfully completed tasks (`Done(Ok)` — the worker short-circuits
     /// overwrite `Skip` to `Ok`, so this covers skipped files too).
+    #[allow(dead_code)] // Task 3 consumer: render::summary_line
     pub fn done_count(&self) -> usize {
         self.tasks
             .iter()
@@ -232,6 +231,7 @@ impl TransferLedger {
             .count()
     }
     /// Failed tasks (`Done(Failed)`).
+    #[allow(dead_code)] // Task 3 consumer: render::summary_line
     pub fn failed_count(&self) -> usize {
         self.tasks
             .iter()

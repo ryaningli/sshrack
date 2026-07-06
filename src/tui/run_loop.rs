@@ -539,15 +539,15 @@ fn drain_transfer_events(app: &mut App, handle: &TerminalHandle) {
                 }
             }
             WorkerEvent::Done(outcome) => {
+                // Snapshot the just-finished direction BEFORE finish_inflight
+                // flips the task to Done (it is still InFlight here). The
+                // refresh fires only when this Done ends the batch; mid-batch
+                // defers to the final job's Done.
+                let last_direction = app.transfer.as_ref().and_then(|s| s.last_direction());
                 if let Some(screen) = app.transfer.as_mut() {
-                    screen.clear_active();
+                    screen.finish_inflight(outcome.clone());
                 }
-                // Snapshot the batch state BEFORE dispatch_next_job pops the
-                // next job (which would overwrite last_direction and change
-                // queue emptiness). The refresh fires only when this Done
-                // ends the batch; mid-batch Defers to the final job's Done.
-                let last_direction = app.transfer.as_ref().and_then(|s| s.last_direction);
-                let queue_empty = app.transfer.as_ref().is_none_or(|s| s.queue.is_empty());
+                let queue_empty = app.transfer.as_ref().is_none_or(|s| s.queue_empty());
                 if let Some(dir) = decide_post_done_refresh(last_direction, queue_empty, &outcome) {
                     pending_refresh = Some(dir);
                 }
@@ -707,10 +707,14 @@ fn dispatch_next_job(app: &mut App, handle: &TerminalHandle) {
             OverwriteChoice::Cancel => {
                 // Popup Esc (Ctrl-C). Stop the whole batch: clear the queue and
                 // drop the in-hand job so neither this nor any subsequent
-                // enqueued job runs. The user can re-enqueue after navigating
-                // around the conflict.
+                // enqueued job runs. `next_job` already marked a task InFlight;
+                // `abort_inflight` reverts that never-sent task and
+                // `clear_queued` drops the rest — matching the old "whole
+                // batch gone" behavior. The user can re-enqueue after
+                // navigating around the conflict.
                 if let Some(screen) = app.transfer.as_mut() {
-                    screen.queue.clear();
+                    screen.abort_inflight();
+                    screen.clear_queued();
                     screen.set_status(super::intent::Status::info(
                         "transfer batch cancelled".to_string(),
                     ));
