@@ -38,9 +38,8 @@ pub enum TaskState {
 #[derive(Debug, Clone)]
 pub struct Task {
     pub id: TaskId,
-    /// Display flavor (File/Folder). Read by Task 4's `render::queue_row` to
-    /// label indeterminate folder tasks; until then only constructed, never
-    /// read in production.
+    /// Display flavor (File/Folder). Read by `render::queue_row` to label
+    /// indeterminate folder tasks in the queue overlay.
     pub kind: TaskKind,
     pub job: TransferJob,
     pub progress: Option<Progress>,

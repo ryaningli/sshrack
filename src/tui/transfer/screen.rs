@@ -324,7 +324,7 @@ impl TransferScreen {
 
         // Gather (path, name, is_dir, size) for marked entries — or just the
         // selected entry when nothing is marked. Owned tuples so the borrow on
-        // the pane ends before we mutate `self.queue`.
+        // the pane ends before we mutate `self.ledger`.
         let mut specs: Vec<(PathBuf, String, bool, Option<u64>)> = Vec::new();
         {
             let src = self.focused_pane();
