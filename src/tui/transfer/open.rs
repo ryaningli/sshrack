@@ -139,11 +139,25 @@ pub fn open_transfer(
     // `List(home)` so the remote pane populates as soon as the worker drains
     // its command queue.
     let local_cwd = std::env::current_dir()?;
-    let mut screen = TransferScreen::new(local_cwd, home.clone());
+    let mut screen = TransferScreen::new(local_cwd.clone(), home.clone());
     screen.set_status(crate::tui::intent::Status::info(
         "sftp ready — Tab switches pane, ^S transfers (or Enter on a file)",
     ));
     worker.send(sshrack_core::connect::sftp::proto::WorkerCmd::List(home));
+
+    // Seed the local pane now (the local fs is fast and synchronous) so it is
+    // not blank until the first keypress. Mirrors what drain_transfer_events
+    // does on navigation; a failure here is non-fatal — the status row surfaces
+    // it and the pane just stays empty until the user navigates.
+    {
+        use sshrack_core::dirsource::{DirSource, LocalDirSource};
+        match LocalDirSource::new().list(&local_cwd) {
+            Ok(entries) => screen.local_mut().set_entries(entries),
+            Err(msg) => screen.set_status(crate::tui::intent::Status::error(format!(
+                "local list failed: {msg}"
+            ))),
+        }
+    }
 
     app.transfer = Some(screen);
     app.transfer_worker = Some(worker);
