@@ -222,15 +222,11 @@ pub(super) enum EntryMode {
     CredWizard { edit_name: Option<String> },
     /// `sshrack sftp <name>` — open the transfer screen for the named host on
     /// the first `run_loop` tick. The target (saved name or ad-hoc address) is
-    /// resolved to a Host in [`run`] by [`resolve_transfer_target`] before the
-    /// alternate screen, so this variant only signals the tab landing — the
-    /// Host itself lives on `App::pending_transfer_host`. The `name` field is
-    /// retained for the `sftp_maps_to_transfer_entry_mode_on_hosts_tab` test
-    /// assertion and is not read in production code.
-    Transfer {
-        #[allow(dead_code)] // retained for the entry-mode test; Host resolved in run
-        name: String,
-    },
+    /// resolved to a Host in [`run`] by [`resolve_transfer_target`] (reading
+    /// the name from `cli.cmd`) before the alternate screen, so this variant
+    /// only signals the tab landing — the Host itself lives on
+    /// `App::pending_transfer_host`.
+    Transfer,
 }
 
 impl EntryMode {
@@ -241,9 +237,7 @@ impl EntryMode {
     pub(super) fn target_tab(&self) -> tab::Tab {
         use tab::Tab;
         match self {
-            EntryMode::Launcher | EntryMode::HostWizard { .. } | EntryMode::Transfer { .. } => {
-                Tab::Hosts
-            }
+            EntryMode::Launcher | EntryMode::HostWizard { .. } | EntryMode::Transfer => Tab::Hosts,
             EntryMode::CredWizard { .. } => Tab::Credentials,
         }
     }
@@ -312,7 +306,7 @@ fn entry_mode_from_cmd(cmd: Option<&Command>) -> EntryMode {
             },
             _ => EntryMode::Launcher,
         },
-        Command::Sftp { name, .. } => EntryMode::Transfer { name: name.clone() },
+        Command::Sftp { .. } => EntryMode::Transfer,
         _ => EntryMode::Launcher,
     }
 }
@@ -441,8 +435,8 @@ mod tests {
 
     // `sshrack sftp <name>` maps to EntryMode::Transfer, which lands on the
     // Hosts tab. The host name is resolved in `run` (via
-    // `resolve_transfer_target`) before the alternate screen; the variant
-    // carries the name only so this test can assert the mapping.
+    // `resolve_transfer_target`, reading it from `cli.cmd`) before the
+    // alternate screen; the variant no longer carries the name.
 
     #[test]
     fn sftp_maps_to_transfer_entry_mode_on_hosts_tab() {
@@ -451,10 +445,7 @@ mod tests {
             name: "web1".into(),
         };
         let mode = entry_mode_from_cmd(Some(&cmd));
-        assert!(matches!(
-            &mode,
-            EntryMode::Transfer { name } if name == "web1"
-        ));
+        assert!(matches!(mode, EntryMode::Transfer));
         assert_eq!(
             mode.target_tab(),
             Tab::Hosts,

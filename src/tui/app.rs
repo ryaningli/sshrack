@@ -438,7 +438,7 @@ impl App {
             // No-op: the host was already resolved in `tui::run` and stashed
             // on `pending_transfer_host`. The first `run_loop` tick opens the
             // transfer screen from there; this arm just lands the tab.
-            super::EntryMode::Transfer { .. } => {}
+            super::EntryMode::Transfer => {}
         }
     }
 
