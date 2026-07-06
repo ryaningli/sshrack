@@ -111,10 +111,14 @@ pub fn open_transfer(
     // surface that as Interrupted so run_loop returns the user to the launcher
     // (no status write), NOT the HostKeyNotConfirmed "sftp open failed" path.
     let host_str = resolved_host.host.as_str();
-    // Capture the remote pane title before `resolved_auth` is moved into
-    // SftpWorker::open below — the bordered block renders "<user>@<host>" so
-    // the two panes are visually distinct without reading the cwd line.
-    let remote_title = format!("{}@{}", resolved_auth.user, resolved_host.host);
+    // Capture the remote pane title before `resolved_auth` / `resolved_host`
+    // are moved into SftpWorker::open below. Prefer the host's friendly name;
+    // fall back to "<user>@<host>" for an unnamed (e.g. ad-hoc) host.
+    let remote_title = remote_title(
+        &resolved_host.name,
+        &resolved_auth.user,
+        &resolved_host.host,
+    );
     let (confirm, interrupted) = host_key_confirm(handle);
     hostkey::run_host_key_flow(host_str, port, confirm)?;
     if interrupted.get() {
@@ -167,6 +171,17 @@ pub fn open_transfer(
     Ok(())
 }
 
+/// Build the remote pane's title: prefer the host's friendly `name`; fall back
+/// to `<user>@<host>` when the host is unnamed (e.g. an ad-hoc host) so the
+/// bordered block never shows an empty title. Pure.
+fn remote_title(name: &str, user: &str, host: &str) -> String {
+    if name.is_empty() {
+        format!("{user}@{host}")
+    } else {
+        name.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Pure-logic tests for `open_transfer`'s master argv shape. The full open
@@ -192,6 +207,20 @@ mod tests {
             port: 22,
             auth: Auth::inline(CredentialBody::new("u")),
         }
+    }
+
+    #[test]
+    fn remote_title_prefers_the_host_name() {
+        // A saved host is always named — the title is the friendly name, not
+        // the user@ip form.
+        assert_eq!(remote_title("web1", "ryan", "10.0.0.4"), "web1");
+    }
+
+    #[test]
+    fn remote_title_falls_back_to_user_at_host_when_unnamed() {
+        // An ad-hoc / unnamed host falls back to <user>@<host> so the title is
+        // never empty.
+        assert_eq!(remote_title("", "ryan", "10.0.0.4"), "ryan@10.0.0.4");
     }
 
     #[test]
