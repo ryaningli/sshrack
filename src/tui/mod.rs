@@ -16,10 +16,11 @@
 use std::collections::HashMap;
 
 use crate::cli::Cli;
-use crate::cli::args::{Command, CredAction, HostAction};
+use crate::cli::args::{Command, ConnectOptions, CredAction, HostAction};
 use sshrack_core::config::path as config_path;
-use sshrack_core::config::schema::SecretStore;
+use sshrack_core::config::schema::{Host, SecretStore, SshrackConfig};
 use sshrack_core::config::store as config_store;
+use sshrack_core::credential;
 use sshrack_core::error::SshrackError;
 use sshrack_core::frecency;
 use sshrack_core::host;
@@ -147,21 +148,15 @@ pub fn run(cli: &Cli) -> Result<Option<ConnectRequest>, SshrackError> {
         .map(|c| (c.id, c.name.clone()))
         .collect();
 
-    // Resolve entry mode + do any name→id resolution BEFORE entering the
-    // alternate screen. `sshrack sftp <name>` resolves the host name here; an
-    // unknown name returns HostNotFound before the screen flip so the user
-    // sees the error on their normal terminal (and `main` maps it to
-    // exit_code::NOT_FOUND, mirroring the CLI connect path).
+    // Entry routing: which view opens first depends on the subcommand that
+    // routed us here. `entry_mode` only signals the tab landing now — the
+    // transfer target (if any) is resolved below.
     let entry_mode = entry_mode_from_cmd(cli.cmd.as_ref());
-    let pending_transfer_host = match &entry_mode {
-        EntryMode::Transfer { name } => {
-            let host = cfg
-                .find_host_by_name(name)
-                .ok_or_else(|| host::host_not_found(&cfg, name))?;
-            Some(host.clone())
-        }
-        _ => None,
-    };
+    // Resolve the sftp entry target (saved name OR ad-hoc literal) BEFORE the
+    // alternate screen: an unknown name / dangling --credential / ad-hoc-without-
+    // identity errors here, on the normal terminal, mapped to exit NOT_FOUND by
+    // main (mirroring the CLI connect path). Non-sftp commands resolve to None.
+    let pending_transfer_host = resolve_transfer_target(cli.cmd.as_ref(), &cfg, &cli.connect_opts)?;
 
     let app = App::new(cfg, config_path, frecency, credential_names);
 
@@ -226,10 +221,16 @@ pub(super) enum EntryMode {
     /// on the Credentials tab.
     CredWizard { edit_name: Option<String> },
     /// `sshrack sftp <name>` — open the transfer screen for the named host on
-    /// the first `run_loop` tick. The name was already resolved to a Host
-    /// in [`run`] (before the alternate screen); this variant carries the name
-    /// only for documentation — the Host lives on `App::pending_transfer_host`.
-    Transfer { name: String },
+    /// the first `run_loop` tick. The target (saved name or ad-hoc address) is
+    /// resolved to a Host in [`run`] by [`resolve_transfer_target`] before the
+    /// alternate screen, so this variant only signals the tab landing — the
+    /// Host itself lives on `App::pending_transfer_host`. The `name` field is
+    /// retained for the `sftp_maps_to_transfer_entry_mode_on_hosts_tab` test
+    /// assertion and is not read in production code.
+    Transfer {
+        #[allow(dead_code)] // retained for the entry-mode test; Host resolved in run
+        name: String,
+    },
 }
 
 impl EntryMode {
@@ -246,6 +247,45 @@ impl EntryMode {
             EntryMode::CredWizard { .. } => Tab::Credentials,
         }
     }
+}
+
+/// Resolve the `sshrack sftp` entry target into a concrete [`Host`], honoring
+/// the merged `--ad-hoc`/`--credential`/`--user`/`--port`/`--identity` flags
+/// exactly like the ssh/scp connect path — a thin wrapper over
+/// [`host::resolve_target`]. Returns `Ok(None)` when the CLI is not an `sftp`
+/// command.
+///
+/// Pure: no I/O, no terminal. The sftp entry path in [`run`] calls this BEFORE
+/// the alternate screen so an unknown name, a dangling `--credential`, or an
+/// ad-hoc target without an identity errors out on the normal terminal
+/// (mirroring the CLI connect path's fail-fast-before-network rule). The
+/// credential name is resolved to an id here (and only here) for the same
+/// reason — a dangling `-c` errors before any popup or connection.
+fn resolve_transfer_target(
+    cmd: Option<&Command>,
+    cfg: &SshrackConfig,
+    top: &ConnectOptions,
+) -> Result<Option<Host>, SshrackError> {
+    let Some(Command::Sftp { opts, name }) = cmd else {
+        return Ok(None);
+    };
+    let merged = opts.clone().overlay(top);
+    let cred_ulid = match merged.credential.as_deref() {
+        None => None,
+        Some(cname) => Some(
+            cfg.find_credential_by_name(cname)
+                .map(|c| c.id)
+                .ok_or_else(|| credential::credential_not_found(cfg, cname))?,
+        ),
+    };
+    let overrides = host::ResolveOverrides {
+        ad_hoc: merged.ad_hoc,
+        credential: cred_ulid,
+        port: merged.port,
+        user: merged.user.as_deref(),
+        identity: merged.identity.as_deref(),
+    };
+    Ok(Some(host::resolve_target(cfg, name, &overrides)?))
 }
 
 /// Map the parsed CLI command to an [`EntryMode`]. Only the
@@ -285,6 +325,8 @@ mod tests {
     use super::*;
     use crate::cli::args::{Command, CredAction, HostAction};
     use crate::tui::tab::Tab;
+    use sshrack_core::config::schema::{Auth, CredentialBody};
+    use ulid::Ulid;
 
     #[test]
     fn bare_maps_to_launcher() {
@@ -398,9 +440,9 @@ mod tests {
     }
 
     // `sshrack sftp <name>` maps to EntryMode::Transfer, which lands on the
-    // Hosts tab. The host name is resolved to an id in `run` before the
-    // alternate screen (a missing name returns HostNotFound + exit NOT_FOUND);
-    // `entry_mode_from_cmd` only carries the name for documentation.
+    // Hosts tab. The host name is resolved in `run` (via
+    // `resolve_transfer_target`) before the alternate screen; the variant
+    // carries the name only so this test can assert the mapping.
 
     #[test]
     fn sftp_maps_to_transfer_entry_mode_on_hosts_tab() {
@@ -418,6 +460,188 @@ mod tests {
             Tab::Hosts,
             "sftp entry lands on the Hosts tab (transfer opens over it)"
         );
+    }
+
+    // ---- resolve_transfer_target: the `sshrack sftp` entry honors --ad-hoc
+    // and the per-connection overrides exactly like the ssh/scp connect path
+    // (host::resolve_target). Pure; no terminal, no I/O. ----
+
+    fn named_host_cfg() -> SshrackConfig {
+        // One saved host named "web1"; an address like "10.0.0.4" is NOT a name.
+        SshrackConfig {
+            hosts: vec![Host {
+                id: Ulid::new(),
+                name: "web1".into(),
+                host: "10.0.0.5".into(),
+                port: 2222,
+                auth: Auth::inline(CredentialBody::new("u")),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn sftp_cmd(name: &str, opts: ConnectOptions) -> Command {
+        Command::Sftp {
+            opts,
+            name: name.into(),
+        }
+    }
+
+    #[test]
+    fn resolve_transfer_target_none_for_non_sftp() {
+        // A bare `sshrack` (no subcommand) has no sftp target to resolve.
+        let cfg = SshrackConfig::default();
+        assert!(
+            resolve_transfer_target(None, &cfg, &ConnectOptions::default())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resolve_transfer_target_named_host_returns_the_entry() {
+        // `sshrack sftp web1` (no overrides) resolves to the saved host as-is.
+        let cfg = named_host_cfg();
+        let host = resolve_transfer_target(
+            Some(&sftp_cmd("web1", ConnectOptions::default())),
+            &cfg,
+            &ConnectOptions::default(),
+        )
+        .unwrap()
+        .expect("named host resolves");
+        assert_eq!(host.name, "web1");
+        assert_eq!(host.host, "10.0.0.5");
+        assert_eq!(host.port, 2222);
+    }
+
+    #[test]
+    fn resolve_transfer_target_ad_hoc_with_credential_builds_ephemeral_ref() {
+        // `sshrack --ad-hoc -c yushi sftp 192.168.20.18`: address is not a name;
+        // --ad-hoc builds an ephemeral host whose auth references the credential.
+        let cfg = named_host_cfg(); // "192.168.20.18" is not a name here
+        // Inject a saved credential named "yushi" so -c resolves to its id.
+        let mut cfg = cfg;
+        let cred_id = Ulid::new();
+        cfg.credentials
+            .push(sshrack_core::config::schema::Credential {
+                id: cred_id,
+                name: "yushi".into(),
+                body: CredentialBody::new("deploy"),
+            });
+        let top = ConnectOptions {
+            ad_hoc: true,
+            credential: Some("yushi".into()),
+            ..Default::default()
+        };
+        let host =
+            resolve_transfer_target(Some(&sftp_cmd("192.168.20.18", top.clone())), &cfg, &top)
+                .unwrap()
+                .expect("ad-hoc resolves");
+        assert_eq!(host.host, "192.168.20.18");
+        assert_eq!(host.port, 22);
+        assert_eq!(host.auth.credential_id(), Some(cred_id));
+    }
+
+    #[test]
+    fn resolve_transfer_target_ad_hoc_with_user_builds_inline_body() {
+        // `sshrack --ad-hoc --user ryan -p 2222 sftp host.example`: ad-hoc inline
+        // user (+ optional port) builds an ephemeral inline-auth host.
+        let cfg = SshrackConfig::default();
+        let opts = ConnectOptions {
+            ad_hoc: true,
+            user: Some("ryan".into()),
+            port: Some(2222),
+            ..Default::default()
+        };
+        let host =
+            resolve_transfer_target(Some(&sftp_cmd("host.example", opts.clone())), &cfg, &opts)
+                .unwrap()
+                .expect("ad-hoc resolves");
+        assert_eq!(host.host, "host.example");
+        assert_eq!(host.port, 2222);
+        let body = host.auth.inline_body().expect("inline auth");
+        assert_eq!(body.user, "ryan");
+    }
+
+    #[test]
+    fn resolve_transfer_target_ad_hoc_without_identity_errors() {
+        // `--ad-hoc` with neither --credential nor --user cannot log in; fail
+        // fast (MissingRequiredField) before the alternate screen.
+        let cfg = SshrackConfig::default();
+        let opts = ConnectOptions {
+            ad_hoc: true,
+            ..Default::default()
+        };
+        let err = resolve_transfer_target(
+            Some(&sftp_cmd("10.0.0.4", opts)),
+            &cfg,
+            &ConnectOptions::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            sshrack_core::error::SshrackError::MissingRequiredField { .. }
+        ));
+    }
+
+    #[test]
+    fn resolve_transfer_target_dangling_credential_errors() {
+        // `-c nope` naming an unknown credential must fail fast (credential not
+        // found), NOT fall through to ad-hoc / host-not-found.
+        let cfg = SshrackConfig::default();
+        let opts = ConnectOptions {
+            credential: Some("nope".into()),
+            ..Default::default()
+        };
+        let err = resolve_transfer_target(
+            Some(&sftp_cmd("web1", opts)),
+            &cfg,
+            &ConnectOptions::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            sshrack_core::error::SshrackError::CredentialNotFound { .. }
+        ));
+    }
+
+    #[test]
+    fn resolve_transfer_target_named_miss_without_ad_hoc_is_host_not_found() {
+        // `sshrack sftp ghost` (no --ad-hoc): unknown name → HostNotFound (the
+        // existing pre-Task-2 behavior preserved).
+        let cfg = named_host_cfg();
+        let err = resolve_transfer_target(
+            Some(&sftp_cmd("ghost", ConnectOptions::default())),
+            &cfg,
+            &ConnectOptions::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            sshrack_core::error::SshrackError::HostNotFound { ref name, .. } if name == "ghost"
+        ));
+    }
+
+    #[test]
+    fn resolve_transfer_target_overlays_top_level_opts() {
+        // Top-level flags (`sshrack --ad-hoc ...`) merge with subcommand flags —
+        // either level opting into --ad-hoc is enough. Mirrors ConnectOptions::overlay.
+        let cfg = SshrackConfig::default();
+        let top = ConnectOptions {
+            ad_hoc: true,
+            user: Some("ryan".into()),
+            ..Default::default()
+        };
+        // Subcommand opts empty; top-level carries --ad-hoc + --user.
+        let host = resolve_transfer_target(
+            Some(&sftp_cmd("host.example", ConnectOptions::default())),
+            &cfg,
+            &top,
+        )
+        .unwrap()
+        .expect("top-level --ad-hoc applies");
+        assert_eq!(host.host, "host.example");
+        assert_eq!(host.auth.inline_body().unwrap().user, "ryan");
     }
 
     #[test]
