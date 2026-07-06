@@ -91,8 +91,8 @@ pub fn run_loop(
     data_dir: Option<&std::path::Path>,
 ) -> Option<ConnectRequest> {
     // First-tick guard: `sshrack sftp <name>` (and any future entry route that
-    // pre-resolves a host id in `tui::run`) stashes the id on
-    // `app.pending_transfer`. Drain it on the FIRST iteration, BEFORE the
+    // pre-resolves a host in `tui::run`) stashes the host on
+    // `app.pending_transfer_host`. Drain it on the FIRST iteration, BEFORE the
     // initial draw, so the user lands in the transfer screen directly rather
     // than seeing the launcher flash for one frame. This mirrors the
     // `Outcome::OpenTransfer` arm below without polluting `App::on_key` with a

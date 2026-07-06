@@ -39,7 +39,7 @@ use crate::tui::app::App;
 use crate::tui::prompt::{TuiPassphrase, host_key_confirm};
 use crate::tui::transfer::screen::TransferScreen;
 
-/// Run all pre-open side effects for an sftp session on `host_id` and seed a
+/// Run all pre-open side effects for an sftp session on `host` and seed a
 /// fresh [`TransferScreen`] on [`App::transfer`] with the [`SftpWorker`] on
 /// [`App::transfer_worker`]. Mirrors [`connect_host`]'s steps 1–4
 /// (auth/hostkey), then opens the worker and seeds the remote pane.

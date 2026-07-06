@@ -127,14 +127,14 @@ pub enum Outcome {
     /// loop clears `App::overlay` and surfaces a default status.
     CloseOverlay,
     /// Pure intent: the user pressed `Ctrl-T` on the Hosts tab with a host
-    /// selected. `on_key` set `App::pending_transfer` to the host's id. The
-    /// event loop reads the id, runs [`crate::tui::transfer::open::open_transfer`]
+    /// selected. `on_key` set `App::pending_transfer_host` to the selected host. The
+    /// event loop reads the Host, runs [`crate::tui::transfer::open::open_transfer`]
     /// (which mirrors `connect_host`'s auth/hostkey steps then opens the
     /// `SftpWorker`), and assigns `App::transfer` + `App::transfer_worker`. A
     /// cancel inside a vault/host-key popup surfaces as
     /// [`SshrackError::Interrupted`] → return to the launcher (no status write).
     ///
-    /// This variant carries no data because the host id lives on `App` (single
+    /// This variant carries no data because the Host lives on `App` (single
     /// source of truth, clearable on cancel), mirroring
     /// [`Outcome::ConnectRequested`].
     ///

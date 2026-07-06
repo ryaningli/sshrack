@@ -181,7 +181,7 @@ pub fn run(cli: &Cli) -> Result<Option<ConnectRequest>, SshrackError> {
     // launcher opens, the user has to press ^a/^e/c, and `sshrack cred add`
     // would surprise them by landing on the host list). For `Transfer` the
     // tab landing is applied here; the actual screen open happens via
-    // `pending_transfer` in run_loop.
+    // `pending_transfer_host` in run_loop.
     app.apply_entry_mode(entry_mode);
     // A weak handle the prompt layer (vault popup, host-key popup) upgrades to
     // borrow the terminal for rendering. Cloned from the guard so it goes dead
@@ -213,7 +213,7 @@ pub fn run(cli: &Cli) -> Result<Option<ConnectRequest>, SshrackError> {
 /// - `cred add` (empty) → Credentials tab + cred add wizard; `cred edit <name>`
 ///   (empty) → Credentials tab + cred edit wizard.
 /// - `sftp <name>` → Hosts tab; the transfer screen opens on the first
-///   `run_loop` tick via `App::pending_transfer` (resolved to a host id in
+///   `run_loop` tick via `App::pending_transfer_host` (resolved to a Host in
 ///   [`run`] before the alternate screen, so an unknown name errors out on the
 ///   normal terminal with `exit_code::NOT_FOUND`).
 pub(super) enum EntryMode {
@@ -226,9 +226,9 @@ pub(super) enum EntryMode {
     /// on the Credentials tab.
     CredWizard { edit_name: Option<String> },
     /// `sshrack sftp <name>` — open the transfer screen for the named host on
-    /// the first `run_loop` tick. The name was already resolved to a host id
+    /// the first `run_loop` tick. The name was already resolved to a Host
     /// in [`run`] (before the alternate screen); this variant carries the name
-    /// only for documentation — the id lives on `App::pending_transfer`.
+    /// only for documentation — the Host lives on `App::pending_transfer_host`.
     Transfer { name: String },
 }
 

@@ -435,8 +435,8 @@ impl App {
                     self.select_cred_by_name(&name);
                 }
             }
-            // No-op: the host id was already resolved in `tui::run` and stashed
-            // on `pending_transfer`. The first `run_loop` tick opens the
+            // No-op: the host was already resolved in `tui::run` and stashed
+            // on `pending_transfer_host`. The first `run_loop` tick opens the
             // transfer screen from there; this arm just lands the tab.
             super::EntryMode::Transfer { .. } => {}
         }
@@ -2533,7 +2533,7 @@ mod tests {
     #[test]
     fn ctrl_t_on_hosts_with_host_signals_open_transfer() {
         // Ctrl-T on the Hosts tab with a host under the cursor sets
-        // pending_transfer to that host's id and returns OpenTransfer. on_key
+        // pending_transfer_host to that host and returns OpenTransfer. on_key
         // performs NO I/O — the loop runs open_transfer.
         let mut app = app_with_host("web");
         let expected_id = app.config.hosts[0].id;
@@ -2552,7 +2552,7 @@ mod tests {
     #[test]
     fn ctrl_t_no_op_when_no_host_selected() {
         // Ctrl-T with no host under the cursor (empty host list) is a silent
-        // no-op: no OpenTransfer, no pending_transfer set.
+        // no-op: no OpenTransfer, no pending_transfer_host set.
         let cfg = SshrackConfig::default();
         let mut app = App::new(cfg, None, Frecency::default(), HashMap::new());
         let out = app.on_key(press(KeyCode::Char('t'), KeyModifiers::CONTROL));
@@ -2609,7 +2609,7 @@ mod tests {
         // Continue. Pin that the OpenTransfer path did NOT fire.
         assert!(
             app.pending_transfer_id().is_none(),
-            "Ctrl-T inside an overlay must not set pending_transfer"
+            "Ctrl-T inside an overlay must not set pending_transfer_host"
         );
         // The wizard is still open (we did not close it).
         assert!(
