@@ -29,6 +29,7 @@ use crate::tui::panel;
 use crate::tui::parts;
 use crate::tui::theme;
 use crate::tui::transfer::pane::Pane;
+use crate::tui::transfer::queue_overlay::QueueView;
 
 /// Cap on the name column. Names longer than this overflow gracefully into the
 /// gap rather than squeezing the meta column off the row. Mirrors the launcher
@@ -480,6 +481,36 @@ pub fn queue_row(
         Span::raw(" ".repeat(fill)),
         Span::styled(label, label_style),
     ])
+}
+
+/// The view-switcher tab strip: `Active (n)   Failed (n)   Completed (n)`,
+/// separated by a 3-space gutter. The current view is rendered accented +
+/// underlined; the others dimmed. `tabs` carries per-view counts (computed by
+/// the caller via `task_indices_for`), so this function stays free of ledger
+/// internals. Pure: returns a [`Line`] for the overlay's tab row.
+pub fn queue_tab_bar(
+    current: QueueView,
+    tabs: &[(QueueView, usize); 3],
+    _width: u16,
+) -> Line<'static> {
+    let mut spans: Vec<Span> = Vec::new();
+    for (i, (view, count)) in tabs.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("   "));
+        }
+        let label = match view {
+            QueueView::Active => "Active",
+            QueueView::Failed => "Failed",
+            QueueView::Completed => "Completed",
+        };
+        let style = if *view == current {
+            crate::tui::theme::accent().add_modifier(Modifier::UNDERLINED)
+        } else {
+            Style::new().dim()
+        };
+        spans.push(Span::styled(format!("{label} ({count})"), style));
+    }
+    Line::from(spans)
 }
 
 // ---- format helpers (pure) ----
@@ -1009,5 +1040,66 @@ mod queue_row_tests {
         let s = text(&queue_row(&t, 60, false));
         assert!(s.contains("photo.jpg"), "{s}");
         assert!(!s.contains('…'), "no truncation when the name fits: {s}");
+    }
+}
+
+#[cfg(test)]
+mod queue_tab_bar_tests {
+    use super::*;
+    use crate::tui::transfer::queue_overlay::QueueView;
+
+    fn line_to_string(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    #[test]
+    fn tab_bar_lists_all_three_views_with_counts() {
+        let tabs = [
+            (QueueView::Active, 2),
+            (QueueView::Failed, 1),
+            (QueueView::Completed, 5),
+        ];
+        let line = queue_tab_bar(QueueView::Active, &tabs, 80);
+        let s = line_to_string(&line);
+        assert!(s.contains("Active (2)"), "{s}");
+        assert!(s.contains("Failed (1)"), "{s}");
+        assert!(s.contains("Completed (5)"), "{s}");
+    }
+
+    #[test]
+    fn tab_bar_underlines_only_the_current_view() {
+        let tabs = [
+            (QueueView::Active, 0),
+            (QueueView::Failed, 0),
+            (QueueView::Completed, 0),
+        ];
+        let line = queue_tab_bar(QueueView::Failed, &tabs, 80);
+        // The span for "Failed (0)" is the only one flagged UNDERLINED.
+        let labeled: Vec<(&str, bool)> = line
+            .spans
+            .iter()
+            .map(|s| {
+                (
+                    s.content.as_ref(),
+                    s.style
+                        .add_modifier
+                        .contains(ratatui::style::Modifier::UNDERLINED),
+                )
+            })
+            .collect();
+        let current = labeled
+            .iter()
+            .find(|(t, _)| t.contains("Failed"))
+            .map(|(_, u)| *u);
+        assert_eq!(current, Some(true), "current view underlined");
+        let others_underlined = labeled
+            .iter()
+            .filter(|(t, u)| (t.contains("Active") || t.contains("Completed")) && *u)
+            .count();
+        assert_eq!(others_underlined, 0, "non-current views not underlined");
     }
 }

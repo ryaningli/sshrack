@@ -1157,3 +1157,22 @@ fn shift_tab_cycles_back_to_completed_view() {
         "Shift-Tab from Active lands on Completed: {view}"
     );
 }
+
+#[test]
+fn empty_view_shows_the_no_tasks_placeholder() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let local_cwd = PathBuf::from("/x");
+    let mut screen = TransferScreen::new(local_cwd.clone(), PathBuf::from("/y"));
+    // No tasks at all — every view is empty.
+    let _ = screen.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)); // open (Active)
+    let _ = screen.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty())); // -> Failed (empty)
+    let backend = TestBackend::new(80, 24);
+    let mut term = Terminal::new(backend).expect("test backend");
+    let res = term.draw(|f| screen.draw(f, f.area()));
+    assert!(res.is_ok());
+    let view = buffer_view(term.backend().buffer());
+    assert!(
+        view.contains("no tasks"),
+        "empty view shows placeholder: {view}"
+    );
+}

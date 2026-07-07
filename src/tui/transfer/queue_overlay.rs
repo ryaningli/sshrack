@@ -14,7 +14,8 @@
 //! inner popups.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
-use ratatui::{Frame, layout::Rect, widgets::Paragraph};
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::{Frame, widgets::Paragraph};
 
 use crate::tui::dialog;
 use crate::tui::theme;
@@ -55,6 +56,12 @@ impl QueueView {
             Self::Failed => Self::Active,
             Self::Completed => Self::Failed,
         }
+    }
+
+    /// All views in `Tab` order. Used to render the tab strip and to compute
+    /// per-view counts.
+    fn all() -> [Self; 3] {
+        [Self::Active, Self::Failed, Self::Completed]
     }
 }
 
@@ -245,23 +252,18 @@ impl QueueOverlay {
         }
     }
 
-    /// Render the overlay as a centered dialog. The current view's rows are
-    /// windowed around the cursor so it stays visible on long queues.
-    ///
-    /// (Task 3 adds the tab strip + empty-state placeholder here; for now the
-    /// active view name is shown in the header so the state is observable.)
+    /// Render the overlay: a tab strip across the top (per-view counts, the
+    /// current view accented + underlined), then the current view's task rows
+    /// windowed around the cursor. An empty view shows a `no tasks` row.
     pub fn draw(&self, frame: &mut Frame, ledger: &TransferLedger) {
         let sel = task_indices_for(ledger, self.view);
-        let max_body = usize::from(dialog::MAX_H).saturating_sub(4);
-        let body_rows = sel.len().max(1).min(max_body) as u16;
+        // body = tab strip (1) + list (rest). Cap so the dialog fits MAX_H.
+        let max_list = usize::from(dialog::MAX_H).saturating_sub(5); // border(2)+blank(1)+footer(1)+tab(1)
+        let list_rows = sel.len().min(max_list).max(1);
+        let body_rows = (1 + list_rows) as u16;
 
-        let view_name = match self.view {
-            QueueView::Active => "active",
-            QueueView::Failed => "failed",
-            QueueView::Completed => "completed",
-        };
         let header = format!(
-            "transfer queue  ·  {view_name}{}",
+            "transfer queue{}",
             if ledger.is_paused() { " · paused" } else { "" }
         );
         let body = dialog::draw_dialog(
@@ -269,6 +271,7 @@ impl QueueOverlay {
             &header,
             body_rows,
             &[
+                ("Tab", "view"),
                 ("↑↓", "select"),
                 ("⏎", "retry"),
                 ("Del", "remove"),
@@ -278,21 +281,41 @@ impl QueueOverlay {
             ],
         );
 
+        let [tab_area, list_area] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(body);
+
+        // Tab strip with per-view counts.
+        let tabs = QueueView::all().map(|v| (v, task_indices_for(ledger, v).len()));
+        let tab_line = render::queue_tab_bar(self.view, &tabs, tab_area.width);
+        frame.render_widget(Paragraph::new(tab_line), tab_area);
+
+        // List body (or empty placeholder).
         let total = sel.len();
-        let cursor = self.current_cursor().min(total.saturating_sub(1));
-        let max_rows = body.height as usize;
-        let half = max_rows.div_ceil(2).saturating_sub(1);
-        let start = cursor.saturating_sub(half).min(total.saturating_sub(1));
-        for (y, (i, ti)) in (body.y..).zip(sel.iter().enumerate().skip(start).take(max_rows)) {
-            let is_sel = i == cursor;
-            let line = render::queue_row(&ledger.tasks[*ti], body.width, is_sel);
+        if total == 0 {
+            frame.render_widget(
+                Paragraph::new("  no tasks").style(ratatui::style::Style::new().dim()),
+                list_area,
+            );
+            return;
+        }
+        let cursor = self.current_cursor().min(total - 1);
+        let win = crate::tui::fit::focus_window(total, cursor, list_area.height as usize);
+        let mut y = list_area.y;
+        for display_i in win {
+            let ti = sel[display_i];
+            let is_sel = display_i == cursor;
+            let line = render::queue_row(&ledger.tasks[ti], list_area.width, is_sel);
             let style = if is_sel {
                 theme::accent()
             } else {
                 ratatui::style::Style::new()
             };
-            let area = Rect::new(body.x, y, body.width, 1);
+            let area = Rect::new(list_area.x, y, list_area.width, 1);
             frame.render_widget(Paragraph::new(line).style(style), area);
+            y += 1;
+            if y - list_area.y >= list_area.height {
+                break;
+            }
         }
     }
 }
