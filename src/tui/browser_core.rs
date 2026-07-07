@@ -9,10 +9,10 @@
 //!
 //! The two consumers' real differences are honored, not papered over:
 //! - `FilePicker` owns its `DirSource` and lists synchronously; it switches
-//!   atomically via [`BrowserCore::commit_switch`] (Task 2).
+//!   atomically via [`BrowserCore::commit_switch`].
 //! - `Pane` is a passive state machine fed by the transfer screen/worker; it
 //!   switches in two phases around an async listing via
-//!   [`BrowserCore::begin_switch`] + [`BrowserCore::finish_switch`] (Task 2).
+//!   [`BrowserCore::begin_switch`] + [`BrowserCore::finish_switch`].
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -51,9 +51,9 @@ pub(crate) enum NavDecision {
 /// no accessor boilerplate. The module itself is `pub(crate)`, so external
 /// crates cannot see any of this.
 ///
-/// Reachability: both consumers (`Pane` since Task 3, `FilePicker` since
-/// Task 4) hold a `BrowserCore` and reach every method, so
-/// `cargo clippy --all-targets` finds no dead code.
+/// Reachability: both consumers (`Pane` and `FilePicker`) hold a
+/// `BrowserCore` and reach every method, so `cargo clippy --all-targets`
+/// finds no dead code.
 #[derive(Debug, Clone)]
 pub(crate) struct BrowserCore {
     /// Absolute current directory.
@@ -81,7 +81,7 @@ pub(crate) struct BrowserCore {
 
 impl BrowserCore {
     /// New core at `initial_cwd` with an empty listing. The component feeds
-    /// the first listing via `commit_switch` / `finish_switch` (Task 2).
+    /// the first listing via `commit_switch` (sync) or `finish_switch` (async).
     #[must_use]
     pub(crate) fn new(initial_cwd: PathBuf) -> Self {
         Self {
