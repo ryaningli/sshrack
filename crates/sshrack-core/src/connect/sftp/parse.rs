@@ -15,6 +15,7 @@ use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::dirsource::{DirEntry, build_entries};
+use crate::pathutil::normalize_lexical;
 
 /// Raw `(name, path, is_dir, is_symlink, size, modified)` tuple that
 /// [`build_entries`] consumes. Matches the Task-1 column contract.
@@ -113,9 +114,14 @@ pub fn parse_ls_line(line: &str, now: SystemTime) -> Option<RawLsEntry> {
     })
 }
 
-/// Parse a full `ls -l` listing into entries, skipping `.`, `..`, and
-/// unparseable lines. `now` is threaded into [`parse_ls_line`] for year
+/// Parse a full `ls -l` listing into entries, skipping literal `.`/`..` rows
+/// and unparseable lines. `now` is threaded into [`parse_ls_line`] for year
 /// inference. Pure.
+///
+/// Note: sftp `ls -la` also emits `.`/`..` as ABSOLUTE-path names (`<cwd>` /
+/// `<cwd>/..`); this filter only sees the raw name and catches the literal
+/// forms — the absolute-path self-refs are dropped later in [`to_dir_entries`]
+/// by normalized path identity.
 pub fn parse_ls_listing(output: &str, now: SystemTime) -> Vec<RawLsEntry> {
     output
         .lines()
@@ -134,6 +140,12 @@ pub fn parse_ls_listing(output: &str, now: SystemTime) -> Vec<RawLsEntry> {
 /// keep the absolute path for navigation. A relative name still joins under
 /// `cwd` (servers that list relatively, or future sources).
 pub fn to_dir_entries(rows: Vec<RawLsEntry>, cwd: &Path) -> Vec<DirEntry> {
+    // `ls -la` self-reference rows: OpenSSH sftp emits `.`/`..` with absolute-
+    // path names (`<cwd>` and `<cwd>/..`), which the literal `.`/`..` filter in
+    // `parse_ls_listing` misses. Drop any entry whose normalized path is the
+    // cwd itself (the `.` row) or its parent (the `..` row).
+    let cwd_norm = normalize_lexical(cwd);
+    let parent_norm = cwd.parent().map(normalize_lexical);
     let items: Vec<RawEntry> = rows
         .into_iter()
         .map(|r| {
@@ -149,6 +161,10 @@ pub fn to_dir_entries(rows: Vec<RawLsEntry>, cwd: &Path) -> Vec<DirEntry> {
                 (clean.clone(), cwd.join(&clean))
             };
             (display, path, r.is_dir, r.is_symlink, r.size, r.modified)
+        })
+        .filter(|(_, path, _, _, _, _)| {
+            let p = normalize_lexical(path);
+            p != cwd_norm && Some(p) != parent_norm
         })
         .collect();
     build_entries(items)

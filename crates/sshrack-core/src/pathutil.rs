@@ -4,7 +4,7 @@
 //! filesystem — `home` is always a parameter — so the whole module is unit-
 //! testable with no tempdir.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// What the filter-box input means. A string with a `~` prefix OR containing a
 /// `/` anywhere is treated as a path the user typed/pasted; anything else is a
@@ -50,6 +50,33 @@ pub fn expand_tilde(input: &str, home: &Path) -> PathBuf {
         return home.join(rest);
     }
     PathBuf::from(input)
+}
+
+/// Lexically normalize `path`: resolve `.` and `..` components without
+/// touching the filesystem (no symlink resolution). `.` is dropped; `..`
+/// pops the preceding normal component, or is dropped at/under a root/prefix
+/// (so `/..` stays `/`). Pure — used to identify sftp `ls -la` self-reference
+/// rows (`.` as `<cwd>`, `..` as `<cwd>/..`) by comparing to `cwd`/its parent.
+pub fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut out: Vec<Component<'_>> = Vec::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => match out.last() {
+                Some(Component::Normal(_)) => {
+                    let _ = out.pop();
+                }
+                Some(Component::RootDir) | Some(Component::Prefix(_)) => {}
+                _ => out.push(c),
+            },
+            other => out.push(other),
+        }
+    }
+    let mut ret = PathBuf::new();
+    for c in &out {
+        ret.push(c.as_os_str());
+    }
+    ret
 }
 
 /// Ordered start-directory candidates (literals — `~` is NOT expanded here; the
@@ -98,6 +125,37 @@ pub enum ResolvedPath {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    // ---- normalize_lexical ----
+
+    #[test]
+    fn normalize_resolves_parent_dir() {
+        assert_eq!(normalize_lexical(Path::new("/tmp/a/..")), Path::new("/tmp"));
+    }
+
+    #[test]
+    fn normalize_drops_cur_dir() {
+        assert_eq!(
+            normalize_lexical(Path::new("/tmp/a/.")),
+            Path::new("/tmp/a")
+        );
+    }
+
+    #[test]
+    fn normalize_keeps_already_clean() {
+        assert_eq!(normalize_lexical(Path::new("/tmp/a")), Path::new("/tmp/a"));
+    }
+
+    #[test]
+    fn normalize_clamps_at_root() {
+        assert_eq!(normalize_lexical(Path::new("/..")), Path::new("/"));
+        assert_eq!(normalize_lexical(Path::new("/")), Path::new("/"));
+    }
+
+    #[test]
+    fn normalize_handles_relative() {
+        assert_eq!(normalize_lexical(Path::new("a/../b")), Path::new("b"));
+    }
 
     // ---- parse_filter_intent ----
 

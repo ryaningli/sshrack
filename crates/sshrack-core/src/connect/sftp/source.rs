@@ -311,6 +311,39 @@ drwxr-xr-x 2 u g 4096 Jan 2 03:04 /srv/.config
         assert_eq!(config.path, PathBuf::from("/srv/.config"));
     }
 
+    #[test]
+    fn list_drops_absolute_path_dot_and_dotdot_self_refs() {
+        // REAL OpenSSH sftp `ls -la <abspath>` shape: the `.` and `..` rows
+        // carry ABSOLUTE-path names (`<cwd>` for `.` and `<cwd>/..` for `..`),
+        // NOT the literal `.`/`..` the fixture above uses. The literal filter
+        // in `parse_ls_listing` misses these, so `to_dir_entries` must drop
+        // them by normalized path identity (== cwd / cwd.parent()). Regression
+        // for the bug where a dir's `.`/`..` showed in the pane as `sftp-test/`
+        // and `/tmp/sftp-test/../`.
+        let canned = "\
+total 12
+drwxr-xr-x 3 u g 4096 Jan 2 03:04 /tmp/sftp-test
+drwxr-xr-x 3 u g 4096 Jan 2 03:04 /tmp/sftp-test/..
+drwxr-xr-x 2 u g 4096 Jan 2 03:04 /tmp/sftp-test/.superpowers
+-rw-r--r-- 1 u g 123 Jan 2 03:04 /tmp/sftp-test/host_auth_modes_test.rs
+-rw-r--r-- 1 u g 456 Jan 2 03:04 /tmp/sftp-test/json_output_test.rs
+-rw-r--r-- 1 u g 789 Jan 2 03:04 /tmp/sftp-test/tab.rs
+";
+        let src = source_with(canned);
+        let entries = src.list(Path::new("/tmp/sftp-test")).expect("parse ok");
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                ".superpowers/",
+                "host_auth_modes_test.rs",
+                "json_output_test.rs",
+                "tab.rs",
+            ],
+            "absolute-path `.`/`..` self-refs dropped; hidden dir + files kept"
+        );
+    }
+
     // ---- classify: maps the first ls -ld row to a PathKind ----
 
     #[test]
