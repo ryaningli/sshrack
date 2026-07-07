@@ -51,12 +51,9 @@ pub(crate) enum NavDecision {
 /// no accessor boilerplate. The module itself is `pub(crate)`, so external
 /// crates cannot see any of this.
 ///
-/// Reachability: `Pane` consumes this in Task 3 and `FilePicker` in Task 4.
-/// Until then no `main` call site reaches it, so `cargo clippy --all-targets`
-/// (which lints the non-test binary target separately from the test target)
-/// flags it dead. The scoped `#[allow(dead_code)]` below is removed in Task 4
-/// once both consumers are wired (the Task-5 sweep verifies it is gone).
-#[allow(dead_code)]
+/// Reachability: both consumers (`Pane` since Task 3, `FilePicker` since
+/// Task 4) hold a `BrowserCore` and reach every method, so
+/// `cargo clippy --all-targets` finds no dead code.
 #[derive(Debug, Clone)]
 pub(crate) struct BrowserCore {
     /// Absolute current directory.
@@ -82,7 +79,6 @@ pub(crate) struct BrowserCore {
     pending_restore: bool,
 }
 
-#[allow(dead_code)] // consumers land in Tasks 3–4; see the struct allow note.
 impl BrowserCore {
     /// New core at `initial_cwd` with an empty listing. The component feeds
     /// the first listing via `commit_switch` / `finish_switch` (Task 2).

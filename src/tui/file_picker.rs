@@ -8,14 +8,25 @@
 //! does no IO; the first directory is loaded lazily by [`ensure_started`] so the
 //! wizard's pure `on_key` tests never touch the filesystem.
 //!
+//! A thin shell over [`crate::tui::browser_core::BrowserCore`]: navigation,
+//! fuzzy filter, and per-directory cursor memory are delegated to the core
+//! shared with the transfer `Pane`, so the two surfaces cannot drift. The old
+//! empty-query `Backspace` step-up (which once diverged from the pane) is gone
+//! — both surfaces now route through [`BrowserCore::apply_nav_key`], where
+//! `Backspace` is a pure edit (noop on an empty query).
+//!
 //! [`new`]: FilePicker::new
 //! [`ensure_started`]: FilePicker::ensure_started
+
+use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
 
-use sshrack_core::dirsource::{DirEntry, DirSource, LocalDirSource};
-use sshrack_core::pathutil::{FilterIntent, parse_filter_intent};
+use sshrack_core::dirsource::{DirSource, LocalDirSource};
+use sshrack_core::pathutil::{FilterIntent, ResolvedPath, parse_filter_intent, start_candidates};
+
+use crate::tui::browser_core::{BrowserCore, NavDecision};
 
 /// The pure result of [`FilePicker::on_key`] handling one key. `Pick` carries
 /// an absolute path (the caller writes it into its field).
@@ -29,72 +40,53 @@ pub enum FilePickerOutcome {
     Pending,
 }
 
-/// Modal file picker. Generic over [`DirSource`] so tests inject a fake and a
-/// future sftp source reuses the component. `cwd`/`entries` are `None`/empty
-/// until the lazy [`ensure_started`] resolves the start directory.
+/// Modal file picker, generic over [`DirSource`]. A thin shell over
+/// [`BrowserCore`]: it owns the `DirSource`, the popup rendering, and the
+/// `started`/`status` lifecycle, and delegates navigation / fuzzy filter /
+/// cursor memory to the core it shares with the transfer `Pane`.
 #[derive(Clone)]
 pub struct FilePicker<S: DirSource + Clone = LocalDirSource> {
-    /// Overlay title (rendered by `draw_overlay`).
+    /// Overlay title (rendered by [`Self::draw_overlay`]).
     title: &'static str,
     /// Injected listing/classification capability.
     source: S,
     /// Literal start-directory candidates (`~` not expanded; the source does
-    /// that during `resolve_start`). Seeded in [`new`], consumed by
-    /// [`ensure_started`].
+    /// that during `resolve_start`). Seeded in [`Self::new`], consumed by
+    /// [`Self::ensure_started`].
     candidates: Vec<String>,
-    /// Absolute current directory. `None` until `ensure_started` resolves it.
-    cwd: Option<std::path::PathBuf>,
-    /// Current directory's entries (real children only — dirs first, then
-    /// files). Reset by [`load`].
-    entries: Vec<DirEntry>,
-    /// Current filter-box text. Drives fuzzy ranking via [`recompute`].
-    query: String,
-    /// Indices into `entries`, fuzzy-ordered for display. `Left` and
-    /// empty-`Backspace` navigate up via [`step_up`].
-    ranked: Vec<usize>,
-    /// Cursor position: index into `ranked`.
-    selected: usize,
+    /// Shared browser state (cwd, entries, query, cursor, history). The core
+    /// starts at `/` with an empty listing; the first successful [`Self::load`]
+    /// populates it.
+    core: BrowserCore,
     /// Transient one-line feedback for the status row (e.g. "no such path").
     status: Option<String>,
-    /// Whether [`ensure_started`] has resolved the start directory yet.
+    /// Whether [`Self::ensure_started`] has resolved the start directory yet.
     started: bool,
-    /// Per-directory cursor memory (ranger-style directory history): maps a
-    /// visited dir's absolute path to the absolute path of the entry that was
-    /// selected when we last left it. Snapshot/restored only inside [`load`];
-    /// never persisted, discarded when the picker closes.
-    history: std::collections::HashMap<std::path::PathBuf, std::path::PathBuf>,
 }
 
 impl<S: DirSource + Clone> FilePicker<S> {
-    /// Open a picker. `identity_hint` seeds the start-directory candidates (its
-    /// parent dir leads). NO filesystem access — the first listing is lazy.
+    /// Number of list rows the overlay renders (drives popup height). Pub so a
+    /// future caller can size the popup; the overlay itself uses a fixed cap.
+    pub const VISIBLE_ROWS: usize = 16;
+
+    /// Open a picker. `identity_hint` seeds the start-directory candidates. NO
+    /// filesystem access — the first listing is lazy ([`Self::ensure_started`]).
+    /// The core starts as an empty shell at `/` until the first successful list.
     #[must_use]
     pub fn new(title: &'static str, identity_hint: Option<&str>, source: S) -> Self {
         Self {
             title,
             source,
-            candidates: sshrack_core::pathutil::start_candidates(identity_hint),
-            cwd: None,
-            entries: Vec::new(),
-            query: String::new(),
-            ranked: Vec::new(),
-            selected: 0,
+            candidates: start_candidates(identity_hint),
+            core: BrowserCore::new(PathBuf::from("/")),
             status: None,
             started: false,
-            history: std::collections::HashMap::new(),
         }
     }
 
-    /// Number of list rows the overlay renders (drives popup height). Pub so a
-    /// future caller can size the popup; the overlay itself uses a fixed cap.
-    pub const VISIBLE_ROWS: usize = 16;
-
     /// Lazily resolve the start directory and list it. Idempotent once it
-    /// succeeds. Called at the top of [`on_key`] (after Esc/^C) and
-    /// [`draw_overlay`]. Touches fs via the injected source only.
-    ///
-    /// On an initial list failure `started` stays `false` so the next call
-    /// retries — relevant for a future `SftpDirSource` with transient errors.
+    /// succeeds. On an initial list failure `started` stays `false` so the
+    /// next call retries. Touches fs via the injected source only.
     pub fn ensure_started(&mut self) {
         if self.started {
             return;
@@ -102,48 +94,21 @@ impl<S: DirSource + Clone> FilePicker<S> {
         let cwd = self
             .source
             .resolve_start(&self.candidates)
-            .unwrap_or_else(|| std::path::PathBuf::from("/"));
+            .unwrap_or_else(|| PathBuf::from("/"));
         if self.load(cwd) {
             self.started = true;
         }
         // On failure: `started` stays false, so the next ensure_started retries.
     }
 
-    /// (Re)list `cwd`, reset ranking + query on success, and remember/restore
-    /// the per-directory cursor (ranger-style history). Returns `true` on the
-    /// `Ok` branch, `false` on `Err`. On error, leaves `cwd`/`entries`/`ranked`
-    /// untouched and only sets `status`. Fs via `source`.
-    ///
-    /// Cursor memory: snapshots the OUTGOING dir's selected-entry path before
-    /// `list` swaps `entries`, then on entry to the INCOMING dir restores the
-    /// remembered cursor by locating that path in `ranked` (first visit → 0).
-    /// `selected` is a ranked index, so the search is over `ranked`, not
-    /// `entries`. A remembered path that no longer exists (dir changed) falls
-    /// back to 0.
-    fn load(&mut self, cwd: std::path::PathBuf) -> bool {
-        // Snapshot against the OLD `ranked`/`entries` (before `list` swaps them).
-        let prev_cwd = self.cwd.clone();
-        let prev_cursor = self.selected_entry().map(|e| e.path.clone());
+    /// (Re)list `cwd` and commit it atomically. On success the core switches
+    /// (snapshotting the outgoing cursor, restoring the incoming one); on
+    /// error the previous view is left intact and only `status` is set.
+    /// Fs via `source`.
+    fn load(&mut self, cwd: PathBuf) -> bool {
         match self.source.list(&cwd) {
             Ok(entries) => {
-                if let (Some(prev), Some(cursor)) = (prev_cwd, prev_cursor) {
-                    self.history.insert(prev, cursor);
-                }
-                self.cwd = Some(cwd.clone());
-                self.entries = entries;
-                self.query.clear();
-                self.recompute();
-                // Restore the incoming dir's remembered cursor by locating the
-                // remembered entry path in `ranked`; first visit → 0. `selected`
-                // is a ranked index, so search `ranked`, not `entries`.
-                // Restore the incoming dir's remembered cursor (first visit →
-                // 0). Shared with transfer::Pane so both browsers stay in sync.
-                self.selected = crate::tui::cursor_history::remembered_cursor_index(
-                    &self.history,
-                    &cwd,
-                    &self.ranked,
-                    &self.entries,
-                );
+                self.core.commit_switch(cwd, entries);
                 self.status = None;
                 true
             }
@@ -154,56 +119,11 @@ impl<S: DirSource + Clone> FilePicker<S> {
         }
     }
 
-    /// Recompute `ranked` (indices into `entries`) for the current `query` via
-    /// the shared nucleo helper (one-field rows, all-zero scores). Empty query
-    /// yields all entries in their sorted order. Pure.
-    fn recompute(&mut self) {
-        let rows: Vec<Vec<String>> = self.entries.iter().map(|e| vec![e.name.clone()]).collect();
-        let scores = vec![0.0f64; self.entries.len()];
-        self.ranked = crate::tui::panel::rank_by_fields(&rows, &scores, &self.query);
-    }
-
-    /// Clamp the cursor into `ranked` bounds (no-op when empty).
-    fn clamp_selected(&mut self) {
-        if self.ranked.is_empty() {
-            self.selected = 0;
-        } else if self.selected >= self.ranked.len() {
-            self.selected = self.ranked.len() - 1;
-        }
-    }
-
-    /// Move the cursor by `delta` with wrap-around. No-op when ranked is empty.
-    fn move_cursor(&mut self, delta: i32) {
-        if self.ranked.is_empty() {
-            return;
-        }
-        let n = self.ranked.len() as i32;
-        self.selected = ((self.selected as i32 + delta).rem_euclid(n)) as usize;
-    }
-
-    /// Entry under the cursor, or `None` when the ranked list is empty.
-    fn selected_entry(&self) -> Option<&DirEntry> {
-        self.ranked
-            .get(self.selected)
-            .and_then(|&i| self.entries.get(i))
-    }
-
-    /// Step into `child` (a dir entry). Reloads its listing.
-    fn step_into(&mut self, child: &DirEntry) {
-        self.load(child.path.clone());
-    }
-
-    /// Step up to the parent of `cwd`. No-op at `/`.
-    fn step_up(&mut self) {
-        let Some(cwd) = self.cwd.clone() else { return };
-        if let Some(parent) = cwd.parent() {
-            self.load(parent.to_path_buf());
-        }
-    }
-
     /// Pure-ish key decision: Esc / Ctrl-C cancel (no fs); everything else
-    /// `ensure_started()` first, then mutates query/cursor/cwd. Returns
-    /// [`FilePickerOutcome::Pick`] only on a resolved file selection.
+    /// `ensure_started()` first, then delegates navigation/edit keys to the
+    /// shared [`BrowserCore::apply_nav_key`] (so this surface cannot drift
+    /// from the pane). Returns [`FilePickerOutcome::Pick`] only on a resolved
+    /// file selection.
     pub fn on_key(&mut self, key: KeyEvent) -> FilePickerOutcome {
         if key.kind != KeyEventKind::Press {
             return FilePickerOutcome::Pending;
@@ -218,49 +138,33 @@ impl<S: DirSource + Clone> FilePicker<S> {
             return FilePickerOutcome::Cancel;
         }
         self.ensure_started();
-
-        match key.code {
-            KeyCode::Up => {
-                self.move_cursor(-1);
-                FilePickerOutcome::Pending
-            }
-            KeyCode::Down => {
-                self.move_cursor(1);
-                FilePickerOutcome::Pending
-            }
-            KeyCode::Char('p') if ctrl => {
-                self.move_cursor(-1);
-                FilePickerOutcome::Pending
-            }
-            KeyCode::Char('n') if ctrl => {
-                self.move_cursor(1);
-                FilePickerOutcome::Pending
-            }
-            KeyCode::Left => {
-                self.step_up();
-                FilePickerOutcome::Pending
-            }
-            KeyCode::Backspace => {
-                if self.query.is_empty() {
-                    self.step_up();
-                } else {
-                    self.query.pop();
-                    self.recompute();
-                    self.clamp_selected();
+        if let Some(decision) = self.core.apply_nav_key(key) {
+            return match decision {
+                NavDecision::CursorMoved | NavDecision::QueryChanged | NavDecision::Noop => {
+                    FilePickerOutcome::Pending
                 }
-                FilePickerOutcome::Pending
-            }
+                NavDecision::StepUp => {
+                    self.step_up();
+                    FilePickerOutcome::Pending
+                }
+            };
+        }
+        // Unhandled by the core: Enter / Right (activation). Space was already
+        // appended to the query by apply_nav_key (FilePicker treats Space as a
+        // query char, unlike the Pane which intercepts it for marks).
+        match key.code {
             KeyCode::Enter => self.activate_selected(),
             // Right is a pure navigation key: enter the dir under the cursor,
             // or do nothing on a file (Enter is the only select key).
             KeyCode::Right => self.step_into_selected(),
-            KeyCode::Char(c) if !ctrl => {
-                self.query.push(c);
-                self.recompute();
-                self.selected = 0;
-                FilePickerOutcome::Pending
-            }
             _ => FilePickerOutcome::Pending,
+        }
+    }
+
+    /// Step up to the parent of `cwd`. No-op at `/`.
+    fn step_up(&mut self) {
+        if let Some(parent) = self.core.cwd.parent() {
+            self.load(parent.to_path_buf());
         }
     }
 
@@ -269,46 +173,48 @@ impl<S: DirSource + Clone> FilePicker<S> {
     /// entered — only [`Self::activate_selected`] / `Enter` selects a file).
     /// Always returns [`FilePickerOutcome::Pending`] (the picker stays open).
     fn step_into_selected(&mut self) -> FilePickerOutcome {
-        if let Some(entry) = self.selected_entry().cloned() {
-            if entry.is_dir {
-                self.step_into(&entry);
-            }
+        // Hoist the owned path before reborrowing self in load (borrow checker).
+        let target = self
+            .core
+            .selected_entry()
+            .filter(|e| e.is_dir)
+            .map(|e| e.path.clone());
+        if let Some(path) = target {
+            self.load(path);
         }
         FilePickerOutcome::Pending
     }
 
-    /// Resolve an `Enter`: a PathLike query resolves via the source; a Fuzzy
-    /// query activates the entry under the cursor (dir -> step in, file ->
-    /// Pick). Sets `status` on a not-found path. Never panics.
+    /// Resolve an `Enter`: a PathLike query resolves via the source (File →
+    /// Pick, Dir → load, NotFound → status); a Fuzzy query activates the entry
+    /// under the cursor (dir → load, file → Pick). Sets `status` on a
+    /// not-found path. Never panics.
     fn activate_selected(&mut self) -> FilePickerOutcome {
-        let intent = parse_filter_intent(&self.query);
-        match intent {
-            FilterIntent::PathLike(raw) => {
-                let Some(cwd) = self.cwd.clone() else {
-                    return FilePickerOutcome::Pending;
-                };
-                match self.source.resolve(&raw, &cwd) {
-                    sshrack_core::pathutil::ResolvedPath::File(abs) => FilePickerOutcome::Pick(abs),
-                    sshrack_core::pathutil::ResolvedPath::Dir(abs) => {
-                        self.load(abs);
-                        FilePickerOutcome::Pending
-                    }
-                    sshrack_core::pathutil::ResolvedPath::NotFound => {
-                        self.status = Some(format!("no such path: {raw}"));
-                        FilePickerOutcome::Pending
-                    }
-                }
-            }
-            FilterIntent::Fuzzy(_) => {
-                if let Some(entry) = self.selected_entry().cloned() {
-                    if entry.is_dir {
-                        self.step_into(&entry);
-                        FilePickerOutcome::Pending
-                    } else {
-                        FilePickerOutcome::Pick(entry.path)
-                    }
-                } else {
+        match parse_filter_intent(&self.core.query) {
+            FilterIntent::PathLike(raw) => match self.source.resolve(&raw, &self.core.cwd) {
+                ResolvedPath::File(abs) => FilePickerOutcome::Pick(abs),
+                ResolvedPath::Dir(abs) => {
+                    self.load(abs);
                     FilePickerOutcome::Pending
+                }
+                ResolvedPath::NotFound => {
+                    self.status = Some(format!("no such path: {raw}"));
+                    FilePickerOutcome::Pending
+                }
+            },
+            FilterIntent::Fuzzy(_) => {
+                // Hoist the owned (is_dir, path) before reborrowing self in load.
+                let picked = self
+                    .core
+                    .selected_entry()
+                    .map(|e| (e.is_dir, e.path.clone()));
+                match picked {
+                    Some((true, path)) => {
+                        self.load(path);
+                        FilePickerOutcome::Pending
+                    }
+                    Some((false, path)) => FilePickerOutcome::Pick(path),
+                    None => FilePickerOutcome::Pending,
                 }
             }
         }
@@ -350,11 +256,7 @@ impl<S: DirSource + Clone> FilePicker<S> {
 
         // cwd line, left-truncated (tail wins): keep the trailing dir name
         // (e.g. `…/.ssh`), not the head (`/home/ry…`).
-        let cwd_str = self
-            .cwd
-            .as_deref()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "/".to_string());
+        let cwd_str = self.core.cwd.to_string_lossy().into_owned();
         let avail = inner.width as usize;
         let shown = crate::tui::fit::truncate_cells_head(&format!(" {cwd_str}"), avail);
         frame.render_widget(
@@ -363,23 +265,20 @@ impl<S: DirSource + Clone> FilePicker<S> {
         );
 
         // windowed, highlighted list.
-        let total = self.ranked.len();
-        let win = crate::tui::fit::focus_window(total, self.selected, Self::VISIBLE_ROWS);
+        let total = self.core.ranked.len();
+        let win = crate::tui::fit::focus_window(total, self.core.selected, Self::VISIBLE_ROWS);
         let mut lines: Vec<Line> = Vec::new();
-        if self.ranked.is_empty() {
+        if self.core.ranked.is_empty() {
             lines.push(Line::from(Span::styled(
                 "  (empty — type a path with Enter to jump, or Esc to cancel)",
                 Style::new().dim(),
             )));
         } else {
             for i in win.start..win.end {
-                let Some(&idx) = self.ranked.get(i) else {
+                let Some(entry) = self.core.entry_at_rank(i) else {
                     continue;
                 };
-                let Some(entry) = self.entries.get(idx) else {
-                    continue;
-                };
-                let is_sel = i == self.selected;
+                let is_sel = i == self.core.selected;
                 let marker = if is_sel { "▶ " } else { "  " };
                 let base = if is_sel {
                     crate::tui::theme::accent().add_modifier(Modifier::BOLD)
@@ -408,7 +307,7 @@ impl<S: DirSource + Clone> FilePicker<S> {
                 let mut spans = vec![Span::styled(marker, base)];
                 spans.extend(crate::tui::panel::highlighted_spans(
                     &entry.name,
-                    &self.query,
+                    &self.core.query,
                     value_style,
                 ));
                 lines.push(Line::from(spans).alignment(Alignment::Left));
@@ -422,11 +321,11 @@ impl<S: DirSource + Clone> FilePicker<S> {
                 "> ",
                 crate::tui::theme::accent().add_modifier(Modifier::BOLD),
             ),
-            Span::raw(self.query.clone()),
+            Span::raw(self.core.query.clone()),
             Span::styled("_", Style::new().dim()),
         ]);
         frame.render_widget(q, query_area);
-        let qx = query_area.x + 2 + self.query.chars().count() as u16;
+        let qx = query_area.x + 2 + self.core.query.chars().count() as u16;
         let max_x = query_area.x + query_area.width.saturating_sub(1);
         frame.set_cursor_position((qx.min(max_x), query_area.y));
 
@@ -565,8 +464,8 @@ mod tests {
     fn started_lands_in_identity_parent_dotssh() {
         let mut p = FilePicker::new("pick", Some("/h/.ssh/id_ed25519"), tree());
         p.ensure_started();
-        assert_eq!(p.cwd.as_deref(), Some(std::path::Path::new("/h/.ssh")));
-        assert!(p.entries.iter().any(|e| e.name == "id_ed25519"));
+        assert_eq!(p.core.cwd, Path::new("/h/.ssh"));
+        assert!(p.core.entries.iter().any(|e| e.name == "id_ed25519"));
     }
 
     // ---- fuzzy filter narrows the ranked list ----
@@ -580,9 +479,10 @@ mod tests {
         // ranked must contain only id_ed25519 + id_ed25519.pub (both fuzzy-match
         // "id_ed"); config drops out.
         let names: Vec<&str> = p
+            .core
             .ranked
             .iter()
-            .map(|&i| p.entries[i].name.as_str())
+            .map(|&i| p.core.entries[i].name.as_str())
             .collect();
         assert!(names.iter().all(|n| n.starts_with("id_ed")), "{names:?}");
     }
@@ -598,12 +498,13 @@ mod tests {
         // Clippy-driven: `Option::is_none_or` (stable since 1.82, MSRV 1.86)
         // replaces `map_or(true, …)`. Behavior unchanged.
         while p
+            .core
             .ranked
-            .get(p.selected)
-            .is_none_or(|&i| p.entries[i].name != "id_ed25519")
+            .get(p.core.selected)
+            .is_none_or(|&i| p.core.entries[i].name != "id_ed25519")
         {
             let _ = p.on_key(press(KeyCode::Down));
-            if p.selected == 0 {
+            if p.core.selected == 0 {
                 break;
             }
         }
@@ -624,7 +525,7 @@ mod tests {
         // /h has one entry: .ssh/. Enter on it -> back into /h/.ssh.
         let out = p.on_key(press(KeyCode::Enter));
         assert!(matches!(out, FilePickerOutcome::Pending));
-        assert_eq!(p.cwd.as_deref(), Some(std::path::Path::new("/h/.ssh")));
+        assert_eq!(p.core.cwd, Path::new("/h/.ssh"));
     }
 
     // ---- Right is a pure navigation key: enters a dir, but is a no-op on a
@@ -636,12 +537,13 @@ mod tests {
         let mut p = FilePicker::new("pick", Some("/h/.ssh/k"), tree());
         // land the cursor on a file (id_ed25519), same nav as Enter-picks test.
         while p
+            .core
             .ranked
-            .get(p.selected)
-            .is_none_or(|&i| p.entries[i].name != "id_ed25519")
+            .get(p.core.selected)
+            .is_none_or(|&i| p.core.entries[i].name != "id_ed25519")
         {
             let _ = p.on_key(press(KeyCode::Down));
-            if p.selected == 0 {
+            if p.core.selected == 0 {
                 break;
             }
         }
@@ -663,7 +565,7 @@ mod tests {
             matches!(out, FilePickerOutcome::Pending),
             "Right on a dir enters it"
         );
-        assert_eq!(p.cwd.as_deref(), Some(std::path::Path::new("/h/.ssh")));
+        assert_eq!(p.core.cwd, Path::new("/h/.ssh"));
     }
 
     // ---- PathLike query: paste an absolute file path, Enter Picks it ----
@@ -688,8 +590,8 @@ mod tests {
         }
         let out = p.on_key(press(KeyCode::Enter));
         assert!(matches!(out, FilePickerOutcome::Pending));
-        assert_eq!(p.cwd.as_deref(), Some(std::path::Path::new("/h/.ssh")));
-        assert!(p.query.is_empty(), "query cleared after switching dir");
+        assert_eq!(p.core.cwd, Path::new("/h/.ssh"));
+        assert!(p.core.query.is_empty(), "query cleared after switching dir");
     }
 
     #[test]
@@ -735,13 +637,20 @@ mod tests {
         assert_eq!(p.on_key(cc), FilePickerOutcome::Cancel);
     }
 
-    // ---- Backspace dual: empty query steps up ----
+    // ---- Backspace is a pure edit key (drift fix): empty query is a NOOP,
+    //      never a step-up. Going up uses Left, shared via apply_nav_key. ----
 
     #[test]
-    fn backspace_on_empty_query_steps_up() {
+    fn backspace_on_empty_query_is_a_noop_never_step_up() {
+        // Drift fix: empty-query Backspace is a pure no-op. It must NOT step
+        // up to the parent (going up uses Left). Matches the transfer Pane
+        // via the shared BrowserCore::apply_nav_key.
         let mut p = FilePicker::new("pick", Some("/h/.ssh/k"), tree());
-        let _ = p.on_key(press(KeyCode::Backspace)); // empty query -> step up to /h
-        assert_eq!(p.cwd.as_deref(), Some(std::path::Path::new("/h")));
+        p.ensure_started();
+        let cwd_before = p.core.cwd.clone();
+        let _ = p.on_key(press(KeyCode::Backspace));
+        assert_eq!(p.core.cwd, cwd_before, "Backspace did not change cwd");
+        assert!(p.core.query.is_empty(), "query still empty");
     }
 
     #[test]
@@ -756,7 +665,7 @@ mod tests {
         // is "pops_a_char" (singular). Typing "id" then pressing Backspace once
         // leaves "i" — the brief's `is_empty()` assertion was self-inconsistent.
         // Corrected to assert exactly one char was popped.
-        assert_eq!(p.query, "i");
+        assert_eq!(p.core.query, "i");
     }
 
     #[test]
@@ -769,7 +678,7 @@ mod tests {
         // make sense against real ranked data, which is what `ensure_started`
         // produces.
         p.ensure_started();
-        let n = p.ranked.len();
+        let n = p.core.ranked.len();
         assert!(n >= 1);
         let _ = p.on_key(press(KeyCode::Down));
         let _ = p.on_key(press(KeyCode::Up));
@@ -777,7 +686,7 @@ mod tests {
         for _ in 0..n {
             let _ = p.on_key(press(KeyCode::Down));
         }
-        assert!(p.selected < n);
+        assert!(p.core.selected < n);
     }
 
     // ---- draw_overlay: no-panic render over a TestBackend ----
@@ -859,12 +768,13 @@ mod tests {
         );
         p.ensure_started();
         assert!(!p.started, "first list failed → not started");
-        assert!(p.cwd.is_none(), "cwd stays None on failure");
+        // NOTE: core.cwd always holds a PathBuf (initially "/"), so the old
+        // `p.cwd.is_none()` / `p.cwd.is_some()` assertions no longer apply —
+        // the `started` flag above already carries that information.
         assert!(p.status.is_some(), "failure surfaced a status");
         p.ensure_started(); // retry
         assert!(p.started, "second list succeeded → started");
-        assert!(p.cwd.is_some(), "cwd populated on retry");
-        assert!(p.entries.iter().any(|e| e.name == "id_ed25519"));
+        assert!(p.core.entries.iter().any(|e| e.name == "id_ed25519"));
     }
 
     /// Multi-level fixture: `/A/{B1/, B2/, B3/}` (subdirs), `/A/B2/{f1, f2}`
@@ -904,23 +814,23 @@ mod tests {
         let mut p = FilePicker::new("pick", None, multi_dir_tree());
         p.ensure_started(); // lands in /A
         // land the cursor on B2 by name (order-agnostic vs the ranker)
-        for _ in 0..p.ranked.len() {
-            if p.selected_entry().is_some_and(|e| e.name == "B2/") {
+        for _ in 0..p.core.ranked.len() {
+            if p.core.selected_entry().is_some_and(|e| e.name == "B2/") {
                 break;
             }
             let _ = p.on_key(press(KeyCode::Down));
         }
         assert_eq!(
-            p.selected_entry().map(|e| e.name.clone()).as_deref(),
+            p.core.selected_entry().map(|e| e.name.clone()).as_deref(),
             Some("B2/"),
             "sanity: cursor on B2 before entering"
         );
         let _ = p.on_key(press(KeyCode::Right)); // enter B2
-        assert_eq!(p.cwd.as_deref(), Some(std::path::Path::new("/A/B2")));
+        assert_eq!(p.core.cwd, Path::new("/A/B2"));
         let _ = p.on_key(press(KeyCode::Left)); // back to /A
-        assert_eq!(p.cwd.as_deref(), Some(std::path::Path::new("/A")));
+        assert_eq!(p.core.cwd, Path::new("/A"));
         assert_eq!(
-            p.selected_entry().map(|e| e.name.clone()).as_deref(),
+            p.core.selected_entry().map(|e| e.name.clone()).as_deref(),
             Some("B2/"),
             "re-entering a dir must restore the previous cursor (directory history)"
         );
@@ -930,18 +840,18 @@ mod tests {
     fn first_visit_lands_on_first_entry() {
         let mut p = FilePicker::new("pick", None, multi_dir_tree());
         p.ensure_started(); // /A, cursor at index 0
-        assert_eq!(p.selected, 0, "initial dir → index 0");
+        assert_eq!(p.core.selected, 0, "initial dir → index 0");
         // navigate to B2 and enter it (never visited, non-empty).
-        for _ in 0..p.ranked.len() {
-            if p.selected_entry().is_some_and(|e| e.name == "B2/") {
+        for _ in 0..p.core.ranked.len() {
+            if p.core.selected_entry().is_some_and(|e| e.name == "B2/") {
                 break;
             }
             let _ = p.on_key(press(KeyCode::Down));
         }
         let _ = p.on_key(press(KeyCode::Right)); // enter B2 — first visit
-        assert_eq!(p.cwd.as_deref(), Some(std::path::Path::new("/A/B2")));
+        assert_eq!(p.core.cwd, Path::new("/A/B2"));
         assert_eq!(
-            p.selected, 0,
+            p.core.selected, 0,
             "first visit to a dir → index 0 (no history yet)"
         );
     }
@@ -1032,8 +942,8 @@ mod tests {
         );
         p.ensure_started(); // /A list #0 → [B1,B2,B3]
         // move to B2
-        for _ in 0..p.ranked.len() {
-            if p.selected_entry().is_some_and(|e| e.name == "B2/") {
+        for _ in 0..p.core.ranked.len() {
+            if p.core.selected_entry().is_some_and(|e| e.name == "B2/") {
                 break;
             }
             let _ = p.on_key(press(KeyCode::Down));
@@ -1041,11 +951,11 @@ mod tests {
         let _ = p.on_key(press(KeyCode::Right)); // enter B2
         let _ = p.on_key(press(KeyCode::Left)); // back to /A → list #1 → [B9]
         assert_eq!(
-            p.selected, 0,
+            p.core.selected, 0,
             "remembered cursor gone from new listing → fall back to index 0"
         );
         assert_eq!(
-            p.selected_entry().map(|e| e.name.clone()).as_deref(),
+            p.core.selected_entry().map(|e| e.name.clone()).as_deref(),
             Some("B9/")
         );
     }
