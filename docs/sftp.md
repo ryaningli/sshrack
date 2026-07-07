@@ -39,18 +39,21 @@ The transfer screen is backed by a `TransferLedger` (in `tui/transfer/ledger.rs`
 
 **Status band (main screen, 2 rows).** Row 1 is the active transfer (`path  P%  rate  ETA` over a `Gauge`; a dim "no transfer in flight" placeholder when idle). Row 2 is the summary line: `done X/Y · fail Z` tinted danger-red when `Z > 0`, followed by `· paused` (accent) when the queue is paused, followed by any transient status message (truncated to fit). `done` counts `Done(Ok)` only — failed and cancelled tasks count toward `Y` (and `Z` for failures) but never toward `X`, so the two counters stay disjoint.
 
-**Opening the modal.** `Ctrl-Q` (`^Q`) opens the queue-manager overlay (footer-advertised; bare `q`/`Q` stay in the pane search box per the key-binding invariant). The overlay lists every task with per-task state and progress; `Esc` closes it. The overlay's header mirrors the summary band (`done X/Y · fail Z [· paused]`); completed (`Done(Ok)`) tasks fold into a trailing `> N completed` row.
+**Opening the modal.** `Ctrl-Q` (`^Q`) opens the queue-manager overlay (footer-advertised; bare `q`/`Q` stay in the pane search box per the key-binding invariant). The overlay splits tasks into three view-tabs cycled by `Tab` / `Shift-Tab`: Active lists in-flight + queued tasks; Failed lists failed + cancelled (retryable); Completed lists finished tasks. Each view keeps its own cursor, so a long completed history never floods the active view. The overlay's header mirrors the summary band (`done X/Y · fail Z [· paused]`); `Esc` closes it.
 
-**Row states.** `InFlight` (the active task), `Queued` (waiting — dispatch is FIFO, head first), `Done(Ok)` (completed, folded), `Done(Failed)` (failed), `Done(Cancelled)` (cancelled). Retry targets `Failed` and `Cancelled` only; `Done(Ok)` and non-`Done` tasks are not retryable.
+**Row states.** `InFlight` (the active task), `Queued` (waiting — dispatch is FIFO, head first), `Done(Ok)` (completed — Completed tab), `Done(Failed)` (failed — Failed tab), `Done(Cancelled)` (cancelled — Failed tab, retryable). Retry targets `Failed` and `Cancelled` only; `Done(Ok)` and non-`Done` tasks are not retryable.
 
 **Operations.**
 
-| Key | Action |
+| Key | Action (queue overlay) |
 |---|---|
-| `⏎` / `r` | retry — re-queue the selected `Failed`/`Cancelled` task in place |
-| `Del` / `d` | remove — drop the selected `Queued`/`Done` task (in-flight falls through to cancel) |
-| `c` | cancel — kill the in-flight task (on a queued/done task it falls through to remove) |
-| `p` | pause — toggle the queue-level pause flag |
+| `Tab` / `Shift-Tab` | cycle view: Active / Failed / Completed |
+| `↑`/`↓` or `k`/`j` | move selection (current view) |
+| `Enter` / `r` | retry the selected failed/cancelled task |
+| `Del` / `d` | remove the selected task (cancel if in-flight) |
+| `c` | cancel the in-flight task |
+| `p` | pause / resume the queue |
+| `Esc` | close the overlay |
 
 **Honest scope notes (MVP).**
 
