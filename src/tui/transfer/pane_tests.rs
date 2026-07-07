@@ -17,7 +17,8 @@ use std::path::PathBuf;
 
 /// Build a `DirEntry` test fixture: `name` is decorated with a trailing
 /// `/` for dirs (matches `LocalDirSource::list`'s decoration); `path` is
-/// `parent.join(name)`. `size`/`modified` are `None` (Task-1 fields).
+/// `parent.join(name)`. `size`/`modified` are left `None` (this fixture
+/// does not populate them).
 fn entry(name: &str, parent: &Path, is_dir: bool) -> DirEntry {
     let decorated = if is_dir {
         format!("{name}/")

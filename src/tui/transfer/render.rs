@@ -364,7 +364,7 @@ pub fn draw_active_transfer(frame: &mut Frame, area: Rect, active: Option<&Progr
 /// `done` counts successfully completed tasks only (`Done(Ok)`); failed and
 /// cancelled tasks count toward `total` (and `failed`, for failures only) but
 /// NOT toward `done`. This keeps the convention universal: `done` = success,
-/// `fail` = failure, disjoint — and matches the Task-4 queue-overlay header's
+/// `fail` = failure, disjoint — and matches the queue-overlay header's
 /// `ledger.done_count()`. So a single failed task reads `done 0/1 · fail 1`.
 pub fn summary_line(
     ledger: &crate::tui::transfer::ledger::TransferLedger,

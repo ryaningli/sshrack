@@ -39,16 +39,16 @@ use crate::tui::transfer::queue_overlay::QueueOverlay;
 use crate::tui::transfer::render;
 
 /// Pure intent returned by [`TransferScreen::on_key`]. The screen mutates its
-/// own focus / marks / queue / `pending_list`; this intent tells the
-/// Task-10 event loop what side effect to perform (worker send, popup,
-/// quit). Mirrors [`PaneOutcome`] in shape — enum-rather-than-`Option` so the
-/// loop's match stays exhaustive over the action vocabulary.
+/// own focus / marks / queue / `pending_list`; this intent tells the run
+/// loop what side effect to perform (worker send, popup, quit). Mirrors
+/// [`PaneOutcome`] in shape — enum-rather-than-`Option` so the loop's match
+/// stays exhaustive over the action vocabulary.
 ///
 /// Naming: `ScreenOutcome` (not `TransferOutcome`) deliberately, to avoid
 /// collision with [`sshrack_core::connect::sftp::proto::TransferOutcome`], the
 /// worker's per-job result enum (`Ok`/`Cancelled`/`Failed`). The two types
-/// cross paths in the Task-10 loop (which drains `WorkerEvent::Done(proto)`
-/// and routes `screen.on_key()`'s result), so giving them the same name would
+/// cross paths in the run loop (which drains `WorkerEvent::Done(proto)` and
+/// routes `screen.on_key()`'s result), so giving them the same name would
 /// force an alias at every import site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScreenOutcome {
@@ -71,15 +71,7 @@ pub enum ScreenOutcome {
 /// The full-screen transfer view. Pure state plus a render entry point —
 /// [`TransferScreen::draw`] lays out the screen and delegates pane painting to
 /// [`render::draw_pane`]. [`TransferScreen::on_key`] is the pure key router;
-/// Task 10 wires the worker handle + overwrite-policy popup onto this struct.
-///
-/// Reachability note: Task 8 shipped the state + pure render path; Task 9
-/// added the pure `on_key` router + queue-advance helpers; Task 10 wires the
-/// `sshrack sftp` event loop that drives all of it. Until Task 10 lands the
-/// screen is constructed only by tests, so methods that have no test caller
-/// (the setters + private draw helpers + the new key router) carry scoped
-/// `#[allow(dead_code)]` with the Task-10 consumer named in the doc comment —
-/// no blanket module-level allow is in use.
+/// the worker and overwrite-policy popup are driven by the live run loop.
 #[derive(Debug, Clone)]
 pub struct TransferScreen {
     /// The local-filesystem pane. Owns its cwd, entries, query, cursor, marks.
@@ -104,13 +96,13 @@ pub struct TransferScreen {
     pub status: Status,
     /// The next directory listing the screen wants the worker to fetch, set by
     /// [`on_key`](Self::on_key) when the focused pane emits `StepInto` /
-    /// `StepUp` / `RequestList`. `None` when no list is pending. The Task-10
+    /// `StepUp` / `RequestList`. `None` when no list is pending. The run
     /// loop reads this after each keypress, dispatches the `WorkerCmd::List`
     /// (or sync `LocalDirSource::list` for the local side), feeds the result
     /// back via [`Pane::set_entries`], and clears the field. Pure: setting
     /// this performs no I/O.
     pub pending_list: Option<(Side, PathBuf)>,
-    /// The user's batch-level overwrite answer, set by the Task-10 loop after
+    /// The user's batch-level overwrite answer, set by the run loop after
     /// the first overwrite popup (`OverwriteAll` / `SkipAll` apply to the rest
     /// of the batch). `None` until the first conflict resolves; per-job
     /// [`decide`](super::overwrite::decide) calls read this so a single popup
@@ -126,9 +118,9 @@ impl TransferScreen {
     /// on Local, no active transfer, an empty queue, an empty status, and no
     /// pending list. Pure: no I/O.
     ///
-    /// Reachability: Task-10 sftp dispatch constructs the live screen via
-    /// [`crate::tui::transfer::open::open_transfer`]; the Task-8 render path
-    /// + Task-9 key router are also exercised by tests.
+    /// Reachability: the live screen is constructed by
+    /// [`crate::tui::transfer::open::open_transfer`]; the render path and key
+    /// router are also exercised by tests.
     #[must_use]
     pub fn new(local_cwd: PathBuf, remote_cwd: PathBuf) -> Self {
         Self {
@@ -176,18 +168,18 @@ impl TransferScreen {
     /// focused pane's marked (or selected) entries, `Esc` cancels an active
     /// transfer or else closes the screen, `Ctrl-C` always closes, and
     /// everything else delegates to the focused [`Pane::on_key`]. Performs no
-    /// I/O; the returned [`ScreenOutcome`] tells the Task-10 loop what side
+    /// I/O; the returned [`ScreenOutcome`] tells the run loop what side
     /// effect to run.
     ///
     /// For navigation intents (`StepInto` / `StepUp` / `RequestList`) this
     /// sets [`pending_list`](Self::pending_list) and returns `Continue` —
-    /// Task 10 reads `pending_list` after each keypress, performs the list
-    /// (sync `LocalDirSource::list` for the local side, `WorkerCmd::List` for
-    /// the remote side), feeds the result back via [`Pane::set_entries`], and
-    /// clears the field.
+    /// the run loop reads `pending_list` after each keypress, performs the
+    /// list (sync `LocalDirSource::list` for the local side, `WorkerCmd::List`
+    /// for the remote side), feeds the result back via [`Pane::set_entries`],
+    /// and clears the field.
     ///
-    /// Reachability: Task 10's sftp event loop calls this on each polled key
-    /// via [`App::route_transfer`](crate::tui::app::App::route_transfer).
+    /// Reachability: the sftp event loop calls this on each polled key via
+    /// [`App::route_transfer`](crate::tui::app::App::route_transfer).
     pub fn on_key(&mut self, key: KeyEvent) -> ScreenOutcome {
         if key.kind != KeyEventKind::Press {
             return ScreenOutcome::Continue;
@@ -430,7 +422,7 @@ impl TransferScreen {
     /// windowed list via [`render::draw_pane`]. The non-focused pane is dimmed
     /// overall. Pure: no I/O, no env access.
     ///
-    /// Reachability: Task-10's transfer dispatch + event loop drives this via
+    /// Reachability: the transfer dispatch + event loop drives this via
     /// [`App::draw`](crate::tui::app::App::draw) when `App::transfer` is set.
     pub fn draw(&self, frame: &mut Frame, area: Rect) {
         let [title_area, panes_area, panel_area, footer_area] = Layout::vertical([

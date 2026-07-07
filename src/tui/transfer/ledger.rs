@@ -21,12 +21,10 @@ pub enum TaskKind {
 
 /// Lifecycle of a task. Concurrency is 1, so at most one task is `InFlight`.
 //
-// Deviation from the plan: the plan specified `#[derive(Debug, Clone,
-// PartialEq, Eq)]`, but `TransferOutcome` (in `sshrack-core`) is only `Debug +
-// Clone` (no `PartialEq`/`Eq`), so deriving either trait here fails to compile.
-// Task 1's scope forbids editing `crates/sshrack-core/`, and nothing in the
-// plan (tests or later tasks) compares `TaskState` with `==` — every site uses
-// `matches!`. Dropping both derives is the minimal behavior-preserving fix.
+// `TransferOutcome` (in `sshrack-core`) is only `Debug + Clone` (no
+// `PartialEq`/`Eq`), so deriving either trait here fails to compile. No call
+// site compares `TaskState` with `==` — every site uses `matches!` — so
+// dropping both derives is the minimal behavior-preserving fix.
 #[derive(Debug, Clone)]
 pub enum TaskState {
     Queued,
@@ -200,7 +198,7 @@ impl TransferLedger {
     pub fn is_paused(&self) -> bool {
         self.paused
     }
-    #[allow(dead_code)] // Task 5 consumer: queue_overlay pause tests
+    #[allow(dead_code)] // test-only setter; production toggles via toggle_paused
     pub fn set_paused(&mut self, paused: bool) {
         self.paused = paused;
     }

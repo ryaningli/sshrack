@@ -1,8 +1,8 @@
 //! Pure overwrite-resolution for the dual-pane transfer screen. Given the
 //! user's batch-level [`OverwritePolicy`] and whether this one destination
 //! already exists, [`decide`] returns the [`OverwriteChoice`] the worker
-//! should apply. No I/O; the popup that surfaces a single conflict (Task 10)
-//! calls into here, as does the batch loop before each transfer.
+//! should apply. No I/O; the popup that surfaces a single conflict calls into
+//! here, as does the batch loop before each transfer.
 //!
 //! Naming note: [`OverwriteChoice::Cancel`] is what the popup returns on `Esc`
 //! — [`decide`] itself never produces `Cancel`. `Cancel` lives in the enum so
@@ -12,11 +12,11 @@
 use sshrack_core::connect::sftp::proto::OverwritePolicy;
 
 /// The action the worker should take for one destination path. Returned by
-/// [`decide`] for the four batch policies; the conflict popup (Task 10) also
-/// emits [`Cancel`](Self::Cancel) on `Esc` to abort the whole batch.
+/// [`decide`] for the four batch policies; the conflict popup also emits
+/// [`Cancel`](Self::Cancel) on `Esc` to abort the whole batch.
 ///
-/// Reachability: Task 10's sftp event loop consumes this (the overwrite popup
-/// + the batch loop call `decide` before each transfer).
+/// Reachability: the sftp event loop consumes this (the overwrite popup +
+/// the batch loop calls `decide` before each transfer).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverwriteChoice {
     /// Overwrite this one destination. Emitted by `Overwrite` and `OverwriteAll`
@@ -57,7 +57,7 @@ pub enum OverwriteChoice {
 /// way and the `*All` policies are decisive either way, so `dest_exists` does
 /// not change the result. It is part of the signature so callers and tests
 /// document the no-conflict case explicitly.
-/// Reachability: Task 10's sftp event loop + overwrite popup call this.
+/// Reachability: the sftp event loop + overwrite popup call this.
 #[must_use]
 pub fn decide(policy: OverwritePolicy, _dest_exists: bool) -> OverwriteChoice {
     match policy {

@@ -130,7 +130,6 @@ fn draw_paints_title_panes_progress_and_footer() {
     // shows up in the progress panel.
     assert!(view.contains('●'), "mark glyph missing: {view}");
     assert!(view.contains("alpha.txt"), "active name missing: {view}");
-    // Summary row (Task 3 collapsed the 4-row panel into a 2-row band).
     assert!(view.contains("done"), "summary label missing: {view}");
 
     // Footer hotkeys.
@@ -879,7 +878,7 @@ fn new_screen_remote_title_defaults_to_remote() {
     assert_eq!(s.remote_title, "remote");
 }
 
-// ---- ^Q queue-manager overlay (Task 4: view + nav only) ----
+// ---- ^Q queue-manager overlay: view + nav only ----
 
 #[test]
 fn ctrl_q_opens_the_queue_overlay() {
@@ -955,7 +954,7 @@ fn arrow_keys_move_the_overlay_selection() {
     );
 }
 
-// ---- ^Q queue-manager overlay (Task 5: retry / remove / cancel / pause) ----
+// ---- ^Q queue-manager overlay: retry / remove / cancel / pause ----
 
 #[test]
 fn overlay_retry_requeues_a_failed_task_and_signals_advance() {
@@ -1089,9 +1088,9 @@ fn tab_switches_to_failed_view_and_lists_the_failed_task() {
     use sshrack_core::connect::sftp::proto::TransferOutcome;
     let local_cwd = PathBuf::from("/x");
     let mut screen = TransferScreen::new(local_cwd.clone(), PathBuf::from("/y"));
-    // Enqueue `failed-one` first so FIFO dispatch lands the failure on it
-    // (the plan's original fixture enqueued `queued-one` first, which made
-    // `queued-one` the failed task and inverted the assertions below).
+    // Enqueue `failed-one` first so FIFO dispatch lands the failure on it;
+    // enqueueing `queued-one` first would make `queued-one` the failed task
+    // and invert the assertions below.
     screen.ledger.enqueue(TransferJob {
         direction: Direction::Download,
         src: PathBuf::from("/y/failed-one"),
