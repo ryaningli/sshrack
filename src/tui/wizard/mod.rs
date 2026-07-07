@@ -31,6 +31,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::tui::fit::truncate_cells;
 use crate::tui::theme;
+use sshrack_core::config::schema::KeySource;
 use sshrack_core::host::validate_name_chars;
 
 pub mod cred;
@@ -642,6 +643,41 @@ pub(super) fn backspace_at(s: &mut String, cursor: usize) -> usize {
         .unwrap_or(0);
     s.replace_range(start..end, "");
     cursor - 1
+}
+
+/// Line count of an inline-key slot from the original (edit-mode) `KeySource`
+/// when the secret is readable plaintext. `None` under vault mode (the secret
+/// is encrypted and the view layer holds no key to decrypt) or when the slot
+/// is absent. Used to echo "N line(s) saved" on the field row in edit mode
+/// without ever surfacing the key text — a count-only read over the *original*
+/// key, mirroring what `KeyPaste::saved_line_count` does for the live buffer.
+pub(super) fn orig_inline_lines(orig: Option<&KeySource>, cert: bool) -> Option<usize> {
+    let KeySource::Inline(ik) = orig? else {
+        return None;
+    };
+    let sec = if cert {
+        ik.certificate.as_ref()
+    } else {
+        ik.private_key.as_ref()
+    };
+    // `as_plain` is None for Encrypted (vault) — the count is only available
+    // when the secret sits in plaintext the view can read.
+    sec.and_then(|s| s.as_plain().map(|t| t.lines().count()))
+}
+
+/// Whether an inline-key slot exists on the original (edit-mode) `KeySource`,
+/// regardless of whether it is readable. Drives the "saved · paste to replace"
+/// fallback on the field row when [`orig_inline_lines`] is `None` (vault mode)
+/// but the key is still there — so edit mode never reads as empty.
+pub(super) fn orig_inline_exists(orig: Option<&KeySource>, cert: bool) -> bool {
+    let Some(KeySource::Inline(ik)) = orig else {
+        return false;
+    };
+    if cert {
+        ik.certificate.is_some()
+    } else {
+        ik.private_key.is_some()
+    }
 }
 
 /// Byte offset of the char at char-index `idx`, or `s.len()` when `idx` is at

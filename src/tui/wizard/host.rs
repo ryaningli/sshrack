@@ -33,7 +33,7 @@ use super::super::theme;
 use super::{
     AuthChoice, AuthKind, CredPicker, Field, FieldKind, HOST_LABEL_WIDTH, HOST_VALUE_COL, KeyPaste,
     PasteKind, PasteOutcome, PickerOutcome, SaveError, SecretChoice, SourceChoice, backspace_at,
-    bracketed, insert_char_at, render_field_row, validate,
+    bracketed, insert_char_at, orig_inline_exists, orig_inline_lines, render_field_row, validate,
 };
 use crate::tui::file_picker::{FilePicker, FilePickerOutcome};
 use sshrack_core::config::schema::{Auth, CredentialBody, Host, KeySource};
@@ -1260,12 +1260,12 @@ impl HostForm {
                 (v, ph)
             }
             Field::InlinePrivate => {
-                // One-line summary of the buffer (never echoes key text):
-                // blank → placeholder, non-blank → "N line(s)" count. The
-                // full editor opens as a popup on Enter (see `on_key`).
-                if self.inline_private.trim().is_empty() {
-                    (String::new(), Some("paste private key"))
-                } else {
+                // One-line summary, never echoing key text. A freshly-pasted
+                // buffer shows its own line count; in edit mode with an empty
+                // buffer, fall back to the ORIGINAL inline key — its readable
+                // line count (plaintext), else a "saved" hint when it exists
+                // but is encrypted (vault). The full editor opens on Enter.
+                if !self.inline_private.trim().is_empty() {
                     (
                         format!(
                             "{} line(s) of private key",
@@ -1273,12 +1273,16 @@ impl HostForm {
                         ),
                         None,
                     )
+                } else if let Some(n) = orig_inline_lines(self.orig_key.as_ref(), false) {
+                    (format!("{} line(s) of private key", n), None)
+                } else if orig_inline_exists(self.orig_key.as_ref(), false) {
+                    (String::new(), Some("saved · paste to replace"))
+                } else {
+                    (String::new(), Some("paste private key"))
                 }
             }
             Field::InlineCert => {
-                if self.inline_cert.trim().is_empty() {
-                    (String::new(), Some("optional certificate"))
-                } else {
+                if !self.inline_cert.trim().is_empty() {
                     (
                         format!(
                             "{} line(s) of certificate",
@@ -1286,6 +1290,12 @@ impl HostForm {
                         ),
                         None,
                     )
+                } else if let Some(n) = orig_inline_lines(self.orig_key.as_ref(), true) {
+                    (format!("{} line(s) of certificate", n), None)
+                } else if orig_inline_exists(self.orig_key.as_ref(), true) {
+                    (String::new(), Some("saved · paste to replace"))
+                } else {
+                    (String::new(), Some("optional certificate"))
                 }
             }
             Field::Identity => {
@@ -2596,6 +2606,92 @@ mod tests {
         assert_eq!(f.source, SourceChoice::Inline);
         assert!(f.inline_private.is_empty(), "key text must NOT echo");
         assert!(matches!(f.orig_key, Some(KeySource::Inline(_))));
+    }
+
+    #[test]
+    fn row_value_inline_echoes_original_line_count_in_edit_mode() {
+        // REGRESSION (bug 3 follow-up): in edit mode the paste buffer starts
+        // empty (key text never echoed), so the field row used to fall through
+        // to the "paste private key" placeholder — reading as if no key
+        // existed. It must instead echo the ORIGINAL inline key's line count
+        // (plaintext secret → readable) so edit mode shows "N line(s)" and
+        // never looks empty. row_value_and_placeholder consults orig_key.
+        use sshrack_core::config::schema::Secret;
+        let host = Host {
+            id: Ulid::new(),
+            name: "h".into(),
+            host: "10.0.0.5".into(),
+            port: 22,
+            auth: Auth::inline(
+                CredentialBody::new("u").with_inline_key(Secret::Plain("abc\ndef\n".into()), None),
+            ),
+        };
+        let f = HostForm::new_edit(&host, vec![], None);
+        let (v, ph) = f.row_value_and_placeholder(Field::InlinePrivate);
+        assert_eq!(v, "2 line(s) of private key");
+        assert_eq!(ph, None);
+        // The buffer itself stays empty — the count comes from orig_key, not a
+        // plaintext echo.
+        assert!(f.inline_private.is_empty());
+    }
+
+    #[test]
+    fn row_value_inline_cert_echoes_original_line_count_in_edit_mode() {
+        // The cert slot (cert = true path) mirrors the private slot.
+        use sshrack_core::config::schema::Secret;
+        let host = Host {
+            id: Ulid::new(),
+            name: "h".into(),
+            host: "10.0.0.5".into(),
+            port: 22,
+            auth: Auth::inline(CredentialBody::new("u").with_inline_key(
+                Secret::Plain("pk".into()),
+                Some(Secret::Plain("c1\nc2\nc3\n".into())),
+            )),
+        };
+        let f = HostForm::new_edit(&host, vec![], None);
+        let (v, _ph) = f.row_value_and_placeholder(Field::InlineCert);
+        assert_eq!(v, "3 line(s) of certificate");
+    }
+
+    #[test]
+    fn row_value_inline_encrypted_original_falls_back_to_saved_hint() {
+        // Under vault mode the original secret is Encrypted — the view layer
+        // cannot count its lines (no key to decrypt), so fall back to a "saved"
+        // hint that still confirms the key exists. Edit mode must never look
+        // empty even when the line count is unreadable.
+        use sshrack_core::config::schema::{EncryptedSecret, Secret};
+        let enc = Secret::Encrypted(EncryptedSecret {
+            nonce: "AAAA".into(),
+            cipher: "BBBB".into(),
+        });
+        let host = Host {
+            id: Ulid::new(),
+            name: "h".into(),
+            host: "10.0.0.5".into(),
+            port: 22,
+            auth: Auth::inline(CredentialBody::new("u").with_inline_key(enc, None)),
+        };
+        let f = HostForm::new_edit(&host, vec![], None);
+        let (v, ph) = f.row_value_and_placeholder(Field::InlinePrivate);
+        assert!(
+            v.is_empty(),
+            "encrypted line count is not readable: got {v:?}"
+        );
+        assert_eq!(ph, Some("saved · paste to replace"));
+    }
+
+    #[test]
+    fn row_value_inline_add_mode_shows_plain_paste_placeholder() {
+        // Add mode: no original key → the plain "paste private key" placeholder,
+        // unchanged. Guards against the edit-mode fallback leaking into add.
+        let mut f = HostForm::new_add(vec![]);
+        f.auth_choice = AuthChoice::Independent;
+        f.secret_kind = SecretChoice::IdentityKey;
+        f.source = SourceChoice::Inline;
+        let (v, ph) = f.row_value_and_placeholder(Field::InlinePrivate);
+        assert!(v.is_empty());
+        assert_eq!(ph, Some("paste private key"));
     }
 
     #[test]

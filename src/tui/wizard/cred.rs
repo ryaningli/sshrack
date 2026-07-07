@@ -23,7 +23,7 @@ use super::super::theme;
 use super::{
     CRED_LABEL_WIDTH, CRED_VALUE_COL, CredField, CredSaveError, FieldKind, KeyPaste, PasteKind,
     PasteOutcome, SecretChoice, SourceChoice, backspace_at, bracketed, insert_char_at,
-    render_field_row, validate_cred,
+    orig_inline_exists, orig_inline_lines, render_field_row, validate_cred,
 };
 use crate::tui::file_picker::{FilePicker, FilePickerOutcome};
 use sshrack_core::config::schema::{Credential, CredentialBody, KeySource};
@@ -949,12 +949,12 @@ impl CredForm {
                 (v, ph)
             }
             CredField::InlinePrivate => {
-                // One-line summary of the buffer (never echoes key text):
-                // blank → placeholder, non-blank → "N line(s)" count. The
-                // full editor opens as a popup on Enter (see `on_key`).
-                if self.inline_private.trim().is_empty() {
-                    (String::new(), Some("paste private key"))
-                } else {
+                // One-line summary, never echoing key text. A freshly-pasted
+                // buffer shows its own line count; in edit mode with an empty
+                // buffer, fall back to the ORIGINAL inline key — its readable
+                // line count (plaintext), else a "saved" hint when it exists
+                // but is encrypted (vault). The full editor opens on Enter.
+                if !self.inline_private.trim().is_empty() {
                     (
                         format!(
                             "{} line(s) of private key",
@@ -962,12 +962,16 @@ impl CredForm {
                         ),
                         None,
                     )
+                } else if let Some(n) = orig_inline_lines(self.orig_key.as_ref(), false) {
+                    (format!("{} line(s) of private key", n), None)
+                } else if orig_inline_exists(self.orig_key.as_ref(), false) {
+                    (String::new(), Some("saved · paste to replace"))
+                } else {
+                    (String::new(), Some("paste private key"))
                 }
             }
             CredField::InlineCert => {
-                if self.inline_cert.trim().is_empty() {
-                    (String::new(), Some("optional certificate"))
-                } else {
+                if !self.inline_cert.trim().is_empty() {
                     (
                         format!(
                             "{} line(s) of certificate",
@@ -975,6 +979,12 @@ impl CredForm {
                         ),
                         None,
                     )
+                } else if let Some(n) = orig_inline_lines(self.orig_key.as_ref(), true) {
+                    (format!("{} line(s) of certificate", n), None)
+                } else if orig_inline_exists(self.orig_key.as_ref(), true) {
+                    (String::new(), Some("saved · paste to replace"))
+                } else {
+                    (String::new(), Some("optional certificate"))
                 }
             }
             CredField::Password => {
@@ -1521,6 +1531,50 @@ mod tests {
             f.password.is_empty(),
             "existing password must NOT be echoed into the form"
         );
+    }
+
+    #[test]
+    fn row_value_inline_echoes_original_line_count_in_edit_mode() {
+        // REGRESSION (bug 3 follow-up, mirrors HostForm): in edit mode the paste
+        // buffer starts empty (key text never echoed), so the field row used to
+        // fall through to the "paste private key" placeholder — reading as if
+        // no key existed. It must echo the ORIGINAL inline key's line count
+        // (plaintext → readable) so edit mode never looks empty.
+        use sshrack_core::config::schema::Secret;
+        let cred = Credential {
+            id: Ulid::new(),
+            name: "ops".into(),
+            body: CredentialBody::new("u")
+                .with_inline_key(Secret::Plain("abc\ndef\n".into()), None),
+        };
+        let f = CredForm::new_edit(&cred);
+        let (v, ph) = f.row_value_and_placeholder(CredField::InlinePrivate);
+        assert_eq!(v, "2 line(s) of private key");
+        assert_eq!(ph, None);
+        assert!(
+            f.inline_private.is_empty(),
+            "buffer stays empty; count comes from orig_key"
+        );
+    }
+
+    #[test]
+    fn row_value_inline_encrypted_original_falls_back_to_saved_hint() {
+        // Vault mode: the original is Encrypted, the view cannot count lines,
+        // so fall back to a "saved" hint that still confirms the key exists.
+        use sshrack_core::config::schema::{EncryptedSecret, Secret};
+        let enc = Secret::Encrypted(EncryptedSecret {
+            nonce: "AAAA".into(),
+            cipher: "BBBB".into(),
+        });
+        let cred = Credential {
+            id: Ulid::new(),
+            name: "ops".into(),
+            body: CredentialBody::new("u").with_inline_key(enc, None),
+        };
+        let f = CredForm::new_edit(&cred);
+        let (v, ph) = f.row_value_and_placeholder(CredField::InlinePrivate);
+        assert!(v.is_empty());
+        assert_eq!(ph, Some("saved · paste to replace"));
     }
 
     #[test]
