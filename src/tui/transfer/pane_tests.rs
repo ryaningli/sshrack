@@ -227,6 +227,44 @@ fn left_is_noop_at_root() {
     assert_eq!(p.on_key(press(KeyCode::Backspace)), PaneOutcome::None);
 }
 
+#[test]
+fn entering_a_child_by_path_lands_cursor_on_it_when_going_back_up() {
+    // Regression: typing a full path like "/tmp/sftp-test" + Enter jumps
+    // straight into the dir from anywhere (here /home/user), so the parent
+    // /tmp is never visited and `history[/tmp]` is empty. Without recording
+    // the parent's cursor as the entered child on the way in, going back up
+    // (Left → StepUp) restores the cursor to index 0 instead of the child we
+    // just came from. `aaa` is a dir that sorts ahead of `sftp-test`, so
+    // index 0 is `aaa`, not `sftp-test` — the bug is observable.
+    let home = PathBuf::from("/home/user");
+    let inner = PathBuf::from("/tmp/sftp-test");
+    let tmp = PathBuf::from("/tmp");
+    let mut p = Pane::new(home.clone());
+    p.set_entries(vec![entry("foo", &home, false)]);
+
+    // Path-resolve Enter into /tmp/sftp-test (run_loop sequence: on_step on
+    // the OLD cwd, switch cwd, set_entries on the NEW cwd).
+    p.on_step();
+    p.cwd = inner.clone();
+    p.set_entries(vec![entry("inner", &inner, false)]);
+
+    // Left → StepUp to /tmp (run_loop: on_step, switch cwd, set_entries).
+    p.on_step();
+    p.cwd = tmp.clone();
+    p.set_entries(vec![
+        entry("aaa", &tmp, true),
+        entry("sftp-test", &tmp, true),
+        entry("zzz", &tmp, false),
+    ]);
+
+    let sel = p.selected_entry().expect("cursor on an entry");
+    assert_eq!(
+        sel.path,
+        PathBuf::from("/tmp/sftp-test"),
+        "going back up should land on the dir we just entered"
+    );
+}
+
 // ---- Right/Enter on a dir → StepInto; on a file → ActivateSelected ----
 
 #[test]

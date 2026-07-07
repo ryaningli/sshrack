@@ -181,6 +181,14 @@ impl Pane {
                 &self.ranked,
                 &self.entries,
             );
+            // Record the parent's cursor as this new cwd, so navigating back
+            // up (Left → StepUp) lands on the directory we just entered —
+            // matches ranger. Fixes a path-like Enter ("/tmp/sftp-test") where
+            // the parent was never visited, so its cursor was never on the
+            // child; without this, going back up restored cursor to index 0.
+            if let Some(parent) = self.cwd.parent() {
+                self.history.insert(parent.to_path_buf(), self.cwd.clone());
+            }
             self.pending_restore = false;
         } else {
             // In-place refresh (same dir, new entries): reset to 0 like before.
