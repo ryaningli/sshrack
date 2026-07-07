@@ -17,7 +17,29 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
 use sshrack_core::dirsource::DirEntry;
+
+/// Neutral result of [`BrowserCore::apply_nav_key`] for the unambiguous
+/// navigation/edit keys (arrows, Ctrl-P/N, Left, Backspace, printable chars
+/// incl. Space). The component translates it into its own outcome. Keys NOT
+/// owned here — `Enter`/`Right` (activation, component-specific), `Space`
+/// (`Pane` marks vs `FilePicker` query char — `Pane` intercepts it earlier),
+/// `Esc`/`Ctrl-C` (cancel) — yield `None` so the component keeps full control.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NavDecision {
+    /// Up/Down/Ctrl-P/N moved the cursor (`selected` already mutated).
+    CursorMoved,
+    /// A printable char was appended or Backspace popped one (`query` + rank
+    /// already mutated).
+    QueryChanged,
+    /// `Left` requested the parent directory. Core did NOT move; the component
+    /// decides (and may no-op at `/`).
+    StepUp,
+    /// Backspace on an empty query — a deliberate no-op (pure-edit semantics).
+    Noop,
+}
 
 /// Pure per-directory browser state: a cwd, its current listing, a fuzzy
 /// filter query, a cursor, a per-directory mark set, and a per-directory
@@ -143,6 +165,117 @@ impl BrowserCore {
         }
         Some(path)
     }
+
+    /// Phase 1 of the async two-phase switch (e.g. remote SFTP): snapshot the
+    /// OUTGOING cwd's cursor into history, clear marks/query/selected, and arm
+    /// `pending_restore`. The caller then sets `cwd` to the new path, fetches
+    /// the listing, and calls [`Self::finish_switch`]. Pure.
+    pub(crate) fn begin_switch(&mut self) {
+        if let Some(cursor) = self.selected_entry().map(|e| e.path.clone()) {
+            self.history.insert(self.cwd.clone(), cursor);
+        }
+        self.marked.clear();
+        self.query.clear();
+        self.selected = 0;
+        self.pending_restore = true;
+    }
+
+    /// Phase 2 of the async switch: adopt `entries` for the CURRENT `cwd` (set
+    /// by the caller between phase 1 and here), re-rank, and restore the
+    /// remembered cursor (dir switch — `pending_restore`) or reset to 0
+    /// (in-place refresh). Also records the parent's cursor as this cwd so
+    /// going back up lands on the child. Pure.
+    pub(crate) fn finish_switch(&mut self, entries: Vec<DirEntry>) {
+        self.entries = entries;
+        self.recompute();
+        if self.pending_restore {
+            self.selected = crate::tui::cursor_history::remembered_cursor_index(
+                &self.history,
+                &self.cwd,
+                &self.ranked,
+                &self.entries,
+            );
+            if let Some(parent) = self.cwd.parent() {
+                self.history.insert(parent.to_path_buf(), self.cwd.clone());
+            }
+            self.pending_restore = false;
+        } else {
+            self.selected = 0;
+        }
+    }
+
+    /// Atomic switch for synchronous sources (e.g. local fs): snapshot
+    /// outgoing, set `new_cwd` + entries, restore incoming — all in one call.
+    /// A listing failure can simply skip this call and leave the previous
+    /// view intact (snapshot happens before `entries` are replaced). Pure.
+    pub(crate) fn commit_switch(&mut self, new_cwd: PathBuf, entries: Vec<DirEntry>) {
+        if let Some(cursor) = self.selected_entry().map(|e| e.path.clone()) {
+            self.history.insert(self.cwd.clone(), cursor);
+        }
+        self.cwd = new_cwd;
+        self.entries = entries;
+        self.query.clear();
+        self.marked.clear();
+        self.recompute();
+        self.selected = crate::tui::cursor_history::remembered_cursor_index(
+            &self.history,
+            &self.cwd,
+            &self.ranked,
+            &self.entries,
+        );
+        if let Some(parent) = self.cwd.parent() {
+            self.history.insert(parent.to_path_buf(), self.cwd.clone());
+        }
+    }
+
+    /// Apply one unambiguous navigation/edit key and return the decision for
+    /// the component to translate. Returns `None` for keys it does NOT own
+    /// (`Enter`, `Right`, `Esc`, `Ctrl-C`, non-Press) so the component keeps
+    /// full control over activation/cancel semantics. `Space` IS appended to
+    /// the query here — `Pane` intercepts it earlier for mark-toggle.
+    pub(crate) fn apply_nav_key(&mut self, key: KeyEvent) -> Option<NavDecision> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Up => {
+                self.move_cursor(-1);
+                Some(NavDecision::CursorMoved)
+            }
+            KeyCode::Down => {
+                self.move_cursor(1);
+                Some(NavDecision::CursorMoved)
+            }
+            KeyCode::Char('p') if ctrl => {
+                self.move_cursor(-1);
+                Some(NavDecision::CursorMoved)
+            }
+            KeyCode::Char('n') if ctrl => {
+                self.move_cursor(1);
+                Some(NavDecision::CursorMoved)
+            }
+            KeyCode::Left => Some(NavDecision::StepUp),
+            KeyCode::Backspace => {
+                // Pure edit: pop a query char, or no-op when empty. NEVER
+                // step up — going up uses Left. Keeps both browsers identical
+                // (fixes the drift where FilePicker stepped up on empty
+                // Backspace).
+                if self.query.is_empty() {
+                    Some(NavDecision::Noop)
+                } else {
+                    self.query.pop();
+                    self.recompute();
+                    self.clamp_selected();
+                    Some(NavDecision::QueryChanged)
+                }
+            }
+            KeyCode::Char(c) if !ctrl => {
+                self.query.push(c);
+                self.recompute();
+                self.selected = 0;
+                Some(NavDecision::QueryChanged)
+            }
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -247,5 +380,185 @@ mod tests {
         let c = core_with("/x", &[("a", false), ("b", false), ("c", false)]);
         let win = c.visible_window(2);
         assert!(win.end - win.start <= 2);
+    }
+
+    // ---- dir-switch protocol ----
+
+    #[test]
+    fn commit_switch_first_visit_lands_on_zero() {
+        let mut c = BrowserCore::new(PathBuf::from("/"));
+        c.commit_switch(
+            PathBuf::from("/x"),
+            vec![
+                entry("a", Path::new("/x"), false),
+                entry("b", Path::new("/x"), false),
+            ],
+        );
+        assert_eq!(c.cwd, PathBuf::from("/x"));
+        assert_eq!(c.selected, 0, "first visit → cursor 0");
+        assert_eq!(c.matched_count(), 2);
+    }
+
+    #[test]
+    fn begin_then_finish_restores_remembered_cursor() {
+        // Enter /x, move to "b", leave; come back — cursor should land on "b".
+        let mut c = BrowserCore::new(PathBuf::from("/"));
+        c.commit_switch(
+            PathBuf::from("/x"),
+            vec![
+                entry("a", Path::new("/x"), false),
+                entry("b", Path::new("/x"), false),
+            ],
+        );
+        c.move_cursor(1); // cursor on "b"
+        // leave /x for /y
+        c.begin_switch();
+        c.cwd = PathBuf::from("/y");
+        c.finish_switch(vec![entry("c", Path::new("/y"), false)]);
+        // come back to /x
+        c.begin_switch();
+        c.cwd = PathBuf::from("/x");
+        c.finish_switch(vec![
+            entry("a", Path::new("/x"), false),
+            entry("b", Path::new("/x"), false),
+        ]);
+        assert_eq!(
+            c.selected_entry().map(|e| e.name.as_str()),
+            Some("b"),
+            "remembered cursor restored on re-entry"
+        );
+    }
+
+    #[test]
+    fn begin_switch_clears_marks_query_and_selected() {
+        let mut c = core_with("/x", &[("a", false), ("b", false)]);
+        c.move_cursor(1);
+        let _ = c.toggle_mark_selected();
+        c.query = "abc".to_string();
+        c.begin_switch();
+        assert!(c.marked.is_empty(), "marks cleared on switch");
+        assert!(c.query.is_empty(), "query cleared on switch");
+        assert_eq!(c.selected, 0, "selected reset on switch");
+    }
+
+    #[test]
+    fn commit_switch_records_parent_cursor_so_going_up_lands_on_child() {
+        // Commit into /tmp/sftp-test; then begin+finish back into /tmp should
+        // land the cursor on sftp-test (the child we just entered).
+        let mut c = BrowserCore::new(PathBuf::from("/"));
+        c.commit_switch(
+            PathBuf::from("/tmp"),
+            vec![
+                entry("aaa", Path::new("/tmp"), true),
+                entry("sftp-test", Path::new("/tmp"), true),
+                entry("zzz", Path::new("/tmp"), false),
+            ],
+        );
+        c.commit_switch(
+            PathBuf::from("/tmp/sftp-test"),
+            vec![entry("file", Path::new("/tmp/sftp-test"), false)],
+        );
+        // go back up to /tmp
+        c.begin_switch();
+        c.cwd = PathBuf::from("/tmp");
+        c.finish_switch(vec![
+            entry("aaa", Path::new("/tmp"), true),
+            entry("sftp-test", Path::new("/tmp"), true),
+            entry("zzz", Path::new("/tmp"), false),
+        ]);
+        assert_eq!(
+            c.selected_entry().map(|e| e.path.as_path()),
+            Some(std::path::Path::new("/tmp/sftp-test")),
+            "going back up lands on the dir we just entered"
+        );
+    }
+
+    #[test]
+    fn finish_switch_in_place_refresh_resets_cursor_when_not_pending() {
+        // finish_switch without a preceding begin_switch is an in-place refresh:
+        // cursor resets to 0.
+        let mut c = core_with("/x", &[("a", false), ("b", false)]);
+        c.move_cursor(1);
+        assert!(!c.pending_restore);
+        c.finish_switch(vec![
+            entry("a", Path::new("/x"), false),
+            entry("b", Path::new("/x"), false),
+        ]);
+        assert_eq!(c.selected, 0, "in-place refresh resets cursor");
+    }
+
+    // ---- apply_nav_key ----
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new_with_kind(code, KeyModifiers::NONE, KeyEventKind::Press)
+    }
+
+    #[test]
+    fn nav_backspace_on_empty_query_is_noop_never_step_up() {
+        // The drift fix: empty-query Backspace must NOT be StepUp. It is Noop.
+        let mut c = core_with("/x", &[("a", false)]);
+        let d = c.apply_nav_key(key(KeyCode::Backspace)).expect("handled");
+        assert_eq!(d, super::NavDecision::Noop);
+        assert_eq!(c.cwd, PathBuf::from("/x"), "cwd unchanged by Backspace");
+    }
+
+    #[test]
+    fn nav_backspace_pops_query_char() {
+        let mut c = core_with("/x", &[("a", false)]);
+        c.query = "ab".to_string();
+        let d = c.apply_nav_key(key(KeyCode::Backspace)).expect("handled");
+        assert_eq!(d, super::NavDecision::QueryChanged);
+        assert_eq!(c.query, "a");
+    }
+
+    #[test]
+    fn nav_left_requests_step_up_without_moving_cwd() {
+        let mut c = core_with("/x", &[("a", false)]);
+        let d = c.apply_nav_key(key(KeyCode::Left)).expect("handled");
+        assert_eq!(d, super::NavDecision::StepUp);
+        assert_eq!(c.cwd, PathBuf::from("/x"), "Left does not move cwd itself");
+    }
+
+    #[test]
+    fn nav_arrows_move_cursor() {
+        let mut c = core_with("/x", &[("a", false), ("b", false)]);
+        let d = c.apply_nav_key(key(KeyCode::Down)).expect("handled");
+        assert_eq!(d, super::NavDecision::CursorMoved);
+        assert_eq!(c.selected, 1);
+    }
+
+    #[test]
+    fn nav_ctrl_p_n_move_cursor() {
+        let mut c = core_with("/x", &[("a", false), ("b", false)]);
+        let pn = KeyEvent::new_with_kind(
+            KeyCode::Char('n'),
+            KeyModifiers::CONTROL,
+            KeyEventKind::Press,
+        );
+        let d = c.apply_nav_key(pn).expect("handled");
+        assert_eq!(d, super::NavDecision::CursorMoved);
+        assert_eq!(c.selected, 1);
+    }
+
+    #[test]
+    fn nav_printable_char_appends_to_query_including_space() {
+        let mut c = core_with("/x", &[("a", false)]);
+        let d = c.apply_nav_key(key(KeyCode::Char('z'))).expect("handled");
+        assert_eq!(d, super::NavDecision::QueryChanged);
+        assert_eq!(c.query, "z");
+        // Space is a query char here; Pane intercepts it earlier for marks.
+        let d2 = c.apply_nav_key(key(KeyCode::Char(' '))).expect("handled");
+        assert_eq!(d2, super::NavDecision::QueryChanged);
+        assert_eq!(c.query, "z ");
+    }
+
+    #[test]
+    fn nav_enter_right_escape_are_not_handled() {
+        let mut c = core_with("/x", &[("a", false)]);
+        assert!(c.apply_nav_key(key(KeyCode::Enter)).is_none());
+        assert!(c.apply_nav_key(key(KeyCode::Right)).is_none());
+        assert!(c.apply_nav_key(key(KeyCode::Esc)).is_none());
     }
 }
