@@ -31,7 +31,6 @@ pub mod app;
 pub(crate) mod browser_core;
 pub mod connect;
 pub mod cred_panel;
-pub(crate) mod cursor_history;
 pub mod dialog;
 pub mod file_picker;
 pub mod fit;

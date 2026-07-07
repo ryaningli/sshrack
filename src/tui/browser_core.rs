@@ -15,7 +15,7 @@
 //!   [`BrowserCore::begin_switch`] + [`BrowserCore::finish_switch`] (Task 2).
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -185,12 +185,8 @@ impl BrowserCore {
         self.entries = entries;
         self.recompute();
         if self.pending_restore {
-            self.selected = crate::tui::cursor_history::remembered_cursor_index(
-                &self.history,
-                &self.cwd,
-                &self.ranked,
-                &self.entries,
-            );
+            self.selected =
+                remembered_cursor_index(&self.history, &self.cwd, &self.ranked, &self.entries);
             if let Some(parent) = self.cwd.parent() {
                 self.history.insert(parent.to_path_buf(), self.cwd.clone());
             }
@@ -213,12 +209,8 @@ impl BrowserCore {
         self.query.clear();
         self.marked.clear();
         self.recompute();
-        self.selected = crate::tui::cursor_history::remembered_cursor_index(
-            &self.history,
-            &self.cwd,
-            &self.ranked,
-            &self.entries,
-        );
+        self.selected =
+            remembered_cursor_index(&self.history, &self.cwd, &self.ranked, &self.entries);
         if let Some(parent) = self.cwd.parent() {
             self.history.insert(parent.to_path_buf(), self.cwd.clone());
         }
@@ -274,6 +266,24 @@ impl BrowserCore {
     }
 }
 
+/// Return the ranked-list index of the entry `history` remembers for `cwd`,
+/// or `0` when nothing is remembered or the remembered path is gone. Pure.
+fn remembered_cursor_index(
+    history: &HashMap<PathBuf, PathBuf>,
+    cwd: &Path,
+    ranked: &[usize],
+    entries: &[DirEntry],
+) -> usize {
+    history
+        .get(cwd)
+        .and_then(|p| {
+            ranked
+                .iter()
+                .position(|&i| entries.get(i).is_some_and(|e| &e.path == p))
+        })
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,6 +312,20 @@ mod tests {
         c.entries = entries;
         c.recompute();
         c
+    }
+
+    // Helper for the remembered_cursor_index tests below. Uses an
+    // absolute-path string (those tests assert on absolute paths), distinct
+    // from `entry` which builds paths from a parent dir.
+    fn e(name: &str, path: &str, is_dir: bool) -> DirEntry {
+        DirEntry {
+            name: name.into(),
+            path: PathBuf::from(path),
+            is_dir,
+            is_symlink: false,
+            size: None,
+            modified: None,
+        }
     }
 
     #[test]
@@ -556,5 +580,63 @@ mod tests {
         assert!(c.apply_nav_key(key(KeyCode::Enter)).is_none());
         assert!(c.apply_nav_key(key(KeyCode::Right)).is_none());
         assert!(c.apply_nav_key(key(KeyCode::Esc)).is_none());
+    }
+
+    // ---- remembered_cursor_index ----
+
+    #[test]
+    fn empty_history_returns_zero() {
+        let history = HashMap::new();
+        let entries = vec![e("a/", "/x/a", true), e("b/", "/x/b", true)];
+        assert_eq!(
+            super::remembered_cursor_index(&history, Path::new("/x"), &[0, 1], &entries),
+            0
+        );
+    }
+
+    #[test]
+    fn remembered_path_present_returns_its_ranked_index() {
+        let mut history = HashMap::new();
+        history.insert(PathBuf::from("/x"), PathBuf::from("/x/b"));
+        let entries = vec![e("a/", "/x/a", true), e("b/", "/x/b", true)];
+        assert_eq!(
+            super::remembered_cursor_index(&history, Path::new("/x"), &[0, 1], &entries),
+            1
+        );
+    }
+
+    #[test]
+    fn ranked_reorder_is_respected() {
+        // dirs-first decoration may rank b before a; the restore follows the
+        // ranked order, not the entries order.
+        let mut history = HashMap::new();
+        history.insert(PathBuf::from("/x"), PathBuf::from("/x/a"));
+        let entries = vec![e("a/", "/x/a", true), e("b/", "/x/b", true)];
+        assert_eq!(
+            super::remembered_cursor_index(&history, Path::new("/x"), &[1, 0], &entries),
+            1
+        );
+    }
+
+    #[test]
+    fn remembered_path_missing_falls_back_to_zero() {
+        let mut history = HashMap::new();
+        history.insert(PathBuf::from("/x"), PathBuf::from("/x/gone"));
+        let entries = vec![e("a/", "/x/a", true)];
+        assert_eq!(
+            super::remembered_cursor_index(&history, Path::new("/x"), &[0], &entries),
+            0
+        );
+    }
+
+    #[test]
+    fn cwd_not_in_history_returns_zero() {
+        let mut history = HashMap::new();
+        history.insert(PathBuf::from("/other"), PathBuf::from("/other/a"));
+        let entries = vec![e("a/", "/x/a", true)];
+        assert_eq!(
+            super::remembered_cursor_index(&history, Path::new("/x"), &[0], &entries),
+            0
+        );
     }
 }
