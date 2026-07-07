@@ -29,7 +29,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # TUI front end (ratatui shell in src/tui/).
 ratatui = "0.30"
-crossterm = "0.28"
+crossterm = "0.29"
 nucleo-matcher = "0.3"
 unicode-width = "0.2"
 # Multiline text area widget for the inline-key paste rows (Task 1 adds the

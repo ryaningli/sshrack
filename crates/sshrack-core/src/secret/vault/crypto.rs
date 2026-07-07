@@ -4,7 +4,7 @@
 //! deterministic except [`encrypt`], whose nonce is random per call.
 
 use base64::{Engine, engine::general_purpose::STANDARD};
-use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
+use chacha20poly1305::{KeyInit, XChaCha20Poly1305, aead::Aead};
 use zeroize::Zeroizing;
 
 use crate::config::schema::{EncryptedSecret, VaultMeta};
@@ -41,9 +41,18 @@ pub fn derive_key(passphrase: &str, meta: &VaultMeta) -> Result<VaultKey, Sshrac
 pub fn encrypt(plain: &[u8], key: &[u8; 32]) -> Result<EncryptedSecret, SshrackError> {
     let mut nonce = [0u8; 24];
     getrandom::fill(&mut nonce).map_err(|_| SshrackError::EncryptionFailed)?;
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
+    let cipher = XChaCha20Poly1305::new(
+        (&key[..])
+            .try_into()
+            .map_err(|_| SshrackError::EncryptionFailed)?,
+    );
     let ciphertext = cipher
-        .encrypt(XNonce::from_slice(&nonce), plain)
+        .encrypt(
+            (&nonce[..])
+                .try_into()
+                .map_err(|_| SshrackError::EncryptionFailed)?,
+            plain,
+        )
         .map_err(|_| SshrackError::EncryptionFailed)?;
     Ok(EncryptedSecret {
         nonce: STANDARD.encode(nonce),
@@ -74,9 +83,15 @@ pub fn decrypt(
     if nonce_bytes.len() != 24 {
         return Err(DecryptError);
     }
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
+    let cipher = XChaCha20Poly1305::new((&key[..]).try_into().map_err(|_| DecryptError)?);
     let plaintext = cipher
-        .decrypt(XNonce::from_slice(&nonce_bytes), ciphertext.as_ref())
+        .decrypt(
+            nonce_bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| DecryptError)?,
+            ciphertext.as_ref(),
+        )
         .map_err(|_| DecryptError)?;
     String::from_utf8(plaintext)
         .map(Zeroizing::new)

@@ -18,17 +18,17 @@ directories = "6"
 zeroize = { version = "1", features = ["derive"] }
 ulid = { version = "1", features = ["serde"] }
 argon2 = "0.5.3"
-chacha20poly1305 = "0.10.1"
+chacha20poly1305 = "0.11"
 getrandom = "0.4.3"
 base64 = "0.22.1"
 tracing = "0.1"
 strsim = "0.11.1"
 
-[target.'cfg(target_os = "macos")'.dependencies]
-keyring = { version = "3", features = ["apple-native"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-keyring = { version = "3", features = ["async-secret-service", "crypto-rust", "async-io"] }
+# v4 unified the platform stores under the default `v1` feature set
+# (apple-native-keychain on macOS, zbus-secret-service on Linux), so the
+# former per-platform feature split collapsed into one Unix-gated dep.
+[target.'cfg(unix)'.dependencies]
+keyring = "4"
 
 [dev-dependencies]
 tempfile = "3"
