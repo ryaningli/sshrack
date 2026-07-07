@@ -39,6 +39,9 @@ ratatui-textarea = "0.9"
 
 [dev-dependencies]
 tempfile = "3"
+# Snapshot testing for TUI render output. Pilot: help overlay only (see
+# docs/superpowers/plans/2026-07-07-insta-snapshot-pilot.md).
+insta = "1"
 
 [profile.release]
 opt-level = 3
