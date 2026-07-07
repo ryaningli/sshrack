@@ -28,6 +28,7 @@ use sshrack_core::secret::{OsKeyring, SecretBackend};
 use ulid::Ulid;
 
 pub mod app;
+pub(crate) mod browser_core;
 pub mod connect;
 pub mod cred_panel;
 pub(crate) mod cursor_history;
