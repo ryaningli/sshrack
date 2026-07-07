@@ -90,9 +90,14 @@ pub enum TransferOutcome {
 
 // ---- batch builders ----
 
-/// Build an `ls -l` batch script for listing a remote directory.
+/// Build an `ls -la` batch script for listing a remote directory.
+///
+/// `-a` is required: OpenSSH `sftp`'s `ls` hides dotfiles by default (matching
+/// Unix `ls`), so a plain `ls -l` would hide remote hidden dirs/files (`.ssh`,
+/// `.bashrc`, …) from the pane. `ls -la` surfaces them; the `.` / `..` rows it
+/// also emits are dropped by the parser (`parse_ls_listing`).
 pub fn list_batch(path: &Path) -> String {
-    format!("ls -l {}\nquit\n", shell_quote(&path.to_string_lossy()))
+    format!("ls -la {}\nquit\n", shell_quote(&path.to_string_lossy()))
 }
 
 /// Build a `pwd` batch script for printing the current remote directory.
@@ -188,9 +193,11 @@ mod tests {
     #[test]
     fn list_batch_exact_string_plain_path() {
         // Exact composed string — locked so flag placement / quoting can't drift.
+        // `-la` (not `-l`): OpenSSH sftp `ls` hides dotfiles by default; `-a`
+        // surfaces them so hidden dirs/files are selectable in the pane.
         assert_eq!(
             list_batch(Path::new("/remote/path")),
-            format!("ls -l {}\nquit\n", shell_quote("/remote/path"))
+            format!("ls -la {}\nquit\n", shell_quote("/remote/path"))
         );
     }
 
@@ -198,7 +205,7 @@ mod tests {
     fn list_batch_exact_string_path_with_spaces() {
         assert_eq!(
             list_batch(Path::new("/path with spaces")),
-            format!("ls -l {}\nquit\n", shell_quote("/path with spaces"))
+            format!("ls -la {}\nquit\n", shell_quote("/path with spaces"))
         );
     }
 

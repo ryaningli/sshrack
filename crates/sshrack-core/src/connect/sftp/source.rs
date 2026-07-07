@@ -273,6 +273,44 @@ drwxr-xr-x 3 u g 4096 Jan 2 03:04 ..
         assert_eq!(names, vec!["keep.txt"]);
     }
 
+    #[test]
+    fn list_keeps_hidden_dotfiles_but_drops_dot_and_dotdot() {
+        // `list_batch` now emits `ls -la`, so the listing includes dotfiles
+        // alongside `.` / `..` and the `total N` summary. The parser must KEEP
+        // real dotfiles (so hidden dirs/files are selectable in the pane) while
+        // still dropping `.`, `..`, and the summary line. Guards against a
+        // regression that re-hides dotfiles or fails to filter `.`/`..`.
+        let canned = "\
+total 12
+drwxr-xr-x 2 u g 4096 Jan 2 03:04 .
+drwxr-xr-x 3 u g 4096 Jan 2 03:04 ..
+drwxr-xr-x 2 u g 4096 Jan 2 03:04 /srv/.config
+-rw-r--r-- 1 u g 256 Jan 2 03:04 /srv/.bashrc
+-rw-r--r-- 1 u g 10 Jan 2 03:04 /srv/keep.txt
+";
+        let src = source_with(canned);
+        let entries = src.list(Path::new("/srv")).expect("parse ok");
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![".config/", ".bashrc", "keep.txt"],
+            "hidden dir + hidden file kept; dirs first then files; ./.. gone"
+        );
+        // The hidden file keeps its size and absolute path; the hidden dir is a dir.
+        let bashrc = entries
+            .iter()
+            .find(|e| e.name == ".bashrc")
+            .expect("hidden file present");
+        assert_eq!(bashrc.size, Some(256));
+        assert_eq!(bashrc.path, PathBuf::from("/srv/.bashrc"));
+        let config = entries
+            .iter()
+            .find(|e| e.name == ".config/")
+            .expect("hidden dir present");
+        assert!(config.is_dir);
+        assert_eq!(config.path, PathBuf::from("/srv/.config"));
+    }
+
     // ---- classify: maps the first ls -ld row to a PathKind ----
 
     #[test]
