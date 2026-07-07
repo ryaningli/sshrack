@@ -474,7 +474,7 @@ fn drain_transfer_events(app: &mut App, handle: &TerminalHandle) {
                 // needs to preserve the query.
                 if let Some(screen) = app.transfer.as_mut() {
                     screen.local.on_step();
-                    screen.local.cwd = path.clone();
+                    screen.local.core.cwd = path.clone();
                 }
                 let listing = LocalDirSource::new().list(&path);
                 if let Some(screen) = app.transfer.as_mut() {
@@ -495,7 +495,7 @@ fn drain_transfer_events(app: &mut App, handle: &TerminalHandle) {
                 // flight; entries refresh when the Listing event lands.
                 if let Some(screen) = app.transfer.as_mut() {
                     screen.remote.on_step();
-                    screen.remote.cwd = path.clone();
+                    screen.remote.core.cwd = path.clone();
                 }
                 if let Some(worker) = app.transfer_worker.as_ref() {
                     worker.send(WorkerCmd::List(path));
@@ -522,7 +522,7 @@ fn drain_transfer_events(app: &mut App, handle: &TerminalHandle) {
                             // The user may have navigated further by the time
                             // this listing lands — only feed it back when its
                             // cwd still matches the pane's cwd.
-                            let still_current = screen.remote.cwd == cwd;
+                            let still_current = screen.remote.core.cwd == cwd;
                             if still_current {
                                 screen.remote_mut().set_entries(entries);
                             }
@@ -600,7 +600,7 @@ fn drain_transfer_events(app: &mut App, handle: &TerminalHandle) {
     if let Some(direction) = pending_refresh {
         match direction {
             Direction::Download => {
-                let cwd = app.transfer.as_ref().map(|s| s.local.cwd.clone());
+                let cwd = app.transfer.as_ref().map(|s| s.local.core.cwd.clone());
                 if let Some(cwd) = cwd {
                     let listing = LocalDirSource::new().list(&cwd);
                     if let Some(screen) = app.transfer.as_mut() {
@@ -614,7 +614,7 @@ fn drain_transfer_events(app: &mut App, handle: &TerminalHandle) {
                 }
             }
             Direction::Upload => {
-                let cwd = app.transfer.as_ref().map(|s| s.remote.cwd.clone());
+                let cwd = app.transfer.as_ref().map(|s| s.remote.core.cwd.clone());
                 if let Some(cwd) = cwd {
                     if let Some(worker) = app.transfer_worker.as_ref() {
                         worker.send(WorkerCmd::List(cwd));
@@ -866,7 +866,7 @@ mod tests {
     // ===============================================================
     // Remote-pane on_step parity: navigation into a new remote dir must
     // clear marks + query + cursor exactly like the local branch. The bug
-    // was that the Remote arm set `screen.remote.cwd` + sent `WorkerCmd::List`
+    // was that the Remote arm set `screen.remote.core.cwd` + sent `WorkerCmd::List`
     // but never called `screen.remote.on_step()`, so a prior filter stayed
     // visible and prior marks persisted in `marked` (reappearing on navigating
     // back). The pane-level clearing mechanism is covered by pane_tests
@@ -883,14 +883,15 @@ mod tests {
         let mut app = app_with_host("web");
         let mut screen =
             TransferScreen::new(PathBuf::from("/local"), PathBuf::from("/remote/start"));
-        screen.remote.query = "stale".to_string();
+        screen.remote.core.query = "stale".to_string();
         screen
             .remote
+            .core
             .marked
             .insert(PathBuf::from("/remote/start/file"));
         // Sanity: the fixtures took.
-        assert!(!screen.remote.query.is_empty());
-        assert_eq!(screen.remote.marked.len(), 1);
+        assert!(!screen.remote.core.query.is_empty());
+        assert_eq!(screen.remote.core.marked.len(), 1);
         app.transfer = Some(screen);
         // Queue a step into a subdirectory of the current remote cwd.
         app.transfer.as_mut().unwrap().pending_list =
@@ -905,15 +906,15 @@ mod tests {
 
         let screen = app.transfer.as_ref().expect("transfer screen present");
         assert!(
-            screen.remote.query.is_empty(),
+            screen.remote.core.query.is_empty(),
             "remote query must be cleared on navigation (on_step parity with local)"
         );
         assert!(
-            screen.remote.marked.is_empty(),
+            screen.remote.core.marked.is_empty(),
             "remote marks must be cleared on navigation (on_step parity with local)"
         );
         assert_eq!(
-            screen.remote.cwd,
+            screen.remote.core.cwd,
             PathBuf::from("/remote/start/sub"),
             "remote cwd must advance to the navigated path"
         );
@@ -935,8 +936,11 @@ mod tests {
         let mut app = app_with_host("web");
         let mut screen =
             TransferScreen::new(PathBuf::from("/local"), PathBuf::from("/remote/here"));
-        screen.remote.query = "/remote/here".to_string();
-        assert!(!screen.remote.query.is_empty(), "fixture: query seeded");
+        screen.remote.core.query = "/remote/here".to_string();
+        assert!(
+            !screen.remote.core.query.is_empty(),
+            "fixture: query seeded"
+        );
         app.transfer = Some(screen);
         // RequestList to the CURRENT cwd (path == prev_cwd) — the bug case.
         app.transfer.as_mut().unwrap().pending_list =
@@ -948,7 +952,7 @@ mod tests {
 
         let screen = app.transfer.as_ref().expect("transfer screen present");
         assert!(
-            screen.remote.query.is_empty(),
+            screen.remote.core.query.is_empty(),
             "RequestList to current cwd must still clear the query (no stale filter / no match)"
         );
     }
@@ -969,8 +973,8 @@ mod tests {
 
         let mut app = app_with_host("web");
         let mut screen = TransferScreen::new(dir.path().to_path_buf(), PathBuf::from("/remote"));
-        screen.local.query = dir.path().to_string_lossy().into_owned();
-        assert!(!screen.local.query.is_empty(), "fixture: query seeded");
+        screen.local.core.query = dir.path().to_string_lossy().into_owned();
+        assert!(!screen.local.core.query.is_empty(), "fixture: query seeded");
         app.transfer = Some(screen);
         app.transfer.as_mut().unwrap().pending_list = Some((Side::Local, dir.path().to_path_buf()));
 
@@ -980,7 +984,7 @@ mod tests {
 
         let screen = app.transfer.as_ref().expect("transfer screen present");
         assert!(
-            screen.local.query.is_empty(),
+            screen.local.core.query.is_empty(),
             "RequestList to current cwd must clear the query"
         );
         assert!(
@@ -991,6 +995,7 @@ mod tests {
         assert!(
             screen
                 .local
+                .core
                 .entries
                 .iter()
                 .any(|e| e.name.as_str() == "alpha.txt"),

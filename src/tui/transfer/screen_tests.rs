@@ -49,7 +49,7 @@ fn canned_screen() -> TransferScreen {
         entry("cache", &remote_cwd, true),
     ]);
     // Mark one local file.
-    screen.local.marked.insert(local_cwd.join("alpha.txt"));
+    screen.local.core.marked.insert(local_cwd.join("alpha.txt"));
     // Active upload: enqueue + dispatch (InFlight) + progress snapshot.
     screen.ledger.enqueue(TransferJob {
         direction: Direction::Upload,
@@ -227,9 +227,9 @@ fn draw_keeps_focused_row_visible_on_small_terminal() {
     screen.remote.set_entries(remote_entries);
     // Move the remote cursor to the last entry.
     for _ in 0..29 {
-        screen.remote.selected = (screen.remote.selected + 1) % 30;
+        screen.remote.core.selected = (screen.remote.core.selected + 1) % 30;
     }
-    assert_eq!(screen.remote.selected, 29);
+    assert_eq!(screen.remote.core.selected, 29);
     screen.focus = Side::Remote;
     // Sanity: `selected_entry` agrees the cursor is on r29.
     assert_eq!(
@@ -286,14 +286,18 @@ fn space_toggles_mark_via_focused_pane_and_returns_continue() {
     screen
         .local
         .set_entries(vec![entry("alpha.txt", &local_cwd, false)]);
-    assert!(screen.local.marked.is_empty(), "no marks initially");
+    assert!(screen.local.core.marked.is_empty(), "no marks initially");
 
     // Space must NOT be pre-empted at the screen level — it reaches the
     // focused pane and toggles the mark on the cursor entry.
     let out = screen.on_key(press(KeyCode::Char(' '), KeyModifiers::NONE));
     assert_eq!(out, ScreenOutcome::Continue);
     assert!(
-        screen.local.marked.contains(&local_cwd.join("alpha.txt")),
+        screen
+            .local
+            .core
+            .marked
+            .contains(&local_cwd.join("alpha.txt")),
         "Space toggled the local mark"
     );
 }
@@ -310,7 +314,7 @@ fn ctrl_enter_with_marked_file_enqueues_upload_job() {
         .set_entries(vec![entry("alpha.txt", &local_cwd, false)]);
     // Mark the local file directly (the screen's Space path is covered
     // above; this test isolates the enqueue direction).
-    screen.local.marked.insert(local_cwd.join("alpha.txt"));
+    screen.local.core.marked.insert(local_cwd.join("alpha.txt"));
 
     let out = screen.on_key(press(KeyCode::Enter, KeyModifiers::CONTROL));
     assert_eq!(out, ScreenOutcome::Enqueue, "marked file → Enqueue");
@@ -328,7 +332,7 @@ fn ctrl_enter_with_marked_file_enqueues_upload_job() {
     assert_eq!(job.size_total, Some(1024), "size carried from entry");
     // Marks are single-shot: cleared after enqueue.
     assert!(
-        screen.local.marked.is_empty(),
+        screen.local.core.marked.is_empty(),
         "marks cleared after enqueue"
     );
 }
@@ -342,7 +346,11 @@ fn ctrl_enter_with_focus_remote_enqueues_download_job() {
     screen
         .remote
         .set_entries(vec![entry("server.log", &remote_cwd, false)]);
-    screen.remote.marked.insert(remote_cwd.join("server.log"));
+    screen
+        .remote
+        .core
+        .marked
+        .insert(remote_cwd.join("server.log"));
 
     let out = screen.on_key(press(KeyCode::Enter, KeyModifiers::CONTROL));
     assert_eq!(out, ScreenOutcome::Enqueue);
@@ -365,7 +373,7 @@ fn ctrl_enter_with_marked_dir_sets_recursive_true() {
     screen
         .local
         .set_entries(vec![entry("docs", &local_cwd, true)]);
-    screen.local.marked.insert(local_cwd.join("docs"));
+    screen.local.core.marked.insert(local_cwd.join("docs"));
 
     let out = screen.on_key(press(KeyCode::Enter, KeyModifiers::CONTROL));
     assert_eq!(out, ScreenOutcome::Enqueue);
@@ -423,8 +431,8 @@ fn ctrl_enter_enqueues_multiple_marked_files_in_entry_order() {
     ]);
     // Mark alpha and docs (skip beta) — order in the queue follows entry
     // order, not mark-insertion order.
-    screen.local.marked.insert(local_cwd.join("docs"));
-    screen.local.marked.insert(local_cwd.join("alpha.txt"));
+    screen.local.core.marked.insert(local_cwd.join("docs"));
+    screen.local.core.marked.insert(local_cwd.join("alpha.txt"));
 
     let out = screen.on_key(press(KeyCode::Enter, KeyModifiers::CONTROL));
     assert_eq!(out, ScreenOutcome::Enqueue);
@@ -520,14 +528,14 @@ fn ctrl_s_with_marks_enqueues_marked_batch() {
         entry("alpha.txt", &local_cwd, false),
         entry("beta.txt", &local_cwd, false),
     ]);
-    screen.local.marked.insert(local_cwd.join("beta.txt"));
+    screen.local.core.marked.insert(local_cwd.join("beta.txt"));
 
     let out = screen.on_key(press(KeyCode::Char('s'), KeyModifiers::CONTROL));
     assert_eq!(out, ScreenOutcome::Enqueue);
     assert_eq!(screen.ledger.tasks.len(), 1, "only the marked entry queued");
     assert_eq!(screen.ledger.tasks[0].job.src, local_cwd.join("beta.txt"));
     assert!(
-        screen.local.marked.is_empty(),
+        screen.local.core.marked.is_empty(),
         "marks cleared after enqueue"
     );
 }
@@ -591,7 +599,10 @@ fn plain_s_types_into_filter_and_does_not_enqueue() {
 
     let out = screen.on_key(press(KeyCode::Char('s'), KeyModifiers::NONE));
     assert_eq!(out, ScreenOutcome::Continue, "bare 's' is not a transfer");
-    assert_eq!(screen.local.query, "s", "bare 's' reaches the filter box");
+    assert_eq!(
+        screen.local.core.query, "s",
+        "bare 's' reaches the filter box"
+    );
     assert!(screen.ledger.tasks.is_empty(), "bare 's' must not enqueue");
 }
 

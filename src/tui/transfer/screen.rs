@@ -285,8 +285,8 @@ impl TransferScreen {
             }
             PaneOutcome::StepUp => {
                 let parent = match focus {
-                    Side::Local => self.local.cwd.parent().map(PathBuf::from),
-                    Side::Remote => self.remote.cwd.parent().map(PathBuf::from),
+                    Side::Local => self.local.core.cwd.parent().map(PathBuf::from),
+                    Side::Remote => self.remote.core.cwd.parent().map(PathBuf::from),
                 };
                 if let Some(parent) = parent {
                     self.pending_list = Some((focus, parent));
@@ -318,8 +318,8 @@ impl TransferScreen {
             Side::Remote => Direction::Download,
         };
         let dst_cwd = match focus {
-            Side::Local => self.remote.cwd.clone(),
-            Side::Remote => self.local.cwd.clone(),
+            Side::Local => self.remote.core.cwd.clone(),
+            Side::Remote => self.local.core.cwd.clone(),
         };
 
         // Gather (path, name, is_dir, size) for marked entries — or just the
@@ -328,9 +328,9 @@ impl TransferScreen {
         let mut specs: Vec<(PathBuf, String, bool, Option<u64>)> = Vec::new();
         {
             let src = self.focused_pane();
-            if !src.marked.is_empty() {
-                for e in &src.entries {
-                    if src.marked.contains(&e.path) {
+            if !src.core.marked.is_empty() {
+                for e in &src.core.entries {
+                    if src.core.marked.contains(&e.path) {
                         specs.push((e.path.clone(), e.name.clone(), e.is_dir, e.size));
                     }
                 }
@@ -344,7 +344,7 @@ impl TransferScreen {
 
         // Marks are single-shot per enqueue — clear them now that their entries
         // are about to be queued.
-        self.focused_pane_mut().marked.clear();
+        self.focused_pane_mut().core.marked.clear();
 
         for (path, name, is_dir, size) in specs {
             let file_name = path

@@ -74,9 +74,9 @@ pub fn draw_pane(frame: &mut Frame, area: Rect, pane: &Pane, focused: bool, titl
     draw_filter_row(
         frame,
         filter_area,
-        &pane.query,
+        &pane.core.query,
         pane.matched_count(),
-        pane.entries.len(),
+        pane.core.entries.len(),
         focused,
     );
 
@@ -97,7 +97,7 @@ pub fn draw_pane(frame: &mut Frame, area: Rect, pane: &Pane, focused: bool, titl
 /// left-truncated so the trailing dir name survives. No prompt prefix — the
 /// pane's bordered title already identifies the side (`local` / remote name).
 fn draw_cwd_row(frame: &mut Frame, area: Rect, pane: &Pane, focused: bool) {
-    let cwd_str = pane.cwd.to_string_lossy();
+    let cwd_str = pane.core.cwd.to_string_lossy();
     let shown = truncate_cells_head(&cwd_str, area.width as usize);
     let style = if focused {
         theme::accent()
@@ -161,7 +161,7 @@ fn draw_filter_row(
 fn draw_pane_list(frame: &mut Frame, area: Rect, pane: &Pane, focused: bool) {
     let total = pane.matched_count();
     if total == 0 {
-        let msg = if pane.entries.is_empty() {
+        let msg = if pane.core.entries.is_empty() {
             "(empty)"
         } else {
             "(no matches)"
@@ -195,11 +195,11 @@ fn draw_pane_list(frame: &mut Frame, area: Rect, pane: &Pane, focused: bool) {
         let Some(entry) = pane.entry_at_rank(i) else {
             continue;
         };
-        let is_cursor = i == pane.selected;
-        let is_marked = pane.marked.contains(&entry.path);
+        let is_cursor = i == pane.core.selected;
+        let is_marked = pane.core.marked.contains(&entry.path);
         lines.push(draw_pane_row(
             entry,
-            &pane.query,
+            &pane.core.query,
             is_cursor,
             is_marked,
             focused,
