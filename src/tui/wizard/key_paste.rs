@@ -12,8 +12,11 @@
 //! discards. Every other key is forwarded to [`TextArea::input`].
 //!
 //! The popup textarea is ALWAYS empty on open — existing inline key text is
-//! never echoed back (security). The owning form preserves the original key
-//! on save when the popup was left empty (see each form's `build_body`).
+//! never echoed back (security). When the field already holds key material,
+//! the bottom hint reports its line COUNT only (never the text), so the empty
+//! editor on edit reads as "N line(s) saved, paste to replace" — not "my key
+//! vanished". The owning form preserves the original key on save when the
+//! popup was left empty (see each form's `build_body`).
 //!
 //! [`CredForm`]: super::cred::CredForm
 //! [`HostForm`]: super::host::HostForm
@@ -54,7 +57,8 @@ pub enum PasteOutcome {
 }
 
 /// Modal multiline paste popup. `textarea` always starts empty (existing key
-/// text is never echoed). See the module docs for the keymap.
+/// text is never echoed — only its line COUNT surfaces in the hint when the
+/// field already holds material). See the module docs for the keymap.
 ///
 /// `Debug` is hand-written (NOT derived): `ratatui_textarea::TextArea`'s
 /// derived `Debug` prints the `lines: Vec<String>` field, which would leak the
@@ -69,6 +73,11 @@ pub struct KeyPaste {
     /// Which slot this popup edits (drives the title + which form field the
     /// `Done` text writes back to).
     pub kind: PasteKind,
+    /// How many lines of inline material already live in the form field (0
+    /// when adding fresh). Drives the "N line(s) saved · empty keeps it" hint
+    /// so the empty textarea on edit is not read as "my key vanished". The
+    /// key text itself is NEVER echoed — only this count.
+    existing_lines: usize,
     textarea: TextArea<'static>,
 }
 
@@ -179,10 +188,26 @@ fn textarea_input_from(key: KeyEvent) -> Input {
 }
 
 impl KeyPaste {
-    /// Open a fresh popup for `kind` with an empty buffer.
-    pub fn new(kind: PasteKind) -> Self {
+    /// Line count of already-saved inline material for the popup hint: 0 when
+    /// the buffer is blank (adding fresh), else its line count. Pure; the popup
+    /// hints only the count ("N line(s) saved"), never the text. Shared by the
+    /// host and credential forms so the blank-vs-count rule lives in one place.
+    pub fn saved_line_count(buf: &str) -> usize {
+        if buf.trim().is_empty() {
+            0
+        } else {
+            buf.lines().count()
+        }
+    }
+
+    /// Open a fresh popup for `kind` with an empty buffer. `existing_lines` is
+    /// the line count already saved in the form field (0 when adding a new
+    /// key, e.g. from [`KeyPaste::saved_line_count`]); it only drives the "N
+    /// line(s) saved" hint — the text itself is never loaded into the textarea.
+    pub fn new(kind: PasteKind, existing_lines: usize) -> Self {
         Self {
             kind,
+            existing_lines,
             textarea: TextArea::default(),
         }
     }
@@ -242,8 +267,19 @@ impl KeyPaste {
         // — the highlight is the visual feedback (matches the upstream
         // `popup_placeholder` example and the prior inline editor).
         frame.render_widget(&self.textarea, ta_area);
-        let hint =
-            Line::from(" Enter newline · Esc done · Ctrl-C discard ").style(Style::new().dim());
+        // When the field already holds key material, say so by line COUNT only
+        // — the empty textarea would otherwise read as "my key vanished".
+        // Empty keeps the original; pasting replaces it. The text itself is
+        // never echoed.
+        let hint = if self.existing_lines > 0 {
+            Line::from(format!(
+                " {} line(s) saved · empty keeps it · Esc done ",
+                self.existing_lines
+            ))
+        } else {
+            Line::from(" Enter newline · Esc done · Ctrl-C discard ")
+        }
+        .style(Style::new().dim());
         frame.render_widget(Paragraph::new(hint), hint_area);
     }
 }
@@ -263,21 +299,58 @@ mod tests {
 
     #[test]
     fn new_starts_empty() {
-        let p = KeyPaste::new(PasteKind::Private);
+        let p = KeyPaste::new(PasteKind::Private, 0);
         assert_eq!(p.kind, PasteKind::Private);
         assert!(p.textarea.lines().iter().all(|l| l.is_empty()));
     }
 
     #[test]
+    fn saved_line_count_is_zero_for_blank_and_counts_for_text() {
+        // Blank (incl. whitespace-only) → 0; otherwise the line count. This is
+        // the number the popup hints as "N line(s) saved" — never the text.
+        assert_eq!(KeyPaste::saved_line_count(""), 0);
+        assert_eq!(
+            KeyPaste::saved_line_count("   \n  "),
+            0,
+            "whitespace-only is treated as blank"
+        );
+        assert_eq!(KeyPaste::saved_line_count("one line"), 1);
+        assert_eq!(KeyPaste::saved_line_count("a\nb\nc"), 3);
+    }
+
+    #[test]
+    fn new_with_existing_lines_keeps_textarea_empty() {
+        // The count drives only the hint; the textarea must stay empty so the
+        // existing key text is never echoed back into the editor.
+        let p = KeyPaste::new(PasteKind::Private, 16);
+        assert_eq!(p.existing_lines, 16);
+        assert!(
+            p.textarea.lines().iter().all(|l| l.is_empty()),
+            "textarea must be empty even when existing material is hinted"
+        );
+    }
+
+    #[test]
+    fn draw_overlay_renders_without_panic_with_existing_lines() {
+        // The "N line(s) saved" hint branch must render without panic when the
+        // field already holds material (existing_lines > 0).
+        use ratatui::{Terminal, backend::TestBackend};
+        let p = KeyPaste::new(PasteKind::Private, 16);
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let _ = term.draw(|f| p.draw_overlay(f));
+    }
+
+    #[test]
     fn esc_with_empty_buffer_returns_done_empty() {
-        let mut p = KeyPaste::new(PasteKind::Private);
+        let mut p = KeyPaste::new(PasteKind::Private, 0);
         let out = p.on_key(press(KeyCode::Esc));
         assert_eq!(out, PasteOutcome::Done(String::new()));
     }
 
     #[test]
     fn esc_after_typing_returns_done_with_joined_text() {
-        let mut p = KeyPaste::new(PasteKind::Cert);
+        let mut p = KeyPaste::new(PasteKind::Cert, 0);
         // Type "lineA", Enter (newline), "lineB".
         for c in "lineA".chars() {
             let _ = p.on_key(press(KeyCode::Char(c)));
@@ -294,7 +367,7 @@ mod tests {
 
     #[test]
     fn ctrl_c_returns_cancel_regardless_of_buffer() {
-        let mut p = KeyPaste::new(PasteKind::Private);
+        let mut p = KeyPaste::new(PasteKind::Private, 0);
         for c in "abc".chars() {
             let _ = p.on_key(press(KeyCode::Char(c)));
         }
@@ -308,7 +381,7 @@ mod tests {
     fn enter_is_pending_and_inserts_a_newline() {
         // Enter must NOT close the popup (it inserts a newline instead). After
         // Enter + one char, Esc yields two lines.
-        let mut p = KeyPaste::new(PasteKind::Private);
+        let mut p = KeyPaste::new(PasteKind::Private, 0);
         assert!(matches!(
             p.on_key(press(KeyCode::Enter)),
             PasteOutcome::Pending
@@ -322,7 +395,7 @@ mod tests {
 
     #[test]
     fn printable_chars_are_pending_and_accumulate() {
-        let mut p = KeyPaste::new(PasteKind::Private);
+        let mut p = KeyPaste::new(PasteKind::Private, 0);
         for c in "hi".chars() {
             assert!(matches!(
                 p.on_key(press(KeyCode::Char(c))),
@@ -337,7 +410,7 @@ mod tests {
 
     #[test]
     fn key_release_is_pending() {
-        let mut p = KeyPaste::new(PasteKind::Private);
+        let mut p = KeyPaste::new(PasteKind::Private, 0);
         let release =
             KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Release);
         assert!(matches!(p.on_key(release), PasteOutcome::Pending));
@@ -346,7 +419,7 @@ mod tests {
     #[test]
     fn draw_overlay_renders_without_panic_private() {
         use ratatui::{Terminal, backend::TestBackend};
-        let mut p = KeyPaste::new(PasteKind::Private);
+        let mut p = KeyPaste::new(PasteKind::Private, 0);
         for c in "x".chars() {
             let _ = p.on_key(press(KeyCode::Char(c)));
         }
@@ -358,7 +431,7 @@ mod tests {
     #[test]
     fn draw_overlay_renders_without_panic_cert_empty() {
         use ratatui::{Terminal, backend::TestBackend};
-        let p = KeyPaste::new(PasteKind::Cert);
+        let p = KeyPaste::new(PasteKind::Cert, 0);
         let backend = TestBackend::new(40, 12); // small terminal — must not panic
         let mut term = Terminal::new(backend).unwrap();
         let _ = term.draw(|f| p.draw_overlay(f));
@@ -369,7 +442,7 @@ mod tests {
         // The hand-written Debug must show only the line COUNT, never the
         // pasted key text. `format!("{:?}", p)` going to logs/errors must not
         // leak "SECRET". Mirrors `host_debug_impl_does_not_leak_textarea_contents`.
-        let mut p = KeyPaste::new(PasteKind::Private);
+        let mut p = KeyPaste::new(PasteKind::Private, 0);
         for c in "SECRET".chars() {
             let _ = p.on_key(press(KeyCode::Char(c)));
         }
@@ -403,7 +476,7 @@ mod tests {
 
     #[test]
     fn ctrl_j_is_treated_as_a_newline_so_paste_keeps_lines() {
-        let mut p = KeyPaste::new(PasteKind::Private);
+        let mut p = KeyPaste::new(PasteKind::Private, 0);
         for c in "lineA".chars() {
             let _ = p.on_key(press(KeyCode::Char(c)));
         }

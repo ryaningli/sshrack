@@ -447,13 +447,20 @@ impl CredForm {
                 if matches!(self.focus, CredField::InlinePrivate | CredField::InlineCert)
                     && Self::field_reachable(self.focus, self.secret_kind, self.source)
                 {
-                    self.key_paste = Some(KeyPaste::new(match self.focus {
-                        CredField::InlinePrivate => PasteKind::Private,
-                        CredField::InlineCert => PasteKind::Cert,
+                    let (kind, existing_lines) = match self.focus {
+                        CredField::InlinePrivate => (
+                            PasteKind::Private,
+                            KeyPaste::saved_line_count(&self.inline_private),
+                        ),
+                        CredField::InlineCert => (
+                            PasteKind::Cert,
+                            KeyPaste::saved_line_count(&self.inline_cert),
+                        ),
                         _ => unreachable!(
                             "invariant: focus is InlinePrivate/InlineCert (guarded above)"
                         ),
-                    }));
+                    };
+                    self.key_paste = Some(KeyPaste::new(kind, existing_lines));
                     self.error = None;
                     return Outcome::Continue;
                 }
@@ -1739,11 +1746,14 @@ mod tests {
             .unwrap();
             // Popup open: the overlay is painted on top via centered_rect —
             // must not panic even when the terminal is shorter than the popup.
-            form.key_paste = Some(KeyPaste::new(match focus {
-                CredField::InlinePrivate => PasteKind::Private,
-                CredField::InlineCert => PasteKind::Cert,
-                _ => unreachable!("focus is one of the two inline rows"),
-            }));
+            form.key_paste = Some(KeyPaste::new(
+                match focus {
+                    CredField::InlinePrivate => PasteKind::Private,
+                    CredField::InlineCert => PasteKind::Cert,
+                    _ => unreachable!("focus is one of the two inline rows"),
+                },
+                0,
+            ));
             term.draw(|f| {
                 let body = draw_dialog(
                     f,

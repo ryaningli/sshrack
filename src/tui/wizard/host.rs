@@ -687,7 +687,14 @@ impl HostForm {
                 // advances focus or saves from here.
                 if self.focus == Field::Credential {
                     if !self.credential_names.is_empty() {
-                        self.cred_picker = Some(CredPicker::new(&self.credential_names));
+                        // Land the cursor on the currently-selected credential
+                        // (if any) so re-opening the picker on an existing
+                        // reference does not jump back to the first name.
+                        let initial = match self.auth_choice {
+                            AuthChoice::Reference { idx } => Some(idx),
+                            AuthChoice::Independent => None,
+                        };
+                        self.cred_picker = Some(CredPicker::new(&self.credential_names, initial));
                     }
                     self.error = None;
                     return Outcome::Continue;
@@ -705,12 +712,19 @@ impl HostForm {
                         self.source,
                     )
                 {
-                    self.key_paste = Some(KeyPaste::new(match self.focus {
-                        Field::InlinePrivate => PasteKind::Private,
-                        Field::InlineCert => PasteKind::Cert,
+                    let (kind, existing_lines) = match self.focus {
+                        Field::InlinePrivate => (
+                            PasteKind::Private,
+                            KeyPaste::saved_line_count(&self.inline_private),
+                        ),
+                        Field::InlineCert => (
+                            PasteKind::Cert,
+                            KeyPaste::saved_line_count(&self.inline_cert),
+                        ),
                         // Guarded by the matches! above.
                         _ => unreachable!("invariant: focus is InlinePrivate/InlineCert"),
-                    }));
+                    };
+                    self.key_paste = Some(KeyPaste::new(kind, existing_lines));
                     self.error = None;
                     return Outcome::Continue;
                 }
@@ -1793,12 +1807,33 @@ mod tests {
     #[test]
     fn picker_select_writes_back_the_credential_index() {
         let mut f = ref_form(&["web-prod", "db-staging", "web-dev"]);
-        let _ = f.on_key(press(KeyCode::Enter, KeyModifiers::NONE)); // open
-        // ranked at empty query = [1,2,0] (name order: db-staging, web-dev, web-prod);
-        // cursor at 0 → idx 1 (db-staging). Enter selects it.
-        let _ = f.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
+        // ref_form leaves auth_choice = Reference{idx:0} (web-prod); the picker
+        // now opens with the cursor ON web-prod (the current selection), not
+        // the top. ranked (name asc) = [1,2,0]; web-prod is at ranked pos 2.
+        let _ = f.on_key(press(KeyCode::Enter, KeyModifiers::NONE)); // open on web-prod
+        // Move to db-staging: from pos 2, Down wraps to pos 0 (db-staging).
+        let _ = f.on_key(press(KeyCode::Down, KeyModifiers::NONE));
+        let _ = f.on_key(press(KeyCode::Enter, KeyModifiers::NONE)); // select db-staging
         assert!(f.cred_picker.is_none(), "picker closed after selecting");
         assert_eq!(f.selected_credential_name(), Some("db-staging"));
+    }
+
+    #[test]
+    fn picker_opens_with_cursor_on_currently_selected_credential() {
+        // ref_form sets auth_choice = Reference{idx:0} (web-prod). The picker
+        // must open with the cursor on web-prod, not the first name in ranked
+        // order (db-staging). Pins the fix where re-entering the picker always
+        // reset the cursor to the top.
+        let mut f = ref_form(&["web-prod", "db-staging", "web-dev"]);
+        let _ = f.on_key(press(KeyCode::Enter, KeyModifiers::NONE)); // open
+        let picker = f.cred_picker.as_ref().expect("picker open");
+        assert_eq!(
+            picker.selected_idx(),
+            Some(0),
+            "cursor on current selection web-prod (idx 0)"
+        );
+        // ranked = [1,2,0]; web-prod (idx 0) is at ranked pos 2.
+        assert_eq!(picker.selected, 2);
     }
 
     #[test]
@@ -2729,11 +2764,14 @@ mod tests {
                     // Popup open for the inline rows (unreachable for other
                     // fields, but harmless to set — the overlay is painted on
                     // top regardless).
-                    f.key_paste = Some(KeyPaste::new(match focus {
-                        Field::InlinePrivate => PasteKind::Private,
-                        Field::InlineCert => PasteKind::Cert,
-                        _ => PasteKind::Private,
-                    }));
+                    f.key_paste = Some(KeyPaste::new(
+                        match focus {
+                            Field::InlinePrivate => PasteKind::Private,
+                            Field::InlineCert => PasteKind::Cert,
+                            _ => PasteKind::Private,
+                        },
+                        0,
+                    ));
                     term.draw(|fr| {
                         let body = draw_dialog(
                             fr,
@@ -2813,11 +2851,14 @@ mod tests {
             .unwrap();
             // Popup open: the overlay is painted on top via centered_rect —
             // must not panic even when the terminal is shorter than the popup.
-            form.key_paste = Some(KeyPaste::new(match focus {
-                Field::InlinePrivate => PasteKind::Private,
-                Field::InlineCert => PasteKind::Cert,
-                _ => unreachable!("focus is one of the two inline rows"),
-            }));
+            form.key_paste = Some(KeyPaste::new(
+                match focus {
+                    Field::InlinePrivate => PasteKind::Private,
+                    Field::InlineCert => PasteKind::Cert,
+                    _ => unreachable!("focus is one of the two inline rows"),
+                },
+                0,
+            ));
             term.draw(|f| {
                 let body = draw_dialog(
                     f,

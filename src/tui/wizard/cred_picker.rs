@@ -50,16 +50,26 @@ pub struct CredPicker {
 const PICKER_VISIBLE_ROWS: usize = 16;
 
 impl CredPicker {
-    /// Fresh picker over `names`: empty query, cursor at the top, every name
-    /// ranked (name order, since scores are all zero). Clones `names` so the
-    /// picker is self-contained — the wizard's `credential_names` cannot change
-    /// while the picker is modal.
-    pub fn new(names: &[String]) -> Self {
+    /// Fresh picker over `names`: empty query, every name ranked (name order,
+    /// since scores are all zero). The cursor starts on `initial_idx`'s entry
+    /// (the wizard's currently-selected credential) when given and in range,
+    /// else at the top — so re-opening the picker on an already-chosen
+    /// reference lands on the current selection instead of jumping to the
+    /// first name. Clones `names` so the picker is self-contained — the
+    /// wizard's `credential_names` cannot change while the picker is modal.
+    pub fn new(names: &[String], initial_idx: Option<usize>) -> Self {
         let ranked = Self::rank(names, "");
+        // `initial_idx` indexes into `names` (the wizard's raw order); find
+        // where it sits in the name-sorted `ranked` list. Out-of-range / None
+        // falls back to the top, so a stale idx (e.g. a credential was
+        // deleted) never panics.
+        let selected = initial_idx
+            .and_then(|idx| ranked.iter().position(|&r| r == idx))
+            .unwrap_or(0);
         Self {
             names: names.to_vec(),
             query: String::new(),
-            selected: 0,
+            selected,
             ranked,
         }
     }
@@ -234,7 +244,7 @@ mod tests {
 
     #[test]
     fn new_empty_query_ranks_all_in_name_order() {
-        let p = CredPicker::new(&names());
+        let p = CredPicker::new(&names(), None);
         // Empty query + all-zero scores → rank_by_name returns every index,
         // sorted by name asc (db-staging < web-dev < web-prod).
         assert_eq!(p.ranked, vec![1, 2, 0]);
@@ -242,11 +252,47 @@ mod tests {
         assert_eq!(p.selected, 0);
     }
 
+    // ---- new: initial cursor lands on the current selection ----
+
+    #[test]
+    fn new_with_initial_idx_positions_cursor_on_that_entry() {
+        // names = [web-prod(0), db-staging(1), web-dev(2)]; empty-query ranked
+        // (name asc) = [1, 2, 0]. Asking to start on idx 0 (web-prod) → it
+        // sits at ranked position 2, not the top.
+        let p = CredPicker::new(&names(), Some(0));
+        assert_eq!(p.ranked, vec![1, 2, 0]);
+        assert_eq!(p.selected, 2);
+        assert_eq!(p.selected_idx(), Some(0));
+    }
+
+    #[test]
+    fn new_with_initial_idx_independent_of_ranked_order() {
+        // idx 1 (db-staging) is at ranked position 0 — the cursor follows the
+        // original idx, not the ranked slot.
+        let p = CredPicker::new(&names(), Some(1));
+        assert_eq!(p.selected, 0);
+        assert_eq!(p.selected_idx(), Some(1));
+    }
+
+    #[test]
+    fn new_with_out_of_range_initial_idx_falls_back_to_top() {
+        // A stale idx (credential deleted, etc.) must never panic — fall back
+        // to the top of the ranked list.
+        let p = CredPicker::new(&names(), Some(99));
+        assert_eq!(p.selected, 0);
+    }
+
+    #[test]
+    fn new_with_none_initial_idx_starts_at_top() {
+        let p = CredPicker::new(&names(), None);
+        assert_eq!(p.selected, 0);
+    }
+
     // ---- query filters by fuzzy match ----
 
     #[test]
     fn typing_query_keeps_only_matches_in_score_order() {
-        let mut p = CredPicker::new(&names());
+        let mut p = CredPicker::new(&names(), None);
         // Type "web": matches web-dev (1) and web-prod (0). Both contain "web"
         // as a prefix at the same position; rank_by_name breaks ties by name
         // asc → web-dev before web-prod.
@@ -260,7 +306,7 @@ mod tests {
 
     #[test]
     fn down_then_up_moves_cursor_with_wrap() {
-        let mut p = CredPicker::new(&names()); // ranked = [1,2,0], selected=0
+        let mut p = CredPicker::new(&names(), None); // ranked = [1,2,0], selected=0
         let _ = p.on_key(press(KeyCode::Down));
         assert_eq!(p.selected, 1);
         let _ = p.on_key(press(KeyCode::Down));
@@ -273,7 +319,7 @@ mod tests {
 
     #[test]
     fn cursor_clamps_when_query_shrinks_the_list() {
-        let mut p = CredPicker::new(&names());
+        let mut p = CredPicker::new(&names(), None);
         // Move to the last of 3, then filter to 1 match — selected must clamp.
         let _ = p.on_key(press(KeyCode::Down));
         let _ = p.on_key(press(KeyCode::Down));
@@ -289,14 +335,14 @@ mod tests {
 
     #[test]
     fn enter_returns_selected_original_index() {
-        let mut p = CredPicker::new(&names()); // ranked=[1,2,0], selected=0 → idx 1
+        let mut p = CredPicker::new(&names(), None); // ranked=[1,2,0], selected=0 → idx 1
         let out = p.on_key(press(KeyCode::Enter));
         assert_eq!(out, PickerOutcome::Selected { idx: 1 });
     }
 
     #[test]
     fn enter_on_empty_list_is_pending() {
-        let mut p = CredPicker::new(&[]); // no credentials at all
+        let mut p = CredPicker::new(&[], None); // no credentials at all
         let out = p.on_key(press(KeyCode::Enter));
         assert!(matches!(out, PickerOutcome::Pending));
     }
@@ -305,7 +351,7 @@ mod tests {
     fn enter_on_no_match_query_is_pending() {
         // Credentials exist, but the query matches none: ranked empties,
         // selected_idx() is None, so Enter stays Pending (no selection, no panic).
-        let mut p = CredPicker::new(&["web-prod".into(), "db-staging".into()]);
+        let mut p = CredPicker::new(&["web-prod".into(), "db-staging".into()], None);
         for c in "zzz".chars() {
             let _ = p.on_key(press(KeyCode::Char(c)));
         }
@@ -320,13 +366,13 @@ mod tests {
 
     #[test]
     fn escape_cancels() {
-        let mut p = CredPicker::new(&names());
+        let mut p = CredPicker::new(&names(), None);
         assert_eq!(p.on_key(press(KeyCode::Esc)), PickerOutcome::Cancel);
     }
 
     #[test]
     fn ctrl_c_cancels() {
-        let mut p = CredPicker::new(&names());
+        let mut p = CredPicker::new(&names(), None);
         assert_eq!(
             p.on_key(press_ctrl(KeyCode::Char('c'))),
             PickerOutcome::Cancel
@@ -335,7 +381,7 @@ mod tests {
 
     #[test]
     fn backspace_pops_query() {
-        let mut p = CredPicker::new(&names());
+        let mut p = CredPicker::new(&names(), None);
         let _ = p.on_key(press(KeyCode::Char('w')));
         let _ = p.on_key(press(KeyCode::Backspace));
         assert!(p.query.is_empty());
@@ -345,7 +391,7 @@ mod tests {
 
     #[test]
     fn non_press_events_are_pending() {
-        let mut p = CredPicker::new(&names());
+        let mut p = CredPicker::new(&names(), None);
         let release =
             KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Release);
         assert!(matches!(p.on_key(release), PickerOutcome::Pending));
@@ -356,7 +402,7 @@ mod tests {
     #[test]
     fn draw_overlay_renders_without_panic_and_places_cursor() {
         use ratatui::{Terminal, backend::TestBackend};
-        let p = CredPicker::new(&["web-prod".into(), "db-staging".into()]);
+        let p = CredPicker::new(&["web-prod".into(), "db-staging".into()], None);
         let backend = TestBackend::new(80, 24);
         let mut term = Terminal::new(backend).unwrap();
         let _ = term.draw(|f| p.draw_overlay(f));
@@ -368,7 +414,7 @@ mod tests {
     #[test]
     fn draw_overlay_on_empty_list_renders_without_panic() {
         use ratatui::{Terminal, backend::TestBackend};
-        let p = CredPicker::new(&[] as &[String]);
+        let p = CredPicker::new(&[] as &[String], None);
         let backend = TestBackend::new(80, 24);
         let mut term = Terminal::new(backend).unwrap();
         let _ = term.draw(|f| p.draw_overlay(f));
