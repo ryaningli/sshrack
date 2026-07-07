@@ -347,23 +347,17 @@ mod tests {
 
     use super::*;
     use std::io::Cursor;
-    use std::path::PathBuf;
-
-    fn temp_dir_for_pid() -> PathBuf {
-        std::env::temp_dir().join(format!("sshrack-test-{}", std::process::id()))
-    }
 
     #[test]
     fn read_secret_file_returns_plain_secret_of_file_contents() {
         // Round-trip: write → read → Secret::Plain. The path is on argv (not
-        // secret); the file's bytes become the inline secret verbatim.
-        let dir = temp_dir_for_pid();
-        std::fs::create_dir_all(&dir).unwrap();
-        let keyfile = dir.join("read_secret_file_plain");
+        // secret); the file's bytes become the inline secret verbatim. The
+        // tempdir is reaped automatically when `dir` drops.
+        let dir = tempfile::tempdir().unwrap();
+        let keyfile = dir.path().join("read_secret_file_plain");
         std::fs::write(&keyfile, "KEY-CONTENTS").unwrap();
         let s = read_secret_file(&keyfile).unwrap();
         assert_eq!(s.as_plain(), Some("KEY-CONTENTS"));
-        let _ = std::fs::remove_file(&keyfile);
     }
 
     #[test]
@@ -379,9 +373,8 @@ mod tests {
     fn read_secret_file_errors_on_non_utf8_bytes() {
         // A binary key file (or any non-UTF-8 input) must error cleanly — the
         // path is named in the error context so the user knows which file.
-        let dir = temp_dir_for_pid();
-        std::fs::create_dir_all(&dir).unwrap();
-        let keyfile = dir.join("read_secret_file_non_utf8");
+        let dir = tempfile::tempdir().unwrap();
+        let keyfile = dir.path().join("read_secret_file_non_utf8");
         std::fs::write(&keyfile, [0xFFu8, 0xFE, 0xFD]).unwrap();
         let err = read_secret_file(&keyfile).unwrap_err();
         let msg = format!("{err:#}");
@@ -393,14 +386,14 @@ mod tests {
             msg.contains(keyfile.to_string_lossy().as_ref()),
             "error must name the offending path, got: {msg}"
         );
-        let _ = std::fs::remove_file(&keyfile);
     }
 
     #[test]
     fn read_secret_file_errors_when_file_missing() {
-        // A missing file must error cleanly with the path in the message.
-        let dir = temp_dir_for_pid();
-        let nosuch = dir.join("does-not-exist-read_secret_file");
+        // A missing file must error cleanly with the path in the message. The
+        // tempdir exists but the named file inside it does not.
+        let dir = tempfile::tempdir().unwrap();
+        let nosuch = dir.path().join("does-not-exist-read_secret_file");
         let err = read_secret_file(&nosuch).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
@@ -459,10 +452,9 @@ mod tests {
     fn resolve_inline_identity_reads_private_from_file_cert_from_file() {
         // --identity-file <a> --certificate-file <b>: both read from files, in
         // the order private-then-certificate.
-        let dir = temp_dir_for_pid();
-        std::fs::create_dir_all(&dir).unwrap();
-        let priv_path = dir.join("resolve_inline_priv");
-        let cert_path = dir.join("resolve_inline_cert");
+        let dir = tempfile::tempdir().unwrap();
+        let priv_path = dir.path().join("resolve_inline_priv");
+        let cert_path = dir.path().join("resolve_inline_cert");
         std::fs::write(&priv_path, "FILE-PRIVATE").unwrap();
         std::fs::write(&cert_path, "FILE-CERT").unwrap();
         let mut cursor = Cursor::new(b"");
@@ -483,8 +475,6 @@ mod tests {
             ik.certificate.as_ref().and_then(Secret::as_plain),
             Some("FILE-CERT")
         );
-        let _ = std::fs::remove_file(&priv_path);
-        let _ = std::fs::remove_file(&cert_path);
     }
 
     // ---- seal_inline_body: per-mode sealing at the CLI boundary ----
