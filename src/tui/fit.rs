@@ -28,6 +28,13 @@ pub fn focus_window(total: usize, selected: usize, visible: usize) -> std::ops::
     start..start + visible
 }
 
+/// Display width of `s` in terminal cells, following Unicode East Asian Width
+/// (via the `unicode-width` crate). Pure. Use to budget text against a
+/// `Rect::width` before passing it to [`truncate_cells`] / [`truncate_cells_head`].
+pub fn cells(s: &str) -> usize {
+    s.width()
+}
+
 /// Left-truncate `s` to at most `max` display cells, prepending a single `…`
 /// (width 1) when anything was dropped — the **tail** is preserved, the head is
 /// the part that gets cut. Use this when the trailing characters are the ones
@@ -225,5 +232,19 @@ mod tests {
         assert_eq!(truncate_cells_head("中文", 2), "…");
         // Budget 3 → ellipsis (1) + one width-2 glyph "文" (fits exactly) = "…文".
         assert_eq!(truncate_cells_head("中文", 3), "…文");
+    }
+
+    // ---- cells ----
+
+    #[test]
+    fn cells_counts_one_per_ascii_char() {
+        assert_eq!(cells("abc"), 3);
+        assert_eq!(cells(""), 0);
+    }
+
+    #[test]
+    fn cells_counts_wide_chars_as_two() {
+        assert_eq!(cells("中文"), 4);
+        assert_eq!(cells("a中"), 3);
     }
 }

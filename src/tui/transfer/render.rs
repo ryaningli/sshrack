@@ -24,7 +24,7 @@ use sshrack_core::connect::sftp::proto::{Direction, Progress};
 use sshrack_core::dirsource::DirEntry;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::tui::fit::truncate_cells_head;
+use crate::tui::fit::{cells, truncate_cells, truncate_cells_head};
 use crate::tui::panel;
 use crate::tui::parts;
 use crate::tui::theme;
@@ -427,14 +427,9 @@ pub fn queue_row(
     } else {
         Style::new()
     };
-    let mut spans = vec![
-        Span::raw(" "),
-        Span::styled(glyph, name_style),
-        Span::raw(" "),
-        Span::styled(task.job.name.clone(), name_style),
-    ];
 
-    // Right-aligned state/progress label.
+    // Build the right-aligned state/progress label FIRST: the name budget is
+    // what remains after the prefix and the label.
     let label = match &task.state {
         TaskState::Queued => {
             if matches!(task.kind, crate::tui::transfer::ledger::TaskKind::Folder) {
@@ -461,17 +456,30 @@ pub fn queue_row(
             format!("failed: {}", truncate_cells_head(msg, 20))
         }
     };
-    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-    let fill = (width as usize).saturating_sub(used + label.chars().count() + 1);
+    let label_cells = cells(&label);
+
+    // Prefix " <glyph> " is 3 cells; reserve ≥1 cell gap before the label.
+    let prefix_cells = 3usize;
+    let name_budget = (width as usize).saturating_sub(prefix_cells + 1 + label_cells);
+    let shown = truncate_cells(&task.job.name, name_budget);
+    let name_cells = cells(&shown);
+
+    let fill = (width as usize).saturating_sub(prefix_cells + name_cells + label_cells + 1);
     let label_style = match &task.state {
         TaskState::Done(TransferOutcome::Failed(_)) => Style::new().fg(crate::tui::theme::DANGER),
         TaskState::Done(TransferOutcome::Ok) => Style::new().dim(),
         TaskState::Queued => Style::new().dim(),
         _ => Style::new(),
     };
-    spans.push(Span::raw(" ".repeat(fill)));
-    spans.push(Span::styled(label, label_style));
-    Line::from(spans)
+
+    Line::from(vec![
+        Span::raw(" "),
+        Span::styled(glyph, name_style),
+        Span::raw(" "),
+        Span::styled(shown, name_style),
+        Span::raw(" ".repeat(fill)),
+        Span::styled(label, label_style),
+    ])
 }
 
 // ---- format helpers (pure) ----
@@ -981,5 +989,25 @@ mod queue_row_tests {
         let t = task("src/", TaskState::Queued, true);
         let s = text(&queue_row(&t, 60, false));
         assert!(s.contains("folder"), "folder label: {s}");
+    }
+
+    #[test]
+    fn queue_row_truncates_a_long_name_and_keeps_label_visible() {
+        let long = "x".repeat(80);
+        let t = task(&long, TaskState::Queued, false);
+        let s = text(&queue_row(&t, 20, false));
+        assert!(s.contains('…'), "long name is truncated: {s}");
+        assert!(
+            s.contains("queued"),
+            "label still visible after truncation: {s}"
+        );
+    }
+
+    #[test]
+    fn queue_row_leaves_a_short_name_intact_at_wide_width() {
+        let t = task("photo.jpg", TaskState::Queued, false);
+        let s = text(&queue_row(&t, 60, false));
+        assert!(s.contains("photo.jpg"), "{s}");
+        assert!(!s.contains('…'), "no truncation when the name fits: {s}");
     }
 }
