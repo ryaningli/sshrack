@@ -179,6 +179,28 @@ mod tests {
     /// so the hints always render regardless of any panel status. (Status
     /// rendering is covered by the panel tests + `parts::draw_status_row`.)
     #[test]
+    fn shell_chrome_snapshots_tabs_border_and_footer() {
+        // Snapshot the three-band shell chrome (tabs / bordered middle / footer)
+        // on the Hosts tab. Locks tab order, the bordered middle panel area, and
+        // footer hint wording — any keymap/footer/chrome change surfaces as a
+        // diff. Pure TestBackend render: no terminal, PATH, or env dependency,
+        // identical output on any machine.
+        use ratatui::{Terminal, backend::TestBackend};
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            let _ = draw_shell(
+                f,
+                f.area(),
+                Tab::Hosts,
+                &[("Ctrl-A", "add"), ("Ctrl-E", "edit"), ("F1", "help")],
+            );
+        })
+        .unwrap();
+        insta::assert_snapshot!(term.backend());
+    }
+
+    #[test]
     fn draw_shell_footer_always_shows_hints() {
         let backend = TestBackend::new(80, 12);
         let mut term = Terminal::new(backend).unwrap();

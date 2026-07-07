@@ -1213,4 +1213,53 @@ mod tests {
         assert_eq!(frecency_tier(5.0), "mid");
         assert_eq!(frecency_tier(20.0), "high");
     }
+
+    #[test]
+    fn host_list_snapshots_two_hosts_in_name_order_with_empty_frecency() {
+        // Snapshot the launcher list with two hosts and an EMPTY frecency. All
+        // hosts score 0, so rank_hosts tie-breaks by name ascending — the order
+        // is deterministic and hermetic (ULIDs only feed frecency.score, they
+        // are never rendered; no network, no real time). Locks row layout, the
+        // selection marker, the cwd/search-box chrome, and the status row.
+        use ratatui::{Terminal, backend::TestBackend};
+        use sshrack_core::config::schema::{Auth, CredentialBody, Host};
+        use sshrack_core::frecency::Frecency;
+        use ulid::Ulid;
+
+        use crate::tui::intent::Status;
+        use crate::tui::launcher::Launcher;
+
+        let hosts = vec![
+            Host {
+                id: Ulid::from_string("01KWAAAAAAAAAAAAAAAAAAAAAA").unwrap(),
+                name: "web-prod".into(),
+                host: "10.0.0.1".into(),
+                port: 22,
+                auth: Auth::inline(CredentialBody::new("deploy")),
+            },
+            Host {
+                id: Ulid::from_string("01KWBBBBBBBBBBBBBBBBBBBBBB").unwrap(),
+                name: "db-staging".into(),
+                host: "10.0.0.2".into(),
+                port: 22,
+                auth: Auth::inline(CredentialBody::new("root")),
+            },
+        ];
+        let launcher = Launcher::new(&hosts, &[], &Frecency::default());
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            launcher.draw_in_shell(
+                f,
+                f.area(),
+                &hosts,
+                &Frecency::default(),
+                &[],
+                &Status::empty(),
+                false,
+            );
+        })
+        .unwrap();
+        insta::assert_snapshot!(term.backend());
+    }
 }
