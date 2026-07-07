@@ -976,7 +976,8 @@ fn overlay_retry_requeues_a_failed_task_and_signals_advance() {
         .finish_inflight(sshrack_core::connect::sftp::proto::TransferOutcome::Failed(
             "boom".into(),
         ));
-    let _ = screen.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)); // open
+    let _ = screen.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)); // open (Active)
+    let _ = screen.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty())); // Active -> Failed
     let out = screen.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())); // retry selected
     assert_eq!(
         out,
@@ -1077,5 +1078,82 @@ fn overlay_resume_with_pending_and_idle_signals_advance() {
         out,
         ScreenOutcome::Enqueue,
         "resume with pending + idle must advance"
+    );
+}
+
+// ---- ^Q queue-manager overlay: view tabs (Tab / Shift-Tab) ----
+
+#[test]
+fn tab_switches_to_failed_view_and_lists_the_failed_task() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use sshrack_core::connect::sftp::proto::TransferOutcome;
+    let local_cwd = PathBuf::from("/x");
+    let mut screen = TransferScreen::new(local_cwd.clone(), PathBuf::from("/y"));
+    // Enqueue `failed-one` first so FIFO dispatch lands the failure on it
+    // (the plan's original fixture enqueued `queued-one` first, which made
+    // `queued-one` the failed task and inverted the assertions below).
+    screen.ledger.enqueue(TransferJob {
+        direction: Direction::Download,
+        src: PathBuf::from("/y/failed-one"),
+        dst: local_cwd.join("failed-one"),
+        name: "failed-one".into(),
+        size_total: Some(1),
+        recursive: false,
+    });
+    screen.ledger.enqueue(TransferJob {
+        direction: Direction::Download,
+        src: PathBuf::from("/y/queued-one"),
+        dst: local_cwd.join("queued-one"),
+        name: "queued-one".into(),
+        size_total: Some(1),
+        recursive: false,
+    });
+    screen.ledger.next_to_dispatch();
+    screen
+        .ledger
+        .finish_inflight(TransferOutcome::Failed("boom".into())); // failed-one now in Failed view
+    let _ = screen.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)); // open (Active)
+    let _ = screen.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty())); // -> Failed
+    let backend = TestBackend::new(80, 24);
+    let mut term = Terminal::new(backend).expect("test backend");
+    let res = term.draw(|f| screen.draw(f, f.area()));
+    assert!(res.is_ok(), "draw must not panic: {:?}", res.err());
+    let view = buffer_view(term.backend().buffer());
+    assert!(
+        view.contains("failed-one"),
+        "Failed view lists the failed task: {view}"
+    );
+    assert!(
+        !view.contains("queued-one"),
+        "queued task is not in the Failed view: {view}"
+    );
+}
+
+#[test]
+fn shift_tab_cycles_back_to_completed_view() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use sshrack_core::connect::sftp::proto::TransferOutcome;
+    let local_cwd = PathBuf::from("/x");
+    let mut screen = TransferScreen::new(local_cwd.clone(), PathBuf::from("/y"));
+    screen.ledger.enqueue(TransferJob {
+        direction: Direction::Download,
+        src: PathBuf::from("/y/done-one"),
+        dst: local_cwd.join("done-one"),
+        name: "done-one".into(),
+        size_total: Some(1),
+        recursive: false,
+    });
+    screen.ledger.next_to_dispatch();
+    screen.ledger.finish_inflight(TransferOutcome::Ok); // done-one in Completed view
+    let _ = screen.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)); // open (Active)
+    let _ = screen.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::empty())); // Active -> Completed (prev)
+    let backend = TestBackend::new(80, 24);
+    let mut term = Terminal::new(backend).expect("test backend");
+    let res = term.draw(|f| screen.draw(f, f.area()));
+    assert!(res.is_ok());
+    let view = buffer_view(term.backend().buffer());
+    assert!(
+        view.contains("done-one"),
+        "Shift-Tab from Active lands on Completed: {view}"
     );
 }
