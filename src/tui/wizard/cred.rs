@@ -765,14 +765,15 @@ impl CredForm {
         // double-set the cursor over the popup. The row index is translated
         // into the viewport so the cursor never points below the list area
         // when the list scrolls.
-        if let Some((row, offset)) = self.cursor_target() {
-            if win.start <= row && row < win.end {
-                let in_win_row = row - win.start;
-                let max_x = list_area.x + list_area.width.saturating_sub(1);
-                let x = (list_area.x + CRED_VALUE_COL + offset as u16).min(max_x);
-                let y = list_area.y + in_win_row as u16;
-                frame.set_cursor_position((x, y));
-            }
+        if let Some((row, offset)) = self.cursor_target()
+            && win.start <= row
+            && row < win.end
+        {
+            let in_win_row = row - win.start;
+            let max_x = list_area.x + list_area.width.saturating_sub(1);
+            let x = (list_area.x + CRED_VALUE_COL + offset as u16).min(max_x);
+            let y = list_area.y + in_win_row as u16;
+            frame.set_cursor_position((x, y));
         }
 
         // If the inline-key paste popup is open, paint it over the wizard.

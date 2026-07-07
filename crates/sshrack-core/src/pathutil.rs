@@ -93,12 +93,12 @@ pub fn start_candidates(identity_hint: Option<&str>) -> Vec<String> {
     };
     if let Some(hint) = identity_hint {
         let hint = hint.trim();
-        if !hint.is_empty() {
-            if let Some(parent) = Path::new(hint).parent() {
-                let p = parent.to_string_lossy().into_owned();
-                if !p.is_empty() {
-                    push_unique(p);
-                }
+        if !hint.is_empty()
+            && let Some(parent) = Path::new(hint).parent()
+        {
+            let p = parent.to_string_lossy().into_owned();
+            if !p.is_empty() {
+                push_unique(p);
             }
         }
     }

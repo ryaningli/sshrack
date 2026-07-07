@@ -569,10 +569,10 @@ fn drain_transfer_events(app: &mut App, handle: &TerminalHandle) {
     // 4. Honor pending_cancel from ScreenOutcome::CancelActive. Sent AFTER the
     //    drain so an inflight Done + a user Esc race resolves to "cancel the
     //    next thing" rather than "drop a stale cancel".
-    if app.take_pending_cancel() {
-        if let Some(worker) = app.transfer_worker.as_ref() {
-            worker.send(WorkerCmd::Cancel);
-        }
+    if app.take_pending_cancel()
+        && let Some(worker) = app.transfer_worker.as_ref()
+    {
+        worker.send(WorkerCmd::Cancel);
     }
 
     // 5. Dispatch the next queued job (if any). Triggered by either a
@@ -585,12 +585,12 @@ fn drain_transfer_events(app: &mut App, handle: &TerminalHandle) {
 
     // 6. Surface a Failed message AFTER dispatching so an overwrite-popup skip
     //    followed by an immediate retry of the next queued job reads cleanly.
-    if let Some(msg) = maybe_failed_msg {
-        if let Some(screen) = app.transfer.as_mut() {
-            screen.set_status(super::intent::Status::error(format!(
-                "transfer failed: {msg}"
-            )));
-        }
+    if let Some(msg) = maybe_failed_msg
+        && let Some(screen) = app.transfer.as_mut()
+    {
+        screen.set_status(super::intent::Status::error(format!(
+            "transfer failed: {msg}"
+        )));
     }
 
     // 7. Refresh the destination pane when a batch just finished (decided in
@@ -615,10 +615,10 @@ fn drain_transfer_events(app: &mut App, handle: &TerminalHandle) {
             }
             Direction::Upload => {
                 let cwd = app.transfer.as_ref().map(|s| s.remote.core.cwd.clone());
-                if let Some(cwd) = cwd {
-                    if let Some(worker) = app.transfer_worker.as_ref() {
-                        worker.send(WorkerCmd::List(cwd));
-                    }
+                if let Some(cwd) = cwd
+                    && let Some(worker) = app.transfer_worker.as_ref()
+                {
+                    worker.send(WorkerCmd::List(cwd));
                 }
             }
         }

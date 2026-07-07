@@ -386,10 +386,10 @@ fn edit(
     };
 
     // Validate rename target before any field work.
-    if let Some(new) = rename {
-        if let Err(e) = host::validate_rename(&cfg, &name, new) {
-            return fail(&format!("sshrack: {e}"), exit_code::DUPLICATE);
-        }
+    if let Some(new) = rename
+        && let Err(e) = host::validate_rename(&cfg, &name, new)
+    {
+        return fail(&format!("sshrack: {e}"), exit_code::DUPLICATE);
     }
 
     let has_any_flag = host_addr.is_some()

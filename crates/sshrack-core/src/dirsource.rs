@@ -98,10 +98,10 @@ pub trait DirSource {
             } else {
                 Some(PathBuf::from(c))
             };
-            if let Some(p) = p {
-                if matches!(self.classify(&p), PathKind::Dir) {
-                    return Some(p);
-                }
+            if let Some(p) = p
+                && matches!(self.classify(&p), PathKind::Dir)
+            {
+                return Some(p);
             }
         }
         None

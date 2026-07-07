@@ -298,10 +298,10 @@ fn edit(
         return fail(&format!("sshrack: {err}"), exit_code::NOT_FOUND);
     };
 
-    if let Some(new) = rename {
-        if let Err(e) = cred_core::validate_rename_credential(&cfg, &name, new) {
-            return fail(&format!("sshrack: {e}"), exit_code::DUPLICATE);
-        }
+    if let Some(new) = rename
+        && let Err(e) = cred_core::validate_rename_credential(&cfg, &name, new)
+    {
+        return fail(&format!("sshrack: {e}"), exit_code::DUPLICATE);
     }
 
     let has_any_flag = user.is_some()

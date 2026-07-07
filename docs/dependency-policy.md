@@ -24,7 +24,15 @@ cargo add -D proptest                         # Dev dependency
 
 Clone to a temp directory and inspect: commit history, open issues, test coverage, MSRV, `unsafe` usage, transitive dependencies, documentation.
 
-**Banned** for this project: SSH protocol libraries (`russh`, `ssh2`, `russh-sftp`), `age`, `ssh2-config` (keeps MSRV at 1.86 and the surface small).
+**Banned** for this project: SSH protocol libraries (`russh`, `ssh2`, `russh-sftp`), `age`, `ssh2-config` (keeps MSRV at 1.88 and the surface small).
+
+## MSRV Policy
+
+- **Current MSRV: 1.88** (set in `workspace.package.rust-version`, inherited by both packages).
+- The MSRV tracks the minimum required by the primary UI dependency tree — the `ratatui` 0.30 ecosystem (`ratatui-core` / `ratatui-crossterm` / `ratatui-widgets`). Re-evaluate on each `ratatui` minor bump or at an annual review.
+- `resolver = "3"` is MSRV-aware: `cargo install` and `cargo build` select the highest dependency version that still satisfies `rust-version`. Bumping the MSRV floats every dependency to its latest same-major patch (e.g. `ratatui` 0.30.0 → 0.30.2); it does **not** cross a major version, because `Cargo.toml` pins each direct dep by major version.
+- Cross-major upgrades (`keyring` 3 → 4, `crossterm` 0.28 → 0.29, `chacha20poly1305` 0.10 → 0.11) are independent decisions evaluated on their own API/behavior merits — never bundled into an MSRV bump.
+- The MSRV is a live, binding value. Historical mentions of an older MSRV in `docs/superpowers/plans/` and `docs/superpowers/specs/` are timestamped design records and are intentionally left as-is when the MSRV moves.
 
 ## Rust Skills
 

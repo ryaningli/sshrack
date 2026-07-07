@@ -545,10 +545,10 @@ fn wait_for_master(target: &str, sock: &Path, deadline: Instant) -> bool {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output();
-        if let Ok(out) = &res {
-            if out.status.success() {
-                return true;
-            }
+        if let Ok(out) = &res
+            && out.status.success()
+        {
+            return true;
         }
         if Instant::now() >= deadline {
             return false;

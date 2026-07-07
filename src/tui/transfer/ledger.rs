@@ -119,10 +119,10 @@ impl TransferLedger {
 
     /// Update the `InFlight` task's progress snapshot (from `WorkerEvent::Progress`).
     pub fn set_inflight_progress(&mut self, p: Progress) {
-        if let Some(id) = self.inflight_id() {
-            if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
-                t.progress = Some(p);
-            }
+        if let Some(id) = self.inflight_id()
+            && let Some(t) = self.tasks.iter_mut().find(|t| t.id == id)
+        {
+            t.progress = Some(p);
         }
     }
 

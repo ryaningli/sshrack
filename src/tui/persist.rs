@@ -87,23 +87,21 @@ pub(crate) fn persist_host_save(
     if form.editing
         && form.secret_kind == super::wizard::SecretChoice::Password
         && form.password.is_empty()
+        && let Auth::Inline(body) = &auth
+        && body.password.is_none()
     {
-        if let Auth::Inline(body) = &auth {
-            if body.password.is_none() {
-                let orig =
-                    app.config
-                        .find_host_by_id(&target_id)
-                        .ok_or(SshrackError::HostNotFound {
-                            name: target_id.to_string(),
-                            hint: sshrack_core::error::DidYouMean::none(),
-                        })?;
-                if let Some(orig_body) = orig.auth.inline_body() {
-                    let mut kept = body.clone();
-                    kept.password = orig_body.password.clone();
-                    kept.keyring = orig_body.keyring;
-                    auth = Auth::inline(kept);
-                }
-            }
+        let orig = app
+            .config
+            .find_host_by_id(&target_id)
+            .ok_or(SshrackError::HostNotFound {
+                name: target_id.to_string(),
+                hint: sshrack_core::error::DidYouMean::none(),
+            })?;
+        if let Some(orig_body) = orig.auth.inline_body() {
+            let mut kept = body.clone();
+            kept.password = orig_body.password.clone();
+            kept.keyring = orig_body.keyring;
+            auth = Auth::inline(kept);
         }
     }
 
@@ -113,32 +111,29 @@ pub(crate) fn persist_host_save(
     // choice with no store mode decided is a user-facing error, NOT a silent
     // plaintext fallback. Vault unlock via TuiPassphrase (no-op unless vault
     // mode); under SSHRACK_PASSPHRASE the env value shadows the popup.
-    if let Some(body) = auth.inline_body() {
-        if matches!(
+    if let Some(body) = auth.inline_body()
+        && matches!(
             body.password,
             Some(sshrack_core::config::schema::Secret::Plain(_))
-        ) {
-            if app.config.store.is_none() {
-                return Err(SshrackError::StoreModeNotDecided);
-            }
-            let passphrase_provider = TuiPassphrase::new(handle.clone());
-            let env_pw = vault::passphrase_from_env();
-            let vault_key = vault::ensure_unlocked_vault_key(
-                &app.config,
-                env_pw.as_ref(),
-                &passphrase_provider,
-            )?;
-            let backend = OsKeyring;
-            let sealed = vault::seal_body(
-                body.clone(),
-                OwnerKind::Host,
-                &target_id,
-                &app.config,
-                vault_key.as_ref(),
-                &backend,
-            )?;
-            auth = Auth::inline(sealed);
+        )
+    {
+        if app.config.store.is_none() {
+            return Err(SshrackError::StoreModeNotDecided);
         }
+        let passphrase_provider = TuiPassphrase::new(handle.clone());
+        let env_pw = vault::passphrase_from_env();
+        let vault_key =
+            vault::ensure_unlocked_vault_key(&app.config, env_pw.as_ref(), &passphrase_provider)?;
+        let backend = OsKeyring;
+        let sealed = vault::seal_body(
+            body.clone(),
+            OwnerKind::Host,
+            &target_id,
+            &app.config,
+            vault_key.as_ref(),
+            &backend,
+        )?;
+        auth = Auth::inline(sealed);
     }
 
     let new_cfg = if form.editing {

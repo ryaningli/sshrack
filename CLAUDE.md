@@ -106,7 +106,7 @@ Do not block on clippy or formatting while the actual issue is still unresolved.
 
 ### Code Style
 
-- Rust edition 2024, MSRV 1.86.
+- Rust edition 2024, MSRV 1.88.
 - **Cross-platform ready, Unix first** — target Linux/macOS now; gate platform diffs behind `cfg(target_os)` so Windows can be added later without re-architecting. Do not block on Windows now.
 - Domain-based module organization, not type-based.
 - `&str` over `String` in signatures; `impl Into<String>` for constructors needing ownership.
@@ -180,7 +180,7 @@ Single `config.toml` for store-meta + hosts + creds (one portable unit; CRUD rew
 
 ## Banned Dependencies
 
-SSH protocol libraries (`russh`, `ssh2`, `russh-sftp`), `age`, `ssh2-config` (keeps MSRV 1.86 and the surface small). Full policy + crate-evaluation checklist → [`docs/dependency-policy.md`](docs/dependency-policy.md).
+SSH protocol libraries (`russh`, `ssh2`, `russh-sftp`), `age`, `ssh2-config` (keeps MSRV 1.88 and the surface small). Full policy + crate-evaluation checklist → [`docs/dependency-policy.md`](docs/dependency-policy.md).
 
 ## Git Commit Convention
 
