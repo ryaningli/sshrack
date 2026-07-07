@@ -258,8 +258,14 @@ impl Pane {
             }
             KeyCode::Left => self.step_up_intent(),
             KeyCode::Backspace => {
+                // Backspace is a pure edit key: it deletes from the query and
+                // is a no-op when the query is empty — it never steps up to
+                // the parent dir. Going up uses `Left` (the arm above). This
+                // removes the ambiguity where emptying the query and pressing
+                // Backspace once more would jump directories (expensive on a
+                // remote listing). Matches ranger / lf.
                 if self.query.is_empty() {
-                    self.step_up_intent()
+                    PaneOutcome::None
                 } else {
                     self.query.pop();
                     self.recompute();

@@ -201,14 +201,23 @@ fn ctrl_p_and_ctrl_n_move_cursor() {
     assert_eq!(p.selected, 0);
 }
 
-// ---- Left / Backspace-empty → StepUp ----
+// ---- Left → StepUp (parent) ; Backspace is a pure edit key ----
 
 #[test]
 fn left_emits_step_up_when_cwd_has_parent() {
     let mut p = pane_with_fruits(); // cwd = /x
     assert_eq!(p.on_key(press(KeyCode::Left)), PaneOutcome::StepUp);
-    // Backspace on empty query is the same intent.
-    assert_eq!(p.on_key(press(KeyCode::Backspace)), PaneOutcome::StepUp);
+}
+
+#[test]
+fn backspace_on_empty_query_is_a_noop_even_with_parent() {
+    // Backspace must never step up to the parent dir — it is a pure edit key.
+    // Going up uses `Left`. Removes the ambiguity where emptying the query and
+    // pressing Backspace once more would jump directories (slow on remote
+    // listings). Matches ranger / lf.
+    let mut p = pane_with_fruits(); // cwd = /x (has a parent)
+    assert!(p.query.is_empty());
+    assert_eq!(p.on_key(press(KeyCode::Backspace)), PaneOutcome::None);
 }
 
 #[test]

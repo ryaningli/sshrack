@@ -510,6 +510,7 @@ impl TransferScreen {
         let hints: &[(&str, &str)] = &[
             ("Tab", "switch"),
             ("↑↓", "move"),
+            ("←", "up"),
             ("→", "open"),
             ("Space", "mark"),
             ("^S", "transfer"),
