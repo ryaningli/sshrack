@@ -864,6 +864,35 @@ mod tests {
         term.draw(|f| draw_pane(f, f.area(), &pane, false, "u@h"))
             .expect("unfocused titled pane must render without panic");
     }
+
+    #[test]
+    fn draw_pane_truncates_a_very_long_filename_snapshot() {
+        // Snapshot a focused pane carrying one entry whose filename is far
+        // wider than the pane. Locks the truncation behavior: the name is cut
+        // to fit, and the marker/cursor glyphs are not pushed off the row.
+        // Hermetic: modified: None (no real time), fixed name/path/size,
+        // in-memory TestBackend — identical output on any machine.
+        use ratatui::{Terminal, backend::TestBackend};
+        use sshrack_core::dirsource::DirEntry;
+
+        use crate::tui::transfer::pane::Pane;
+
+        let long = "this-is-an-extremely-long-filename-that-overflows-the-pane-width.tar.gz";
+        let mut pane = Pane::new(std::path::PathBuf::from("/home/u/project"));
+        pane.set_entries(vec![DirEntry {
+            name: long.to_string(),
+            path: std::path::PathBuf::from(format!("/home/u/project/{long}")),
+            is_dir: false,
+            is_symlink: false,
+            size: Some(1024),
+            modified: None,
+        }]);
+        let backend = TestBackend::new(40, 10);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw_pane(f, f.area(), &pane, true, "local"))
+            .unwrap();
+        insta::assert_snapshot!(term.backend());
+    }
 }
 
 #[cfg(test)]

@@ -1,0 +1,14 @@
+---
+source: src/tui/transfer/render.rs
+expression: term.backend()
+---
+"┌ local ───────────────────────────────┐"
+"│/home/u/project                       │"
+"│❯                                  1/1│"
+"│  ▶ this-is-an-extremely-long-filename│"
+"│                                      │"
+"│                                      │"
+"│                                      │"
+"│                                      │"
+"│                                      │"
+"└──────────────────────────────────────┘"
