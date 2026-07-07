@@ -219,4 +219,22 @@ mod tests {
         })
         .unwrap();
     }
+
+    #[test]
+    fn draw_help_dialog_renders_first_page() {
+        // Snapshot the help overlay at scroll 0. The dialog chrome (MAX_H=24
+        // in `dialog`) caps the body at ~20 rows regardless of terminal size,
+        // so this locks the dialog GEOMETRY (centering / border / " help "
+        // title / "↑↓ scroll · F1/Esc close" footer) and the FIRST keymap page
+        // (Tabs through Settings) — not the full keymap. The complete keymap
+        // text is already covered by `help_lines_cover_every_surface_*` above;
+        // this snapshot's job is render regression (layout, footer wording,
+        // first-page bindings). Accept intentional changes via
+        // `cargo insta review` (or, for this pilot, `INSTA_UPDATE=always cargo
+        // test ...`).
+        let backend = TestBackend::new(100, 40);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw_help_dialog(f, 0)).unwrap();
+        insta::assert_snapshot!(term.backend());
+    }
 }
