@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use ulid::Ulid;
 
 use super::CredentialNames;
+use super::alert::draw_alert;
 use super::cred_panel::CredPanel;
 use super::dialog::draw_dialog;
 use super::help::draw_help_dialog;
@@ -764,6 +765,19 @@ impl App {
                 }
                 out
             }
+            Overlay::Alert { title, body } => {
+                // Modal error: only Esc / Ctrl-C dismiss it (any other key is
+                // swallowed so the user must acknowledge explicitly). The close
+                // returns to wherever the shell was before the alert opened.
+                let ctrl_c = key.kind == KeyEventKind::Press
+                    && key.modifiers == KeyModifiers::CONTROL
+                    && key.code == KeyCode::Char('c');
+                if key.kind == KeyEventKind::Press && (matches!(key.code, KeyCode::Esc) || ctrl_c) {
+                    return Outcome::CloseOverlay;
+                }
+                self.overlay = Some(Overlay::Alert { title, body });
+                Outcome::Continue
+            }
         }
     }
 
@@ -1158,6 +1172,9 @@ impl App {
                     .as_ref()
                     .expect("invariant: store_view stashed while StorePicker overlay is open")
                     .draw_in_dialog(frame, body);
+            }
+            Overlay::Alert { title, body } => {
+                draw_alert(frame, title, body);
             }
         }
     }
