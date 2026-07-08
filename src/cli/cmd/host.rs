@@ -24,6 +24,7 @@ use sshrack_core::error::SshrackError;
 use sshrack_core::host;
 use sshrack_core::id::new_id;
 use sshrack_core::secret::OsKeyring;
+use sshrack_core::secret::SecretBackend;
 
 use crate::cli::args::{Cli, HostAction, OutputFormat};
 use crate::shared::exit_code;
@@ -719,7 +720,8 @@ fn reveal_password(
         Ok(k) => k,
         Err((msg, code)) => return Err(fail(&msg, code)),
     };
-    let resolved = match cred_core::resolve(host, cfg, vault_key.as_ref()) {
+    let backend = sshrack_core::secret::OsKeyring;
+    let resolved = match cred_core::resolve(host, cfg, vault_key.as_ref(), &backend) {
         Ok(r) => r,
         Err(e) => return Err(fail(&format!("sshrack: {e}"), exit_code::STORE)),
     };
@@ -734,7 +736,7 @@ fn reveal_password(
             Some(p) => RevealedPassword::Plaintext(p),
             None => RevealedPassword::None,
         },
-        PasswordSource::Keyring { key } => match sshrack_core::secret::keyring::get(&key) {
+        PasswordSource::Keyring { key } => match backend.get(&key) {
             Ok(Some(p)) => RevealedPassword::Plaintext(p),
             Ok(None) | Err(_) => RevealedPassword::KeyringMissing,
         },

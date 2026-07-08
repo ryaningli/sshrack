@@ -328,6 +328,7 @@ fn env_for_seam_documents_env_shape_per_source() {
 fn plaintext_mode_host_resolves_to_config_channel_and_writes_no_temp_file() {
     use sshrack_core::config::schema::{Auth, CredentialBody, Host, SecretStore, SshrackConfig};
     use sshrack_core::credential::resolve;
+    use sshrack_core::secret::OsKeyring;
     use ulid::Ulid;
 
     let (_dir, shim_path, capture_path) = fresh_shim();
@@ -347,7 +348,7 @@ fn plaintext_mode_host_resolves_to_config_channel_and_writes_no_temp_file() {
     };
 
     // The flipped decision point: plaintext mode resolves to the config channel.
-    let resolved = resolve(&h, &cfg, None).expect("resolve ok");
+    let resolved = resolve(&h, &cfg, None, &OsKeyring).expect("resolve ok");
     let host_id_emitted = match &resolved.password {
         PasswordSource::Config { host_id } => host_id.clone(),
         other => panic!("plaintext mode must resolve to Config, got {other:?}"),
@@ -395,4 +396,212 @@ fn plaintext_mode_host_resolves_to_config_channel_and_writes_no_temp_file() {
     for (k, v) in &cap.env {
         assert!(!v.contains("hunter2"), "plaintext leaked into env: {k}={v}");
     }
+}
+
+/// In-memory `SecretBackend` for the keyring-mode connect test. Core's
+/// `FakeBackend` is `pub(crate)` and invisible to integration tests, so the
+/// test defines its own minimal impl keyed by the raw account key (mirroring
+/// `OsKeyring`). Used only to seed the inline-key slots and let `resolve`
+/// read them back — no daemon dependency, hermetic in CI.
+struct LocalFakeBackend {
+    entries: std::cell::RefCell<std::collections::HashMap<String, String>>,
+}
+
+impl LocalFakeBackend {
+    fn new() -> Self {
+        Self {
+            entries: std::cell::RefCell::new(std::collections::HashMap::new()),
+        }
+    }
+}
+
+impl sshrack_core::secret::SecretBackend for LocalFakeBackend {
+    fn set_at(&self, key: &str, secret: &str) -> Result<(), sshrack_core::error::SshrackError> {
+        self.entries
+            .borrow_mut()
+            .insert(key.to_string(), secret.to_string());
+        Ok(())
+    }
+    fn get(
+        &self,
+        key: &str,
+    ) -> Result<Option<Zeroizing<String>>, sshrack_core::error::SshrackError> {
+        Ok(self
+            .entries
+            .borrow()
+            .get(key)
+            .map(|p| Zeroizing::new(p.clone())))
+    }
+    fn delete_at(&self, key: &str) -> Result<(), sshrack_core::error::SshrackError> {
+        self.entries.borrow_mut().remove(key);
+        Ok(())
+    }
+    fn available(&self) -> bool {
+        true
+    }
+}
+
+/// Keyring-mode inline-key end-to-end: a host whose inline key text lives in
+/// the OS keyring (the body is the sealed marker form) must, through the
+/// connect pre-exec path, (a) materialize a `0600` temp file containing the
+/// key text, (b) carry `-i <tempfile>` in the ssh argv, and (c) NEVER let the
+/// key text itself appear in argv. This is the secret-never-in-argv invariant
+/// extended to keyring-backed inline keys (Task 4's `resolve` reads the text
+/// from the backend; Task 8 wires it through the connect path).
+///
+/// Drives the real `credential::resolve` decision (the keyring-marker inline
+/// branch) into the real `materialize_inline_key` + `ssh::build` + `launch`,
+/// then asserts what the child actually observed. The temp file is read
+/// before the artifact drops (its `Drop` deletes it on launch completion).
+#[test]
+fn keyring_mode_inline_key_materializes_temp_file_and_never_leaks_to_argv() {
+    use sshrack_core::config::schema::{
+        Auth, CredentialBody, Host, InlineKey, KeySource, SecretStore, SshrackConfig,
+    };
+    use sshrack_core::connect::ssh;
+    use sshrack_core::credential::{PasswordSource, resolve};
+    use sshrack_core::id::{OwnerKind, keyring_key_inline_cert, keyring_key_inline_priv};
+    use sshrack_core::secret::SecretBackend;
+    use ulid::Ulid;
+
+    let (_dir, shim_path, capture_path) = fresh_shim();
+    let self_exe = std::env::current_exe().expect("current_exe");
+
+    // A keyring-mode config + a host whose inline key is the sealed marker
+    // form (ik.keyring == true, no in-body text). The plaintext lives in the
+    // backend slots — seeded below.
+    let cfg = SshrackConfig {
+        store: Some(SecretStore::Keyring),
+        ..Default::default()
+    };
+    let backend = LocalFakeBackend::new();
+    let host_id = Ulid::new();
+    let h = Host {
+        id: host_id,
+        name: "kr-ik-host".into(),
+        host: "10.0.0.5".into(),
+        port: 22,
+        auth: Auth::inline(CredentialBody {
+            user: "deploy".into(),
+            password: None,
+            key: Some(KeySource::Inline(InlineKey {
+                private_key: None,
+                certificate: None,
+                keyring: true,
+            })),
+            keyring: false,
+        }),
+    };
+    const PRIVATE_TEXT: &str = "PRIVATEKEYTEXT-NEVER-IN-ARGV";
+    const CERT_TEXT: &str = "CERTTEXT-NEVER-IN-ARGV";
+    backend
+        .set_at(
+            &keyring_key_inline_priv(OwnerKind::Host, &host_id),
+            PRIVATE_TEXT,
+        )
+        .unwrap();
+    backend
+        .set_at(
+            &keyring_key_inline_cert(OwnerKind::Host, &host_id),
+            CERT_TEXT,
+        )
+        .unwrap();
+
+    // Step 1: resolve reads the inline-key text from the backend slots.
+    let mut resolved = resolve(&h, &cfg, None, &backend).expect("resolve ok");
+    let inline_mat = resolved
+        .inline_key
+        .as_ref()
+        .expect("inline key materialized from keyring slots");
+    assert_eq!(inline_mat.private.as_str(), PRIVATE_TEXT);
+    assert_eq!(
+        inline_mat.certificate.as_ref().map(|c| c.as_str()),
+        Some(CERT_TEXT)
+    );
+
+    // Step 2: materialize the temp file. The artifact's Drop deletes the files
+    // — hold it across launch so the plaintext outlives the ssh process.
+    let key_artifact = sshrack_core::connect::materialize_inline_key(&mut resolved)
+        .expect("materialize ok")
+        .expect("artifact present for inline key");
+    let temp_private_path = resolved
+        .key_path
+        .clone()
+        .expect("key_path points at the temp file");
+
+    // (a) The materialized temp file contains the private key text.
+    let temp_contents = std::fs::read_to_string(&temp_private_path)
+        .expect("temp private file readable before drop");
+    assert!(
+        temp_contents.contains(PRIVATE_TEXT),
+        "temp file must contain the private key text"
+    );
+    // The certificate sits beside it as <private>-cert.pub (OpenSSH auto-load).
+    let cert_path = {
+        let mut p = temp_private_path.clone().into_os_string();
+        p.push("-cert.pub");
+        std::path::PathBuf::from(p)
+    };
+    let cert_contents =
+        std::fs::read_to_string(&cert_path).expect("temp cert file readable before drop");
+    assert!(
+        cert_contents.contains(CERT_TEXT),
+        "temp cert file must contain the certificate text"
+    );
+
+    // Step 3: build the ssh argv. (b) It carries `-i <tempfile>`. (c) The key
+    // text NEVER appears in argv (the secret-never-in-argv invariant).
+    let argv = ssh::build(&resolved, &h, &ssh::Overrides::default(), &[]);
+    let i_idx = argv
+        .iter()
+        .position(|a| a == "-i")
+        .expect("argv carries -i for an inline-key host");
+    assert_eq!(
+        argv[i_idx + 1],
+        temp_private_path.to_string_lossy(),
+        "-i points at the materialized temp file"
+    );
+    for arg in &argv {
+        assert!(
+            !arg.contains(PRIVATE_TEXT) && !arg.contains(CERT_TEXT),
+            "key text leaked into ssh argv: {arg}"
+        );
+    }
+
+    // Step 4: drive the real launcher with the shim so the end-to-end path is
+    // locked (launch must not mutate argv to inject key text either). The
+    // artifact is held across launch and drops afterward, wiping both files.
+    let launch_argv: Vec<String> = std::iter::once(shim_path.to_string_lossy().into_owned())
+        .chain(argv.iter().skip(1).cloned())
+        .collect();
+    let code = launch_retrying_etxtbsy(launch_argv, PasswordSource::None, &self_exe, None);
+    assert_eq!(code, 0, "shim exits 0");
+    let cap = read_capture(&capture_path);
+    let received = &cap.argv[1..]; // skip argv[0] (the shim path)
+    let shim_i_idx = received
+        .iter()
+        .position(|a| a == "-i")
+        .expect("shim observed -i in argv");
+    assert_eq!(
+        received[shim_i_idx + 1],
+        temp_private_path.to_string_lossy(),
+        "shim saw -i pointed at the temp file"
+    );
+    for arg in received {
+        assert!(
+            !arg.contains(PRIVATE_TEXT) && !arg.contains(CERT_TEXT),
+            "key text leaked into the shim's captured argv: {arg}"
+        );
+    }
+
+    // After launch the artifact drops and deletes both temp files.
+    drop(key_artifact);
+    assert!(
+        !temp_private_path.exists(),
+        "temp private file deleted after the artifact drops"
+    );
+    assert!(
+        !cert_path.exists(),
+        "temp cert file deleted after the artifact drops"
+    );
 }

@@ -33,6 +33,7 @@ use sshrack_core::connect::{self, KeyArtifact};
 use sshrack_core::credential;
 use sshrack_core::error::SshrackError;
 use sshrack_core::hostkey;
+use sshrack_core::secret::OsKeyring;
 use sshrack_core::secret::vault;
 
 use crate::tui::TerminalHandle;
@@ -91,7 +92,8 @@ pub fn open_transfer(
     let vault_key = vault::ensure_unlocked_vault_key(cfg, env_pw.as_ref(), &passphrase_provider)?;
 
     // ── Step 3: Resolve auth → PasswordSource (dangling ref fails here). ─────
-    let mut resolved_auth = credential::resolve(&resolved_host, cfg, vault_key.as_ref())?;
+    let backend = OsKeyring;
+    let mut resolved_auth = credential::resolve(&resolved_host, cfg, vault_key.as_ref(), &backend)?;
 
     // ── Step 4: Materialize an inline (pasted) key to a temp file so the
     // master `ssh -N` can read it with `ssh -i`. The artifact's Drop MUST out-
@@ -308,7 +310,7 @@ mod tests {
         // holds the connection open). No real ssh is spawned here.
         let host = host_with_inline_user("web");
         let cfg = SshrackConfig::default();
-        let auth = credential::resolve(&host, &cfg, None).unwrap();
+        let auth = credential::resolve(&host, &cfg, None, &OsKeyring).unwrap();
         let sock = Path::new("/tmp/sshrack-mux-test.sock");
         let argv = master_argv(&auth, &host, &Overrides::default(), sock);
         // Master: ssh -N -o ControlMaster=yes ... <user/port via connect_opts> <host>

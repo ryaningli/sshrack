@@ -34,6 +34,7 @@ use sshrack_core::config::store;
 use sshrack_core::connect;
 use sshrack_core::error::SshrackError;
 use sshrack_core::hostkey;
+use sshrack_core::secret::OsKeyring;
 use sshrack_core::secret::vault;
 
 use crate::cli::args::{Cli, Command};
@@ -112,7 +113,8 @@ pub fn run(cli: &Cli) -> i32 {
         credential: cred_ulid,
         ad_hoc: opts.ad_hoc,
     };
-    let plan = match connect::scp::build(args, &cfg, &overrides, vault_key.as_ref()) {
+    let backend = OsKeyring;
+    let plan = match connect::scp::build(args, &cfg, &overrides, vault_key.as_ref(), &backend) {
         Ok(p) => p,
         Err(SshrackError::HostNotFound { name, hint }) => {
             eprintln!("sshrack: host not found: {name}{hint}");

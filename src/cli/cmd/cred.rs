@@ -18,6 +18,7 @@ use sshrack_core::config::schema::{Auth, Credential, CredentialBody};
 use sshrack_core::credential as cred_core;
 use sshrack_core::host;
 use sshrack_core::id::new_id;
+use sshrack_core::secret::SecretBackend;
 
 use crate::cli::args::{Cli, CredAction, OutputFormat};
 use crate::shared::exit_code;
@@ -533,6 +534,7 @@ fn reveal_password(
         Ok(k) => k,
         Err((msg, code)) => return Err(fail(&msg, code)),
     };
+    let backend = sshrack_core::secret::OsKeyring;
     // Reuse credential::resolve via a synthetic host that references this
     // credential by id — resolve returns PasswordSource keyed off the cred id.
     let host_shell = sshrack_core::config::schema::Host {
@@ -542,7 +544,7 @@ fn reveal_password(
         port: 22,
         auth: Auth::reference(cred.id),
     };
-    let resolved = match cred_core::resolve(&host_shell, cfg, vault_key.as_ref()) {
+    let resolved = match cred_core::resolve(&host_shell, cfg, vault_key.as_ref(), &backend) {
         Ok(r) => r,
         Err(e) => return Err(fail(&format!("sshrack: {e}"), exit_code::STORE)),
     };
@@ -558,12 +560,10 @@ fn reveal_password(
                 None => RevealedPassword::None,
             }
         }
-        cred_core::PasswordSource::Keyring { key } => {
-            match sshrack_core::secret::keyring::get(&key) {
-                Ok(Some(p)) => RevealedPassword::Plaintext(p),
-                Ok(None) | Err(_) => RevealedPassword::KeyringMissing,
-            }
-        }
+        cred_core::PasswordSource::Keyring { key } => match backend.get(&key) {
+            Ok(Some(p)) => RevealedPassword::Plaintext(p),
+            Ok(None) | Err(_) => RevealedPassword::KeyringMissing,
+        },
     })
 }
 

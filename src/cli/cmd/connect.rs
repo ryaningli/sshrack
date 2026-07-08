@@ -33,6 +33,7 @@ use sshrack_core::error::SshrackError;
 use sshrack_core::frecency;
 use sshrack_core::host;
 use sshrack_core::hostkey;
+use sshrack_core::secret::OsKeyring;
 use sshrack_core::secret::vault;
 
 use crate::cli::args::{Cli, Command};
@@ -130,32 +131,34 @@ pub fn run(cli: &Cli) -> i32 {
         };
 
     // ── Step 4: Resolve auth (dangling credential errors here). ──────────────
-    let mut resolved_auth = match credential::resolve(&resolved_host, &cfg, vault_key.as_ref()) {
-        Ok(a) => a,
-        Err(SshrackError::CredentialNotFound { name, hint }) => {
-            // The ref-by-id path surfaces a bare ULID as `name` (the host
-            // references the credential by id; the credential is missing so no
-            // name exists to show). Reword to name the originating host so the
-            // message reads like a host problem, not a stray id. CLI-layer
-            // concern only — core's `credential::resolve` is unchanged.
-            eprintln!(
-                "sshrack: host '{}' references an unknown credential{hint}",
-                resolved_host.name
-            );
-            let _ = name; // the bare ULID is intentionally not surfaced
-            return exit_code::NOT_FOUND;
-        }
-        Err(SshrackError::VaultLocked) => {
-            eprintln!(
-                "sshrack: vault is locked; run `sshrack store unlock` or set SSHRACK_PASSPHRASE"
-            );
-            return exit_code::STORE;
-        }
-        Err(e) => {
-            eprintln!("sshrack: auth error: {e}");
-            return exit_code::CONNECT;
-        }
-    };
+    let backend = OsKeyring;
+    let mut resolved_auth =
+        match credential::resolve(&resolved_host, &cfg, vault_key.as_ref(), &backend) {
+            Ok(a) => a,
+            Err(SshrackError::CredentialNotFound { name, hint }) => {
+                // The ref-by-id path surfaces a bare ULID as `name` (the host
+                // references the credential by id; the credential is missing so no
+                // name exists to show). Reword to name the originating host so the
+                // message reads like a host problem, not a stray id. CLI-layer
+                // concern only — core's `credential::resolve` is unchanged.
+                eprintln!(
+                    "sshrack: host '{}' references an unknown credential{hint}",
+                    resolved_host.name
+                );
+                let _ = name; // the bare ULID is intentionally not surfaced
+                return exit_code::NOT_FOUND;
+            }
+            Err(SshrackError::VaultLocked) => {
+                eprintln!(
+                    "sshrack: vault is locked; run `sshrack store unlock` or set SSHRACK_PASSPHRASE"
+                );
+                return exit_code::STORE;
+            }
+            Err(e) => {
+                eprintln!("sshrack: auth error: {e}");
+                return exit_code::CONNECT;
+            }
+        };
 
     // ── Step 4b: Materialize an inline (pasted) key to a temp file so ssh -i
     // can read it. The artifact MUST outlive launch — its Drop deletes the

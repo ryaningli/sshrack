@@ -43,6 +43,7 @@ use sshrack_core::credential;
 use sshrack_core::error::SshrackError;
 use sshrack_core::frecency;
 use sshrack_core::hostkey;
+use sshrack_core::secret::OsKeyring;
 use sshrack_core::secret::vault;
 
 use super::ConnectRequest;
@@ -102,7 +103,8 @@ pub fn connect_host(
     let vault_key = vault::ensure_unlocked_vault_key(cfg, env_pw.as_ref(), &passphrase_provider)?;
 
     // ── Step 3: Resolve auth → PasswordSource (dangling ref fails here). ─────
-    let mut resolved_auth = credential::resolve(&resolved_host, cfg, vault_key.as_ref())?;
+    let backend = OsKeyring;
+    let mut resolved_auth = credential::resolve(&resolved_host, cfg, vault_key.as_ref(), &backend)?;
 
     // ── Step 3b: Materialize an inline (pasted) key to a temp file so ssh -i
     // can read it. The artifact MUST outlive launch (its Drop deletes the temp
@@ -200,7 +202,7 @@ mod tests {
         // no remote command).
         let host = host_with_inline_user("web");
         let cfg = SshrackConfig::default();
-        let auth = credential::resolve(&host, &cfg, None).unwrap();
+        let auth = credential::resolve(&host, &cfg, None, &OsKeyring).unwrap();
         let argv = connect::ssh::build(&auth, &host, &connect::ssh::Overrides::default(), &[]);
         // Interactive shell: ssh -l <user> -p <port> <host>, no remote command.
         assert_eq!(argv[0], "ssh");
