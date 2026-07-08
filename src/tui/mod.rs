@@ -27,7 +27,6 @@ use sshrack_core::host;
 use sshrack_core::secret::{OsKeyring, SecretBackend};
 use ulid::Ulid;
 
-pub mod alert;
 pub mod app;
 pub(crate) mod browser_core;
 pub mod connect;

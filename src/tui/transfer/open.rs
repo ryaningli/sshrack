@@ -9,8 +9,8 @@
 //! [`SshrackError::Interrupted`]; [`crate::tui::run_loop`] maps that to "return
 //! to the launcher" — NOT an exit and NOT a status write. Any other error
 //! (vault unlock failed, host key rejected, dangling credential,
-//! no-password-no-key, worker spawn failed) is surfaced as a modal
-//! [`Overlay::Alert`] and returns to the launcher once the user dismisses it.
+//! no-password-no-key, worker spawn failed) is surfaced in the status bar via
+//! `App::report_failure` and returns to the launcher.
 //!
 //! ## Inline-key lifetime (load-bearing)
 //!

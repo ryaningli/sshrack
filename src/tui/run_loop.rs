@@ -372,8 +372,8 @@ pub fn run_loop(
                     // Run open_transfer (vault unlock, host-key, worker spawn,
                     // screen seed). A cancel inside a popup surfaces as
                     // Interrupted → return to the launcher (no status write);
-                    // any other error surfaces as a modal Alert and returns to
-                    // the launcher when the user dismisses it (Esc/^C).
+                    // any other error surfaces as a red status-bar line via
+                    // report_failure and returns to the launcher.
                     let Some(host) = app.pending_transfer_host.take() else {
                         // No host: defensive — Ctrl-T hit no host.
                         continue;
@@ -387,15 +387,14 @@ pub fn run_loop(
                         }
                         Err(e) => {
                             // Surface every open failure (vault locked, dangling
-                            // credential, no-password-no-key, master auth
-                            // failure, handshake timeout) as a modal Alert. The
-                            // body carries the real reason — captured stderr for
-                            // master failures (Task 3), a precise message for
-                            // the fail-fast cases. Esc/^C closes → launcher.
-                            app.overlay = Some(Overlay::Alert {
-                                title: " SFTP connection failed ".into(),
-                                body: e.to_string(),
-                            });
+                            // credential, no-password-no-key, master auth failure,
+                            // handshake timeout) as a red status-bar line via the
+                            // error's own wording. A modal Alert offered no
+                            // interaction value here (only dismiss), so the status
+                            // bar — uniform with connect/delete failures — is the
+                            // right surface. Esc/^C in any popup still returns to
+                            // the launcher via the Interrupted arm above.
+                            app.report_failure(&e);
                         }
                     }
                 }

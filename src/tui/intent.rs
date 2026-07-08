@@ -176,11 +176,6 @@ pub enum Overlay {
     /// Storage-mode picker (opened from Settings). Task 8 drives the cursor +
     /// switch intents; for Task 6 Esc closes it.
     StorePicker,
-    /// A modal error alert (e.g. a failed SFTP open). `body` is the multi-line
-    /// message; `Esc` / `Ctrl-C` close it via the standard overlay close path
-    /// (`Outcome::CloseOverlay`) — the shell renders behind it. Set by the
-    /// `OpenTransfer` arm for every `open_transfer` failure.
-    Alert { title: String, body: String },
 }
 
 /// The consolidated status-bar message: a transient one-liner the user reads as
