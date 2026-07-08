@@ -14,7 +14,9 @@
 
 use zeroize::Zeroizing;
 
-use crate::config::schema::{CredentialBody, KeySource, Secret, SecretStore, SshrackConfig};
+use crate::config::schema::{
+    CredentialBody, EncryptedSecret, KeySource, Secret, SecretStore, SshrackConfig,
+};
 use crate::error::SshrackError;
 use crate::id::{OwnerKind, keyring_key};
 use crate::secret::SecretBackend;
@@ -93,14 +95,18 @@ pub fn count_secrets(cfg: &SshrackConfig) -> (usize, usize, usize) {
             }
             // Inline key material counts each secret it carries (private key +
             // optional certificate), so store-mode switches / rekeys see them.
-            // Keyring-mode inline keys are rejected by `CredentialBody::validate`
-            // before reaching here, so they never land in the `keyring` arm.
+            // A keyring-marker inline body (ik.keyring) counts toward the
+            // keyring total, mirroring the body-level marker.
             if let Some(KeySource::Inline(ik)) = &b.key {
-                if let Some(s) = &ik.private_key {
-                    count_one_secret(s, &mut enc, &mut plain);
-                }
-                if let Some(s) = &ik.certificate {
-                    count_one_secret(s, &mut enc, &mut plain);
+                if ik.keyring {
+                    keyring += 1;
+                } else {
+                    if let Some(s) = &ik.private_key {
+                        count_one_secret(s, &mut enc, &mut plain);
+                    }
+                    if let Some(s) = &ik.certificate {
+                        count_one_secret(s, &mut enc, &mut plain);
+                    }
                 }
             }
         }
@@ -118,9 +124,10 @@ fn count_one_secret(s: &Secret, enc: &mut usize, plain: &mut usize) {
     }
 }
 
-/// A copy of `body` with an encrypted password (if any) decrypted under `key`,
-/// tagged with `name_label` on failure. Plaintext/key/default bodies pass
-/// through. The body's `user`/`key`/`keyring` are preserved verbatim.
+/// A copy of `body` with its encrypted secret material — password and/or an
+/// inline key's `private_key`/`certificate` — decrypted under `key`, tagged
+/// with `name_label` on failure. Plaintext/key/default bodies pass through. The
+/// body's `user`/`keyring` and any path key are preserved verbatim.
 ///
 /// `name_label` is the owner's display label (host or credential name) used
 /// only in the [`SshrackError::DecryptionFailed`] message — never the secret.
@@ -131,33 +138,74 @@ pub(crate) fn decrypt_body(
 ) -> Result<CredentialBody, SshrackError> {
     let password = match &body.password {
         Some(Secret::Encrypted(enc)) => {
-            // crypto::decrypt fails with a fieldless DecryptError; attach the
-            // name here, intentionally discarding crypto detail (no oracle).
-            let plain = crypto::decrypt(enc, key).map_err(|_| SshrackError::DecryptionFailed {
-                name: name_label.to_string(),
-            })?;
-            // `plain.to_string()` moves the decrypted text into a plain
-            // `Secret::Plain(String)` that is not zeroized (the String-typed
-            // Secret does not allow it); only `plain` itself is wiped. This
-            // path serves enable/disable/rekey, not the connect path.
-            Some(Secret::Plain(plain.to_string()))
+            Some(Secret::Plain(decrypt_to_plain(enc, key, name_label)?))
         }
         other => other.clone(),
     };
+    // Decrypt inline-key material when present, so rekey (decrypt-all before
+    // re-encrypting under a new key) does not strand private-key/certificate
+    // ciphertext on the old vault key. Path keys carry no secret material and
+    // pass through untouched.
+    let mut body_key = body.key.clone();
+    if let Some(KeySource::Inline(ik)) = &mut body_key {
+        if let Some(Secret::Encrypted(enc)) = ik.private_key.take() {
+            ik.private_key = Some(Secret::Plain(decrypt_to_plain(&enc, key, name_label)?));
+        }
+        if let Some(Secret::Encrypted(enc)) = ik.certificate.take() {
+            ik.certificate = Some(Secret::Plain(decrypt_to_plain(&enc, key, name_label)?));
+        }
+    }
     Ok(CredentialBody {
         user: body.user.clone(),
         password,
-        key: body.key.clone(),
+        key: body_key,
         keyring: body.keyring,
     })
 }
 
-/// Decrypt every encrypted password under `key`. Returns the count converted.
-/// Used by rekey (decrypt-all before re-encrypting under a new key).
+/// Decrypt one [`EncryptedSecret`] to an owned plaintext `String`, attaching
+/// `name_label` on the (fieldless) [`crypto::DecryptError`] so the caller sees
+/// [`SshrackError::DecryptionFailed`] without leaking crypto detail (no oracle).
+/// The returned `String` is not `Zeroizing` (the `Secret::Plain` variant is a
+/// plain `String`); the wipe lives in [`crypto::decrypt`]'s `Zeroizing<String>`
+/// intermediate. Shared by the password and inline-key arms of [`decrypt_body`].
+fn decrypt_to_plain(
+    enc: &EncryptedSecret,
+    key: &VaultKey,
+    name_label: &str,
+) -> Result<String, SshrackError> {
+    crypto::decrypt(enc, key)
+        .map(|plain| plain.to_string())
+        .map_err(|_| SshrackError::DecryptionFailed {
+            name: name_label.to_string(),
+        })
+}
+
+/// True if `body` carries any [`Secret::Encrypted`] material — a password or an
+/// inline key's `private_key`/`certificate` — that [`decrypt_body`] would
+/// convert. Used by [`decrypt_all`] to decide which bodies to visit, so an
+/// inline-key-only encrypted body is not skipped (which would strand its
+/// ciphertext on the old vault key during rekey).
+fn body_has_encrypted(body: &CredentialBody) -> bool {
+    if matches!(body.password, Some(Secret::Encrypted(_))) {
+        return true;
+    }
+    if let Some(KeySource::Inline(ik)) = &body.key {
+        ik.private_key.as_ref().is_some_and(Secret::is_encrypted)
+            || ik.certificate.as_ref().is_some_and(Secret::is_encrypted)
+    } else {
+        false
+    }
+}
+
+/// Decrypt every encrypted secret — passwords and inline-key material — under
+/// `key`. Returns the count of bodies converted. Used by rekey (decrypt-all
+/// before re-encrypting under a new key). A body counts once if it carries any
+/// [`Secret::Encrypted`] material; see [`body_has_encrypted`].
 pub fn decrypt_all(cfg: &mut SshrackConfig, key: &VaultKey) -> Result<usize, SshrackError> {
     let mut n = 0usize;
     for c in &mut cfg.credentials {
-        if matches!(c.body.password, Some(Secret::Encrypted(_))) {
+        if body_has_encrypted(&c.body) {
             let name = c.name.clone();
             c.body = decrypt_body(&c.body, key, &name)?;
             n += 1;
@@ -165,7 +213,7 @@ pub fn decrypt_all(cfg: &mut SshrackConfig, key: &VaultKey) -> Result<usize, Ssh
     }
     for h in &mut cfg.hosts {
         if let Some(body) = h.auth.inline_body_mut()
-            && matches!(body.password, Some(Secret::Encrypted(_)))
+            && body_has_encrypted(body)
         {
             let name = h.name.clone();
             let next = decrypt_body(body, key, &name)?;
@@ -660,6 +708,34 @@ mod tests {
     }
 
     #[test]
+    fn count_secrets_counts_keyring_marker_inline_body() {
+        // A keyring-marker inline body (ik.keyring = true) must count toward the
+        // keyring total so `store status` and `store use` show accurate counts.
+        use crate::config::schema::{InlineKey, KeySource};
+        let cfg = SshrackConfig {
+            hosts: vec![Host {
+                id: ulid::Ulid::new(),
+                name: "h".into(),
+                host: "x".into(),
+                port: 22,
+                auth: Auth::inline(CredentialBody {
+                    user: "u".into(),
+                    password: None,
+                    key: Some(KeySource::Inline(InlineKey {
+                        private_key: None,
+                        certificate: None,
+                        keyring: true,
+                    })),
+                    keyring: false,
+                }),
+            }],
+            ..Default::default()
+        };
+        let (_enc, _plain, keyring) = count_secrets(&cfg);
+        assert!(keyring >= 1, "keyring-marker inline body must be counted");
+    }
+
+    #[test]
     fn decrypt_all_round_trips_after_migrate_to_vault_with_counts() {
         let mut cfg = SshrackConfig {
             credentials: vec![Credential {
@@ -996,6 +1072,93 @@ mod tests {
             assert_eq!(plain.as_str(), "REKEY-CERT");
         } else {
             panic!("certificate must remain Encrypted after rekey");
+        }
+    }
+
+    #[test]
+    fn decrypt_all_then_enable_rekeys_inline_key_under_new_key() {
+        // `store rekey` flow: decrypt_all under the old key, then enable under
+        // a fresh passphrase. Inline-key material must be decrypted by
+        // decrypt_all (the gap: previously only passwords were decrypted) and
+        // re-encrypted by enable. Mirrors
+        // migrate_vault_to_vault_rekeys_inline_key_under_new_key but exercises
+        // the decrypt_all -> enable path actually used by `store rekey`.
+        use crate::secret::vault::enable;
+
+        let old_key: VaultKey = Zeroizing::new(KEY);
+        // Seed: plaintext inline key in a vault-mode cfg.
+        let mut cfg = SshrackConfig {
+            credentials: vec![Credential {
+                id: ulid::Ulid::new(),
+                name: "ik-rekey-da".into(),
+                body: inline_plain_body("u", "REKEY-PRIVATE", Some("REKEY-CERT")),
+            }],
+            ..vault_cfg()
+        };
+        let backend = crate::secret::test_doubles::FakeBackend::new();
+        // Seal the inline key under the old key (simulates a prior `store use
+        // vault`). The seed store is already vault, but migrate re-seals each
+        // body's secret under the provided target key regardless of cfg.store.
+        migrate(&mut cfg, &vault_target(), None, Some(&old_key), &backend).unwrap();
+        // Sanity: the inline key is now Encrypted under the old key.
+        if let Some(KeySource::Inline(ik)) = &cfg.credentials[0].body.key {
+            assert!(
+                ik.private_key.as_ref().is_some_and(Secret::is_encrypted),
+                "precondition: private_key must be encrypted after seal"
+            );
+        } else {
+            panic!("expected Inline after seal");
+        }
+
+        // rekey step 1: decrypt_all under the old key. THIS IS THE GAP —
+        // previously decrypt_all left inline-key Encrypted ciphertext stranded
+        // on the old vault key, so the subsequent enable would re-encrypt still-
+        // encrypted bytes under the new key (double-wrap) or skip them.
+        let n = decrypt_all(&mut cfg, &old_key).unwrap();
+        assert_eq!(n, 1, "decrypt_all must count the inline-key body");
+        let ik = match &cfg.credentials[0].body.key {
+            Some(KeySource::Inline(ik)) => ik,
+            other => panic!("expected Inline, got {other:?}"),
+        };
+        assert_eq!(
+            ik.private_key.as_ref().and_then(Secret::as_plain),
+            Some("REKEY-PRIVATE"),
+            "decrypt_all must decrypt the inline private_key to plaintext"
+        );
+        assert_eq!(
+            ik.certificate.as_ref().and_then(Secret::as_plain),
+            Some("REKEY-CERT"),
+            "decrypt_all must decrypt the inline certificate to plaintext"
+        );
+
+        // rekey step 2: drop store + enable under a fresh passphrase (new key).
+        cfg.store = None;
+        let new_key = enable(&mut cfg, "new-passphrase", None, &backend).unwrap();
+        assert!(cfg.is_vault(), "enable must flip cfg.store back to vault");
+        // The inline key must be re-encrypted under the NEW key and round-trip
+        // to the original plaintext. Proves the rekey rewrap landed correctly.
+        let ik = match &cfg.credentials[0].body.key {
+            Some(KeySource::Inline(ik)) => ik,
+            other => panic!("expected Inline after enable, got {other:?}"),
+        };
+        if let Some(Secret::Encrypted(enc)) = &ik.private_key {
+            let plain = crypto::decrypt(enc, &new_key).unwrap();
+            assert_eq!(plain.as_str(), "REKEY-PRIVATE");
+        } else {
+            panic!("private_key must be Encrypted under the new key after enable");
+        }
+        if let Some(Secret::Encrypted(enc)) = &ik.certificate {
+            let plain = crypto::decrypt(enc, &new_key).unwrap();
+            assert_eq!(plain.as_str(), "REKEY-CERT");
+        } else {
+            panic!("certificate must be Encrypted under the new key after enable");
+        }
+        // The old key can no longer decrypt the rewrapped private_key.
+        if let Some(Secret::Encrypted(enc)) = &ik.private_key {
+            assert!(
+                crypto::decrypt(enc, &old_key).is_err(),
+                "old key must not decrypt the rewrapped private_key"
+            );
         }
     }
 
