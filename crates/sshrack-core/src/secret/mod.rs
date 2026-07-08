@@ -33,15 +33,28 @@ pub mod vault;
 /// (`<kind>:<ulid>`) is built via [`crate::id::keyring_key`]. [`get`] takes the
 /// raw key because the askpass helper only knows the key.
 pub trait SecretBackend {
-    /// Store `password` under the owner + id-derived key (overwrites). I/O.
-    fn set(&self, kind: OwnerKind, id: &Ulid, password: &str) -> Result<(), SshrackError>;
-    /// Fetch the password for a raw account key; `Ok(None)` when absent.
+    /// Store `secret` under the raw account `key` (overwrites). I/O. Used for
+    /// the password slot (`<kind>:<id>`) and the inline-key slots
+    /// (`<kind>:<id>#ikpriv` / `#ikcert`).
+    fn set_at(&self, key: &str, secret: &str) -> Result<(), SshrackError>;
+    /// Fetch the secret for a raw account key; `Ok(None)` when absent.
     fn get(&self, key: &str) -> Result<Option<Zeroizing<String>>, SshrackError>;
-    /// Delete the entry for owner + id if present. A missing entry is success.
-    fn delete(&self, kind: OwnerKind, id: &Ulid) -> Result<(), SshrackError>;
+    /// Delete the entry for a raw account key if present. A missing entry is
+    /// success.
+    fn delete_at(&self, key: &str) -> Result<(), SshrackError>;
     /// True when the backend is reachable (a daemon is running / keychain
     /// unlocked). Probed before migrating into keyring mode.
     fn available(&self) -> bool;
+
+    /// Store `password` under the owner's password slot (`<kind>:<id>`).
+    /// Provided for ergonomics: existing password-slot callers are unchanged.
+    fn set(&self, kind: OwnerKind, id: &Ulid, password: &str) -> Result<(), SshrackError> {
+        self.set_at(&crate::id::keyring_key(kind, id), password)
+    }
+    /// Delete the owner's password slot. Provided for ergonomics.
+    fn delete(&self, kind: OwnerKind, id: &Ulid) -> Result<(), SshrackError> {
+        self.delete_at(&crate::id::keyring_key(kind, id))
+    }
 }
 
 /// Where a vault passphrase comes from. Methods that read a passphrase return
@@ -63,14 +76,14 @@ pub trait PassphraseProvider {
 pub struct OsKeyring;
 
 impl SecretBackend for OsKeyring {
-    fn set(&self, kind: OwnerKind, id: &Ulid, password: &str) -> Result<(), SshrackError> {
-        keyring::set_by_key(&crate::id::keyring_key(kind, id), password)
+    fn set_at(&self, key: &str, secret: &str) -> Result<(), SshrackError> {
+        keyring::set_by_key(key, secret)
     }
     fn get(&self, key: &str) -> Result<Option<Zeroizing<String>>, SshrackError> {
         keyring::get(key)
     }
-    fn delete(&self, kind: OwnerKind, id: &Ulid) -> Result<(), SshrackError> {
-        keyring::delete_by_key(&crate::id::keyring_key(kind, id))
+    fn delete_at(&self, key: &str) -> Result<(), SshrackError> {
+        keyring::delete_by_key(key)
     }
     fn available(&self) -> bool {
         keyring::daemon_available()
@@ -117,10 +130,10 @@ pub(crate) mod test_doubles {
     }
 
     impl SecretBackend for FakeBackend {
-        fn set(&self, kind: OwnerKind, id: &Ulid, password: &str) -> Result<(), SshrackError> {
+        fn set_at(&self, key: &str, secret: &str) -> Result<(), SshrackError> {
             self.entries
                 .borrow_mut()
-                .insert(crate::id::keyring_key(kind, id), password.to_string());
+                .insert(key.to_string(), secret.to_string());
             Ok(())
         }
         fn get(&self, key: &str) -> Result<Option<Zeroizing<String>>, SshrackError> {
@@ -130,10 +143,8 @@ pub(crate) mod test_doubles {
                 .get(key)
                 .map(|p| Zeroizing::new(p.clone())))
         }
-        fn delete(&self, kind: OwnerKind, id: &Ulid) -> Result<(), SshrackError> {
-            self.entries
-                .borrow_mut()
-                .remove(&crate::id::keyring_key(kind, id));
+        fn delete_at(&self, key: &str) -> Result<(), SshrackError> {
+            self.entries.borrow_mut().remove(key);
             Ok(())
         }
         fn available(&self) -> bool {
@@ -193,7 +204,7 @@ pub(crate) mod test_doubles {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::id::{OwnerKind, keyring_key};
+    use crate::id::{OwnerKind, keyring_key, keyring_key_inline_cert, keyring_key_inline_priv};
     use ulid::Ulid;
 
     #[test]
@@ -277,5 +288,63 @@ mod tests {
         let p = deny();
         assert!(matches!(p.passphrase(), Err(SshrackError::Interrupted)));
         assert!(!p.confirm("sure?").unwrap());
+    }
+
+    #[test]
+    fn fake_backend_round_trips_inline_slots_independently() {
+        let id = Ulid::new();
+        let be = test_doubles::FakeBackend::new();
+        be.set_at(&keyring_key(OwnerKind::Host, &id), "pw").unwrap();
+        be.set_at(&keyring_key_inline_priv(OwnerKind::Host, &id), "PRIV")
+            .unwrap();
+        be.set_at(&keyring_key_inline_cert(OwnerKind::Host, &id), "CERT")
+            .unwrap();
+        assert_eq!(
+            be.get(&keyring_key(OwnerKind::Host, &id))
+                .unwrap()
+                .as_deref()
+                .map(String::as_str),
+            Some("pw")
+        );
+        assert_eq!(
+            be.get(&keyring_key_inline_priv(OwnerKind::Host, &id))
+                .unwrap()
+                .as_deref()
+                .map(String::as_str),
+            Some("PRIV")
+        );
+        be.delete_at(&keyring_key(OwnerKind::Host, &id)).unwrap();
+        assert!(
+            be.get(&keyring_key(OwnerKind::Host, &id))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            be.get(&keyring_key_inline_priv(OwnerKind::Host, &id))
+                .unwrap()
+                .as_deref()
+                .map(String::as_str),
+            Some("PRIV")
+        );
+    }
+
+    #[test]
+    fn provided_set_delete_delegate_through_keyring_key() {
+        let id = Ulid::new();
+        let be = test_doubles::FakeBackend::new();
+        be.set(OwnerKind::Host, &id, "pw").unwrap();
+        assert_eq!(
+            be.get(&keyring_key(OwnerKind::Host, &id))
+                .unwrap()
+                .as_deref()
+                .map(String::as_str),
+            Some("pw")
+        );
+        be.delete(OwnerKind::Host, &id).unwrap();
+        assert!(
+            be.get(&keyring_key(OwnerKind::Host, &id))
+                .unwrap()
+                .is_none()
+        );
     }
 }

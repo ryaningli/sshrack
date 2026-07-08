@@ -27,6 +27,20 @@ pub fn keyring_key(kind: OwnerKind, id: &Ulid) -> String {
     }
 }
 
+/// The keyring account key for an inline private key stored under keyring
+/// mode. Shares the `<kind>:<id>` base with [`keyring_key`] (the password
+/// slot) and appends a `#ikpriv` suffix so a single owner may own a password
+/// slot, a private-key slot, and a certificate slot simultaneously.
+pub fn keyring_key_inline_priv(kind: OwnerKind, id: &Ulid) -> String {
+    format!("{}#ikpriv", keyring_key(kind, id))
+}
+
+/// The keyring account key for an inline SSH certificate stored under keyring
+/// mode. Appends `#ikcert` to the owner's base key.
+pub fn keyring_key_inline_cert(kind: OwnerKind, id: &Ulid) -> String {
+    format!("{}#ikcert", keyring_key(kind, id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -53,5 +67,35 @@ mod tests {
     #[test]
     fn new_id_is_unique_enough() {
         assert_ne!(new_id(), new_id());
+    }
+
+    #[test]
+    fn inline_priv_key_is_base_plus_suffix() {
+        let id = Ulid::new();
+        assert_eq!(
+            keyring_key_inline_priv(OwnerKind::Host, &id),
+            format!("host:{id}#ikpriv")
+        );
+        assert_eq!(
+            keyring_key_inline_priv(OwnerKind::Credential, &id),
+            format!("cred:{id}#ikpriv")
+        );
+    }
+
+    #[test]
+    fn inline_cert_key_is_base_plus_suffix() {
+        let id = Ulid::new();
+        assert_eq!(
+            keyring_key_inline_cert(OwnerKind::Host, &id),
+            format!("host:{id}#ikcert")
+        );
+    }
+
+    #[test]
+    fn inline_keys_share_base_with_password_key() {
+        let id = Ulid::new();
+        let base = keyring_key(OwnerKind::Host, &id);
+        assert!(keyring_key_inline_priv(OwnerKind::Host, &id).starts_with(&base));
+        assert!(keyring_key_inline_cert(OwnerKind::Host, &id).starts_with(&base));
     }
 }
