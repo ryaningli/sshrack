@@ -145,6 +145,12 @@ pub enum SshrackError {
     #[error("askpass: could not resolve the config file path")]
     AskpassNoConfigPath,
 
+    /// The SFTP master pointed the helper here with `SSHRACK_ASKPASS_DENY` set:
+    /// the TUI owns the tty, so the helper refuses to prompt and ssh must fail
+    /// the auth immediately. Carries no secret.
+    #[error("askpass denied: SFTP session has no password configured")]
+    AskpassDenied,
+
     #[error("failed to resolve path to this binary: {source}")]
     SelfExe {
         #[source]

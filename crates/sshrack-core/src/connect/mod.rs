@@ -12,7 +12,7 @@ use std::process::Command;
 
 use zeroize::Zeroizing;
 
-use crate::askpass::{ASKPASS_FILE_ENV, CONFIG_ENV, HOST_ID_ENV};
+use crate::askpass::{ASKPASS_DENY_ENV, ASKPASS_FILE_ENV, CONFIG_ENV, HOST_ID_ENV};
 use crate::credential::PasswordSource;
 use crate::error::SshrackError;
 use crate::secret::keyring::KEYRING_KEY_ENV;
@@ -78,6 +78,33 @@ pub fn askpass_env_for(
             env.push((KEYRING_KEY_ENV, key.clone()));
         }
         PasswordSource::None => {}
+    }
+    env
+}
+
+/// Like [`askpass_env_for`] but for the SFTP master, which runs under the TUI
+/// and must NEVER read `/dev/tty`. Every source gets the `SSH_ASKPASS` triplet
+/// (`SSH_ASKPASS_REQUIRE=force`); [`PasswordSource::None`] additionally sets
+/// [`ASKPASS_DENY_ENV`] so the helper fails clearly instead of letting ssh
+/// prompt on the terminal the TUI still owns. This is the structural guarantee
+/// that a master needing auth interaction cannot corrupt the TUI.
+pub fn askpass_env_for_sftp(
+    self_exe: &Path,
+    source: &PasswordSource,
+    pw_file: Option<&Path>,
+    config_path: Option<&Path>,
+) -> Vec<(&'static str, String)> {
+    let mut env = askpass_env_for(self_exe, source, pw_file, config_path);
+    if matches!(source, PasswordSource::None) {
+        // No payload to deliver. askpass_env_for returned empty for None, so add
+        // the triplet ourselves: SSH_ASKPASS_REQUIRE=force makes ssh call the
+        // helper (never /dev/tty), and the deny marker makes the helper fail.
+        if env.is_empty() {
+            env.push(("SSH_ASKPASS", self_exe.to_string_lossy().into_owned()));
+            env.push(("SSH_ASKPASS_REQUIRE", "force".to_string()));
+            env.push(("DISPLAY", ":0".to_string()));
+        }
+        env.push((ASKPASS_DENY_ENV, "1".to_string()));
     }
     env
 }
@@ -635,5 +662,57 @@ mod tests {
             Some(PathBuf::from("/home/u/.ssh/id_ed25519")),
             "existing key_path must be preserved"
         );
+    }
+
+    // ---- askpass_env_for_sftp: SFTP master must never read /dev/tty ----
+
+    #[test]
+    fn sftp_none_source_sets_force_triplet_and_deny() {
+        // The SFTP master must never read /dev/tty. A None source still gets
+        // the SSH_ASKPASS triplet (force) PLUS the deny marker, so the helper
+        // fails clearly instead of ssh prompting on the TUI's tty.
+        let env = askpass_env_for_sftp(Path::new("/sshrack"), &PasswordSource::None, None, None);
+        let map: std::collections::HashMap<&str, &str> =
+            env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        assert_eq!(map.get("SSH_ASKPASS").copied(), Some("/sshrack"));
+        assert_eq!(map.get("SSH_ASKPASS_REQUIRE").copied(), Some("force"));
+        assert_eq!(
+            map.get(crate::askpass::ASKPASS_DENY_ENV).copied(),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn sftp_inline_source_keeps_payload_and_no_deny() {
+        // A source WITH a payload keeps the file env and never sets deny.
+        let env = askpass_env_for_sftp(
+            Path::new("/sshrack"),
+            &PasswordSource::Inline(Zeroizing::new("x".into())),
+            Some(Path::new("/tmp/x.pw")),
+            None,
+        );
+        let map: std::collections::HashMap<&str, &str> =
+            env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        assert_eq!(map.get(ASKPASS_FILE_ENV).copied(), Some("/tmp/x.pw"));
+        assert!(
+            !map.contains_key(crate::askpass::ASKPASS_DENY_ENV),
+            "Inline must not set deny"
+        );
+    }
+
+    #[test]
+    fn sftp_keyring_source_no_deny() {
+        // Keyring has a payload; deny stays unset.
+        let env = askpass_env_for_sftp(
+            Path::new("/sshrack"),
+            &PasswordSource::Keyring {
+                key: "host:01J".into(),
+            },
+            None,
+            None,
+        );
+        let map: std::collections::HashMap<&str, &str> =
+            env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        assert!(!map.contains_key(crate::askpass::ASKPASS_DENY_ENV));
     }
 }

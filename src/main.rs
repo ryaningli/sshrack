@@ -15,6 +15,7 @@ fn main() {
     if std::env::var_os(askpass::HOST_ID_ENV).is_some()
         || std::env::var_os(askpass::ASKPASS_FILE_ENV).is_some()
         || std::env::var_os(sshrack_core::secret::keyring::KEYRING_KEY_ENV).is_some()
+        || std::env::var_os(askpass::ASKPASS_DENY_ENV).is_some()
     {
         match askpass::run() {
             Ok(()) => std::process::exit(shared::exit_code::SUCCESS),

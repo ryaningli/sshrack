@@ -42,6 +42,14 @@ pub const HOST_ID_ENV: &str = "SSHRACK_HOST_ID";
 /// play so the helper always reads the same file the parent loaded.
 pub const CONFIG_ENV: &str = "SSHRACK_CONFIG";
 
+/// Env var set by the SFTP launcher when the master must NEVER fall back to
+/// `/dev/tty`. The helper sees it, prints a fixed error, and exits non-zero so
+/// ssh treats the auth as failed (no `/dev/tty` prompt, because the master also
+/// sets `SSH_ASKPASS_REQUIRE=force`). Used for SFTP hosts whose resolved
+/// password source is `None` — there is no payload to deliver, and the TUI
+/// still owns the terminal the master would otherwise prompt on.
+pub const ASKPASS_DENY_ENV: &str = "SSHRACK_ASKPASS_DENY";
+
 /// Read the password from `path` (a 0600 file written by the parent), then
 /// best-effort delete the file so the plaintext does not outlive the
 /// handshake. The parent also deletes it after the child exits; this is
@@ -96,6 +104,14 @@ pub fn run_config<W: Write>(
 /// In every case the password is written to stdout (where ssh reads it) and
 /// flushed before returning.
 pub fn run() -> Result<(), SshrackError> {
+    // SFTP deny: the TUI owns the tty; refuse to prompt. ssh reads this non-zero
+    // exit as an auth failure — and because the master sets
+    // SSH_ASKPASS_REQUIRE=force, ssh never falls back to /dev/tty. Nothing is
+    // written to stdout (no secret, no empty password).
+    if std::env::var_os(ASKPASS_DENY_ENV).is_some() {
+        eprintln!("sshrack: no password configured for this SFTP session");
+        return Err(SshrackError::AskpassDenied);
+    }
     if let Some(host_id) = std::env::var_os(HOST_ID_ENV) {
         let host_id = host_id.to_string_lossy();
         let config_path = std::env::var_os(CONFIG_ENV)
