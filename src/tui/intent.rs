@@ -180,10 +180,6 @@ pub enum Overlay {
     /// message; `Esc` / `Ctrl-C` close it via the standard overlay close path
     /// (`Outcome::CloseOverlay`) — the shell renders behind it. Set by the
     /// `OpenTransfer` arm for every `open_transfer` failure.
-    //
-    // Constructed in Task 4 (run_loop.rs OpenTransfer arm); Task 1 ships the
-    // chrome + render only, so `dead_code` is allowed until that arm lands.
-    #[allow(dead_code)]
     Alert { title: String, body: String },
 }
 

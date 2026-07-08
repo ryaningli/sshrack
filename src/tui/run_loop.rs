@@ -372,8 +372,8 @@ pub fn run_loop(
                     // Run open_transfer (vault unlock, host-key, worker spawn,
                     // screen seed). A cancel inside a popup surfaces as
                     // Interrupted → return to the launcher (no status write);
-                    // any other error surfaces in the status line and also
-                    // returns to the launcher.
+                    // any other error surfaces as a modal Alert and returns to
+                    // the launcher when the user dismisses it (Esc/^C).
                     let Some(host) = app.pending_transfer_host.take() else {
                         // No host: defensive — Ctrl-T hit no host.
                         continue;
@@ -386,7 +386,16 @@ pub fn run_loop(
                             // dismissing is the feedback.
                         }
                         Err(e) => {
-                            app.set_status_error(format!("sftp open failed: {e}"));
+                            // Surface every open failure (vault locked, dangling
+                            // credential, no-password-no-key, master auth
+                            // failure, handshake timeout) as a modal Alert. The
+                            // body carries the real reason — captured stderr for
+                            // master failures (Task 3), a precise message for
+                            // the fail-fast cases. Esc/^C closes → launcher.
+                            app.overlay = Some(Overlay::Alert {
+                                title: " SFTP connection failed ".into(),
+                                body: e.to_string(),
+                            });
                         }
                     }
                 }
