@@ -52,9 +52,8 @@ pub fn finalize_password(
 /// Finalize one inline **key/cert** secret the same way [`finalize_password`]
 /// finalizes a password: encrypt under vault when a key is present, else keep
 /// plaintext. Separate name from `finalize_password` so call sites read as
-/// "key material", not "password". Keyring mode is never reached here (an
-/// inline key on a keyring-mode body is rejected by `CredentialBody::validate`
-/// before sealing).
+/// "key material", not "password". Keyring mode is handled by `seal_inline_key`
+/// before this helper runs, so only vault/plaintext reach here.
 pub fn finalize_secret(
     plain: &str,
     cfg: &SshrackConfig,

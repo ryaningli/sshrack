@@ -273,9 +273,9 @@ pub fn seal_body(
     };
     let key = match body.key {
         // Inline key material: re-host private_key + certificate per the mode.
-        Some(KeySource::Inline(ik)) => {
-            Some(KeySource::Inline(seal_inline_key(ik, cfg, vault_key)?))
-        }
+        Some(KeySource::Inline(ik)) => Some(KeySource::Inline(seal_inline_key(
+            ik, kind, id, cfg, vault_key, backend,
+        )?)),
         // A path reference or absent key passes through unchanged.
         other => other,
     };
@@ -292,15 +292,36 @@ pub fn seal_body(
 }
 
 /// Seal an inline key's freshly collected plaintext secrets (private key, and
-/// the optional certificate) per the active mode. Already-sealed (`Encrypted`)
-/// secrets pass through. Keyring mode is rejected upstream by
-/// [`CredentialBody::validate`](crate::config::schema::CredentialBody::validate),
-/// so this helper never needs a keyring branch.
+/// the optional certificate) per the active mode:
+/// - keyring mode → store each text in its OS-keyring slot, clear the in-body
+///   text, and set `ik.keyring = true` (the body becomes a marker).
+/// - vault mode → encrypt each text under `vault_key` as `Secret::Encrypted`.
+/// - plaintext/undecided → keep each text as `Secret::Plain`.
+///
+/// Already-sealed (`Encrypted`) secrets pass through (vault re-save is a
+/// no-op; re-sealing a keyring marker body is a no-op).
 fn seal_inline_key(
     mut ik: InlineKey,
+    kind: OwnerKind,
+    id: &Ulid,
     cfg: &SshrackConfig,
     vault_key: Option<&VaultKey>,
+    backend: &dyn SecretBackend,
 ) -> Result<InlineKey, SshrackError> {
+    if cfg.is_keyring() {
+        if let Some(Secret::Plain(ref p)) = ik.private_key {
+            backend.set_at(&crate::id::keyring_key_inline_priv(kind, id), p)?;
+            ik.private_key = None;
+        }
+        if let Some(Secret::Plain(ref c)) = ik.certificate {
+            backend.set_at(&crate::id::keyring_key_inline_cert(kind, id), c)?;
+            ik.certificate = None;
+        }
+        ik.keyring = true;
+        return Ok(ik);
+    }
+    // Vault / plaintext path: finalize each in-body secret in place via the
+    // shared helper (encrypt under vault, or keep plaintext).
     if let Some(Secret::Plain(ref p)) = ik.private_key {
         ik.private_key = Some(transform::finalize_secret(p, cfg, vault_key)?);
     }
@@ -795,6 +816,84 @@ mod tests {
             }
             other => panic!("expected Inline, got {other:?}"),
         }
+    }
+
+    // ---- seal_inline_key: keyring-mode write path ----
+
+    #[test]
+    fn seal_inline_key_keyring_mode_stores_text_in_keyring_and_clears_body() {
+        // Under keyring mode, sealing an inline key with plaintext private + cert
+        // must: (a) write both texts to the keyring slots, (b) clear the in-body
+        // text, (c) set ik.keyring = true. The body left on disk carries no secret.
+        use crate::config::schema::{InlineKey, Secret, SecretStore};
+        use crate::secret::test_doubles::FakeBackend;
+        use ulid::Ulid;
+
+        let cfg = SshrackConfig {
+            store: Some(SecretStore::Keyring),
+            ..SshrackConfig::default()
+        };
+        let id = Ulid::new();
+        let backend = FakeBackend::new();
+        let ik = InlineKey {
+            private_key: Some(Secret::Plain("PRIV-TEXT".into())),
+            certificate: Some(Secret::Plain("CERT-TEXT".into())),
+            keyring: false,
+        };
+        let sealed =
+            super::seal_inline_key(ik, OwnerKind::Host, &id, &cfg, None, &backend).unwrap();
+        // Body cleared + marker set.
+        assert!(sealed.private_key.is_none());
+        assert!(sealed.certificate.is_none());
+        assert!(sealed.keyring);
+        // Both texts live in the keyring under the slot keys.
+        assert_eq!(
+            backend
+                .get(&crate::id::keyring_key_inline_priv(OwnerKind::Host, &id))
+                .unwrap()
+                .as_deref()
+                .map(String::as_str),
+            Some("PRIV-TEXT")
+        );
+        assert_eq!(
+            backend
+                .get(&crate::id::keyring_key_inline_cert(OwnerKind::Host, &id))
+                .unwrap()
+                .as_deref()
+                .map(String::as_str),
+            Some("CERT-TEXT")
+        );
+    }
+
+    #[test]
+    fn seal_inline_key_keyring_mode_without_cert_leaves_cert_slot_absent() {
+        // A private-only inline key writes only the priv slot; the cert slot is
+        // not created.
+        use crate::config::schema::{InlineKey, Secret, SecretStore};
+        use crate::secret::test_doubles::FakeBackend;
+        use ulid::Ulid;
+
+        let cfg = SshrackConfig {
+            store: Some(SecretStore::Keyring),
+            ..SshrackConfig::default()
+        };
+        let id = Ulid::new();
+        let backend = FakeBackend::new();
+        let ik = InlineKey {
+            private_key: Some(Secret::Plain("PRIV".into())),
+            certificate: None,
+            keyring: false,
+        };
+        let sealed =
+            super::seal_inline_key(ik, OwnerKind::Host, &id, &cfg, None, &backend).unwrap();
+        assert!(sealed.keyring);
+        assert!(sealed.private_key.is_none());
+        assert!(
+            backend
+                .get(&crate::id::keyring_key_inline_cert(OwnerKind::Host, &id))
+                .unwrap()
+                .is_none()
+        );
     }
 
     // ---- seal_auth ----
