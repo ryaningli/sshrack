@@ -96,10 +96,10 @@ Do not block on clippy or formatting while the actual issue is still unresolved.
 ### Hard Rules
 
 - **English only** — all source, comments, doc comments, errors, help text, log output, and commit messages.
-- **Zero `unsafe`** — never, including tests. (Rust 2024 made `std::env::set_var` unsafe; tests inject via params/seams, never mutate the real env.)
+- **Zero `unsafe`** — never, including tests. (Rust 2024 made `std::env::set_var` unsafe; tests inject via params/seams — hermetic discipline in Testing.)
 - **Zero `unwrap()` / `expect()`** in production — only `#[cfg(test)]` or genuinely unreachable states with `expect("invariant: ...")`.
-- **TDD for pure logic** — RED → GREEN → REFACTOR for pure-logic modules (config parsing, command assembly, credential encode/decode, name resolution, frecency scoring). Process/PTY behavior is covered by integration tests.
-- **Write enough tests** — unit tests for pure logic; integration tests where feasible (mock-ssh shim). No hard coverage gate; use judgment to cover meaningful branches and failure paths.
+- **TDD for pure logic** — RED → GREEN → REFACTOR (which modules, and the integration boundary, are listed in Testing).
+- **Write enough tests** — no hard coverage gate; use judgment to cover meaningful branches and failure paths (see Testing for which layer to pick).
 - **Clippy strict** — `cargo clippy --workspace --all-targets -- -D warnings` green before every commit.
 - **Format** — `cargo fmt` green before every commit.
 - **Error handling** — library errors use `thiserror`; application errors use `anyhow` with `.context()`. All fallible ops propagate via `?`.
