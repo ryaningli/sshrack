@@ -321,17 +321,14 @@ impl CredentialBody {
 
     /// Enforce the mutual-exclusion invariant: at most one of password / key
     /// (Path or Inline) / keyring marker. Any pair set is a malformed body — no
-    /// silent winner. Additionally reject an inline key when keyring storage
-    /// mode is implied (the body-level marker or the [`InlineKey`] `keyring`
-    /// flag), since inline key text cannot live in the OS keyring in this MVP.
+    /// silent winner. An inline key in keyring-marker form (`ik.keyring == true`
+    /// with no in-body secret text) is the sealed form stored under keyring
+    /// storage and is accepted; a marker that coexists with in-body plaintext
+    /// is a half-migrated body and is rejected.
     pub fn validate(&self) -> Result<(), SshrackError> {
         // Count the secret slots: password, any key (Path or Inline), and the
         // body-level keyring marker (password-in-keyring). At most one allowed.
         let key_present = self.key.is_some();
-        let inline_keyring = matches!(
-            self.key,
-            Some(KeySource::Inline(ref ik)) if ik.keyring
-        );
         let secrets_set = [self.password.is_some(), key_present, self.keyring]
             .into_iter()
             .filter(|b| *b)
@@ -341,11 +338,17 @@ impl CredentialBody {
                 user: self.user.clone(),
             });
         }
-        // Inline key contents are not supported in keyring storage mode: the
-        // body-level `keyring` marker or the Inline's own `keyring` flag both
-        // mean "key text in the OS keyring", which this MVP does not implement.
-        if inline_keyring || (matches!(self.key, Some(KeySource::Inline(_))) && self.keyring) {
-            return Err(SshrackError::InlineKeyNeedsVaultOrPlaintext);
+        // An inline key whose text lives in the OS keyring (`ik.keyring == true`)
+        // is the sealed form under keyring storage: it carries no in-body secret
+        // text, so accept it. Reject a marker that coexists with in-body plaintext
+        // — that is a half-migrated body, not a valid sealed form.
+        if let Some(KeySource::Inline(ik)) = &self.key
+            && ik.keyring
+            && (ik.private_key.is_some() || ik.certificate.is_some())
+        {
+            return Err(SshrackError::InvalidCredentialBody {
+                user: self.user.clone(),
+            });
         }
         Ok(())
     }
@@ -874,6 +877,43 @@ key = "/old/path"
         // The top-level `keyring = true` marker means "the password is in the OS
         // keyring". Inline key contents are not supported in keyring mode (see plan
         // design note), so the combination is a malformed body.
+        let body = CredentialBody {
+            user: "u".into(),
+            password: None,
+            key: Some(KeySource::Inline(InlineKey {
+                private_key: Some(Secret::Plain("k".into())),
+                certificate: None,
+                keyring: true,
+            })),
+            keyring: false,
+        };
+        assert!(body.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_inline_key_in_keyring_marker_form() {
+        // A keyring-stored inline key carries no in-body secret text — private_key
+        // and certificate are both None, and ik.keyring marks their residence in
+        // the OS keyring. This is the sealed form produced under keyring mode and
+        // must pass validation.
+        let body = CredentialBody {
+            user: "u".into(),
+            password: None,
+            key: Some(KeySource::Inline(InlineKey {
+                private_key: None,
+                certificate: None,
+                keyring: true,
+            })),
+            keyring: false,
+        };
+        assert!(body.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_plaintext_inline_key_under_keyring_marker() {
+        // The marker must never coexist with in-body plaintext: that is a
+        // half-migrated body (text not yet moved to the keyring). Reject it as a
+        // malformed body.
         let body = CredentialBody {
             user: "u".into(),
             password: None,
