@@ -883,10 +883,11 @@ key = "/old/path"
     // ---- validate: mutex incl. Inline + keyring-mode rejection ----
 
     #[test]
-    fn validate_rejects_inline_key_under_keyring_mode_marker() {
-        // The top-level `keyring = true` marker means "the password is in the OS
-        // keyring". Inline key contents are not supported in keyring mode (see plan
-        // design note), so the combination is a malformed body.
+    fn validate_rejects_half_migrated_inline_marker() {
+        // An inline key with `ik.keyring = true` must carry no in-body secret
+        // text — the marker means the private key/certificate live in the OS
+        // keyring slots. A coexisting plaintext `private_key` is a half-migrated
+        // body (text not yet moved out), so reject it as malformed.
         let body = CredentialBody {
             user: "u".into(),
             password: None,

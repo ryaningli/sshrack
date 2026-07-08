@@ -29,9 +29,11 @@ pub mod vault;
 /// write/migrate path and the rm/cp keyring cleanup go through this, so they
 /// are unit-testable without a running Secret Service daemon.
 ///
-/// Keying is `OwnerKind + Ulid` at this layer; the derived account key
-/// (`<kind>:<ulid>`) is built via [`crate::id::keyring_key`]. [`get`] takes the
-/// raw key because the askpass helper only knows the key.
+/// Raw-keyed at the required layer: `set_at`/`get`/`delete_at` take a raw
+/// account key (`<kind>:<id>` for the password slot, `<kind>:<id>#ikpriv` /
+/// `#ikcert` for inline-key slots). The `OwnerKind + Ulid` `set`/`delete`
+/// defaults are ergonomic wrappers over [`crate::id::keyring_key`] for the
+/// password slot; inline-key slots go through the raw methods directly.
 pub trait SecretBackend {
     /// Store `secret` under the raw account `key` (overwrites). I/O. Used for
     /// the password slot (`<kind>:<id>`) and the inline-key slots
@@ -142,7 +144,8 @@ pub fn copy_keyring_secret(
 /// Copy an owner's inline-key keyring slots (private + certificate) from
 /// `src_id` to `dst_id`, if the source has any. Returns `true` if at least one
 /// slot was copied. Used by `host cp` / `cred cp` so the cloned owner owns its
-/// keyring-stored inline key. Best-effort: absent slots are silently skipped.
+/// keyring-stored inline key. Absent slots are silently skipped (not every
+/// inline key has a certificate); real I/O errors propagate via `?`.
 pub fn copy_inline_keyring_slots(
     backend: &dyn SecretBackend,
     kind: OwnerKind,
