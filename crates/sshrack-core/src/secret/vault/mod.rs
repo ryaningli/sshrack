@@ -265,6 +265,9 @@ pub fn seal_body(
     vault_key: Option<&VaultKey>,
     backend: &dyn SecretBackend,
 ) -> Result<CredentialBody, SshrackError> {
+    let had_password = matches!(body.password, Some(Secret::Plain(_)));
+    let had_key = body.key.is_some();
+    let orig_keyring = body.keyring;
     let password = match body.password {
         // A freshly collected plaintext password is re-hosted per the mode.
         Some(Secret::Plain(ref p)) => seal_password(p, kind, id, cfg, vault_key, backend)?,
@@ -279,10 +282,16 @@ pub fn seal_body(
         // A path reference or absent key passes through unchanged.
         other => other,
     };
-    // Keyring mode stored the password in the backend (or the body was already
-    // a keyring-marker body with `password = None`): `password.is_none()` is
-    // the signal, so flip the marker so `resolve` produces PasswordSource::Keyring.
-    let keyring = password.is_none() && cfg.is_keyring();
+    // The body-level keyring marker means "the password lives in the OS
+    // keyring" — it is the password-slot marker, distinct from the inline-key
+    // marker (`ik.keyring`). Set it only under keyring mode for a body that
+    // carries no key (so the marker is not conflated with a key-carrying body)
+    // AND whose password was either freshly sealed to the backend
+    // (`had_password` → `password` is now `None`) or was already marked (a
+    // re-save of an existing keyring-password entry). A key-carrying or
+    // passwordless body never carries the password-slot marker.
+    let keyring =
+        cfg.is_keyring() && !had_key && password.is_none() && (had_password || orig_keyring);
     Ok(CredentialBody {
         user: body.user,
         password,
@@ -819,6 +828,53 @@ mod tests {
     }
 
     // ---- seal_inline_key: keyring-mode write path ----
+
+    #[test]
+    fn seal_body_inline_key_under_keyring_mode_does_not_set_password_marker() {
+        // seal_body must not set the body-level `keyring` marker when sealing
+        // an inline-key body under keyring mode. That marker is the
+        // password-slot marker; an inline-key body has its own `ik.keyring`
+        // marker. Setting both `key = Some(...)` and `keyring = true` would
+        // make `CredentialBody::validate` reject the body (secrets_set == 2),
+        // which the credential persist path (which validates) would surface as
+        // InvalidCredentialBody. Pins the seal_body output shape that the TUI
+        // and CLI persist paths rely on.
+        use crate::config::schema::{InlineKey, KeySource, Secret, SecretStore};
+
+        let cfg = SshrackConfig {
+            store: Some(SecretStore::Keyring),
+            ..SshrackConfig::default()
+        };
+        let id = ulid::Ulid::new();
+        let backend = FakeBackend::new();
+        let body = CredentialBody::new("u").with_inline_key(
+            Secret::Plain("PRIV-TEXT".into()),
+            Some(Secret::Plain("CERT-TEXT".into())),
+        );
+        let sealed = seal_body(body, OwnerKind::Credential, &id, &cfg, None, &backend).unwrap();
+        // The body carries an inline-key marker, NOT the password marker.
+        assert!(
+            !sealed.keyring,
+            "no body-level password marker for a key body"
+        );
+        assert!(sealed.password.is_none());
+        let ik = match &sealed.key {
+            Some(KeySource::Inline(ik)) => ik,
+            other => panic!("expected Inline, got {other:?}"),
+        };
+        assert_eq!(
+            *ik,
+            InlineKey {
+                private_key: None,
+                certificate: None,
+                keyring: true,
+            },
+            "inline key sealed to marker form"
+        );
+        // And the resulting body must pass validation (the regression: before
+        // the fix it carried both `key` and `keyring = true`).
+        sealed.validate().expect("sealed body is valid");
+    }
 
     #[test]
     fn seal_inline_key_keyring_mode_stores_text_in_keyring_and_clears_body() {

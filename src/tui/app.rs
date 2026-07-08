@@ -1183,6 +1183,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
     use sshrack_core::config::schema::{Auth, CredentialBody, Host, SshrackConfig};
     use sshrack_core::error::SshrackError;
+    use sshrack_core::secret::OsKeyring;
     use std::collections::HashMap;
     use ulid::Ulid;
 
@@ -1490,7 +1491,7 @@ mod tests {
         assert!(matches!(outcome, Outcome::SaveHost));
 
         // Loop actions.
-        persist_host_save(&mut app, &dead_handle()).expect("save");
+        persist_host_save(&mut app, &dead_handle(), &OsKeyring).expect("save");
         app.close_host_wizard();
         assert!(app.overlay().is_none(), "overlay closed back to launcher");
         // The launcher now sees the new host (re-ranked on close).
@@ -1541,7 +1542,7 @@ mod tests {
         let outcome = app.on_key(press(KeyCode::Char('s'), KeyModifiers::CONTROL));
         assert!(matches!(outcome, Outcome::SaveHost));
 
-        persist_host_save(&mut app, &dead_handle()).expect("save");
+        persist_host_save(&mut app, &dead_handle(), &OsKeyring).expect("save");
         app.close_host_wizard();
         assert_eq!(app.config().hosts.len(), 1);
         assert_eq!(app.config().hosts[0].port, 2200);
@@ -1711,7 +1712,7 @@ mod tests {
         let outcome = app.on_key(press(KeyCode::Char('s'), KeyModifiers::CONTROL));
         assert!(matches!(outcome, Outcome::SaveCred));
 
-        persist_cred_save(&mut app, &dead_handle()).expect("save");
+        persist_cred_save(&mut app, &dead_handle(), &OsKeyring).expect("save");
         app.close_cred_wizard();
         assert!(app.overlay().is_none(), "overlay closed back to launcher");
         assert_eq!(app.config().credentials.len(), 1);

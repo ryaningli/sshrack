@@ -22,6 +22,32 @@ use super::intent::Overlay;
 use super::prompt::TuiPassphrase;
 use super::term::TerminalHandle;
 
+/// True if the body carries a freshly collected plaintext secret that must be
+/// sealed per the store mode: a plaintext password, or an inline key with
+/// plaintext private/cert text. Already-sealed ([`Secret::Encrypted`]) or
+/// marker-only bodies (e.g. a keyring-marker inline key with no in-body text)
+/// pass through unchanged — they have nothing to re-host.
+///
+/// This widens the TUI persist seal trigger so inline-key plaintext routes
+/// through [`vault::seal_body`] under any decided mode, matching the CLI path
+/// (which seals via `seal_inline_body`). Previously the trigger only fired on
+/// `password == Plain`, so an inline-key body's plaintext was written to
+/// `config.toml` verbatim even under vault/keyring mode.
+///
+/// [`Secret::Encrypted`]: sshrack_core::config::schema::Secret::Encrypted
+fn body_has_plaintext_secret(body: &sshrack_core::config::schema::CredentialBody) -> bool {
+    use sshrack_core::config::schema::{KeySource, Secret};
+    if matches!(body.password, Some(Secret::Plain(_))) {
+        return true;
+    }
+    matches!(
+        &body.key,
+        Some(KeySource::Inline(ik))
+            if matches!(ik.private_key, Some(Secret::Plain(_)))
+                || matches!(ik.certificate, Some(Secret::Plain(_)))
+    )
+}
+
 /// Fulfill a [`Outcome::SaveHost`] intent: resolve the form to a [`Host`],
 /// persist via core, reload, and update the app's config. Pure validation
 /// already passed inside the wizard; this is the I/O half — duplicate-name /
@@ -34,9 +60,13 @@ use super::term::TerminalHandle;
 /// auth choice, the picked credential name is resolved to its stable [`Ulid`]
 /// here (the wizard only ever holds the name). For an
 /// [`Independent`][crate::tui::wizard::AuthChoice::Independent] auth choice
-/// whose secret is a password, the inline password is sealed per the configured
-/// store mode (keyring / vault / plaintext) here — mirroring `persist_cred_save` —
-/// so the host owns its own secret without a detour to the credential tab.
+/// whose secret is a password OR an inline (pasted) identity key, the inline
+/// plaintext is sealed per the configured store mode (keyring / vault /
+/// plaintext) here — mirroring `persist_cred_save` — so the host owns its own
+/// secret without a detour to the credential tab. The seal trigger is
+/// [`body_has_plaintext_secret`]: any freshly collected in-body plaintext
+/// (password or inline key text) routes through [`vault::seal_body`]; an
+/// already-sealed body passes through unchanged.
 ///
 /// Keyring lifecycle: an inline password is keyed by the host's ULID
 /// (`OwnerKind::Host`); on edit the old entry is cleaned up, and on delete /
@@ -44,6 +74,7 @@ use super::term::TerminalHandle;
 pub(crate) fn persist_host_save(
     app: &mut App,
     handle: &TerminalHandle,
+    backend: &dyn SecretBackend,
 ) -> Result<(), SshrackError> {
     // Take the form out of the overlay so we can borrow `app.config` for the
     // credential-name → id resolution without a borrow conflict. The form lives
@@ -105,17 +136,19 @@ pub(crate) fn persist_host_save(
         }
     }
 
-    // ── Seal an inline plaintext password per the configured store mode ─────
-    // (mirror persist_cred_save). Only when there is a freshly collected
-    // plaintext password; a key / none body passes through unchanged. A Password
-    // choice with no store mode decided is a user-facing error, NOT a silent
-    // plaintext fallback. Vault unlock via TuiPassphrase (no-op unless vault
-    // mode); under SSHRACK_PASSPHRASE the env value shadows the popup.
+    // ── Seal any freshly collected plaintext secret per the configured store
+    //    mode (mirror persist_cred_save). The trigger is
+    //    [`body_has_plaintext_secret`]: a plaintext password OR an inline key
+    //    with plaintext private/cert text. Already-sealed (Encrypted) or
+    //    marker-only bodies pass through unchanged. Previously only the
+    //    password was sealed, so an inline-key body's plaintext was written to
+    //    config.toml verbatim even under vault/keyring mode — a divergence from
+    //    the CLI path (which seals via `seal_inline_body`). A secret-carrying
+    //    body with no store mode decided is a user-facing error, NOT a silent
+    //    plaintext fallback. Vault unlock via TuiPassphrase (no-op unless vault
+    //    mode); under SSHRACK_PASSPHRASE the env value shadows the popup.
     if let Some(body) = auth.inline_body()
-        && matches!(
-            body.password,
-            Some(sshrack_core::config::schema::Secret::Plain(_))
-        )
+        && body_has_plaintext_secret(body)
     {
         if app.config.store.is_none() {
             return Err(SshrackError::StoreModeNotDecided);
@@ -124,14 +157,13 @@ pub(crate) fn persist_host_save(
         let env_pw = vault::passphrase_from_env();
         let vault_key =
             vault::ensure_unlocked_vault_key(&app.config, env_pw.as_ref(), &passphrase_provider)?;
-        let backend = OsKeyring;
         let sealed = vault::seal_body(
             body.clone(),
             OwnerKind::Host,
             &target_id,
             &app.config,
             vault_key.as_ref(),
-            &backend,
+            backend,
         )?;
         auth = Auth::inline(sealed);
     }
@@ -261,6 +293,7 @@ pub(crate) fn persist_cred_delete(app: &mut App, name: &str) -> Result<(), Sshra
 pub(crate) fn persist_cred_save(
     app: &mut App,
     handle: &TerminalHandle,
+    backend: &dyn SecretBackend,
 ) -> Result<(), SshrackError> {
     // Take the form out of the overlay so we can borrow app.config/launcher
     // without a conflict. The form lives inside `Overlay::CredWizard`; clone it
@@ -305,16 +338,16 @@ pub(crate) fn persist_cred_save(
         (Ulid::new(), form.build_body())
     };
 
-    // ── Seal the password per the configured store mode. ────────────────────
-    // Only seal when there is a freshly collected plaintext password to re-host
-    // (a key / none body passes through unchanged). And only when a store mode
-    // is decided; a Password choice with no mode decided is a user-facing
-    // error, NOT a silent plaintext fallback.
-    let has_plaintext_password = matches!(
-        body.password,
-        Some(sshrack_core::config::schema::Secret::Plain(_))
-    );
-    if has_plaintext_password {
+    // ── Seal any freshly collected plaintext secret per the configured store
+    //    mode. The trigger is [`body_has_plaintext_secret`]: a plaintext
+    //    password OR an inline key with plaintext private/cert text. Only when
+    //    there is a freshly collected plaintext secret to re-host (a path-key /
+    //    none / already-sealed body passes through unchanged). And only when a
+    //    store mode is decided; a secret-carrying body with no mode decided is a
+    //    user-facing error, NOT a silent plaintext fallback. Previously only the
+    //    password was sealed, so an inline-key body's plaintext diverged from
+    //    the CLI path (which seals via `seal_inline_body`).
+    if body_has_plaintext_secret(&body) {
         if app.config.store.is_none() {
             return Err(SshrackError::StoreModeNotDecided);
         }
@@ -326,14 +359,13 @@ pub(crate) fn persist_cred_save(
         let env_pw = vault::passphrase_from_env();
         let vault_key =
             vault::ensure_unlocked_vault_key(&app.config, env_pw.as_ref(), &passphrase_provider)?;
-        let backend = OsKeyring;
         body = vault::seal_body(
             body,
             OwnerKind::Credential,
             &id,
             &app.config,
             vault_key.as_ref(),
-            &backend,
+            backend,
         )?;
     }
 
@@ -396,7 +428,8 @@ pub(crate) fn recover_store_mode_and_retry_cred_save(
         true => {
             // Store mode switched + persisted; retry the save. Any error propagates
             // (fulfill_save_cred surfaces it in the wizard's core-error line).
-            persist_cred_save(app, handle).map(|_| true)
+            let backend = OsKeyring;
+            persist_cred_save(app, handle, &backend).map(|_| true)
         }
         false => {
             // Switch refused (keyring daemon down, plaintext declined, ...).
@@ -417,7 +450,8 @@ pub(crate) fn recover_store_mode_and_retry_cred_save(
 /// retry instead of erroring out of the wizard. All outcomes surface through
 /// the wizard's core-error line or a launcher status + wizard close.
 pub(crate) fn fulfill_save_cred(app: &mut App, handle: &TerminalHandle) {
-    match persist_cred_save(app, handle) {
+    let backend = OsKeyring;
+    match persist_cred_save(app, handle, &backend) {
         Ok(()) => {
             app.set_status("credential saved".to_string());
             app.close_cred_wizard();
@@ -626,6 +660,7 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::rc::Rc;
+    use zeroize::Zeroizing;
 
     #[test]
     fn persist_host_save_add_appends_and_reloads() {
@@ -649,7 +684,7 @@ mod tests {
         w.user = "deploy".into();
         app.overlay = Some(Overlay::HostWizard(w));
 
-        persist_host_save(&mut app, &dead_handle()).expect("add save should succeed");
+        persist_host_save(&mut app, &dead_handle(), &OsKeyring).expect("add save should succeed");
 
         // Wizard is NOT auto-closed by persist (the loop does that); but the
         // config has been reloaded with the new host.
@@ -689,7 +724,7 @@ mod tests {
         w.name = "web-renamed".into();
         app.overlay = Some(Overlay::HostWizard(w));
 
-        persist_host_save(&mut app, &dead_handle()).expect("edit save should succeed");
+        persist_host_save(&mut app, &dead_handle(), &OsKeyring).expect("edit save should succeed");
 
         let reloaded = sshrack_core::config::store::load(&path).unwrap();
         assert_eq!(reloaded.hosts.len(), 1);
@@ -725,7 +760,7 @@ mod tests {
         w.host_addr = "h2".into();
         app.overlay = Some(Overlay::HostWizard(w));
 
-        let err = persist_host_save(&mut app, &dead_handle()).unwrap_err();
+        let err = persist_host_save(&mut app, &dead_handle(), &OsKeyring).unwrap_err();
         assert!(matches!(err, SshrackError::HostAlreadyExists { .. }));
         // The duplicate host was NOT written.
         let reloaded = sshrack_core::config::store::load(&path).unwrap();
@@ -758,7 +793,7 @@ mod tests {
         w.auth_choice = super::super::wizard::AuthChoice::Reference { idx: 0 };
         app.overlay = Some(Overlay::HostWizard(w));
 
-        persist_host_save(&mut app, &dead_handle()).unwrap();
+        persist_host_save(&mut app, &dead_handle(), &OsKeyring).unwrap();
 
         let reloaded = sshrack_core::config::store::load(&path).unwrap();
         let h = &reloaded.hosts[0];
@@ -794,7 +829,7 @@ mod tests {
         w.auth_choice = super::super::wizard::AuthChoice::Reference { idx: 0 };
         app.overlay = Some(Overlay::HostWizard(w));
 
-        let err = persist_host_save(&mut app, &dead_handle()).unwrap_err();
+        let err = persist_host_save(&mut app, &dead_handle(), &OsKeyring).unwrap_err();
         assert!(matches!(err, SshrackError::CredentialNotFound { .. }));
     }
 
@@ -835,7 +870,7 @@ mod tests {
         w.password = Zeroizing::new("hunter2".into());
         app.overlay = Some(Overlay::HostWizard(w));
 
-        persist_host_save(&mut app, &dead_handle()).expect("seal + save succeeds");
+        persist_host_save(&mut app, &dead_handle(), &OsKeyring).expect("seal + save succeeds");
 
         let saved = app.config.find_host_by_name("pw-host").expect("host saved");
         let body = saved.auth.inline_body().expect("inline body");
@@ -878,7 +913,7 @@ mod tests {
         w.password = Zeroizing::new("hunter2".into());
         app.overlay = Some(Overlay::HostWizard(w));
 
-        persist_host_save(&mut app, &dead_handle()).expect("seal + save succeeds");
+        persist_host_save(&mut app, &dead_handle(), &OsKeyring).expect("seal + save succeeds");
 
         let saved = app.config.find_host_by_name("kr-host").expect("host saved");
         let body = saved.auth.inline_body().expect("inline body");
@@ -890,6 +925,245 @@ mod tests {
             body.password.is_none(),
             "keyring mode: plaintext must NOT live in the body"
         );
+    }
+
+    // ===============================================================
+    // Inline-key plaintext sealing under keyring mode (Task 8).
+    //
+    // The seal trigger was widened from "password == Plain" to
+    // [`body_has_plaintext_secret`] so an inline-key body's private/cert text
+    // also routes through `vault::seal_body`. Under keyring mode that stores
+    // the text in the backend and leaves a marker body (`ik.keyring == true`,
+    // no in-body text). The OS keyring is not reachable in CI, so these tests
+    // inject a local in-memory `SecretBackend` impl (core's `FakeBackend` is
+    // `pub(crate)` and invisible to the binary crate) and assert the slot
+    // contents directly — the no-leak invariant the `#[ignore]`'d OS-keyring
+    // test above cannot check.
+    // ===============================================================
+
+    /// In-memory `SecretBackend` for the persist tests. Mirrors core's
+    /// `FakeBackend` (keyed by the raw account key) but lives in the binary
+    /// test module so the persist fns can accept it via the injected
+    /// `&dyn SecretBackend` parameter.
+    struct FakeSecretBackend {
+        entries: RefCell<HashMap<String, String>>,
+    }
+
+    impl FakeSecretBackend {
+        fn new() -> Self {
+            Self {
+                entries: RefCell::new(HashMap::new()),
+            }
+        }
+    }
+
+    impl SecretBackend for FakeSecretBackend {
+        fn set_at(&self, key: &str, secret: &str) -> Result<(), SshrackError> {
+            self.entries
+                .borrow_mut()
+                .insert(key.to_string(), secret.to_string());
+            Ok(())
+        }
+        fn get(&self, key: &str) -> Result<Option<Zeroizing<String>>, SshrackError> {
+            Ok(self
+                .entries
+                .borrow()
+                .get(key)
+                .map(|p| Zeroizing::new(p.clone())))
+        }
+        fn delete_at(&self, key: &str) -> Result<(), SshrackError> {
+            self.entries.borrow_mut().remove(key);
+            Ok(())
+        }
+        fn available(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn persist_host_save_inline_key_seals_under_keyring_into_backend() {
+        // Keyring store + an inline (pasted) private key: the persist path must
+        // route the plaintext through seal_body, which stores it in the
+        // backend under the host's inline-private slot and leaves a marker body
+        // (`ik.keyring == true`, no in-body text). This is the no-leak
+        // invariant for inline key text under keyring mode — previously the
+        // TUI never sealed inline keys, so the plaintext was written to
+        // config.toml verbatim.
+        use super::super::wizard::{AuthChoice, SecretChoice, SourceChoice};
+        use sshrack_core::config::schema::{InlineKey, KeySource, SecretStore};
+        use sshrack_core::id::{OwnerKind, keyring_key_inline_priv};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = SshrackConfig {
+            store: Some(SecretStore::Keyring),
+            ..SshrackConfig::default()
+        };
+        sshrack_core::config::store::save(&path, &cfg).unwrap();
+        let mut app = App::new(cfg, Some(path.clone()), Frecency::default(), HashMap::new());
+
+        app.open_host_wizard_add();
+        let Overlay::HostWizard(mut w) = app.overlay.take().unwrap() else {
+            unreachable!("host wizard open");
+        };
+        w.name = "ik-host".into();
+        w.host_addr = "10.0.0.1".into();
+        w.auth_choice = AuthChoice::Independent;
+        w.secret_kind = SecretChoice::IdentityKey;
+        w.source = SourceChoice::Inline;
+        w.inline_private = "PRIVATEKEYTEXT".into();
+        app.overlay = Some(Overlay::HostWizard(w));
+
+        let backend = FakeSecretBackend::new();
+        persist_host_save(&mut app, &dead_handle(), &backend).expect("seal + save succeeds");
+
+        let saved = app.config.find_host_by_name("ik-host").expect("host saved");
+        let body = saved.auth.inline_body().expect("inline body");
+        // The body is now a keyring marker: ik.keyring == true and no in-body
+        // private/cert text.
+        let ik = match &body.key {
+            Some(KeySource::Inline(ik)) => ik,
+            other => panic!("expected Inline key after seal, got {other:?}"),
+        };
+        let expected = InlineKey {
+            private_key: None,
+            certificate: None,
+            keyring: true,
+        };
+        assert_eq!(
+            *ik, expected,
+            "keyring mode: inline key must be a marker (no in-body text)"
+        );
+        assert!(
+            ik.private_key.is_none(),
+            "keyring mode: private key text must NOT live in the body"
+        );
+        // The plaintext lives in the backend under the host's inline-private
+        // slot, keyed by the host's ULID.
+        let host_id = saved.id;
+        let slot = backend
+            .get(&keyring_key_inline_priv(OwnerKind::Host, &host_id))
+            .unwrap()
+            .expect("private key text stored in the backend");
+        assert_eq!(slot.as_str(), "PRIVATEKEYTEXT");
+        assert!(
+            body.password.is_none(),
+            "no password on a key-carrying body"
+        );
+        // The plaintext never reached the on-disk config.
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !on_disk.contains("PRIVATEKEYTEXT"),
+            "private key text leaked into config.toml"
+        );
+    }
+
+    #[test]
+    fn persist_cred_save_inline_key_seals_under_keyring_into_backend() {
+        // Mirror of the host test for the credential wizard: an inline private
+        // key + certificate under keyring mode must seal both texts into the
+        // backend (private + cert slots) and leave a marker body. Pins the
+        // widening on the cred persist path too.
+        use super::super::wizard::{SecretChoice, SourceChoice};
+        use sshrack_core::config::schema::{InlineKey, KeySource, SecretStore};
+        use sshrack_core::id::{OwnerKind, keyring_key_inline_cert, keyring_key_inline_priv};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = SshrackConfig {
+            store: Some(SecretStore::Keyring),
+            ..SshrackConfig::default()
+        };
+        sshrack_core::config::store::save(&path, &cfg).unwrap();
+        let mut app = App::new(cfg, Some(path.clone()), Frecency::default(), HashMap::new());
+
+        app.open_cred_wizard_add();
+        let Overlay::CredWizard(mut w) = app.overlay.take().unwrap() else {
+            unreachable!("cred wizard open");
+        };
+        w.name = "ik-cred".into();
+        w.user = "deploy".into();
+        w.secret_kind = SecretChoice::IdentityKey;
+        w.source = SourceChoice::Inline;
+        w.inline_private = "PRIVATEKEYTEXT".into();
+        w.inline_cert = "CERTTEXT".into();
+        app.overlay = Some(Overlay::CredWizard(w));
+
+        let backend = FakeSecretBackend::new();
+        persist_cred_save(&mut app, &dead_handle(), &backend).expect("seal + save succeeds");
+
+        let saved = app
+            .config
+            .find_credential_by_name("ik-cred")
+            .expect("cred saved");
+        let body = &saved.body;
+        let ik = match &body.key {
+            Some(KeySource::Inline(ik)) => ik,
+            other => panic!("expected Inline key after seal, got {other:?}"),
+        };
+        let expected = InlineKey {
+            private_key: None,
+            certificate: None,
+            keyring: true,
+        };
+        assert_eq!(
+            *ik, expected,
+            "keyring mode: inline key must be a marker (no in-body text)"
+        );
+        let cred_id = saved.id;
+        let priv_slot = backend
+            .get(&keyring_key_inline_priv(OwnerKind::Credential, &cred_id))
+            .unwrap()
+            .expect("private key text stored in the backend");
+        assert_eq!(priv_slot.as_str(), "PRIVATEKEYTEXT");
+        let cert_slot = backend
+            .get(&keyring_key_inline_cert(OwnerKind::Credential, &cred_id))
+            .unwrap()
+            .expect("cert text stored in the backend");
+        assert_eq!(cert_slot.as_str(), "CERTTEXT");
+        // Neither plaintext reached the on-disk config.
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !on_disk.contains("PRIVATEKEYTEXT") && !on_disk.contains("CERTTEXT"),
+            "key text leaked into config.toml"
+        );
+    }
+
+    #[test]
+    fn persist_host_save_inline_key_under_undecided_store_errors_not_silent_plaintext() {
+        // An inline-key body with no store mode decided must surface
+        // StoreModeNotDecided, NOT silently fall through to plaintext (which
+        // core's seal would otherwise do). Mirrors the password undecided-mode
+        // guard, widened to inline keys.
+        use super::super::wizard::{AuthChoice, SecretChoice, SourceChoice};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        sshrack_core::config::store::save(&path, &SshrackConfig::default()).unwrap();
+        let cfg = sshrack_core::config::store::load(&path).unwrap();
+        let mut app = App::new(cfg, Some(path.clone()), Frecency::default(), HashMap::new());
+
+        app.open_host_wizard_add();
+        let Overlay::HostWizard(mut w) = app.overlay.take().unwrap() else {
+            unreachable!("host wizard open");
+        };
+        w.name = "ik-host".into();
+        w.host_addr = "10.0.0.1".into();
+        w.auth_choice = AuthChoice::Independent;
+        w.secret_kind = SecretChoice::IdentityKey;
+        w.source = SourceChoice::Inline;
+        w.inline_private = "PRIVATEKEYTEXT".into();
+        app.overlay = Some(Overlay::HostWizard(w));
+
+        let backend = FakeSecretBackend::new();
+        let err = persist_host_save(&mut app, &dead_handle(), &backend).unwrap_err();
+        assert!(
+            matches!(err, SshrackError::StoreModeNotDecided),
+            "undecided store mode must error, not silently pick plaintext: {err}"
+        );
+        // Nothing was written.
+        let reloaded = sshrack_core::config::store::load(&path).unwrap();
+        assert!(reloaded.hosts.is_empty());
     }
 
     // ===============================================================
@@ -1041,7 +1315,7 @@ mod tests {
         w.secret_kind = super::super::wizard::SecretChoice::None;
         app.overlay = Some(Overlay::CredWizard(w));
 
-        persist_cred_save(&mut app, &dead_handle()).expect("add save");
+        persist_cred_save(&mut app, &dead_handle(), &OsKeyring).expect("add save");
 
         let reloaded = sshrack_core::config::store::load(&path).unwrap();
         assert_eq!(reloaded.credentials.len(), 1);
@@ -1075,7 +1349,7 @@ mod tests {
         w.identity = "/home/me/.ssh/id_ed25519".into();
         app.overlay = Some(Overlay::CredWizard(w));
 
-        persist_cred_save(&mut app, &dead_handle()).expect("add save");
+        persist_cred_save(&mut app, &dead_handle(), &OsKeyring).expect("add save");
 
         let reloaded = sshrack_core::config::store::load(&path).unwrap();
         let c = &reloaded.credentials[0];
@@ -1113,7 +1387,7 @@ mod tests {
         *w.password = "hunter2".into();
         app.overlay = Some(Overlay::CredWizard(w));
 
-        persist_cred_save(&mut app, &dead_handle()).expect("add save");
+        persist_cred_save(&mut app, &dead_handle(), &OsKeyring).expect("add save");
 
         let reloaded = sshrack_core::config::store::load(&path).unwrap();
         let c = &reloaded.credentials[0];
@@ -1142,7 +1416,7 @@ mod tests {
         *w.password = "hunter2".into();
         app.overlay = Some(Overlay::CredWizard(w));
 
-        let err = persist_cred_save(&mut app, &dead_handle()).unwrap_err();
+        let err = persist_cred_save(&mut app, &dead_handle(), &OsKeyring).unwrap_err();
         assert!(
             matches!(err, SshrackError::StoreModeNotDecided),
             "undecided store mode must error, not silently pick plaintext: {err}"
@@ -1223,7 +1497,7 @@ mod tests {
         w.user = "deploy".into();
         app.overlay = Some(Overlay::CredWizard(w));
 
-        let err = persist_cred_save(&mut app, &dead_handle()).unwrap_err();
+        let err = persist_cred_save(&mut app, &dead_handle(), &OsKeyring).unwrap_err();
         assert!(matches!(err, SshrackError::CredentialAlreadyExists { .. }));
     }
 
@@ -1260,7 +1534,7 @@ mod tests {
         w.user = "ops".into();
         app.overlay = Some(Overlay::CredWizard(w));
 
-        persist_cred_save(&mut app, &dead_handle()).expect("edit save");
+        persist_cred_save(&mut app, &dead_handle(), &OsKeyring).expect("edit save");
 
         let reloaded = sshrack_core::config::store::load(&path).unwrap();
         assert_eq!(reloaded.credentials.len(), 1);
@@ -1300,7 +1574,7 @@ mod tests {
         // password left blank → preserved.
         app.overlay = Some(Overlay::CredWizard(w));
 
-        persist_cred_save(&mut app, &dead_handle()).expect("edit save");
+        persist_cred_save(&mut app, &dead_handle(), &OsKeyring).expect("edit save");
 
         let reloaded = sshrack_core::config::store::load(&path).unwrap();
         let c = &reloaded.credentials[0];
@@ -1340,7 +1614,7 @@ mod tests {
 
         // The save path under test: persist + reload + close_cred_wizard (which
         // re-ranks the cred panel).
-        persist_cred_save(&mut app, &handle).expect("cred save should succeed");
+        persist_cred_save(&mut app, &handle, &OsKeyring).expect("cred save should succeed");
         app.close_cred_wizard();
 
         // The cred panel now ranks the new credential.

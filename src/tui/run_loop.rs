@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use crossterm::event::{self, Event};
 use sshrack_core::error::SshrackError;
-use sshrack_core::secret::PassphraseProvider;
+use sshrack_core::secret::{OsKeyring, PassphraseProvider};
 
 use super::ConnectRequest;
 use super::app::App;
@@ -184,7 +184,7 @@ pub fn run_loop(
                     // add or apply-patch, write config, reload, close the wizard
                     // overlay. on_key's route_overlay stashed the form back on
                     // SaveHost (non-terminal), so the overlay is still open here.
-                    match persist_host_save(app, &handle) {
+                    match persist_host_save(app, &handle, &OsKeyring) {
                         Ok(()) => {
                             app.set_status("host saved".to_string());
                             app.close_host_wizard();
