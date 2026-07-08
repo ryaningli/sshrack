@@ -104,6 +104,26 @@ Do not block on clippy or formatting while the actual issue is still unresolved.
 - **Format** — `cargo fmt` green before every commit.
 - **Error handling** — library errors use `thiserror`; application errors use `anyhow` with `.context()`. All fallible ops propagate via `?`.
 
+### Testing
+
+**Match the layer to the bug** — use the lightest layer that reaches the failure:
+
+| Layer | Locks | Use for |
+|---|---|---|
+| Unit, TDD (pure logic) | input → output | core: config parse, command assembly, credential encode/decode, name resolution, frecency |
+| `on_key` + state assert | a state field after a key sequence | state / index / selection / mode bugs — lightest, no rendering |
+| TestBackend + `insta` snapshot | one rendered frame | layout / truncation / highlight regressions |
+| `on_key` chain → draw → `insta` | a frame after a key sequence | interaction flows (key → state → picture) |
+| Integration (mock-ssh shim) | real `ssh`/`scp`/`sftp` argv + env | connect/transfer process behavior; password-never-in-argv |
+
+`on_key` covers the **logic core, not the I/O boundary**. `App::on_key` is a pure state machine and `draw` is pure render — for a logic bug it equals real use; for a decode / raw-mode / event-loop / side-effect bug it cannot see the failure. Feed `KeyEvent`s that match the keymap's own definitions (same enum in test and prod): the silent risk is a false green from a path no real terminal produces.
+
+**Hermetic by default.** `cargo test --workspace` with no env vars must pass; tests never mutate the real environment (inject via params / traits / tempfiles); fix dynamic output (timestamps, ULIDs) at the input, not after.
+
+**Snapshots.** Seed the baseline once with `INSTA_UPDATE=always cargo test <name>`; commit the `.snap`, never the `.snap.new`. Accept intentional changes via `cargo insta review`.
+
+**CI runs tests under a pty:** the test step is `script -qec "cargo test --workspace" /dev/null`. `stdout_tui` (src/tui/test_support.rs) builds a real `CrosstermBackend` whose `Terminal::new` probes the tty, and CI's pipe-bound stdout returns `EAGAIN` without the wrapper — keep `script -qec` and its `-e` (cargo exit-code propagation) when editing the workflow. Those `stdout_tui`-backed tests are borrow-regression pins, not a template: new TUI tests use `TestBackend` / `on_key`, not real terminals.
+
 ### Code Style
 
 - Rust edition 2024, MSRV 1.88.
