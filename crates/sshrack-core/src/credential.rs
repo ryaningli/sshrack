@@ -26,8 +26,12 @@ use crate::suggest;
 /// Where a resolved password lives, if any.
 ///
 /// - [`PasswordSource::None`] — no password (key-only or default-ssh hosts).
-/// - [`PasswordSource::Inline`] — plaintext password carried inline (plaintext
-///   or decrypted-vault body); delivered to ssh via the askpass temp file.
+/// - [`PasswordSource::Inline`] — plaintext password carried inline (decrypted
+///   vault body); delivered to ssh via the askpass temp file.
+/// - [`PasswordSource::Config`] — plaintext storage mode: the password already
+///   lives at 0600 in `config.toml`, so the connect layer sets `SSHRACK_HOST_ID`
+///   (no temp file) and the askpass helper reads it straight back out of the
+///   config via [`plaintext_password`]. No new exposure, no crash-residue file.
 /// - [`PasswordSource::Keyring`] — plaintext lives in the OS keyring under
 ///   `key`; the main process never materializes it. The askpass helper fetches
 ///   it directly via [`crate::secret::keyring::get`].
@@ -38,6 +42,15 @@ pub enum PasswordSource {
     None,
     /// Plaintext password, wiped on drop. Redacted in `Debug`.
     Inline(Zeroizing<String>),
+    /// Plaintext storage mode: the password already lives at 0600 in
+    /// `config.toml`. The connect layer sets `SSHRACK_HOST_ID` instead of
+    /// writing a temp file, and the askpass helper reads it straight from the
+    /// config via [`plaintext_password`]. No temp file, no new exposure.
+    Config {
+        /// The host's stable ULID stringified; the helper resolves it back to
+        /// the host (and thus the password) via the config.
+        host_id: String,
+    },
     /// The password is in the OS keyring under the derived account `key`
     /// (see [`keyring_key`]).
     Keyring {
@@ -57,6 +70,11 @@ impl std::fmt::Debug for PasswordSource {
                 .debug_struct("PasswordSource")
                 .field("variant", &"Inline")
                 .field("password", &"<redacted>")
+                .finish(),
+            Self::Config { host_id } => f
+                .debug_struct("PasswordSource")
+                .field("variant", &"Config")
+                .field("host_id", &host_id)
                 .finish(),
             Self::Keyring { key } => f
                 .debug_struct("PasswordSource")
@@ -232,6 +250,32 @@ pub fn find_referrers(cfg: &SshrackConfig, cred_id: &Ulid) -> Vec<Ulid> {
             _ => None,
         })
         .collect()
+}
+
+/// The plaintext password for `host` as it lives at rest in the config (an
+/// inline body's password, or a referenced credential's password). Returns
+/// `None` when the host has no password, the password is encrypted (vault mode
+/// — not readable here without the master key), or `host.auth` references a
+/// missing credential.
+///
+/// The askpass helper's config channel ([`crate::askpass::run_config`]) calls
+/// this in plaintext storage mode so the helper never materializes a temp file:
+/// the password already lives at 0600 in `config.toml`, so re-reading it is
+/// zero new exposure. Pure w.r.t. the world: no IO, no env. The result is
+/// [`Zeroizing`] so the caller wipes the plaintext on drop.
+pub fn plaintext_password(host: &Host, cfg: &SshrackConfig) -> Option<Zeroizing<String>> {
+    // Read the plaintext (a `&str` borrowed from the host body or the config
+    // credential) without unifying two different borrow sources into one
+    // reference; `to_owned` copies it into a fresh `Zeroizing<String>` before
+    // the borrow ends.
+    let plain: &str = match &host.auth {
+        Auth::Inline(body) => body.password_plain()?,
+        Auth::Ref { credential } => cfg
+            .find_credential_by_id(credential)?
+            .body
+            .password_plain()?,
+    };
+    Some(Zeroizing::new(plain.to_owned()))
 }
 
 // ===========================================================================
@@ -600,6 +644,91 @@ mod tests {
         };
         let dbg = format!("{p:?}");
         assert!(dbg.contains("host:web1"), "key redacted: {dbg}");
+    }
+
+    #[test]
+    fn password_source_debug_config_shows_host_id() {
+        // host_id is a non-sensitive ULID routing label (never the secret); it
+        // must stay visible in Debug so diagnostics identify the host.
+        let p = PasswordSource::Config {
+            host_id: "01HXYZ0000000000000000000Z".into(),
+        };
+        let dbg = format!("{p:?}");
+        assert!(
+            dbg.contains("01HXYZ0000000000000000000Z"),
+            "host_id redacted: {dbg}"
+        );
+        assert!(
+            !dbg.contains("hunter2"),
+            "Config Debug must never carry a password"
+        );
+    }
+
+    // ---- plaintext_password: the config-channel reader (pure) ----
+
+    #[test]
+    fn plaintext_password_inline_body_returns_plain_secret() {
+        let host = inline_host(CredentialBody::new("u").with_password("hunter2"));
+        let cfg = SshrackConfig::default();
+        let pw = plaintext_password(&host, &cfg).expect("inline plain password");
+        assert_eq!(pw.as_str(), "hunter2");
+    }
+
+    #[test]
+    fn plaintext_password_ref_body_resolves_credential() {
+        // A host referencing a credential by id resolves that credential's
+        // plaintext password through the config.
+        let cid = Ulid::new();
+        let host = ref_host(cid);
+        let cfg = SshrackConfig {
+            credentials: vec![Credential {
+                id: cid,
+                name: "team".into(),
+                body: CredentialBody::new("deploy").with_password("s3cret"),
+            }],
+            ..Default::default()
+        };
+        let pw = plaintext_password(&host, &cfg).expect("ref plain password");
+        assert_eq!(pw.as_str(), "s3cret");
+    }
+
+    #[test]
+    fn plaintext_password_returns_none_when_no_password() {
+        // A key-only body has no password → None.
+        let host = inline_host(CredentialBody::new("u").with_key("/k"));
+        let cfg = SshrackConfig::default();
+        assert!(plaintext_password(&host, &cfg).is_none());
+    }
+
+    #[test]
+    fn plaintext_password_returns_none_for_default_body() {
+        // Default (user-only) body has no secret → None.
+        let host = inline_host(CredentialBody::new("ec2-user"));
+        assert!(plaintext_password(&host, &SshrackConfig::default()).is_none());
+    }
+
+    #[test]
+    fn plaintext_password_returns_none_for_encrypted_secret() {
+        // An encrypted (vault) password is not plaintext-readable without the
+        // master key; the config channel cannot read it, so None.
+        use crate::config::schema::{CredentialBody, EncryptedSecret, Secret};
+        let host = inline_host(CredentialBody {
+            user: "u".into(),
+            password: Some(Secret::Encrypted(EncryptedSecret {
+                nonce: "n".into(),
+                cipher: "c".into(),
+            })),
+            key: None,
+            keyring: false,
+        });
+        assert!(plaintext_password(&host, &SshrackConfig::default()).is_none());
+    }
+
+    #[test]
+    fn plaintext_password_returns_none_for_dangling_ref() {
+        // A host referencing a missing credential → None (nothing to read).
+        let host = ref_host(Ulid::new());
+        assert!(plaintext_password(&host, &SshrackConfig::default()).is_none());
     }
 
     #[test]

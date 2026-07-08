@@ -12,7 +12,8 @@ use tui::ConnectRequest;
 
 fn main() {
     // Askpass role: the launcher (or ssh) forks us with one of these set.
-    if std::env::var_os(askpass::ASKPASS_FILE_ENV).is_some()
+    if std::env::var_os(askpass::HOST_ID_ENV).is_some()
+        || std::env::var_os(askpass::ASKPASS_FILE_ENV).is_some()
         || std::env::var_os(sshrack_core::secret::keyring::KEYRING_KEY_ENV).is_some()
     {
         match askpass::run() {
@@ -74,6 +75,11 @@ fn run_main() -> i32 {
                         return exit_code::CONNECT;
                     }
                 };
+                // Resolve the config path the same way the TUI did, so the
+                // askpass helper's config channel (plaintext mode) reads the
+                // same file the parent loaded -- a --config override must not
+                // silently point the helper at the XDG default.
+                let config_path = sshrack_core::config::path::resolve(cli.config.as_deref());
                 // Pull the inline-key artifact out so it is held across launch
                 // (its Drop removes the temp files when this block ends —
                 // AFTER ssh exits). argv was built with the temp private path
@@ -83,7 +89,7 @@ fn run_main() -> i32 {
                     source,
                     key_artifact: _key_artifact,
                 } = req;
-                match sshrack_core::connect::launch(argv, source, &exe) {
+                match sshrack_core::connect::launch(argv, source, &exe, config_path.as_deref()) {
                     Ok(code) => code,
                     Err(e) => {
                         eprintln!("{e}");

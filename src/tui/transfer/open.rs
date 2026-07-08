@@ -120,7 +120,9 @@ pub fn open_transfer(
     // ── Step 6: Spawn the SftpWorker (master + worker thread). ───────────────
     // resolved_auth.password is moved into SftpWorker::open; clone it first so
     // we can hand an owned PasswordSource in (it carries a Zeroizing<String>
-    // for the inline case which cannot be shared by reference).
+    // for the inline case which cannot be shared by reference). config_path is
+    // forwarded so the plaintext-mode config channel reads the same file the
+    // parent loaded.
     let self_exe = connect::current_exe()?;
     let pw_source = resolved_auth.password.clone();
     let (worker, home) = SftpWorker::open(
@@ -129,6 +131,7 @@ pub fn open_transfer(
         Overrides::default(),
         &self_exe,
         pw_source,
+        app.config_path(),
     )
     .map_err(|detail| SshrackError::SftpOpenFailed { detail })?;
 

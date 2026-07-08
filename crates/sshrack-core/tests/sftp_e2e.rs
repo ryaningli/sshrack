@@ -111,6 +111,7 @@ fn sftp_round_trip_local_sshd() {
         overrides,
         &self_exe,
         PasswordSource::None,
+        None,
     )
     .expect("master open");
 

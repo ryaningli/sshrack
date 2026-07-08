@@ -123,7 +123,7 @@ fn key_only_host_launches_ssh_with_argv_and_no_askpass_env() {
         "uname".into(),
         "-r".into(),
     ];
-    let code = connect::launch(argv, PasswordSource::None, &self_exe).expect("launch ok");
+    let code = connect::launch(argv, PasswordSource::None, &self_exe, None).expect("launch ok");
     assert_eq!(code, 0, "shim exits 0");
     let cap = read_capture(&capture_path);
 
@@ -180,6 +180,7 @@ fn keyring_source_sets_keyring_env_not_file() {
             key: "host:01J".into(),
         },
         &self_exe,
+        None,
     )
     .expect("launch ok");
     assert_eq!(code, 0);
@@ -213,6 +214,7 @@ fn inline_source_stages_askpass_file_not_keyring() {
         argv,
         PasswordSource::Inline(Zeroizing::new("hunter2".into())),
         &self_exe,
+        None,
     )
     .expect("launch ok");
     assert_eq!(code, 0);
@@ -244,18 +246,49 @@ fn env_for_seam_documents_env_shape_per_source() {
     // password to inject, so ssh must NOT be pointed at our payload-less
     // askpass helper — leaving SSH_ASKPASS unset lets ssh prompt at /dev/tty
     // for an encrypted private key's passphrase itself.
-    let none = connect::env_for(&PasswordSource::None);
+    let none = connect::env_for(&PasswordSource::None, None);
     assert!(
         none.is_empty(),
         "key-only connections set no askpass env, got {none:?}"
     );
 
     // Keyring: triplet + keyring key, no file.
-    let kr = connect::env_for(&PasswordSource::Keyring {
-        key: "cred:01J".into(),
-    });
+    let kr = connect::env_for(
+        &PasswordSource::Keyring {
+            key: "cred:01J".into(),
+        },
+        None,
+    );
     let kr_map: std::collections::HashMap<&str, &str> =
         kr.iter().map(|(k, v)| (*k, v.as_str())).collect();
     assert_eq!(kr_map.get("SSHRACK_KEYRING_KEY").copied(), Some("cred:01J"));
     assert!(!kr_map.contains_key("SSHRACK_ASKPASS_FILE"));
+
+    // Config (plaintext mode): triplet + host id, no file, no keyring key.
+    // SSHRACK_CONFIG is forwarded when the caller passes a config path so the
+    // helper reads the same file the parent loaded.
+    let cfg_env = connect::env_for(
+        &PasswordSource::Config {
+            host_id: "01HXYZ0000000000000000000Z".into(),
+        },
+        Some(std::path::Path::new("/custom/config.toml")),
+    );
+    let cfg_map: std::collections::HashMap<&str, &str> =
+        cfg_env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    assert_eq!(
+        cfg_map.get("SSHRACK_HOST_ID").copied(),
+        Some("01HXYZ0000000000000000000Z")
+    );
+    assert_eq!(
+        cfg_map.get("SSHRACK_CONFIG").copied(),
+        Some("/custom/config.toml")
+    );
+    assert!(
+        !cfg_map.contains_key("SSHRACK_ASKPASS_FILE"),
+        "config path must not stage a temp file"
+    );
+    assert!(
+        !cfg_map.contains_key("SSHRACK_KEYRING_KEY"),
+        "config path must not stage the keyring key"
+    );
 }

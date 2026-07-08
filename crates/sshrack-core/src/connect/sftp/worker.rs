@@ -97,13 +97,15 @@ impl SftpWorker {
     /// 5. Probe the remote home via an `sftp pwd` batch (fall back to `/`).
     /// 6. Spawn the worker thread; return `(worker, home)`.
     ///
-    /// `resolved`/`host`/`overrides`/`self_exe`/`source` mirror [`crate::connect::launch`].
+    /// `resolved`/`host`/`overrides`/`self_exe`/`source`/`config_path` mirror
+    /// [`crate::connect::launch`].
     pub fn open(
         resolved: ResolvedAuth,
         host: Host,
         overrides: Overrides,
         self_exe: &Path,
         source: PasswordSource,
+        config_path: Option<&Path>,
     ) -> Result<(Self, PathBuf), String> {
         let sock = ControlSocket::new();
         let sock_path = sock.path().to_path_buf();
@@ -115,7 +117,7 @@ impl SftpWorker {
             PasswordSource::Inline(pw) => Some(write_password_file(pw).map_err(|e| e.to_string())?),
             _ => None,
         };
-        let env = askpass_env_for(self_exe, &source, pw_file.as_deref());
+        let env = askpass_env_for(self_exe, &source, pw_file.as_deref(), config_path);
 
         // (3) Spawn the master `ssh -N`. stdin null (ssh -N never reads it),
         // stdout null (ssh -N never writes it), stderr inherited so the user

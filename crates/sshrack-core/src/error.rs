@@ -122,6 +122,29 @@ pub enum SshrackError {
         source: std::io::Error,
     },
 
+    /// Plaintext-mode config channel: `SSHRACK_HOST_ID` did not parse as a
+    /// ULID. `raw` is the offending value (never a secret — it is a routing
+    /// label set by the parent sshrack process, not user input).
+    #[error("askpass: malformed host id {raw:?}")]
+    AskpassBadHostId { raw: String },
+
+    /// Plaintext-mode config channel: the host id parsed but no host with that
+    /// id is present in the config. `id` is the ULID string (never a secret).
+    #[error("askpass: host {id:?} not found in config")]
+    AskpassHostMissing { id: String },
+
+    /// Plaintext-mode config channel: the host exists but has no plaintext
+    /// password (key-only, keyring-marked, or an encrypted vault body the
+    /// helper cannot read without the master key). `id` is the ULID string.
+    #[error("askpass: host {id:?} has no plaintext password in config")]
+    AskpassNoPlaintextPassword { id: String },
+
+    /// Plaintext-mode config channel: neither `SSHRACK_CONFIG` nor the XDG
+    /// default config path could be resolved (no home/config directory). The
+    /// parent must set `SSHRACK_CONFIG` in that environment.
+    #[error("askpass: could not resolve the config file path")]
+    AskpassNoConfigPath,
+
     #[error("failed to resolve path to this binary: {source}")]
     SelfExe {
         #[source]

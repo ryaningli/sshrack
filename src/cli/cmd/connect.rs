@@ -211,7 +211,12 @@ pub fn run(cli: &Cli) -> i32 {
             return exit_code::CONNECT;
         }
     };
-    match connect::launch(argv, resolved_auth.password, &self_exe) {
+    match connect::launch(
+        argv,
+        resolved_auth.password,
+        &self_exe,
+        config_path.as_deref(),
+    ) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("sshrack: launch failed: {e}");

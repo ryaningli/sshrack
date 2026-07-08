@@ -12,7 +12,7 @@ use std::process::Command;
 
 use zeroize::Zeroizing;
 
-use crate::askpass::ASKPASS_FILE_ENV;
+use crate::askpass::{ASKPASS_FILE_ENV, CONFIG_ENV, HOST_ID_ENV};
 use crate::credential::PasswordSource;
 use crate::error::SshrackError;
 use crate::secret::keyring::KEYRING_KEY_ENV;
@@ -27,19 +27,25 @@ pub fn current_exe() -> Result<PathBuf, SshrackError> {
 ///
 /// Pure (no I/O) so the exact keys/values are unit-testable. `pw_file` is the
 /// temp-file path for [`PasswordSource::Inline`] (the caller materializes it);
-/// `None` for the keyring path (no temp file, no plaintext in this process) and
-/// the none path (no askpass payload at all).
+/// `None` for the keyring/config/none paths (no temp file). `config_path` is
+/// the config file the parent loaded; it is forwarded as `SSHRACK_CONFIG` so
+/// the [`PasswordSource::Config`] helper reads the same file (a `--config`
+/// override must not silently point the helper at the XDG default).
 ///
-/// For `Inline` and `Keyring` the `SSH_ASKPASS` triplet is set so ssh forks the
-/// helper, plus the payload env (`SSHRACK_ASKPASS_FILE` vs `SSHRACK_KEYRING_KEY`)
-/// that tells the helper which branch to take. For [`PasswordSource::None`] no
-/// env is set at all: a key-only connection has no account password to inject,
-/// and leaving askpass unset lets ssh prompt at `/dev/tty` for an encrypted
-/// private key's passphrase instead of calling this payload-less helper.
+/// For `Inline`, `Config`, and `Keyring` the `SSH_ASKPASS` triplet is set so
+/// ssh forks the helper, plus the payload env that tells the helper which
+/// branch to take: `SSHRACK_ASKPASS_FILE` (Inline — temp file),
+/// `SSHRACK_HOST_ID` [+ optional `SSHRACK_CONFIG`] (Config — read the config),
+/// `SSHRACK_KEYRING_KEY` (Keyring — query the OS keyring). For
+/// [`PasswordSource::None`] no env is set at all: a key-only connection has no
+/// account password to inject, and leaving askpass unset lets ssh prompt at
+/// `/dev/tty` for an encrypted private key's passphrase instead of calling this
+/// payload-less helper.
 pub fn askpass_env_for(
     self_exe: &Path,
     source: &PasswordSource,
     pw_file: Option<&Path>,
+    config_path: Option<&Path>,
 ) -> Vec<(&'static str, String)> {
     // Key-only / default-auth connection: nothing to inject. Leaving askpass
     // unset lets ssh prompt at /dev/tty for an encrypted key's passphrase
@@ -59,6 +65,15 @@ pub fn askpass_env_for(
                 env.push((ASKPASS_FILE_ENV, p.to_string_lossy().into_owned()));
             }
         }
+        PasswordSource::Config { host_id } => {
+            // Plaintext mode: the password already lives at 0600 in the config,
+            // so no temp file is written. Point the helper at the host (and, if
+            // non-default, the config file) and let it read the password back.
+            env.push((HOST_ID_ENV, host_id.clone()));
+            if let Some(p) = config_path {
+                env.push((CONFIG_ENV, p.to_string_lossy().into_owned()));
+            }
+        }
         PasswordSource::Keyring { key } => {
             env.push((KEYRING_KEY_ENV, key.clone()));
         }
@@ -68,12 +83,13 @@ pub fn askpass_env_for(
 }
 
 /// Test seam over [`askpass_env_for`] with a fixed `self_exe` and no `pw_file`
-/// (the keyring/none paths carry no file). Exposed so unit and integration
-/// tests can assert the env shape for each [`PasswordSource`] variant without
-/// touching I/O. Not used by production code paths.
-pub fn env_for(source: &PasswordSource) -> Vec<(&'static str, String)> {
+/// (the keyring/config/none paths carry no file). Exposed so unit and
+/// integration tests can assert the env shape for each [`PasswordSource`]
+/// variant without touching I/O. `config_path` is forwarded for the
+/// [`PasswordSource::Config`] arm. Not used by production code paths.
+pub fn env_for(source: &PasswordSource, config_path: Option<&Path>) -> Vec<(&'static str, String)> {
     let exe = Path::new("/sshrack");
-    askpass_env_for(exe, source, None)
+    askpass_env_for(exe, source, None, config_path)
 }
 
 /// Write `pw` to a fresh 0600 temp file and return its path. The caller is
@@ -275,14 +291,18 @@ pub fn materialize_inline_key(
 /// Run `argv` to completion. stdio is INHERITED — ssh talks straight to the
 /// user's terminal; we are not in the data path. Password delivery depends on
 /// `source` (see the [module docs](self)): `Inline` writes a 0600 temp file,
+/// `Config` sets `SSHRACK_HOST_ID` (+ `SSHRACK_CONFIG`) and writes no temp file,
 /// `Keyring` sets only `SSHRACK_KEYRING_KEY` (no temp file, no plaintext here),
-/// `None` carries no askpass payload. Returns the child's exit code.
+/// `None` carries no askpass payload. `config_path` is the config file the
+/// caller loaded; forwarded so the `Config` helper reads the same file. Returns
+/// the child's exit code.
 pub fn launch(
     argv: Vec<String>,
     source: PasswordSource,
     self_exe: &Path,
+    config_path: Option<&Path>,
 ) -> Result<i32, SshrackError> {
-    // Only Inline materializes a plaintext temp file. Keyring/None do not.
+    // Only Inline materializes a plaintext temp file. Config/Keyring/None do not.
     let pw_file = match source {
         PasswordSource::Inline(ref p) => Some(write_password_file(p)?),
         _ => None,
@@ -290,7 +310,7 @@ pub fn launch(
 
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]);
-    for (k, v) in askpass_env_for(self_exe, &source, pw_file.as_deref()) {
+    for (k, v) in askpass_env_for(self_exe, &source, pw_file.as_deref(), config_path) {
         cmd.env(k, v);
     }
 
@@ -314,7 +334,7 @@ mod tests {
         // encrypted, ssh would call askpass (which has no payload for a key-only
         // connection) and fail. Leaving SSH_ASKPASS unset lets ssh fall back to
         // /dev/tty and prompt the user for the key passphrase itself.
-        let env = env_for(&PasswordSource::None);
+        let env = env_for(&PasswordSource::None, None);
         assert!(
             env.is_empty(),
             "key-only connections set no askpass env, got {env:?}"
@@ -329,6 +349,7 @@ mod tests {
             Path::new("/sshrack"),
             &PasswordSource::Inline(Zeroizing::new("x".into())),
             Some(Path::new("/tmp/x.pw")),
+            None,
         );
         let map: std::collections::HashMap<&str, &str> =
             env.iter().map(|(k, v)| (*k, v.as_str())).collect();
@@ -340,9 +361,12 @@ mod tests {
     fn env_for_keyring_sets_keyring_env_not_file() {
         // Pure helper: given a keyring source, the env must carry KEYRING_KEY
         // and NOT SSHRACK_ASKPASS_FILE. No plaintext exists in this process.
-        let env = env_for(&PasswordSource::Keyring {
-            key: "host:web1".into(),
-        });
+        let env = env_for(
+            &PasswordSource::Keyring {
+                key: "host:web1".into(),
+            },
+            None,
+        );
         let map: std::collections::HashMap<&str, &str> =
             env.iter().map(|(k, v)| (*k, v.as_str())).collect();
         assert_eq!(map.get(KEYRING_KEY_ENV).copied(), Some("host:web1"));
@@ -358,10 +382,75 @@ mod tests {
             Path::new("/sshrack"),
             &PasswordSource::Inline(Zeroizing::new("x".into())),
             None,
+            None,
         );
         assert!(
             env.iter()
                 .all(|(k, _)| *k != ASKPASS_FILE_ENV && *k != KEYRING_KEY_ENV)
+        );
+    }
+
+    #[test]
+    fn env_for_config_sets_host_id_and_writes_no_file() {
+        // Plaintext mode: the connect layer points the helper at the host (no
+        // temp file). The env must carry SSHRACK_HOST_ID and MUST NOT carry
+        // SSHRACK_ASKPASS_FILE (that would be the temp-file path).
+        let env = askpass_env_for(
+            Path::new("/sshrack"),
+            &PasswordSource::Config {
+                host_id: "01HXYZ0000000000000000000Z".into(),
+            },
+            None,
+            None,
+        );
+        let map: std::collections::HashMap<&str, &str> =
+            env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        assert_eq!(
+            map.get(HOST_ID_ENV).copied(),
+            Some("01HXYZ0000000000000000000Z")
+        );
+        assert!(
+            !map.contains_key(ASKPASS_FILE_ENV),
+            "Config arm must not stage a temp-file path: {map:?}"
+        );
+        assert!(
+            !map.contains_key(KEYRING_KEY_ENV),
+            "Config arm must not stage the keyring key: {map:?}"
+        );
+    }
+
+    #[test]
+    fn env_for_config_propagates_config_override_when_given() {
+        // A non-default config path must be pushed as SSHRACK_CONFIG so the
+        // helper reads the same file the parent loaded (--config override);
+        // otherwise the helper would fall back to the XDG default and return
+        // the wrong password for a config that lives elsewhere.
+        let env = askpass_env_for(
+            Path::new("/sshrack"),
+            &PasswordSource::Config {
+                host_id: "01HXYZ0000000000000000000Z".into(),
+            },
+            None,
+            Some(Path::new("/custom/config.toml")),
+        );
+        let map: std::collections::HashMap<&str, &str> =
+            env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        assert_eq!(map.get(CONFIG_ENV).copied(), Some("/custom/config.toml"));
+    }
+
+    #[test]
+    fn env_for_config_omits_config_env_when_path_none() {
+        // The common case (no --config override): the helper falls back to the
+        // XDG default, so SSHRACK_CONFIG stays unset.
+        let env = env_for(
+            &PasswordSource::Config {
+                host_id: "01HXYZ0000000000000000000Z".into(),
+            },
+            None,
+        );
+        assert!(
+            !env.iter().any(|(k, _)| *k == CONFIG_ENV),
+            "SSHRACK_CONFIG must be unset when no override: {env:?}"
         );
     }
 

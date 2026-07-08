@@ -726,6 +726,14 @@ fn reveal_password(
     Ok(match resolved.password {
         PasswordSource::None => RevealedPassword::None,
         PasswordSource::Inline(p) => RevealedPassword::Plaintext(p),
+        // Plaintext mode: the password already lives at 0600 in the config, so
+        // read it straight back (the connect path's config channel reuses the
+        // same reader). host_id is the routing label; the password comes from
+        // the host being shown. None (e.g. key-only) surfaces as no password.
+        PasswordSource::Config { .. } => match cred_core::plaintext_password(host, cfg) {
+            Some(p) => RevealedPassword::Plaintext(p),
+            None => RevealedPassword::None,
+        },
         PasswordSource::Keyring { key } => match sshrack_core::secret::keyring::get(&key) {
             Ok(Some(p)) => RevealedPassword::Plaintext(p),
             Ok(None) | Err(_) => RevealedPassword::KeyringMissing,

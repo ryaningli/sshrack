@@ -549,6 +549,15 @@ fn reveal_password(
     Ok(match resolved.password {
         cred_core::PasswordSource::None => RevealedPassword::None,
         cred_core::PasswordSource::Inline(p) => RevealedPassword::Plaintext(p),
+        // Plaintext mode: the password already lives at 0600 in the config.
+        // host_shell references this credential by id, so plaintext_password
+        // resolves through the credential table and reads the cred's password.
+        cred_core::PasswordSource::Config { .. } => {
+            match cred_core::plaintext_password(&host_shell, cfg) {
+                Some(p) => RevealedPassword::Plaintext(p),
+                None => RevealedPassword::None,
+            }
+        }
         cred_core::PasswordSource::Keyring { key } => {
             match sshrack_core::secret::keyring::get(&key) {
                 Ok(Some(p)) => RevealedPassword::Plaintext(p),
