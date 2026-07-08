@@ -445,21 +445,37 @@ pub fn delete_credential_with_secret(
         return Err(credential_not_found(cfg, name));
     };
     // Snapshot the keyring-relevant fields before the (cloned) remove, so the
-    // forget decision reflects the credential as it stood at call time.
-    let (cred_id, keyring) = (cred.id, cred.body.keyring);
+    // forget decision reflects the credential as it stood at call time. A
+    // keyring-mode credential may own up to three slots: the password slot
+    // (body.keyring) and the inline-key slots (ik.keyring); both markers are
+    // snapshotted here.
+    let (cred_id, password_keyring, inline_key_keyring) = (
+        cred.id,
+        cred.body.keyring,
+        cred.body.inline_key_in_keyring(),
+    );
     let next = remove_credential(cfg, name)
         // remove_credential returns None only when the name is absent, which
         // the find_credential_by_name above already ruled out.
         .expect("invariant: credential present (checked above)");
-    secret::forget_keyring_secret(backend, OwnerKind::Credential, &cred_id, keyring);
+    secret::forget_keyring_secret(backend, OwnerKind::Credential, &cred_id, password_keyring);
+    secret::forget_inline_keyring_slots(
+        backend,
+        OwnerKind::Credential,
+        &cred_id,
+        inline_key_keyring,
+    );
     Ok(next)
 }
 
-/// Best-effort: if `src` is a keyring-password credential, copy its keyring
-/// entry from the source's id to `dst`'s fresh id so the copy connects
-/// immediately. A missing/unreachable entry is reported via the returned `Err`
-/// (carrying no secret); the caller logs-and-continues. Never materializes the
-/// password outside the backend round-trip.
+/// Best-effort: if `src` is a keyring-mode credential, copy every keyring slot
+/// it owns (password + inline private/cert) from the source's id to `dst`'s
+/// fresh id so the copy connects immediately. A missing/unreachable entry is
+/// reported via the returned `Err` (carrying no secret); the caller
+/// logs-and-continues. Never materializes any secret outside the backend
+/// round-trip. The per-slot copy lives in [`secret::copy_keyring_secret`] /
+/// [`secret::copy_inline_keyring_slots`]; this wrapper only reads the source
+/// body's markers and delegates.
 ///
 /// Used by `cred cp`: the copy gets a fresh id (it is an independent keyring
 /// identity), and this helper re-keys the entry onto it.
@@ -468,13 +484,13 @@ pub fn copy_keyring_entry(
     dst: &Credential,
     backend: &dyn SecretBackend,
 ) -> Result<(), SshrackError> {
-    if !src.body.keyring {
-        return Ok(());
+    if src.body.keyring {
+        secret::copy_keyring_secret(backend, OwnerKind::Credential, &src.id, &dst.id)?;
     }
-    match backend.get(&keyring_key(OwnerKind::Credential, &src.id))? {
-        Some(pw) => backend.set(OwnerKind::Credential, &dst.id, &pw),
-        None => Ok(()),
+    if src.body.inline_key_in_keyring() {
+        secret::copy_inline_keyring_slots(backend, OwnerKind::Credential, &src.id, &dst.id)?;
     }
+    Ok(())
 }
 
 /// Decrypt a stored password secret into plaintext, given an optional master
@@ -2097,6 +2113,133 @@ mod tests {
                 .get(&keyring_key(OwnerKind::Credential, &dst.id))
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    // ---- inline-key keyring slots: rm / cp lifecycle ----
+
+    /// Build a credential whose inline key text lives in the OS keyring
+    /// (`ik.keyring = true`, no in-body text). This is the sealed form stored
+    /// under keyring mode and owns the priv + cert slots.
+    fn keyring_inline_key_credential(name: &str, id: Ulid) -> Credential {
+        use crate::config::schema::{InlineKey, KeySource};
+        Credential {
+            id,
+            name: name.into(),
+            body: CredentialBody {
+                user: "u".into(),
+                password: None,
+                key: Some(KeySource::Inline(InlineKey {
+                    private_key: None,
+                    certificate: None,
+                    keyring: true,
+                })),
+                keyring: false,
+            },
+        }
+    }
+
+    #[test]
+    fn delete_credential_with_secret_forgets_inline_key_slots() {
+        // A keyring-mode inline-key credential owns priv + cert slots keyed by
+        // its id; rm must delete both so no orphaned key material survives.
+        let backend = FakeBackend::new();
+        let id = new_id();
+        backend
+            .set_at(
+                &crate::id::keyring_key_inline_priv(OwnerKind::Credential, &id),
+                "PRIV",
+            )
+            .unwrap();
+        backend
+            .set_at(
+                &crate::id::keyring_key_inline_cert(OwnerKind::Credential, &id),
+                "CERT",
+            )
+            .unwrap();
+        let cfg = SshrackConfig {
+            credentials: vec![keyring_inline_key_credential("kr-ik-cred-rm", id)],
+            ..Default::default()
+        };
+        let next = delete_credential_with_secret(&cfg, "kr-ik-cred-rm", &backend).unwrap();
+        assert!(next.credentials.is_empty());
+        assert!(
+            backend
+                .get(&crate::id::keyring_key_inline_priv(
+                    OwnerKind::Credential,
+                    &id
+                ))
+                .unwrap()
+                .is_none(),
+            "inline priv slot must be deleted on rm"
+        );
+        assert!(
+            backend
+                .get(&crate::id::keyring_key_inline_cert(
+                    OwnerKind::Credential,
+                    &id
+                ))
+                .unwrap()
+                .is_none(),
+            "inline cert slot must be deleted on rm"
+        );
+    }
+
+    #[test]
+    fn copy_keyring_entry_copies_inline_key_slots_when_source_marked() {
+        // `cred cp` of a keyring-mode inline-key credential: the clone (fresh
+        // id) must own copies of both the priv and cert slots.
+        let backend = FakeBackend::new();
+        let src_id = new_id();
+        backend
+            .set_at(
+                &crate::id::keyring_key_inline_priv(OwnerKind::Credential, &src_id),
+                "PRIV",
+            )
+            .unwrap();
+        backend
+            .set_at(
+                &crate::id::keyring_key_inline_cert(OwnerKind::Credential, &src_id),
+                "CERT",
+            )
+            .unwrap();
+        let src = keyring_inline_key_credential("src", src_id);
+        let dst_id = new_id();
+        let dst = keyring_inline_key_credential("dst", dst_id);
+        copy_keyring_entry(&src, &dst, &backend).unwrap();
+        assert_eq!(
+            backend
+                .get(&crate::id::keyring_key_inline_priv(
+                    OwnerKind::Credential,
+                    &dst_id
+                ))
+                .unwrap()
+                .as_deref()
+                .map(String::as_str),
+            Some("PRIV")
+        );
+        assert_eq!(
+            backend
+                .get(&crate::id::keyring_key_inline_cert(
+                    OwnerKind::Credential,
+                    &dst_id
+                ))
+                .unwrap()
+                .as_deref()
+                .map(String::as_str),
+            Some("CERT")
+        );
+        // Source survives (copy, not move).
+        assert_eq!(
+            backend
+                .get(&crate::id::keyring_key_inline_priv(
+                    OwnerKind::Credential,
+                    &src_id
+                ))
+                .unwrap()
+                .as_deref()
+                .map(String::as_str),
+            Some("PRIV")
         );
     }
 }

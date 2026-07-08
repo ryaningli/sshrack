@@ -457,10 +457,19 @@ pub fn delete_host_with_secret(
         return Err(host_not_found(cfg, name));
     };
     // Snapshot the keyring-relevant fields before the (cloned) remove, so the
-    // forget decision reflects the host as it stood at call time.
-    let (host_id, keyring) = (host.id, host.auth.inline_body().is_some_and(|b| b.keyring));
+    // forget decision reflects the host as it stood at call time. A keyring-mode
+    // host may own up to three slots: the password slot (body.keyring) and the
+    // inline-key slots (ik.keyring); both markers are snapshotted here.
+    let (host_id, password_keyring, inline_key_keyring) = (
+        host.id,
+        host.auth.inline_body().is_some_and(|b| b.keyring),
+        host.auth
+            .inline_body()
+            .is_some_and(|b| b.inline_key_in_keyring()),
+    );
     let next = remove_host(cfg, name).expect("invariant: host present (checked above)");
-    secret::forget_keyring_secret(backend, OwnerKind::Host, &host_id, keyring);
+    secret::forget_keyring_secret(backend, OwnerKind::Host, &host_id, password_keyring);
+    secret::forget_inline_keyring_slots(backend, OwnerKind::Host, &host_id, inline_key_keyring);
     Ok(next)
 }
 
@@ -478,15 +487,25 @@ pub fn forget_keyring_on_overwrite(cfg: &SshrackConfig, name: &str, backend: &dy
     let Some(old) = cfg.find_host_by_name(name) else {
         return;
     };
-    let keyring = old.auth.inline_body().is_some_and(|b| b.keyring);
-    secret::forget_keyring_secret(backend, OwnerKind::Host, &old.id, keyring);
+    // Mirror delete_host_with_secret: a keyring-mode host being overwritten may
+    // own a password slot and/or inline-key slots, all keyed by the old id.
+    let (password_keyring, inline_key_keyring) = (
+        old.auth.inline_body().is_some_and(|b| b.keyring),
+        old.auth
+            .inline_body()
+            .is_some_and(|b| b.inline_key_in_keyring()),
+    );
+    secret::forget_keyring_secret(backend, OwnerKind::Host, &old.id, password_keyring);
+    secret::forget_inline_keyring_slots(backend, OwnerKind::Host, &old.id, inline_key_keyring);
 }
 
-/// Best-effort: if `src` is a keyring-password host, copy its keyring entry from
-/// the source's id to `dst`'s fresh id so the copy connects immediately. A
-/// missing/unreachable entry is reported via the returned `Err` (carrying no
-/// secret); the caller logs-and-continues. Never materializes the password
-/// outside the backend round-trip.
+/// Best-effort: if `src` is a keyring-mode host, copy every keyring slot it
+/// owns (password + inline private/cert) from the source's id to `dst`'s fresh
+/// id so the copy connects immediately. A missing/unreachable entry is reported
+/// via the returned `Err` (carrying no secret); the caller logs-and-continues.
+/// Never materializes any secret outside the backend round-trip. The per-slot
+/// copy lives in [`secret::copy_keyring_secret`] / [`secret::copy_inline_keyring_slots`];
+/// this wrapper only reads the source body's markers and delegates.
 pub fn copy_keyring_entry(
     src: &Host,
     dst: &Host,
@@ -495,13 +514,13 @@ pub fn copy_keyring_entry(
     let (Some(src_body), Some(_dst_body)) = (src.auth.inline_body(), dst.auth.inline_body()) else {
         return Ok(());
     };
-    if !src_body.keyring {
-        return Ok(());
+    if src_body.keyring {
+        secret::copy_keyring_secret(backend, OwnerKind::Host, &src.id, &dst.id)?;
     }
-    match backend.get(&crate::id::keyring_key(OwnerKind::Host, &src.id))? {
-        Some(pw) => backend.set(OwnerKind::Host, &dst.id, &pw),
-        None => Ok(()),
+    if src_body.inline_key_in_keyring() {
+        secret::copy_inline_keyring_slots(backend, OwnerKind::Host, &src.id, &dst.id)?;
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1474,5 +1493,309 @@ mod tests {
         };
         let dst = clone_host_as(&src, new_id(), "web2");
         copy_keyring_entry(&src, &dst, &backend).unwrap();
+    }
+
+    // ---- inline-key keyring slots: rm / cp / overwrite lifecycle ----
+
+    /// Build a host whose inline key text lives in the OS keyring
+    /// (`ik.keyring = true`, no in-body text). This is the sealed form stored
+    /// under keyring mode and owns the priv + cert slots.
+    fn keyring_inline_key_host(name: &str, id: Ulid) -> Host {
+        use crate::config::schema::{InlineKey, KeySource};
+        Host {
+            id,
+            name: name.into(),
+            host: "h".into(),
+            port: 22,
+            auth: Auth::inline(CredentialBody {
+                user: "root".into(),
+                password: None,
+                key: Some(KeySource::Inline(InlineKey {
+                    private_key: None,
+                    certificate: None,
+                    keyring: true,
+                })),
+                keyring: false,
+            }),
+        }
+    }
+
+    #[test]
+    fn delete_host_with_secret_forgets_inline_key_slots() {
+        // A keyring-mode inline-key host owns priv + cert slots keyed by its
+        // id; rm must delete both so no orphaned key material survives.
+        let backend = FakeBackend::new();
+        let id = new_id();
+        backend
+            .set_at(
+                &crate::id::keyring_key_inline_priv(OwnerKind::Host, &id),
+                "PRIV",
+            )
+            .unwrap();
+        backend
+            .set_at(
+                &crate::id::keyring_key_inline_cert(OwnerKind::Host, &id),
+                "CERT",
+            )
+            .unwrap();
+        let cfg = SshrackConfig {
+            hosts: vec![keyring_inline_key_host("kr-ik-rm", id)],
+            ..Default::default()
+        };
+        let next = delete_host_with_secret(&cfg, "kr-ik-rm", &backend).unwrap();
+        assert!(next.hosts.is_empty());
+        assert!(
+            backend
+                .get(&crate::id::keyring_key_inline_priv(OwnerKind::Host, &id))
+                .unwrap()
+                .is_none(),
+            "inline priv slot must be deleted on rm"
+        );
+        assert!(
+            backend
+                .get(&crate::id::keyring_key_inline_cert(OwnerKind::Host, &id))
+                .unwrap()
+                .is_none(),
+            "inline cert slot must be deleted on rm"
+        );
+    }
+
+    #[test]
+    fn delete_host_with_secret_leaves_inline_key_slots_untouched_when_not_keyring() {
+        // A plaintext/vault inline key (ik.keyring = false) owns NO keyring
+        // slots; rm must not touch the backend (forget is delete-if-marked).
+        use crate::config::schema::{InlineKey, KeySource, Secret};
+        let backend = FakeBackend::new();
+        let id = new_id();
+        // Seed an unrelated priv slot to prove it survives.
+        backend
+            .set_at(
+                &crate::id::keyring_key_inline_priv(OwnerKind::Host, &id),
+                "STALE",
+            )
+            .unwrap();
+        let cfg = SshrackConfig {
+            hosts: vec![Host {
+                id,
+                name: "vault-ik".into(),
+                host: "h".into(),
+                port: 22,
+                auth: Auth::inline(CredentialBody {
+                    user: "root".into(),
+                    password: None,
+                    key: Some(KeySource::Inline(InlineKey {
+                        private_key: Some(Secret::Plain("PRIV-TEXT".into())),
+                        certificate: None,
+                        keyring: false,
+                    })),
+                    keyring: false,
+                }),
+            }],
+            ..Default::default()
+        };
+        let next = delete_host_with_secret(&cfg, "vault-ik", &backend).unwrap();
+        assert!(next.hosts.is_empty());
+        // The slot is NOT deleted (the body was not keyring-marked). This
+        // confirms forget_inline_keyring_slots is gated on ik.keyring.
+        assert_eq!(
+            backend
+                .get(&crate::id::keyring_key_inline_priv(OwnerKind::Host, &id))
+                .unwrap()
+                .as_deref()
+                .map(String::as_str),
+            Some("STALE")
+        );
+    }
+
+    #[test]
+    fn forget_keyring_on_overwrite_deletes_inline_key_slots_when_marked() {
+        // `host add --force` overwrites by generating a fresh id; the old
+        // inline-key slots (keyed by the OLD id) must be cleaned up so no
+        // orphaned key material remains.
+        let backend = FakeBackend::new();
+        let old_id = new_id();
+        backend
+            .set_at(
+                &crate::id::keyring_key_inline_priv(OwnerKind::Host, &old_id),
+                "PRIV",
+            )
+            .unwrap();
+        backend
+            .set_at(
+                &crate::id::keyring_key_inline_cert(OwnerKind::Host, &old_id),
+                "CERT",
+            )
+            .unwrap();
+        let cfg = SshrackConfig {
+            hosts: vec![keyring_inline_key_host("kr-ik-overwrite", old_id)],
+            ..Default::default()
+        };
+        forget_keyring_on_overwrite(&cfg, "kr-ik-overwrite", &backend);
+        assert!(
+            backend
+                .get(&crate::id::keyring_key_inline_priv(
+                    OwnerKind::Host,
+                    &old_id
+                ))
+                .unwrap()
+                .is_none(),
+            "old inline priv slot must be deleted on --force overwrite"
+        );
+        assert!(
+            backend
+                .get(&crate::id::keyring_key_inline_cert(
+                    OwnerKind::Host,
+                    &old_id
+                ))
+                .unwrap()
+                .is_none(),
+            "old inline cert slot must be deleted on --force overwrite"
+        );
+    }
+
+    #[test]
+    fn copy_keyring_entry_copies_inline_key_slots_when_source_marked() {
+        // `host cp` of a keyring-mode inline-key host: the cloned host (fresh
+        // id) must own copies of both the priv and cert slots so it can
+        // connect immediately without re-pasting the key.
+        let backend = FakeBackend::new();
+        let src_id = new_id();
+        backend
+            .set_at(
+                &crate::id::keyring_key_inline_priv(OwnerKind::Host, &src_id),
+                "PRIV",
+            )
+            .unwrap();
+        backend
+            .set_at(
+                &crate::id::keyring_key_inline_cert(OwnerKind::Host, &src_id),
+                "CERT",
+            )
+            .unwrap();
+        let src = keyring_inline_key_host("src", src_id);
+        let dst_id = new_id();
+        let dst = clone_host_as(&src, dst_id, "dst");
+        copy_keyring_entry(&src, &dst, &backend).unwrap();
+        assert_eq!(
+            backend
+                .get(&crate::id::keyring_key_inline_priv(
+                    OwnerKind::Host,
+                    &dst_id
+                ))
+                .unwrap()
+                .as_deref()
+                .map(String::as_str),
+            Some("PRIV")
+        );
+        assert_eq!(
+            backend
+                .get(&crate::id::keyring_key_inline_cert(
+                    OwnerKind::Host,
+                    &dst_id
+                ))
+                .unwrap()
+                .as_deref()
+                .map(String::as_str),
+            Some("CERT")
+        );
+        // Source slots survive (copy, not move).
+        assert_eq!(
+            backend
+                .get(&crate::id::keyring_key_inline_priv(
+                    OwnerKind::Host,
+                    &src_id
+                ))
+                .unwrap()
+                .as_deref()
+                .map(String::as_str),
+            Some("PRIV")
+        );
+    }
+
+    #[test]
+    fn copy_keyring_entry_skips_inline_key_slots_when_source_not_marked() {
+        // A vault/plaintext inline key (ik.keyring = false) owns no keyring
+        // slots; cp must not fabricate any. The dst owns nothing.
+        use crate::config::schema::{InlineKey, KeySource, Secret};
+        let backend = FakeBackend::new();
+        let src = Host {
+            id: new_id(),
+            name: "src".into(),
+            host: "h".into(),
+            port: 22,
+            auth: Auth::inline(CredentialBody {
+                user: "root".into(),
+                password: None,
+                key: Some(KeySource::Inline(InlineKey {
+                    private_key: Some(Secret::Plain("PRIV-TEXT".into())),
+                    certificate: None,
+                    keyring: false,
+                })),
+                keyring: false,
+            }),
+        };
+        let dst = clone_host_as(&src, new_id(), "dst");
+        copy_keyring_entry(&src, &dst, &backend).unwrap();
+        // No inline-key slots created for the dst.
+        assert!(backend.entries.borrow().is_empty());
+    }
+
+    #[test]
+    fn copy_keyring_entry_copies_both_password_and_inline_key_slots() {
+        // When the mutex allows both markers (not simultaneously on the same
+        // body, but two different src bodies through two calls), each slot
+        // kind is copied independently. Here we verify a keyring-password host
+        // and a keyring-inline-key host each copy their own slots. This
+        // confirms the password-slot and inline-slot paths do not interfere.
+        let backend = FakeBackend::new();
+        // Password-slot source.
+        let pw_src_id = new_id();
+        backend
+            .set(OwnerKind::Host, &pw_src_id, "topsecret")
+            .unwrap();
+        let pw_src = Host {
+            id: pw_src_id,
+            name: "pw-src".into(),
+            host: "h".into(),
+            port: 22,
+            auth: Auth::inline(CredentialBody {
+                user: "root".into(),
+                password: None,
+                key: None,
+                keyring: true,
+            }),
+        };
+        let pw_dst = clone_host_as(&pw_src, new_id(), "pw-dst");
+        copy_keyring_entry(&pw_src, &pw_dst, &backend).unwrap();
+        assert_eq!(
+            backend
+                .get(&crate::id::keyring_key(OwnerKind::Host, &pw_dst.id))
+                .unwrap()
+                .as_deref()
+                .map(String::as_str),
+            Some("topsecret")
+        );
+        // Inline-key source.
+        let ik_src_id = new_id();
+        backend
+            .set_at(
+                &crate::id::keyring_key_inline_priv(OwnerKind::Host, &ik_src_id),
+                "PRIV",
+            )
+            .unwrap();
+        let ik_src = keyring_inline_key_host("ik-src", ik_src_id);
+        let ik_dst = clone_host_as(&ik_src, new_id(), "ik-dst");
+        copy_keyring_entry(&ik_src, &ik_dst, &backend).unwrap();
+        assert_eq!(
+            backend
+                .get(&crate::id::keyring_key_inline_priv(
+                    OwnerKind::Host,
+                    &ik_dst.id
+                ))
+                .unwrap()
+                .as_deref()
+                .map(String::as_str),
+            Some("PRIV")
+        );
     }
 }

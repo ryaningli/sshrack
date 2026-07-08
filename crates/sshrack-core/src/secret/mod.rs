@@ -104,6 +104,65 @@ pub fn forget_keyring_secret(
     }
 }
 
+/// Best-effort delete of an owner's inline-key keyring slots (private +
+/// certificate) when the owning body carried a keyring-stored inline key.
+/// Never returns an error. Mirrors [`forget_keyring_secret`] for the inline
+/// slots. `marked` is the source body's inline-key `keyring` flag.
+pub fn forget_inline_keyring_slots(
+    backend: &dyn SecretBackend,
+    kind: OwnerKind,
+    id: &Ulid,
+    marked: bool,
+) {
+    if marked {
+        let _ = backend.delete_at(&crate::id::keyring_key_inline_priv(kind, id));
+        let _ = backend.delete_at(&crate::id::keyring_key_inline_cert(kind, id));
+    }
+}
+
+/// Copy an owner's password keyring slot from `src_id` to `dst_id` when present.
+/// Returns `true` if a slot was copied. Centralizes the cp cleanup policy so
+/// host and credential copy share one implementation (no duplicated match
+/// arms). Never materializes the password outside the backend round-trip.
+pub fn copy_keyring_secret(
+    backend: &dyn SecretBackend,
+    kind: OwnerKind,
+    src_id: &Ulid,
+    dst_id: &Ulid,
+) -> Result<bool, SshrackError> {
+    match backend.get(&crate::id::keyring_key(kind, src_id))? {
+        Some(pw) => {
+            backend.set(kind, dst_id, &pw)?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+/// Copy an owner's inline-key keyring slots (private + certificate) from
+/// `src_id` to `dst_id`, if the source has any. Returns `true` if at least one
+/// slot was copied. Used by `host cp` / `cred cp` so the cloned owner owns its
+/// keyring-stored inline key. Best-effort: absent slots are silently skipped.
+pub fn copy_inline_keyring_slots(
+    backend: &dyn SecretBackend,
+    kind: OwnerKind,
+    src_id: &Ulid,
+    dst_id: &Ulid,
+) -> Result<bool, SshrackError> {
+    let mut copied = false;
+    let priv_key = crate::id::keyring_key_inline_priv(kind, src_id);
+    if let Some(p) = backend.get(&priv_key)? {
+        backend.set_at(&crate::id::keyring_key_inline_priv(kind, dst_id), &p)?;
+        copied = true;
+    }
+    let cert_key = crate::id::keyring_key_inline_cert(kind, src_id);
+    if let Some(c) = backend.get(&cert_key)? {
+        backend.set_at(&crate::id::keyring_key_inline_cert(kind, dst_id), &c)?;
+        copied = true;
+    }
+    Ok(copied)
+}
+
 #[cfg(test)]
 pub(crate) mod test_doubles {
     use super::*;
@@ -346,5 +405,115 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn forget_inline_keyring_slots_deletes_priv_and_cert() {
+        let id = Ulid::new();
+        let be = test_doubles::FakeBackend::new();
+        be.set_at(&keyring_key_inline_priv(OwnerKind::Host, &id), "p")
+            .unwrap();
+        be.set_at(&keyring_key_inline_cert(OwnerKind::Host, &id), "c")
+            .unwrap();
+        super::forget_inline_keyring_slots(&be, OwnerKind::Host, &id, true);
+        assert!(
+            be.get(&keyring_key_inline_priv(OwnerKind::Host, &id))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            be.get(&keyring_key_inline_cert(OwnerKind::Host, &id))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn forget_inline_keyring_slots_noop_when_not_marked() {
+        // Not marked: slots must survive (the cleanup is delete-if-marked).
+        let id = Ulid::new();
+        let be = test_doubles::FakeBackend::new();
+        be.set_at(&keyring_key_inline_priv(OwnerKind::Host, &id), "p")
+            .unwrap();
+        super::forget_inline_keyring_slots(&be, OwnerKind::Host, &id, false);
+        assert_eq!(
+            be.get(&keyring_key_inline_priv(OwnerKind::Host, &id))
+                .unwrap()
+                .as_deref()
+                .map(String::as_str),
+            Some("p")
+        );
+    }
+
+    #[test]
+    fn copy_inline_keyring_slots_copies_priv_and_cert_to_new_owner() {
+        let src = Ulid::new();
+        let dst = Ulid::new();
+        let be = test_doubles::FakeBackend::new();
+        be.set_at(&keyring_key_inline_priv(OwnerKind::Host, &src), "p")
+            .unwrap();
+        be.set_at(&keyring_key_inline_cert(OwnerKind::Host, &src), "c")
+            .unwrap();
+        let copied = super::copy_inline_keyring_slots(&be, OwnerKind::Host, &src, &dst).unwrap();
+        assert!(copied);
+        assert_eq!(
+            be.get(&keyring_key_inline_priv(OwnerKind::Host, &dst))
+                .unwrap()
+                .as_deref()
+                .map(String::as_str),
+            Some("p")
+        );
+        assert_eq!(
+            be.get(&keyring_key_inline_cert(OwnerKind::Host, &dst))
+                .unwrap()
+                .as_deref()
+                .map(String::as_str),
+            Some("c")
+        );
+    }
+
+    #[test]
+    fn copy_inline_keyring_slots_returns_false_when_no_slots_present() {
+        // No source slots → nothing copied, returns false. The source owner
+        // simply owns no inline-key keyring material.
+        let src = Ulid::new();
+        let dst = Ulid::new();
+        let be = test_doubles::FakeBackend::new();
+        let copied = super::copy_inline_keyring_slots(&be, OwnerKind::Host, &src, &dst).unwrap();
+        assert!(!copied);
+    }
+
+    #[test]
+    fn copy_keyring_secret_copies_password_slot_to_new_owner() {
+        let src = Ulid::new();
+        let dst = Ulid::new();
+        let be = test_doubles::FakeBackend::new();
+        be.set(OwnerKind::Credential, &src, "hunter2").unwrap();
+        let copied = super::copy_keyring_secret(&be, OwnerKind::Credential, &src, &dst).unwrap();
+        assert!(copied);
+        assert_eq!(
+            be.get(&keyring_key(OwnerKind::Credential, &dst))
+                .unwrap()
+                .as_deref()
+                .map(String::as_str),
+            Some("hunter2")
+        );
+        // Source survives (copy, not move).
+        assert_eq!(
+            be.get(&keyring_key(OwnerKind::Credential, &src))
+                .unwrap()
+                .as_deref()
+                .map(String::as_str),
+            Some("hunter2")
+        );
+    }
+
+    #[test]
+    fn copy_keyring_secret_returns_false_when_slot_absent() {
+        let src = Ulid::new();
+        let dst = Ulid::new();
+        let be = test_doubles::FakeBackend::new();
+        let copied = super::copy_keyring_secret(&be, OwnerKind::Host, &src, &dst).unwrap();
+        assert!(!copied);
     }
 }

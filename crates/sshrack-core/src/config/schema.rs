@@ -359,6 +359,16 @@ impl CredentialBody {
     pub fn password_plain(&self) -> Option<&str> {
         self.password.as_ref().and_then(Secret::as_plain)
     }
+
+    /// True when the body's inline key text lives in the OS keyring
+    /// (`key = { inline = { keyring = true } }`): the private-key and
+    /// certificate texts are read from the keyring slots keyed by the owner's
+    /// id, not from the body. Independent of the body-level [`keyring`](Self::keyring)
+    /// marker (which marks the password slot). Used by rm/cp/overwrite to keep
+    /// the inline-key slots in sync with the owner's lifecycle.
+    pub fn inline_key_in_keyring(&self) -> bool {
+        matches!(self.key.as_ref(), Some(KeySource::Inline(ik)) if ik.keyring)
+    }
 }
 
 /// A named credential table entry: a first-class id, a name, plus its
