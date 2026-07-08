@@ -526,10 +526,10 @@ pub(crate) fn decrypt_secret(
 /// [`PasswordSource::Config`] for plaintext-mode bodies (the password already
 /// lives at 0600 in the config; the connect layer points the askpass helper at
 /// the host instead of writing a temp file), [`PasswordSource::Inline`] for
-/// vault-mode bodies (decrypted here; the connect layer writes the temp file),
-/// [`PasswordSource::Keyring`] for keyring-marker bodies (keyed off the owner's
-/// stable id — `host:<id>` for inline auth, `cred:<id>` for a referenced
-/// credential), and [`PasswordSource::None`] otherwise.
+/// non-plaintext-mode bodies (vault or undecided; decrypted here; the connect
+/// layer writes the temp file), [`PasswordSource::Keyring`] for keyring-marker
+/// bodies (keyed off the owner's stable id — `host:<id>` for inline auth,
+/// `cred:<id>` for a referenced credential), and [`PasswordSource::None`] otherwise.
 ///
 /// The resulting [`ResolvedAuth::key_path`] / [`ResolvedAuth::inline_key`] pair
 /// is mutually exclusive: a path-key body sets `key_path` (the file `ssh -i`
