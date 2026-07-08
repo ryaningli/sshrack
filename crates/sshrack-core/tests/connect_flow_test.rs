@@ -328,6 +328,7 @@ fn env_for_seam_documents_env_shape_per_source() {
 fn plaintext_mode_host_resolves_to_config_channel_and_writes_no_temp_file() {
     use sshrack_core::config::schema::{Auth, CredentialBody, Host, SecretStore, SshrackConfig};
     use sshrack_core::credential::resolve;
+    use sshrack_core::secret::OsKeyring;
     use ulid::Ulid;
 
     let (_dir, shim_path, capture_path) = fresh_shim();
@@ -347,7 +348,7 @@ fn plaintext_mode_host_resolves_to_config_channel_and_writes_no_temp_file() {
     };
 
     // The flipped decision point: plaintext mode resolves to the config channel.
-    let resolved = resolve(&h, &cfg, None).expect("resolve ok");
+    let resolved = resolve(&h, &cfg, None, &OsKeyring).expect("resolve ok");
     let host_id_emitted = match &resolved.password {
         PasswordSource::Config { host_id } => host_id.clone(),
         other => panic!("plaintext mode must resolve to Config, got {other:?}"),

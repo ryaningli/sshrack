@@ -11,6 +11,7 @@ use crate::config::schema::{Host, SshrackConfig};
 use crate::credential::{self, PasswordSource};
 use crate::error::SshrackError;
 use crate::host::{ResolveOverrides, host_not_found, resolve_target};
+use crate::secret::SecretBackend;
 
 /// The assembled scp invocation plus the resolved remote host (if any), so the
 /// caller can resolve a password without re-parsing.
@@ -58,12 +59,15 @@ pub struct ScpPlan {
 ///
 /// `vault` is the unlocked master key (from [`crate::secret::vault`]) used to
 /// decrypt any stored password; `None` means the config is not in encrypted
-/// mode (or the caller is a unit test).
+/// mode (or the caller is a unit test). `backend` is where keyring-stored
+/// inline key text is read from when a host carries a keyring-marker inline
+/// key (`ik.keyring = true`).
 pub fn build(
     args: &[String],
     cfg: &SshrackConfig,
     overrides: &Overrides,
     vault: Option<&crate::secret::vault::VaultKey>,
+    backend: &dyn SecretBackend,
 ) -> Result<ScpPlan, SshrackError> {
     let mut out_args: Vec<String> = Vec::with_capacity(args.len());
     let mut host: Option<Host> = None;
@@ -102,7 +106,7 @@ pub fn build(
             None if overrides.ad_hoc => resolve_target(cfg, left, &resolve_overrides)?,
             None => return Err(host_not_found(cfg, left)),
         };
-        let mut auth = credential::resolve(&host_cfg, cfg, vault)?;
+        let mut auth = credential::resolve(&host_cfg, cfg, vault, backend)?;
         let user = overrides.user.as_deref().unwrap_or(&auth.user);
         out_args.push(format!("{user}@{}:{rest}", host_cfg.host));
         let port = overrides.port.unwrap_or(host_cfg.port);
@@ -151,6 +155,7 @@ pub fn build(
 mod tests {
     use super::*;
     use crate::config::schema::{Auth, Credential, CredentialBody, Host, SshrackConfig};
+    use crate::secret::test_doubles::FakeBackend;
     use ulid::Ulid;
 
     fn cfg_with_key_host(name: &str) -> SshrackConfig {
@@ -176,6 +181,7 @@ mod tests {
             &cfg_with_key_host("web1"),
             &Overrides::default(),
             None,
+            &FakeBackend::new(),
         )
         .unwrap();
         assert_eq!(plan.argv[0], "scp");
@@ -193,6 +199,7 @@ mod tests {
             &SshrackConfig::default(),
             &Overrides::default(),
             None,
+            &FakeBackend::new(),
         )
         .unwrap();
         assert_eq!(plan.argv, vec!["scp", "a.txt", "b.txt"]);
@@ -205,7 +212,14 @@ mod tests {
             user: Some("root".into()),
             ..Default::default()
         };
-        let plan = build(&["web1:/x".into()], &cfg_with_key_host("web1"), &o, None).unwrap();
+        let plan = build(
+            &["web1:/x".into()],
+            &cfg_with_key_host("web1"),
+            &o,
+            None,
+            &FakeBackend::new(),
+        )
+        .unwrap();
         assert!(plan.argv.iter().any(|a| a == "root@10.0.0.5:/x"));
     }
 
@@ -215,7 +229,14 @@ mod tests {
             port: Some(22000),
             ..Default::default()
         };
-        let plan = build(&["web1:/x".into()], &cfg_with_key_host("web1"), &o, None).unwrap();
+        let plan = build(
+            &["web1:/x".into()],
+            &cfg_with_key_host("web1"),
+            &o,
+            None,
+            &FakeBackend::new(),
+        )
+        .unwrap();
         assert!(plan.argv.contains(&"22000".to_string()));
         assert!(!plan.argv.contains(&"2222".to_string()));
     }
@@ -230,6 +251,7 @@ mod tests {
             &cfg_with_key_host("web1"),
             &Overrides::default(),
             None,
+            &FakeBackend::new(),
         )
         .unwrap_err();
         assert!(matches!(
@@ -251,7 +273,14 @@ mod tests {
             credentials: vec![],
             ..Default::default()
         };
-        let err = build(&["web1:/x".into()], &cfg, &Overrides::default(), None).unwrap_err();
+        let err = build(
+            &["web1:/x".into()],
+            &cfg,
+            &Overrides::default(),
+            None,
+            &FakeBackend::new(),
+        )
+        .unwrap_err();
         // The dangling id surfaces as CredentialNotFound (the looked-for string
         // is the ULID, per the ref-by-id resolution path).
         assert!(matches!(err, SshrackError::CredentialNotFound { .. }));
@@ -296,7 +325,14 @@ mod tests {
             credential: Some(cid),
             ..Default::default()
         };
-        let plan = build(&["file.txt".into(), "1.2.3.4:/tmp/".into()], &cfg, &o, None).unwrap();
+        let plan = build(
+            &["file.txt".into(), "1.2.3.4:/tmp/".into()],
+            &cfg,
+            &o,
+            None,
+            &FakeBackend::new(),
+        )
+        .unwrap();
         match plan.password {
             PasswordSource::Inline(p) => assert_eq!(p.as_str(), "s3cret"),
             other => panic!("expected Inline, got {other:?}"),
@@ -311,7 +347,14 @@ mod tests {
             credential: Some(cid),
             ..Default::default()
         };
-        let plan = build(&["file.txt".into(), "1.2.3.4:/tmp/".into()], &cfg, &o, None).unwrap();
+        let plan = build(
+            &["file.txt".into(), "1.2.3.4:/tmp/".into()],
+            &cfg,
+            &o,
+            None,
+            &FakeBackend::new(),
+        )
+        .unwrap();
         assert!(plan.argv.iter().any(|a| a == "deploy@1.2.3.4:/tmp/"));
         assert!(plan.argv.contains(&"-P".to_string()));
         assert!(plan.argv.contains(&"22".to_string()));
@@ -333,7 +376,7 @@ mod tests {
             credential: Some(cid),
             ..Default::default()
         };
-        let err = build(&["1.2.3.4:/x".into()], &cfg, &o, None).unwrap_err();
+        let err = build(&["1.2.3.4:/x".into()], &cfg, &o, None, &FakeBackend::new()).unwrap_err();
         assert!(matches!(err, SshrackError::HostNotFound { .. }));
     }
 
@@ -348,6 +391,7 @@ mod tests {
             &cfg,
             &Overrides::default(),
             None,
+            &FakeBackend::new(),
         )
         .unwrap();
         assert_eq!(plan.argv, vec!["scp", "root@1.2.3.4:/x"]);
@@ -360,7 +404,14 @@ mod tests {
             ad_hoc: true,
             ..Default::default()
         };
-        let err = build(&["1.2.3.4:/x".into()], &SshrackConfig::default(), &o, None).unwrap_err();
+        let err = build(
+            &["1.2.3.4:/x".into()],
+            &SshrackConfig::default(),
+            &o,
+            None,
+            &FakeBackend::new(),
+        )
+        .unwrap_err();
         assert!(matches!(err, SshrackError::MissingRequiredField { .. }));
     }
 }

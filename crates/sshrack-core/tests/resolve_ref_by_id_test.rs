@@ -11,6 +11,7 @@ use sshrack_core::config::schema::{Auth, Credential, CredentialBody, Host, Sshra
 use sshrack_core::config::store;
 use sshrack_core::credential;
 use sshrack_core::id::new_id;
+use sshrack_core::secret::OsKeyring;
 
 /// A host referencing a credential by its stable id keeps resolving after the
 /// credential's name is renamed and the whole config is saved + reloaded.
@@ -47,7 +48,8 @@ fn ref_by_id_survives_credential_name_rename_across_disk() {
     let loaded = store::load(&cfg_path).expect("load");
     // The reference survived serialization: still resolves before the rename.
     let host = loaded.find_host_by_name("web1").expect("host present");
-    let resolved = credential::resolve(host, &loaded, None).expect("resolve before rename");
+    let resolved =
+        credential::resolve(host, &loaded, None, &OsKeyring).expect("resolve before rename");
     assert_eq!(resolved.user, "deploy");
     assert_eq!(
         resolved.key_path.as_deref(),
@@ -68,7 +70,8 @@ fn ref_by_id_survives_credential_name_rename_across_disk() {
     // The host's Auth::Ref still points at the same id and still resolves.
     let host = reloaded.find_host_by_name("web1").expect("host present");
     assert_eq!(host.auth.credential_id(), Some(cred_id));
-    let resolved = credential::resolve(host, &reloaded, None).expect("resolve after rename");
+    let resolved =
+        credential::resolve(host, &reloaded, None, &OsKeyring).expect("resolve after rename");
     assert_eq!(
         resolved.user, "deploy",
         "user travels with the credential, not the name"
@@ -115,7 +118,8 @@ fn ref_by_id_dangles_when_credential_deleted_across_disk() {
     let reloaded = store::load(&cfg_path).expect("load after delete");
 
     let host = reloaded.find_host_by_name("web1").expect("host present");
-    let err = credential::resolve(host, &reloaded, None).expect_err("dangling ref errors");
+    let err =
+        credential::resolve(host, &reloaded, None, &OsKeyring).expect_err("dangling ref errors");
     assert!(
         matches!(
             err,

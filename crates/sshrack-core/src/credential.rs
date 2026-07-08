@@ -518,6 +518,12 @@ pub(crate) fn decrypt_secret(
 /// a did-you-mean hint computed from credential names), `VaultLocked` when an
 /// encrypted password or inline key is seen without a key.
 ///
+/// `backend` is where keyring-stored secrets are read from: the password slot
+/// for a keyring-marker body is NOT read here (the askpass helper fetches it
+/// directly), but a keyring-marker inline key (`ik.keyring = true`) has its
+/// private/cert text read from the backend now so the connect layer can write
+/// it to a temp file for `ssh -i`.
+///
 /// The reference arm follows [`Auth::Ref`] by the credential's stable [`Ulid`]
 /// (via [`SshrackConfig::find_credential_by_id`]) — never its name — so
 /// renaming the credential leaves this resolution intact.
@@ -541,6 +547,7 @@ pub fn resolve(
     host: &Host,
     cfg: &SshrackConfig,
     vault: Option<&crate::secret::vault::VaultKey>,
+    backend: &dyn crate::secret::SecretBackend,
 ) -> Result<ResolvedAuth, SshrackError> {
     // owner_kind + owner_id select the keyring account; name_label is the
     // display name attached to a decryption failure (never the secret).
@@ -582,15 +589,31 @@ pub fn resolve(
     // Derive the ssh `-i` target (and any inline material) from the key source.
     // Path → use the file directly; Inline → decrypt private/cert via the vault
     // (None/Plain need no key; Encrypted needs the master key, else VaultLocked).
-    // The two slots stay mutually exclusive: an inline body sets inline_key and
-    // leaves key_path None so the connect layer knows to materialize a temp file.
+    // A keyring-marker body (`ik.keyring = true`) carries no in-body text — read
+    // both texts from the OS-keyring slots instead. The two slots stay mutually
+    // exclusive: an inline body sets inline_key and leaves key_path None so the
+    // connect layer knows to materialize a temp file.
     let (key_path, inline_key) = match key_source {
         None => (None, None),
         Some(KeySource::Path(p)) => (Some(p.clone()), None),
         Some(KeySource::Inline(ik)) => {
-            let private = decrypt_secret(ik.private_key.as_ref(), vault, name_label)?
-                .unwrap_or_else(|| Zeroizing::new(String::new()));
-            let certificate = decrypt_secret(ik.certificate.as_ref(), vault, name_label)?;
+            // A keyring-marker body carries no in-body text — read both texts
+            // from the OS-keyring slots. Otherwise decrypt the in-body Secret
+            // (Plain needs no key; Encrypted needs the vault key, else
+            // VaultLocked).
+            let (private, certificate) = if ik.keyring {
+                let priv_text = backend
+                    .get(&crate::id::keyring_key_inline_priv(owner_kind, &owner_id))?
+                    .unwrap_or_else(|| Zeroizing::new(String::new()));
+                let cert_text =
+                    backend.get(&crate::id::keyring_key_inline_cert(owner_kind, &owner_id))?;
+                (priv_text, cert_text)
+            } else {
+                let priv_text = decrypt_secret(ik.private_key.as_ref(), vault, name_label)?
+                    .unwrap_or_else(|| Zeroizing::new(String::new()));
+                let cert_text = decrypt_secret(ik.certificate.as_ref(), vault, name_label)?;
+                (priv_text, cert_text)
+            };
             (
                 None,
                 Some(InlineKeyMaterial {
@@ -792,7 +815,7 @@ mod tests {
         // A path key source puts its path on `key_path` and never materializes
         // inline text — the inline_key slot stays None.
         let h = inline_host(CredentialBody::new("u").with_key("/k/id"));
-        let r = resolve(&h, &SshrackConfig::default(), None).unwrap();
+        let r = resolve(&h, &SshrackConfig::default(), None, &FakeBackend::new()).unwrap();
         assert_eq!(r.key_path.as_deref(), Some(std::path::Path::new("/k/id")));
         assert!(r.inline_key.is_none());
     }
@@ -807,7 +830,7 @@ mod tests {
             Some(crate::config::schema::Secret::Plain("CERT-TEXT".into())),
         );
         let h = inline_host(b);
-        let r = resolve(&h, &SshrackConfig::default(), None).unwrap();
+        let r = resolve(&h, &SshrackConfig::default(), None, &FakeBackend::new()).unwrap();
         assert!(r.key_path.is_none());
         let mat = r.inline_key.expect("inline material present");
         assert_eq!(mat.private.as_str(), "PRIV-TEXT");
@@ -836,8 +859,62 @@ mod tests {
             keyring: false,
         };
         let h = inline_host(b);
-        let r = resolve(&h, &SshrackConfig::default(), None);
+        let r = resolve(&h, &SshrackConfig::default(), None, &FakeBackend::new());
         assert!(matches!(r, Err(SshrackError::VaultLocked)));
+    }
+
+    #[test]
+    fn resolve_inline_key_in_keyring_reads_text_from_backend() {
+        // A keyring-marker inline key (ik.keyring = true, no in-body text)
+        // resolves by reading the private/cert text from the backend slots and
+        // carrying it as InlineKeyMaterial for temp-file materialization. The
+        // in-body decrypt path is bypassed entirely — the text comes from the
+        // OS-keyring slots keyed by the owner's stable id.
+        use crate::config::schema::{CredentialBody, InlineKey, KeySource, SecretStore};
+        use crate::secret::test_doubles::FakeBackend;
+        use ulid::Ulid;
+
+        let cfg = SshrackConfig {
+            store: Some(SecretStore::Keyring),
+            ..SshrackConfig::default()
+        };
+        let id = Ulid::new();
+        let backend = FakeBackend::new();
+        backend
+            .set_at(
+                &crate::id::keyring_key_inline_priv(OwnerKind::Host, &id),
+                "PRIV-TEXT",
+            )
+            .unwrap();
+        backend
+            .set_at(
+                &crate::id::keyring_key_inline_cert(OwnerKind::Host, &id),
+                "CERT-TEXT",
+            )
+            .unwrap();
+        let h = Host {
+            id,
+            name: "k".into(),
+            host: "x".into(),
+            port: 22,
+            auth: Auth::inline(CredentialBody {
+                user: "u".into(),
+                password: None,
+                key: Some(KeySource::Inline(InlineKey {
+                    private_key: None,
+                    certificate: None,
+                    keyring: true,
+                })),
+                keyring: false,
+            }),
+        };
+        let r = resolve(&h, &cfg, None, &backend).unwrap();
+        let mat = r.inline_key.expect("inline material present");
+        assert_eq!(mat.private.as_str(), "PRIV-TEXT");
+        assert_eq!(
+            mat.certificate.as_ref().map(|c| c.as_str()),
+            Some("CERT-TEXT")
+        );
     }
 
     #[test]
@@ -889,7 +966,7 @@ mod tests {
     #[test]
     fn inline_password_resolves() {
         let h = inline_host(CredentialBody::new("root").with_password("secret"));
-        let r = resolve(&h, &SshrackConfig::default(), None).unwrap();
+        let r = resolve(&h, &SshrackConfig::default(), None, &FakeBackend::new()).unwrap();
         assert_eq!(r.user, "root");
         assert!(r.key_path.is_none());
         match &r.password {
@@ -901,7 +978,7 @@ mod tests {
     #[test]
     fn inline_key_resolves() {
         let h = inline_host(CredentialBody::new("ops").with_key("/k"));
-        let r = resolve(&h, &SshrackConfig::default(), None).unwrap();
+        let r = resolve(&h, &SshrackConfig::default(), None, &FakeBackend::new()).unwrap();
         assert_eq!(r.user, "ops");
         assert_eq!(r.key_path.as_deref(), Some(PathBuf::from("/k").as_path()));
         assert!(matches!(r.password, PasswordSource::None));
@@ -910,7 +987,7 @@ mod tests {
     #[test]
     fn inline_default_resolves_no_secret() {
         let h = inline_host(CredentialBody::new("ec2-user"));
-        let r = resolve(&h, &SshrackConfig::default(), None).unwrap();
+        let r = resolve(&h, &SshrackConfig::default(), None, &FakeBackend::new()).unwrap();
         assert_eq!(r.user, "ec2-user");
         assert!(r.key_path.is_none());
         assert!(matches!(r.password, PasswordSource::None));
@@ -928,7 +1005,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let r = resolve(&h, &cfg, None).unwrap();
+        let r = resolve(&h, &cfg, None, &FakeBackend::new()).unwrap();
         assert_eq!(r.user, "deploy");
         assert_eq!(
             r.key_path.as_deref(),
@@ -940,7 +1017,7 @@ mod tests {
     fn dangling_reference_errors() {
         // A host whose auth refs a credential id that is not in the table.
         let h = ref_host(Ulid::new());
-        let err = resolve(&h, &SshrackConfig::default(), None).unwrap_err();
+        let err = resolve(&h, &SshrackConfig::default(), None, &FakeBackend::new()).unwrap_err();
         assert!(matches!(err, SshrackError::CredentialNotFound { .. }));
     }
 
@@ -954,7 +1031,7 @@ mod tests {
         };
         let h = inline_host(b);
         assert!(matches!(
-            resolve(&h, &SshrackConfig::default(), None),
+            resolve(&h, &SshrackConfig::default(), None, &FakeBackend::new()),
             Err(SshrackError::InvalidCredentialBody { .. })
         ));
     }
@@ -1143,7 +1220,7 @@ mod tests {
                 keyring: true,
             }),
         };
-        let r = resolve(&h, &SshrackConfig::default(), None).unwrap();
+        let r = resolve(&h, &SshrackConfig::default(), None, &FakeBackend::new()).unwrap();
         match r.password {
             PasswordSource::Keyring { key } => {
                 assert_eq!(key, format!("host:{host_id}"));
@@ -1170,7 +1247,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let r = resolve(&h, &cfg, None).unwrap();
+        let r = resolve(&h, &cfg, None, &FakeBackend::new()).unwrap();
         match r.password {
             PasswordSource::Keyring { key } => {
                 assert_eq!(key, format!("cred:{cid}"));
@@ -1183,21 +1260,21 @@ mod tests {
     fn resolve_key_body_emits_no_password() {
         // A key body has no password of any kind.
         let h = inline_host(CredentialBody::new("ops").with_key("/k"));
-        let r = resolve(&h, &SshrackConfig::default(), None).unwrap();
+        let r = resolve(&h, &SshrackConfig::default(), None, &FakeBackend::new()).unwrap();
         assert!(matches!(r.password, PasswordSource::None));
     }
 
     #[test]
     fn resolve_default_body_emits_no_password() {
         let h = inline_host(CredentialBody::new("ec2-user"));
-        let r = resolve(&h, &SshrackConfig::default(), None).unwrap();
+        let r = resolve(&h, &SshrackConfig::default(), None, &FakeBackend::new()).unwrap();
         assert!(matches!(r.password, PasswordSource::None));
     }
 
     #[test]
     fn resolve_plaintext_body_emits_inline_source() {
         let h = inline_host(CredentialBody::new("root").with_password("secret"));
-        let r = resolve(&h, &SshrackConfig::default(), None).unwrap();
+        let r = resolve(&h, &SshrackConfig::default(), None, &FakeBackend::new()).unwrap();
         match r.password {
             PasswordSource::Inline(p) => {
                 assert_eq!(p.as_str(), "secret");
@@ -1222,7 +1299,13 @@ mod tests {
             key: None,
             keyring: false,
         });
-        let r = resolve(&h, &SshrackConfig::default(), Some(&key)).unwrap();
+        let r = resolve(
+            &h,
+            &SshrackConfig::default(),
+            Some(&key),
+            &FakeBackend::new(),
+        )
+        .unwrap();
         match &r.password {
             PasswordSource::Inline(p) => assert_eq!(p.as_str(), "secret"),
             other => panic!("expected Inline, got {other:?}"),
@@ -1242,7 +1325,7 @@ mod tests {
             keyring: false,
         });
         assert!(matches!(
-            resolve(&h, &SshrackConfig::default(), None),
+            resolve(&h, &SshrackConfig::default(), None, &FakeBackend::new()),
             Err(SshrackError::VaultLocked)
         ));
     }
@@ -1274,6 +1357,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            &FakeBackend::new(),
         )
         .unwrap_err();
         assert!(matches!(err, SshrackError::DecryptionFailed { name } if name == "web1"));
@@ -1299,7 +1383,7 @@ mod tests {
             store: Some(SecretStore::Plaintext),
             ..Default::default()
         };
-        let r = resolve(&h, &cfg, None).unwrap();
+        let r = resolve(&h, &cfg, None, &FakeBackend::new()).unwrap();
         match r.password {
             PasswordSource::Config { host_id: emitted } => {
                 assert_eq!(
@@ -1336,7 +1420,7 @@ mod tests {
             store: Some(SecretStore::Plaintext),
             ..Default::default()
         };
-        let r = resolve(&h, &cfg, None).unwrap();
+        let r = resolve(&h, &cfg, None, &FakeBackend::new()).unwrap();
         match r.password {
             PasswordSource::Config { host_id: emitted } => {
                 assert_eq!(
@@ -1375,7 +1459,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let r = resolve(&h, &cfg, Some(&key)).unwrap();
+        let r = resolve(&h, &cfg, Some(&key), &FakeBackend::new()).unwrap();
         match &r.password {
             PasswordSource::Inline(p) => assert_eq!(p.as_str(), "secret"),
             other => panic!("vault mode must still emit Inline, got {other:?}"),
@@ -1405,7 +1489,7 @@ mod tests {
             store: Some(SecretStore::Plaintext),
             ..Default::default()
         };
-        let r = resolve(&h, &cfg, None).unwrap();
+        let r = resolve(&h, &cfg, None, &FakeBackend::new()).unwrap();
         match r.password {
             PasswordSource::Keyring { key } => assert_eq!(key, format!("host:{host_id}")),
             other => {
@@ -1442,7 +1526,7 @@ mod tests {
             ..Default::default()
         };
         // Resolve works before the rename.
-        let before = resolve(&h, &cfg, None).unwrap();
+        let before = resolve(&h, &cfg, None, &FakeBackend::new()).unwrap();
         assert_eq!(before.user, "deploy");
         // find_referrers lists the host before the rename.
         assert_eq!(find_referrers(&cfg, &cid), vec![host_id]);
@@ -1458,7 +1542,7 @@ mod tests {
 
         // Resolve still works after the rename — the host's id reference is
         // intact. This is the central promise of ref-by-id.
-        let after = resolve(&h, &cfg, None).unwrap();
+        let after = resolve(&h, &cfg, None, &FakeBackend::new()).unwrap();
         assert_eq!(after.user, "deploy");
         match after.password {
             PasswordSource::Inline(p) => assert_eq!(p.as_str(), "p"),
