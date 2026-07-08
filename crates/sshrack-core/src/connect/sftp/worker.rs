@@ -145,13 +145,33 @@ impl SftpWorker {
             .spawn()
             .map_err(|e| format!("sftp master spawn failed: {e}"))?;
 
-        // Drain master stderr into the buffer (see run_transfer for the shape).
+        // Drain master stderr into the buffer. Unlike run_transfer's drain
+        // (which is safe with `read_to_end` because the buffer is read only
+        // AFTER `try_wait` shows the child exited), this buffer is polled by
+        // `wait_for_master` every HANDSHAKE_POLL while the master is still
+        // alive. Holding the lock across a blocking `read_to_end` would lock
+        // out `wait_for_master`'s per-poll `lock()` for the master's entire
+        // lifetime (the happy path — `ssh -N` stays up, stderr never EOFs) and
+        // hang the handshake indefinitely. Read in chunks instead, holding the
+        // lock only briefly per chunk so `wait_for_master` can acquire it
+        // between reads.
         {
             let buf = Arc::clone(&stderr_buf);
             if let Some(mut stderr) = master_child.stderr.take() {
                 let _ = thread::spawn(move || {
                     use std::io::Read;
-                    let _ = stderr.read_to_end(&mut buf.lock().expect("invariant: stderr lock"));
+                    let mut chunk = [0u8; 1024];
+                    loop {
+                        match stderr.read(&mut chunk) {
+                            Ok(0) => break, // EOF — master exited
+                            Ok(n) => {
+                                buf.lock()
+                                    .expect("invariant: stderr lock")
+                                    .extend_from_slice(&chunk[..n]);
+                            }
+                            Err(_) => break,
+                        }
+                    }
                 });
             }
         }
@@ -832,6 +852,116 @@ mod tests {
         assert!(
             recorded.is_empty(),
             "recursive upload cleanup must be a no-op (documented gap): {recorded:?}"
+        );
+    }
+
+    // ---- master stderr drain: lock-contention regression (C1 deadlock) ----
+
+    #[test]
+    fn master_stderr_drain_does_not_hold_lock_across_blocking_read() {
+        // Regression for the C1 deadlock. The master-stderr drain thread must
+        // NOT hold the buffer's `Mutex` across a blocking read. On the happy
+        // path the master `ssh -N` stays alive and stderr never EOFs, so a
+        // drain that locks across `read_to_end` keeps the lock for the
+        // master's whole lifetime — and `wait_for_master`'s per-poll `lock()`
+        // blocks forever, hanging the handshake (the 30s timeout never fires
+        // because the loop never re-enters past the lock acquire).
+        //
+        // We reproduce the shape WITHOUT a real sshd: spawn a long-lived
+        // "master" that writes a marker to stderr and then sleeps (stderr stays
+        // open), drain it with the SAME chunked loop used in `open`, and assert
+        // BOTH that:
+        //   (a) the marker reaches the buffer through the chunked append
+        //       (preserves full stderr for the `Exited` path), and
+        //   (b) a `try_lock` from this thread succeeds WHILE the child is
+        //       still alive (the lock is not held continuously — the drain
+        //       released it after appending and is now blocked in `read()`
+        //       without holding it).
+        //
+        // Under the old `read_to_end`-with-lock drain the lock is held until
+        // EOF, so every `try_lock` below fails while the child lives and the
+        // test fails fast (it does NOT hang — `try_lock` is non-blocking, by
+        // design, so the regression pins the bug class without risking an
+        // indefinite hang in the suite).
+        use std::io::Read;
+
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("printf hello-stderr 1>&2; sleep 5")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sh");
+
+        let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let buf = Arc::clone(&buf);
+            let mut stderr = child.stderr.take().expect("piped stderr");
+            let _ = thread::spawn(move || {
+                let mut chunk = [0u8; 1024];
+                loop {
+                    match stderr.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.lock()
+                                .expect("invariant: stderr lock")
+                                .extend_from_slice(&chunk[..n]);
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+
+        let marker = b"hello-stderr";
+
+        // (a) Chunked append must deliver the marker to the buffer. `try_lock`
+        // so the test never blocks even under a buggy drain.
+        let marker_deadline = Instant::now() + Duration::from_secs(2);
+        let mut marker_seen = false;
+        while Instant::now() < marker_deadline {
+            if let Ok(drained) = buf.try_lock()
+                && drained.windows(marker.len()).any(|w| w == marker)
+            {
+                marker_seen = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            marker_seen,
+            "chunked drain must deliver stderr to the buffer: got {:?}",
+            buf.try_lock().map(|b| b.clone()).unwrap_or_default()
+        );
+
+        // (b) The child is still alive (sleeping ~5s). The drain thread already
+        // consumed the marker so it is now blocked inside `stderr.read(...)`.
+        // The lock MUST be free so a `try_lock` succeeds — `wait_for_master`
+        // depends on acquiring it each poll. Under the old `read_to_end`-with-
+        // lock drain this `try_lock` never succeeds while the child lives.
+        let lock_deadline = Instant::now() + Duration::from_secs(2);
+        let mut acquired_while_alive = false;
+        while Instant::now() < lock_deadline {
+            if buf.try_lock().is_ok() {
+                acquired_while_alive = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        // Reap BEFORE the asserts so a failure does not leak a `sleep` process.
+        let alive_at_assert = child.try_wait().ok().flatten().is_none();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            acquired_while_alive,
+            "drain thread held the stderr buffer lock while the master was still \
+             alive — wait_for_master would deadlock on the happy path"
+        );
+        assert!(
+            alive_at_assert,
+            "the master must still be alive when the lock is acquired — otherwise \
+             the regression test does not exercise the deadlock shape"
         );
     }
 }
