@@ -202,12 +202,10 @@ impl SftpWorker {
                     let _ = std::fs::remove_file(p);
                 }
                 let reason = match outcome {
-                    HandshakeOutcome::Exited(s) if !s.trim().is_empty() => {
-                        format!("sftp master failed: {s}")
-                    }
-                    HandshakeOutcome::Exited(_) => {
-                        "sftp master failed (authentication rejected)".to_string()
-                    }
+                    HandshakeOutcome::Exited(s) => match first_meaningful_line(&s) {
+                        "" => "sftp master failed (authentication rejected)".to_string(),
+                        line => format!("sftp master failed: {line}"),
+                    },
                     HandshakeOutcome::Timeout => "sftp master handshake timed out".to_string(),
                     HandshakeOutcome::Ready => unreachable!("handled above"),
                 };
@@ -470,11 +468,10 @@ fn run_transfer(
                     // borrows from it.
                     let stderr_bytes = stderr_buf.lock().expect("invariant: stderr lock");
                     let stderr_str = String::from_utf8_lossy(&stderr_bytes);
-                    let first_line = stderr_str
-                        .lines()
-                        .find(|l| !l.trim().is_empty())
-                        .unwrap_or("sftp failed")
-                        .to_string();
+                    let first_line = match first_meaningful_line(&stderr_str) {
+                        "" => "sftp failed".to_string(),
+                        s => s.to_string(),
+                    };
                     drop(stderr_bytes);
                     remove_partial_dst(runner, job, target, sock);
                     let _ = event_tx.send(WorkerEvent::Done(TransferOutcome::Failed(first_line)));
@@ -631,6 +628,19 @@ fn classify_poll(
         return Some(HandshakeOutcome::Timeout);
     }
     None
+}
+
+/// The first line of `s` whose trimmed form is non-empty, or `""` if there is
+/// none. Collapses a multi-line captured stderr into a single status-bar line
+/// (the footer is one row). Pure.
+fn first_meaningful_line(s: &str) -> &str {
+    for line in s.lines() {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            return trimmed;
+        }
+    }
+    ""
 }
 
 /// Poll `ssh -O check <target>` until it exits 0 (master up) or the deadline.
@@ -962,6 +972,34 @@ mod tests {
             alive_at_assert,
             "the master must still be alive when the lock is acquired — otherwise \
              the regression test does not exercise the deadlock shape"
+        );
+    }
+
+    // ---- first_meaningful_line: collapse captured stderr to one line ----
+
+    #[test]
+    fn first_meaningful_line_returns_first_non_empty_trimmed_line() {
+        assert_eq!(
+            first_meaningful_line("  \n\nPermission denied (password).\nsecond line"),
+            "Permission denied (password)."
+        );
+    }
+
+    #[test]
+    fn first_meaningful_line_empty_when_all_lines_blank() {
+        assert_eq!(first_meaningful_line("  \n\n\t "), "");
+    }
+
+    #[test]
+    fn first_meaningful_line_empty_for_empty_input() {
+        assert_eq!(first_meaningful_line(""), "");
+    }
+
+    #[test]
+    fn first_meaningful_line_single_line_is_trimmed() {
+        assert_eq!(
+            first_meaningful_line("  host unreachable  "),
+            "host unreachable"
         );
     }
 }
