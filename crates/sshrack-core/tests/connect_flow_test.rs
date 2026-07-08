@@ -97,6 +97,31 @@ fn fresh_shim() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
     (dir, shim, capture)
 }
 
+/// Drive `connect::launch` retrying transient ETXTBSY (errno 26, "Text file
+/// busy"). Under `cargo test --workspace` many binaries run in parallel and a
+/// freshly-written shim script can be exec'd before its directory entry fully
+/// settles; the error vanishes on immediate retry. Production `launch` does NOT
+/// retry — a real ETXTBSY there signals a genuine problem, not a race.
+fn launch_retrying_etxtbsy(
+    argv: Vec<String>,
+    source: PasswordSource,
+    self_exe: &Path,
+    config_path: Option<&Path>,
+) -> i32 {
+    let mut last = String::new();
+    for _ in 0..6 {
+        match connect::launch(argv.clone(), source.clone(), self_exe, config_path) {
+            Ok(code) => return code,
+            Err(sshrack_core::error::SshrackError::Io(io)) if io.raw_os_error() == Some(26) => {
+                last = format!("{io}");
+                std::thread::sleep(std::time::Duration::from_millis(15));
+            }
+            Err(e) => panic!("launch failed (non-transient): {e}"),
+        }
+    }
+    panic!("launch failed: ETXTBSY persisted across retries ({last})");
+}
+
 /// A key-only host: the launcher sets NO askpass env at all. There is no
 /// account password to inject, so ssh must NOT be pointed at our payload-less
 /// askpass helper — if it were, an encrypted private key would make ssh call
@@ -123,7 +148,7 @@ fn key_only_host_launches_ssh_with_argv_and_no_askpass_env() {
         "uname".into(),
         "-r".into(),
     ];
-    let code = connect::launch(argv, PasswordSource::None, &self_exe, None).expect("launch ok");
+    let code = launch_retrying_etxtbsy(argv, PasswordSource::None, &self_exe, None);
     assert_eq!(code, 0, "shim exits 0");
     let cap = read_capture(&capture_path);
 
@@ -174,15 +199,14 @@ fn keyring_source_sets_keyring_env_not_file() {
     let (_dir, shim_path, capture_path) = fresh_shim();
     let self_exe = std::env::current_exe().expect("current_exe");
     let argv: Vec<String> = vec![shim_path.to_string_lossy().into_owned(), "10.0.0.5".into()];
-    let code = connect::launch(
+    let code = launch_retrying_etxtbsy(
         argv,
         PasswordSource::Keyring {
             key: "host:01J".into(),
         },
         &self_exe,
         None,
-    )
-    .expect("launch ok");
+    );
     assert_eq!(code, 0);
     let cap = read_capture(&capture_path);
     assert_eq!(
@@ -210,13 +234,12 @@ fn inline_source_stages_askpass_file_not_keyring() {
     let (_dir, shim_path, capture_path) = fresh_shim();
     let self_exe = std::env::current_exe().expect("current_exe");
     let argv: Vec<String> = vec![shim_path.to_string_lossy().into_owned(), "10.0.0.5".into()];
-    let code = connect::launch(
+    let code = launch_retrying_etxtbsy(
         argv,
         PasswordSource::Inline(Zeroizing::new("hunter2".into())),
         &self_exe,
         None,
-    )
-    .expect("launch ok");
+    );
     assert_eq!(code, 0);
     let cap = read_capture(&capture_path);
     let file_env = cap
@@ -332,13 +355,12 @@ fn plaintext_mode_host_resolves_to_config_channel_and_writes_no_temp_file() {
     assert_eq!(host_id_emitted, host_id.to_string());
 
     let argv: Vec<String> = vec![shim_path.to_string_lossy().into_owned(), "10.0.0.5".into()];
-    let code = connect::launch(
+    let code = launch_retrying_etxtbsy(
         argv,
         resolved.password.clone(),
         &self_exe,
         None, // default config path; the shim does not read it
-    )
-    .expect("launch ok");
+    );
     assert_eq!(code, 0, "shim exits 0");
 
     let cap = read_capture(&capture_path);
