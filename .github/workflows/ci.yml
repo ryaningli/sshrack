@@ -21,5 +21,11 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy (warnings as errors)
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # Drive tests under a pty. `stdout_tui` (src/tui/test_support.rs) builds a
+      # real CrosstermBackend whose `Terminal::new` probes the controlling tty;
+      # on CI's pipe-bound stdout that probe returns EAGAIN and the
+      # borrow-regression tests panic. `script -qec` hands cargo a real pty so
+      # the probe succeeds; `-e` propagates the cargo exit code so a test
+      # failure still fails the job (no false-green).
       - name: Test
-        run: cargo test --workspace
+        run: script -qec "cargo test --workspace" /dev/null
