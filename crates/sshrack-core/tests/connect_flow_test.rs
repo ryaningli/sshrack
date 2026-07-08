@@ -51,7 +51,7 @@ fn write_ssh_shim(shim_path: &Path, out_path: &Path) -> std::io::Result<()> {
          : > '{out}'\n\
          for a in \"$0\" \"$@\"; do printf '%s\\n' \"$(printf '%s' \"$a\" | base64)\" >> '{out}'; done\n\
          printf '%s\\n' '---ENV---' >> '{out}'\n\
-         for k in SSH_ASKPASS SSH_ASKPASS_REQUIRE DISPLAY SSHRACK_ASKPASS_FILE SSHRACK_KEYRING_KEY; do\n\
+         for k in SSH_ASKPASS SSH_ASKPASS_REQUIRE DISPLAY SSHRACK_ASKPASS_FILE SSHRACK_KEYRING_KEY SSHRACK_HOST_ID SSHRACK_CONFIG; do\n\
            eval \"v=\\$$k\"\n\
            if [ -n \"${{v:+set}}\" ]; then printf '%s=%s\\n' \"$k\" \"$v\" >> '{out}'; fi\n\
          done\n\
@@ -291,4 +291,86 @@ fn env_for_seam_documents_env_shape_per_source() {
         !cfg_map.contains_key("SSHRACK_KEYRING_KEY"),
         "config path must not stage the keyring key"
     );
+}
+
+/// Plaintext-mode end-to-end: `credential::resolve` flips to the config channel
+/// for a plaintext-mode host, and `connect::launch` must wire that channel
+/// without writing a temp file. Drives the real `resolve` decision (Task 2's
+/// one flipped branch) into the real `launch` subprocess, then asserts the
+/// child observed `SSHRACK_HOST_ID` equal to the host's ULID, the
+/// `SSHRACK_ASKPASS_FILE` env is absent (no temp file staged), and the
+/// keyring env is absent. This is the integration lock that ties the resolve
+/// flip to the connect wiring.
+#[test]
+fn plaintext_mode_host_resolves_to_config_channel_and_writes_no_temp_file() {
+    use sshrack_core::config::schema::{Auth, CredentialBody, Host, SecretStore, SshrackConfig};
+    use sshrack_core::credential::resolve;
+    use ulid::Ulid;
+
+    let (_dir, shim_path, capture_path) = fresh_shim();
+    let self_exe = std::env::current_exe().expect("current_exe");
+
+    let host_id = Ulid::new();
+    let h = Host {
+        id: host_id,
+        name: "web1".into(),
+        host: "10.0.0.5".into(),
+        port: 22,
+        auth: Auth::inline(CredentialBody::new("deploy").with_password("hunter2")),
+    };
+    let cfg = SshrackConfig {
+        store: Some(SecretStore::Plaintext),
+        ..Default::default()
+    };
+
+    // The flipped decision point: plaintext mode resolves to the config channel.
+    let resolved = resolve(&h, &cfg, None).expect("resolve ok");
+    let host_id_emitted = match &resolved.password {
+        PasswordSource::Config { host_id } => host_id.clone(),
+        other => panic!("plaintext mode must resolve to Config, got {other:?}"),
+    };
+    assert_eq!(host_id_emitted, host_id.to_string());
+
+    let argv: Vec<String> = vec![shim_path.to_string_lossy().into_owned(), "10.0.0.5".into()];
+    let code = connect::launch(
+        argv,
+        resolved.password.clone(),
+        &self_exe,
+        None, // default config path; the shim does not read it
+    )
+    .expect("launch ok");
+    assert_eq!(code, 0, "shim exits 0");
+
+    let cap = read_capture(&capture_path);
+
+    // The child saw the host id (the helper resolves it back to the password).
+    let expected_host_id = host_id.to_string();
+    assert_eq!(
+        cap.env.get("SSHRACK_HOST_ID").map(String::as_str),
+        Some(expected_host_id.as_str()),
+        "config channel must set SSHRACK_HOST_ID to the host's ULID"
+    );
+
+    // No temp file is staged: the askpass-file env is absent. The password
+    // never exists as a standalone file in this path.
+    assert!(
+        !cap.env.contains_key("SSHRACK_ASKPASS_FILE"),
+        "plaintext mode must not stage an askpass temp file"
+    );
+    assert!(
+        !cap.env.contains_key("SSHRACK_KEYRING_KEY"),
+        "plaintext mode must not set the keyring key"
+    );
+
+    // The askpass triplet is still wired so ssh actually invokes the helper.
+    assert!(cap.env.contains_key("SSH_ASKPASS"));
+    assert_eq!(
+        cap.env.get("SSH_ASKPASS_REQUIRE").map(String::as_str),
+        Some("force")
+    );
+
+    // The plaintext password must not leak into any captured env var.
+    for (k, v) in &cap.env {
+        assert!(!v.contains("hunter2"), "plaintext leaked into env: {k}={v}");
+    }
 }

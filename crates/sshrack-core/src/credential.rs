@@ -523,7 +523,10 @@ pub(crate) fn decrypt_secret(
 /// renaming the credential leaves this resolution intact.
 ///
 /// The resulting [`ResolvedAuth::password`] is a [`PasswordSource`]:
-/// [`PasswordSource::Inline`] for plaintext/vault bodies (decrypted here),
+/// [`PasswordSource::Config`] for plaintext-mode bodies (the password already
+/// lives at 0600 in the config; the connect layer points the askpass helper at
+/// the host instead of writing a temp file), [`PasswordSource::Inline`] for
+/// vault-mode bodies (decrypted here; the connect layer writes the temp file),
 /// [`PasswordSource::Keyring`] for keyring-marker bodies (keyed off the owner's
 /// stable id — `host:<id>` for inline auth, `cred:<id>` for a referenced
 /// credential), and [`PasswordSource::None`] otherwise.
@@ -603,8 +606,18 @@ pub fn resolve(
         PasswordSource::Keyring {
             key: keyring_key(owner_kind, &owner_id),
         }
+    } else if cfg.is_plaintext() && password_secret.is_some() {
+        // Plaintext storage mode: the password already lives at 0600 in
+        // config.toml, so hand the connect layer the config channel (no temp
+        // file). Emit the HOST's ULID in both Auth shapes — run_config resolves
+        // the host by id first, then follows Auth::Ref to the credential. The
+        // credential's ULID would make find_host_by_id miss for Ref-auth hosts.
+        PasswordSource::Config {
+            host_id: host.id.to_string(),
+        }
     } else {
-        // Plaintext or vault body: decrypt to inline plaintext (None if absent).
+        // Vault path (or no password): decrypt into memory; connect writes the
+        // 0600 temp file. Vault-mode elimination is out of scope.
         match decrypt_secret(password_secret.as_ref(), vault, name_label)? {
             Some(p) => PasswordSource::Inline(p),
             None => PasswordSource::None,
@@ -1264,6 +1277,141 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, SshrackError::DecryptionFailed { name } if name == "web1"));
+    }
+
+    #[test]
+    fn resolve_plaintext_mode_emits_config_variant_not_inline() {
+        // Plaintext storage mode: the password already lives at 0600 in the
+        // config, so resolve must hand the connect layer the config channel
+        // (`Config { host_id }`) instead of an inline plaintext (which would
+        // write a temp file). host_id is the HOST's ULID in both Auth shapes —
+        // run_config resolves the host first, then the credential if needed.
+        use crate::config::schema::SecretStore;
+        let host_id = Ulid::new();
+        let h = Host {
+            id: host_id,
+            name: "h".into(),
+            host: "x".into(),
+            port: 22,
+            auth: Auth::inline(CredentialBody::new("root").with_password("secret")),
+        };
+        let cfg = SshrackConfig {
+            store: Some(SecretStore::Plaintext),
+            ..Default::default()
+        };
+        let r = resolve(&h, &cfg, None).unwrap();
+        match r.password {
+            PasswordSource::Config { host_id: emitted } => {
+                assert_eq!(
+                    emitted,
+                    host_id.to_string(),
+                    "must emit the host's ULID, got {emitted}"
+                );
+            }
+            other => panic!("plaintext mode must use the config channel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_plaintext_mode_emits_config_for_ref_auth_host_id() {
+        // A Ref-auth host in plaintext mode must still emit the HOST's ULID
+        // (not the credential's). run_config resolves the host by id, then
+        // follows Auth::Ref to the credential internally.
+        use crate::config::schema::SecretStore;
+        let cid = Ulid::new();
+        let host_id = Ulid::new();
+        let h = Host {
+            id: host_id,
+            name: "h".into(),
+            host: "x".into(),
+            port: 22,
+            auth: Auth::reference(cid),
+        };
+        let cfg = SshrackConfig {
+            credentials: vec![Credential {
+                id: cid,
+                name: "team-dev".into(),
+                body: CredentialBody::new("deploy").with_password("secret"),
+            }],
+            store: Some(SecretStore::Plaintext),
+            ..Default::default()
+        };
+        let r = resolve(&h, &cfg, None).unwrap();
+        match r.password {
+            PasswordSource::Config { host_id: emitted } => {
+                assert_eq!(
+                    emitted,
+                    host_id.to_string(),
+                    "Ref-auth host must emit the HOST id, not the credential id"
+                );
+                assert_ne!(emitted, cid.to_string());
+            }
+            other => panic!("plaintext mode must use the config channel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_vault_mode_still_emits_inline_for_decrypted_password() {
+        // Vault mode is unchanged by the plaintext-channel flip: the password
+        // is encrypted at rest and is decrypted into memory here, then delivered
+        // via the temp-file path. Vault elimination is explicitly out of scope.
+        use crate::config::schema::{CredentialBody, Secret, SecretStore, VaultMeta};
+        use crate::secret::vault::{VaultKey, crypto};
+        let key: VaultKey = crypto::derive_key(
+            "x",
+            &crate::secret::vault::fast_meta("AAAAAAAAAAAAAAAAAAAAAA=="),
+        )
+        .unwrap();
+        let enc = crypto::encrypt(b"secret", &key).unwrap();
+        let h = inline_host(CredentialBody {
+            user: "root".into(),
+            password: Some(Secret::Encrypted(enc)),
+            key: None,
+            keyring: false,
+        });
+        let cfg = SshrackConfig {
+            store: Some(SecretStore::Vault {
+                meta: VaultMeta::default_argon2id("AAAAAAAAAAAAAAAAAAAAAA=="),
+            }),
+            ..Default::default()
+        };
+        let r = resolve(&h, &cfg, Some(&key)).unwrap();
+        match &r.password {
+            PasswordSource::Inline(p) => assert_eq!(p.as_str(), "secret"),
+            other => panic!("vault mode must still emit Inline, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_keyring_body_emits_keyring_regardless_of_store_mode() {
+        // A keyring-marker body wins over the plaintext-channel branch even
+        // when the config is in plaintext mode: the keyring path never writes
+        // a temp file and never touches the config channel.
+        use crate::config::schema::SecretStore;
+        let host_id = Ulid::new();
+        let h = Host {
+            id: host_id,
+            name: "h".into(),
+            host: "x".into(),
+            port: 22,
+            auth: Auth::inline(CredentialBody {
+                user: "root".into(),
+                password: None,
+                key: None,
+                keyring: true,
+            }),
+        };
+        let cfg = SshrackConfig {
+            store: Some(SecretStore::Plaintext),
+            ..Default::default()
+        };
+        let r = resolve(&h, &cfg, None).unwrap();
+        match r.password {
+            PasswordSource::Keyring { key } => assert_eq!(key, format!("host:{host_id}")),
+            other => {
+                panic!("keyring body must emit Keyring regardless of store mode, got {other:?}")
+            }
+        }
     }
 
     /// Regression for the core ref-by-id guarantee: a host references a
