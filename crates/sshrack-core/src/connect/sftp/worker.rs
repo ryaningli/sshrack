@@ -50,7 +50,7 @@ use crate::connect::sftp::{
     progress_snapshot, put_batch, pwd_batch, sftp_batch_argv, sftp_target, shell_quote,
 };
 use crate::connect::ssh::Overrides;
-use crate::connect::{askpass_env_for, write_password_file};
+use crate::connect::{askpass_env_for_sftp, write_password_file};
 use crate::credential::{PasswordSource, ResolvedAuth};
 use crate::dirsource::DirSource;
 
@@ -87,13 +87,16 @@ impl SftpWorker {
     /// Open the master and start the worker thread.
     ///
     /// 1. Allocate a [`ControlSocket`].
-    /// 2. Build askpass env via the shared [`askpass_env_for`] /
+    /// 2. Build askpass env via the shared [`askpass_env_for_sftp`] /
     ///    [`write_password_file`] helpers (DRY: the worker never reinvents
-    ///    password materialization).
+    ///    password materialization). The SFTP variant forces
+    ///    `SSH_ASKPASS_REQUIRE=force` and denies `/dev/tty` for `None`.
     /// 3. Spawn the master `ssh -N` (NOT `status()` — the master must stay
-    ///    alive). Keep the `Child`.
-    /// 4. Poll `ssh -O check` until "Master running" / exit 0 or
-    ///    [`HANDSHAKE_TIMEOUT`] (30s).
+    ///    alive). Keep the `Child`. stderr is piped + drained on a side thread
+    ///    so an auth failure's reason is captured instead of corrupting the
+    ///    TUI's tty.
+    /// 4. Poll `ssh -O check` until "Master running" / exit 0, the master
+    ///    exits, or [`HANDSHAKE_TIMEOUT`] (30s).
     /// 5. Probe the remote home via an `sftp pwd` batch (fall back to `/`).
     /// 6. Spawn the worker thread; return `(worker, home)`.
     ///
@@ -117,17 +120,24 @@ impl SftpWorker {
             PasswordSource::Inline(pw) => Some(write_password_file(pw).map_err(|e| e.to_string())?),
             _ => None,
         };
-        let env = askpass_env_for(self_exe, &source, pw_file.as_deref(), config_path);
+        let env = askpass_env_for_sftp(self_exe, &source, pw_file.as_deref(), config_path);
+
+        // Captured master stderr: drained on a side thread so (a) the pipe
+        // never fills and blocks the handshake, and (b) an auth failure's real
+        // reason is captured instead of being written to the TUI's tty.
+        let stderr_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
 
         // (3) Spawn the master `ssh -N`. stdin null (ssh -N never reads it),
-        // stdout null (ssh -N never writes it), stderr inherited so the user
-        // sees auth errors during the handshake window.
+        // stdout null (ssh -N never writes it), stderr piped + drained on a
+        // side thread so an auth failure's reason is captured instead of
+        // corrupting the TUI's tty.
         let master_argv = master_argv(&resolved, &host, &overrides, &sock_path);
         let mut master_cmd = Command::new(&master_argv[0]);
         master_cmd
             .args(&master_argv[1..])
             .stdin(Stdio::null())
-            .stdout(Stdio::null());
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
         for (k, v) in &env {
             master_cmd.env(k, v);
         }
@@ -135,19 +145,54 @@ impl SftpWorker {
             .spawn()
             .map_err(|e| format!("sftp master spawn failed: {e}"))?;
 
-        // (4) Poll `ssh -O check` until ready or the handshake deadline.
-        if !wait_for_master(&target, &sock_path, Instant::now() + HANDSHAKE_TIMEOUT) {
-            let _ = master_child.kill();
-            let _ = master_child.wait();
-            // Best-effort: tell the master to exit politely too (it may have
-            // come up between the last poll and now).
-            let exit_argv = control_exit_argv(&target, &sock_path);
-            let _ = Command::new(&exit_argv[0]).args(&exit_argv[1..]).status();
-            drop(sock); // removes the socket file (if any)
-            if let Some(p) = pw_file {
-                let _ = std::fs::remove_file(p);
+        // Drain master stderr into the buffer (see run_transfer for the shape).
+        {
+            let buf = Arc::clone(&stderr_buf);
+            if let Some(mut stderr) = master_child.stderr.take() {
+                let _ = thread::spawn(move || {
+                    use std::io::Read;
+                    let _ = stderr.read_to_end(&mut buf.lock().expect("invariant: stderr lock"));
+                });
             }
-            return Err("sftp master handshake timed out".to_string());
+        }
+
+        // (4) Poll `ssh -O check` until ready, the master exits, or the deadline.
+        match wait_for_master(
+            &target,
+            &sock_path,
+            Instant::now() + HANDSHAKE_TIMEOUT,
+            &mut master_child,
+            &stderr_buf,
+        ) {
+            HandshakeOutcome::Ready => {}
+            outcome => {
+                // Teardown on handshake failure: kill + reap the master, ask it
+                // to exit politely, drop the socket, remove the pw file.
+                let _ = master_child.kill();
+                let _ = master_child.wait();
+                let exit_argv = control_exit_argv(&target, &sock_path);
+                let _ = Command::new(&exit_argv[0])
+                    .args(&exit_argv[1..])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                drop(sock);
+                if let Some(p) = pw_file {
+                    let _ = std::fs::remove_file(p);
+                }
+                let reason = match outcome {
+                    HandshakeOutcome::Exited(s) if !s.trim().is_empty() => {
+                        format!("sftp master failed: {s}")
+                    }
+                    HandshakeOutcome::Exited(_) => {
+                        "sftp master failed (authentication rejected)".to_string()
+                    }
+                    HandshakeOutcome::Timeout => "sftp master handshake timed out".to_string(),
+                    HandshakeOutcome::Ready => unreachable!("handled above"),
+                };
+                return Err(reason);
+            }
         }
 
         // (5) Probe the remote home via `sftp pwd`. Falls back to `/` on any
@@ -535,25 +580,68 @@ fn poll_dst_size(
     }
 }
 
+/// Outcome of polling the master handshake. [`wait_for_master`] returns this;
+/// [`SftpWorker::open`] maps `Exited`/`Timeout` to a `Err` carrying the reason.
+enum HandshakeOutcome {
+    /// `ssh -O check` succeeded — the master is up.
+    Ready,
+    /// The master exited before coming up (auth failure, refused key, etc.).
+    /// Carries the drained stderr so the user sees the real reason.
+    Exited(String),
+    /// The master neither came up nor exited before the deadline.
+    Timeout,
+}
+
+/// Pure decision over one handshake poll's signals, factored out so the logic
+/// (check wins; master-exit beats timeout; else keep polling) is unit-testable
+/// without a real sshd. `stderr` is attached only to [`HandshakeOutcome::Exited`].
+fn classify_poll(
+    check_ok: bool,
+    master_exited: bool,
+    timed_out: bool,
+    stderr: String,
+) -> Option<HandshakeOutcome> {
+    if check_ok {
+        return Some(HandshakeOutcome::Ready);
+    }
+    if master_exited {
+        return Some(HandshakeOutcome::Exited(stderr));
+    }
+    if timed_out {
+        return Some(HandshakeOutcome::Timeout);
+    }
+    None
+}
+
 /// Poll `ssh -O check <target>` until it exits 0 (master up) or the deadline.
 /// Pure-I/O wrapper: the readiness check is itself a process spawn (no stdout
 /// parsing — readiness is exit-0 only), so this is not unit-tested.
-fn wait_for_master(target: &str, sock: &Path, deadline: Instant) -> bool {
+fn wait_for_master(
+    target: &str,
+    sock: &Path,
+    deadline: Instant,
+    master: &mut Child,
+    stderr_buf: &Arc<Mutex<Vec<u8>>>,
+) -> HandshakeOutcome {
     loop {
         let argv = control_check_argv(target, sock);
-        let res = Command::new(&argv[0])
+        let check_ok = Command::new(&argv[0])
             .args(&argv[1..])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output();
-        if let Ok(out) = &res
-            && out.status.success()
-        {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        // A master that exited (auth refused, wrong password, bad key) must not
+        // be masked by a 30s wait: detect it each poll and fail at once.
+        let master_exited = master.try_wait().ok().flatten().is_some();
+        let timed_out = Instant::now() >= deadline;
+        let stderr =
+            String::from_utf8_lossy(&stderr_buf.lock().expect("invariant: stderr lock").clone())
+                .into_owned();
+        if let Some(outcome) = classify_poll(check_ok, master_exited, timed_out, stderr) {
+            return outcome;
         }
         thread::sleep(HANDSHAKE_POLL);
     }
@@ -578,6 +666,40 @@ mod tests {
         // make polling 10x more or less aggressive.
         assert_eq!(HANDSHAKE_POLL, Duration::from_millis(250));
         assert_eq!(PROGRESS_POLL, Duration::from_millis(200));
+    }
+
+    // ---- classify_poll: pure handshake decision ----
+
+    #[test]
+    fn classify_poll_ready_wins() {
+        // A successful ssh -O check means the master is up — ready, even if the
+        // master also happened to exit (race) or the deadline passed.
+        let out = classify_poll(true, false, true, String::new());
+        assert!(matches!(out, Some(HandshakeOutcome::Ready)));
+    }
+
+    #[test]
+    fn classify_poll_master_exit_beats_timeout() {
+        // Master exited (auth failure) before the deadline: report Exited with
+        // the captured stderr, not Timeout.
+        let out = classify_poll(false, true, true, "Permission denied".into());
+        assert!(matches!(
+            out,
+            Some(HandshakeOutcome::Exited(s)) if s == "Permission denied"
+        ));
+    }
+
+    #[test]
+    fn classify_poll_timeout_when_only_deadline() {
+        let out = classify_poll(false, false, true, String::new());
+        assert!(matches!(out, Some(HandshakeOutcome::Timeout)));
+    }
+
+    #[test]
+    fn classify_poll_none_keeps_polling() {
+        // No signal yet: return None so the caller polls again.
+        let out = classify_poll(false, false, false, String::new());
+        assert!(out.is_none());
     }
 
     // ---- remove_partial_dst ----
