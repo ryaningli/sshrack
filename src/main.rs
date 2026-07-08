@@ -36,6 +36,12 @@ fn main() {
 /// scp, ls, show, rm, cp, store — runs the non-interactive CLI. `--help`/
 /// `--version` and usage errors are still owned by clap.
 fn run_main() -> i32 {
+    // Best-effort: clear sshrack temp files a prior crashed run left behind
+    // (Ctrl-C / SIGKILL skip the connect path's Drop cleanup). Runs only on a
+    // real launch, never in the askpass-helper fork — that early-returns above
+    // in `main()` before this function is reached.
+    sshrack_core::sweep::sweep_default();
+
     let cli = match cli::Cli::try_parse() {
         Ok(c) => c,
         Err(e) => {

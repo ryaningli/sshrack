@@ -21,3 +21,4 @@ pub mod keydetect;
 pub mod pathutil;
 pub mod secret;
 pub mod suggest;
+pub mod sweep;
