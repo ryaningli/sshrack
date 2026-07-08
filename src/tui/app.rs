@@ -491,10 +491,15 @@ impl App {
         self.status = Status::info(message);
     }
 
-    /// Set an error status (red). Used when an action fails (connect failed,
-    /// switch failed, delete failed).
-    pub fn set_status_error(&mut self, message: String) {
-        self.status = Status::error(message);
+    /// Report an action failure via the status bar: the error's own `Display`
+    /// (self-describing — every `SshrackError` variant renders a full sentence)
+    /// is shown verbatim as a red one-liner. No `"<action> failed: "` prefix is
+    /// added: it would duplicate the error's own wording (e.g. `SftpOpenFailed`
+    /// already renders `"sftp open failed: …"`) and the action the user just
+    /// took supplies the context. This is the single call site for failure
+    /// wording — connect, SFTP-open, and delete all route through it.
+    pub fn report_failure(&mut self, e: &sshrack_core::error::SshrackError) {
+        self.status = Status::error(e.to_string());
     }
 
     /// The consolidated status, for the footer to render. Exposed for tests
@@ -1194,6 +1199,7 @@ mod tests {
     };
     use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
     use sshrack_core::config::schema::{Auth, CredentialBody, Host, SshrackConfig};
+    use sshrack_core::error::SshrackError;
     use std::collections::HashMap;
     use ulid::Ulid;
 
@@ -2123,18 +2129,40 @@ mod tests {
     }
 
     #[test]
-    fn set_status_and_set_status_error_round_trip() {
+    fn set_status_info_then_report_failure_error_round_trip() {
         let mut app = app_with_host("web");
         assert!(app.status().message.is_none());
         app.set_status("host saved".to_string());
         assert_eq!(app.status().message.as_deref(), Some("host saved"));
         assert!(!app.status().is_error);
-        app.set_status_error("connect failed: timeout".to_string());
+        // report_failure replaces the removed set_status_error: an action
+        // failure overwrites the info status with a red line built from the
+        // error's own Display.
+        app.report_failure(&SshrackError::HostKeyScanFailed { host: "x".into() });
+        assert!(app.status().is_error);
         assert_eq!(
             app.status().message.as_deref(),
-            Some("connect failed: timeout")
+            Some("ssh-keyscan failed for 'x' (is the host reachable on that port?)"),
         );
-        assert!(app.status().is_error);
+    }
+
+    #[test]
+    fn report_failure_shows_error_display_with_no_prefix() {
+        // report_failure writes the error's own Display as a red status, with
+        // NO "<action> failed:" prefix — the wording comes from the error type
+        // alone (single source of truth). HostKeyScanFailed already renders a
+        // full sentence, so the status is exactly that sentence.
+        let mut app = app_with_host("web");
+        let e = SshrackError::HostKeyScanFailed {
+            host: "x.example".into(),
+        };
+        app.report_failure(&e);
+        let status = app.status();
+        assert!(status.is_error);
+        assert_eq!(
+            status.message.as_deref(),
+            Some("ssh-keyscan failed for 'x.example' (is the host reachable on that port?)"),
+        );
     }
 
     // ---- Credentials panel routing (Task 7) ----

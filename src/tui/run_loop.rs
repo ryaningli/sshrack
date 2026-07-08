@@ -111,7 +111,7 @@ pub fn run_loop(
                         // return to the launcher with no status write.
                     }
                     Err(e) => {
-                        app.set_status_error(format!("sftp open failed: {e}"));
+                        app.report_failure(&e);
                     }
                 }
             }
@@ -172,9 +172,9 @@ pub fn run_loop(
                         Err(e) => {
                             // A real error (vault unlock fail, host-key reject,
                             // dangling credential, frecency save fail). Surface
-                            // it in the status line (red) and return to the
-                            // launcher so the user can read it.
-                            app.set_status_error(format!("connect failed: {e}"));
+                            // it as a red one-liner via the error's own wording
+                            // and return to the launcher so the user can read it.
+                            app.report_failure(&e);
                         }
                     }
                 }
@@ -312,7 +312,7 @@ pub fn run_loop(
                                 app.set_status(format!("removed '{name}'"));
                             }
                             Err(e) => {
-                                app.set_status_error(format!("delete failed: {e}"));
+                                app.report_failure(&e);
                             }
                         },
                         Ok(false) => {
@@ -326,7 +326,7 @@ pub fn run_loop(
                             app.overlay = None;
                         }
                         Err(e) => {
-                            app.set_status_error(format!("delete failed: {e}"));
+                            app.report_failure(&e);
                         }
                     }
                 }
@@ -349,7 +349,7 @@ pub fn run_loop(
                                 app.set_status(format!("removed '{name}'"));
                             }
                             Err(e) => {
-                                app.set_status_error(format!("delete failed: {e}"));
+                                app.report_failure(&e);
                             }
                         },
                         Ok(false) => {
@@ -363,7 +363,7 @@ pub fn run_loop(
                             app.overlay = None;
                         }
                         Err(e) => {
-                            app.set_status_error(format!("delete failed: {e}"));
+                            app.report_failure(&e);
                         }
                     }
                 }
