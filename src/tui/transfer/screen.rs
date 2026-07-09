@@ -536,6 +536,7 @@ impl TransferScreen {
             ("^Q", "queue"),
             ("Esc", "cancel"),
             ("^C", "close"),
+            ("F1", "help"),
         ];
         let mut spans: Vec<Span> = Vec::with_capacity(hints.len() * 3);
         for (i, (k, label)) in hints.iter().enumerate() {
