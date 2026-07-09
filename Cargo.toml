@@ -36,6 +36,7 @@ unicode-width = "0.2"
 # dep; Tasks 2/4 wire it into the cred/host wizards). Default features pull in
 # crossterm, matching our existing ratatui backend.
 ratatui-textarea = "0.9"
+signal-hook = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

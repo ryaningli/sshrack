@@ -242,6 +242,11 @@ mod tests {
 
     #[test]
     fn master_argv_exact_shape() {
+        // The fixture is key-only with no password, so `connect_opts` appends
+        // its key-only tail (`-o IdentitiesOnly=yes -o PasswordAuthentication=no`)
+        // after `-i <key>`. The SFTP master is non-interactive (no tty), so a
+        // bad key fails faster here too — harmless and aligned with the
+        // interactive `ssh` argv.
         let argv = master_argv(
             &resolved(),
             &host(),
@@ -267,6 +272,10 @@ mod tests {
                 "2222".to_string(),
                 "-i".to_string(),
                 "~/.ssh/id_ed25519".to_string(),
+                "-o".to_string(),
+                "IdentitiesOnly=yes".to_string(),
+                "-o".to_string(),
+                "PasswordAuthentication=no".to_string(),
                 "192.168.1.10".to_string(),
             ]
         );

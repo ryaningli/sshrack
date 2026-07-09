@@ -4,6 +4,13 @@
 //! orphans (`sshrack-askpass-*.pw`, `sshrack-key-*.pem`, plus the matching
 //! `*-cert.pub`). Files newer than the staleness threshold are left alone so a
 //! concurrent live connection's freshly-written file is never deleted.
+//!
+//! The threshold is kept short (5 minutes): `ssh` reads the `-i` IdentityFile
+//! once, early, at connect time, so a `sshrack-key-*.pem` older than a few
+//! minutes is residue from a crashed prior run, not a live connection's file
+//! (a connection whose ssh still hasn't opened the key after that long has
+//! hung). This bounds the on-disk secret leak window from SIGKILL/crash to the
+//! next sshrack launch.
 
 use std::path::Path;
 use std::time::{Duration, SystemTime};
@@ -11,6 +18,22 @@ use std::time::{Duration, SystemTime};
 /// Patterns owned by sshrack that the connect path creates and is responsible
 /// for removing. Anything else in the temp dir is left untouched.
 const STALE_PREFIXES: &[&str] = &["sshrack-askpass-", "sshrack-key-"];
+
+/// SIGKILL/crash leak window: a temp file older than this at startup is
+/// reclaimed. `ssh` reads the `-i` IdentityFile once at connect time, so a
+/// file more than a few minutes old is residue from a crashed prior run, not a
+/// live connection's file (a live connection whose ssh hasn't opened the key
+/// after this long has hung). Kept small to bound the on-disk secret window.
+const STALE_THRESHOLD: Duration = Duration::from_secs(300);
+
+/// Exposed so the threshold can be pinned by a unit test (a future bump should
+/// be a conscious decision, since it bounds how long a leaked key sits on disk).
+/// Test-only: nothing in production reads this (production uses `STALE_THRESHOLD`
+/// directly via `sweep_default`), hence the `#[cfg(test)]` gate.
+#[cfg(test)]
+pub(crate) fn stale_threshold() -> Duration {
+    STALE_THRESHOLD
+}
 
 /// Remove sshrack temp files under `dir` whose mtime is older than `max_age`
 /// (relative to `now`). Returns the count removed. Best-effort: unreadable
@@ -55,16 +78,13 @@ fn is_sshrack_tempfile(path: &Path) -> bool {
     STALE_PREFIXES.iter().any(|pfx| name.starts_with(pfx))
 }
 
-/// Default startup sweep: the std temp dir, "now", and a 1-hour staleness
-/// threshold. A normal connection closes its temp files within seconds, so a
-/// file older than an hour is residue from a crashed prior run (or a zombie
+/// Default startup sweep: the std temp dir, "now", and the staleness threshold
+/// ([`STALE_THRESHOLD`]). A normal connection closes its temp files within
+/// seconds; `ssh` reads the `-i` IdentityFile once at connect, so a file older
+/// than the 5-minute threshold is residue from a crashed prior run (or a hung
 /// connection). Best-effort; all errors are swallowed.
 pub fn sweep_default() {
-    let _ = sweep_stale_tempfiles(
-        &std::env::temp_dir(),
-        SystemTime::now(),
-        Duration::from_secs(3600),
-    );
+    let _ = sweep_stale_tempfiles(&std::env::temp_dir(), SystemTime::now(), STALE_THRESHOLD);
 }
 
 #[cfg(test)]
@@ -128,5 +148,16 @@ mod tests {
             Duration::from_secs(3600),
         );
         assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn sweep_default_threshold_is_short() {
+        // The SIGKILL/crash leak window = the sweep threshold. ssh reads the -i
+        // IdentityFile once at connect, so files older than a few minutes are safe
+        // to reclaim. Pin the constant so a future bump is a conscious decision.
+        assert!(
+            super::stale_threshold() <= std::time::Duration::from_secs(600),
+            "sweep threshold must stay <= 10 min to bound the on-disk secret window"
+        );
     }
 }
