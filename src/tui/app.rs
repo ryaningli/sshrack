@@ -20,7 +20,7 @@ use ulid::Ulid;
 use super::CredentialNames;
 use super::cred_panel::CredPanel;
 use super::dialog::draw_dialog;
-use super::help::draw_help_dialog;
+use super::help::{HelpContext, draw_help_dialog, help_lines};
 use super::intent::{Outcome, Overlay, Status};
 use super::launcher::Launcher;
 use super::settings::SettingsPanel;
@@ -214,6 +214,37 @@ impl App {
     #[cfg(test)]
     pub fn active_tab(&self) -> Tab {
         self.active_tab
+    }
+
+    /// Snapshot which surface the user is on, so `F1` can show the right
+    /// keybinding set. Read once when Help opens and carried inside the Help
+    /// overlay state so scrolling does not re-read live state. Order matters:
+    /// the queue overlay is a child of the transfer screen, and the file picker
+    /// is a child of a wizard form.
+    pub(super) fn current_help_context(&self) -> HelpContext {
+        if let Some(screen) = self.transfer.as_ref() {
+            if screen.queue_overlay.is_some() {
+                return HelpContext::QueueManager;
+            }
+            return HelpContext::Sftp;
+        }
+        if let Some(ov) = &self.overlay {
+            return match ov {
+                Overlay::HostWizard(f) if f.file_picker.is_some() => HelpContext::FilePicker,
+                Overlay::CredWizard(f) if f.file_picker.is_some() => HelpContext::FilePicker,
+                Overlay::HostWizard(_) | Overlay::CredWizard(_) => HelpContext::WizardForm,
+                Overlay::StorePicker => HelpContext::StorePicker,
+                // Task 1 only: Help still lives in the Overlay enum, so when it
+                // is the active overlay the surface underneath (the launcher)
+                // is what we document. Task 2 removes this variant entirely.
+                Overlay::Help => HelpContext::Launcher {
+                    tab: self.active_tab,
+                },
+            };
+        }
+        HelpContext::Launcher {
+            tab: self.active_tab,
+        }
     }
 
     /// The current overlay, if any. Test accessor for assertions on overlay
@@ -664,7 +695,7 @@ impl App {
             // return across all screen sizes (it's lines − body, maximized when
             // the body is smallest), so the offset can reach the tail on a
             // short screen. The renderer re-clamps per render to the real body.
-            let m = crate::tui::help::help_lines().len() as u16;
+            let m = help_lines(&self.current_help_context()).len() as u16;
             match key.code {
                 KeyCode::Down | KeyCode::Char('j') => {
                     self.help_scroll = self.help_scroll.saturating_add(1).min(m);
@@ -1141,7 +1172,9 @@ impl App {
     /// are not rendered here — the loop drives them via `confirm_popup`.
     fn draw_overlay(&self, frame: &mut Frame, ov: &Overlay) {
         match ov {
-            Overlay::Help => draw_help_dialog(frame, self.help_scroll),
+            Overlay::Help => {
+                draw_help_dialog(frame, &self.current_help_context(), self.help_scroll)
+            }
             Overlay::HostWizard(form) => {
                 let body = draw_dialog(
                     frame,
@@ -1993,7 +2026,7 @@ mod tests {
         // sizes — NOT the old max_scroll(MAX_H − 3) = 10, so the Help tail
         // stays reachable on a short terminal. PgDn steps 5 each time and
         // clamps at that cap.
-        let max = crate::tui::help::help_lines().len() as u16;
+        let max = help_lines(&HelpContext::Launcher { tab: Tab::Hosts }).len() as u16;
         let mut app = app_with_host("web");
         app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
         // PgDn from 0 → 5.
@@ -2033,7 +2066,7 @@ mod tests {
         // Single-step Down clamps to the same cap as PageDown. Pin the shared
         // ceiling (help_lines().len(), NOT the old 10) so the two paths never
         // disagree.
-        let max = crate::tui::help::help_lines().len() as u16;
+        let max = help_lines(&HelpContext::Launcher { tab: Tab::Hosts }).len() as u16;
         let mut app = app_with_host("web");
         app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
         for _ in 0..40 {
