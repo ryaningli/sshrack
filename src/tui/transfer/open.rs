@@ -101,18 +101,11 @@ pub fn open_transfer(
     // (dropped when the screen closes alongside the worker). ──────────────────
     let key_artifact: Option<KeyArtifact> = connect::materialize_inline_key(&mut resolved_auth)?;
 
-    // ── Fail-fast: a host with no password AND no key cannot authenticate
-    // without TTY interaction. The SFTP master must never read /dev/tty, so
-    // reject now with a precise message instead of spawning a master that
-    // fails via the deny path with a vaguer error. ─────────────────────────────
-    if host_unconfigured(&resolved_auth) {
-        return Err(SshrackError::SftpOpenFailed {
-            detail: format!(
-                "host '{}' has no password and no identity key configured",
-                resolved_host.name
-            ),
-        });
-    }
+    // No up-front rejection for password-less, key-less hosts: system ssh
+    // falls back to ~/.ssh/id_* and ssh-agent just like the SSH connect path
+    // (see `connect_opts`: "ssh-agent handles the rest"). A host that truly
+    // has no credential fails inside the master and is reported by the
+    // tty-safe deny path — mirroring SSH, not pre-empting it.
 
     // ── Step 5: Host-key pre-flight via the TUI confirm closure. ─────────────
     // A cancel inside the popup (Ctrl-C/Esc) flips the shared flag; we re-
@@ -182,16 +175,6 @@ pub fn open_transfer(
     Ok(())
 }
 
-/// True when the resolved identity has neither a password nor an identity key:
-/// such a host cannot authenticate without TTY interaction, and the SFTP master
-/// must never read `/dev/tty`, so `open_transfer` rejects it before spawn with a
-/// precise message. A key-only host returns `false` (it may still auth via the
-/// key; an encrypted key with no passphrase source is caught by the deny path).
-fn host_unconfigured(resolved: &sshrack_core::credential::ResolvedAuth) -> bool {
-    use sshrack_core::credential::PasswordSource;
-    matches!(resolved.password, PasswordSource::None) && resolved.key_path.is_none()
-}
-
 /// Build the remote pane's title: prefer the host's friendly `name`; fall back
 /// to `<user>@<host>` when there is no real name. A saved host carries a name
 /// distinct from its address; an ad-hoc host (built by `host::resolve_target`'s
@@ -255,50 +238,6 @@ mod tests {
             remote_title("192.168.20.18", "yushi", "192.168.20.18"),
             "yushi@192.168.20.18"
         );
-    }
-
-    // ---- host_unconfigured: pure fail-fast predicate ----
-
-    #[test]
-    fn host_unconfigured_true_for_no_password_no_key() {
-        // A user-only host (no password, no key) cannot authenticate without TTY
-        // interaction — the SFTP master must reject it up front.
-        use sshrack_core::credential::{PasswordSource, ResolvedAuth};
-        let r = ResolvedAuth {
-            user: "u".into(),
-            key_path: None,
-            password: PasswordSource::None,
-            inline_key: None,
-        };
-        assert!(host_unconfigured(&r));
-    }
-
-    #[test]
-    fn host_unconfigured_false_when_key_present() {
-        // A key-only host (encrypted or not) is NOT unconfigured: it may still
-        // auth via the key. If the key is encrypted and no passphrase source
-        // exists, the deny path (Task 2) handles it — not this predicate.
-        use sshrack_core::credential::{PasswordSource, ResolvedAuth};
-        let r = ResolvedAuth {
-            user: "u".into(),
-            key_path: Some("/k/id".into()),
-            password: PasswordSource::None,
-            inline_key: None,
-        };
-        assert!(!host_unconfigured(&r));
-    }
-
-    #[test]
-    fn host_unconfigured_false_when_password_present() {
-        use sshrack_core::credential::{PasswordSource, ResolvedAuth};
-        use zeroize::Zeroizing;
-        let r = ResolvedAuth {
-            user: "u".into(),
-            key_path: None,
-            password: PasswordSource::Inline(Zeroizing::new("p".into())),
-            inline_key: None,
-        };
-        assert!(!host_unconfigured(&r));
     }
 
     #[test]
