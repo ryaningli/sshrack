@@ -22,3 +22,4 @@ pub mod pathutil;
 pub mod secret;
 pub mod suggest;
 pub mod sweep;
+pub mod tempfile_registry;

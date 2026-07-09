@@ -4,6 +4,7 @@ use sshrack_core::askpass;
 
 mod cli;
 mod shared;
+mod signal_cleanup;
 mod tui;
 
 use cli::args::{Command, CredAction, HostAction};
@@ -25,6 +26,12 @@ fn main() {
             }
         }
     }
+
+    // Install before any connection can run: a Ctrl-C / SIGTERM mid-connection
+    // must wipe live temp files (Drop is skipped on signal-kill). No-op outside
+    // a connection. Not installed for the askpass helper fork (above early
+    // return) — it owns no temp files.
+    signal_cleanup::install();
 
     let code = run_main();
     std::process::exit(code);

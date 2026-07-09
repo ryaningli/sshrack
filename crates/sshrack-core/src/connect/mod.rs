@@ -157,6 +157,9 @@ pub fn write_password_file(pw: &Zeroizing<String>) -> Result<PathBuf, SshrackErr
         let _ = std::fs::remove_file(&path);
         write_err(e)
     })?;
+    // Register so a signal-time cleanup can wipe it if the process is killed
+    // before `launch` removes it (`Drop` is skipped on signal-kill).
+    crate::tempfile_registry::register(path.clone());
     Ok(path)
 }
 
@@ -262,6 +265,13 @@ impl KeyArtifact {
             None
         };
 
+        // Register the temp files so a signal-time cleanup (`Drop` is skipped
+        // when the process is killed by SIGINT/SIGTERM) can still wipe them.
+        crate::tempfile_registry::register(private_path.clone());
+        if let Some(cp) = &cert_path {
+            crate::tempfile_registry::register(cp.clone());
+        }
+
         Ok(Self {
             private: private_path,
             cert: cert_path,
@@ -277,6 +287,13 @@ impl KeyArtifact {
 
 impl Drop for KeyArtifact {
     fn drop(&mut self) {
+        // Unregister BEFORE removing so the registry and disk stay in sync: a
+        // racing `cleanup_all` cannot double-remove (unregister drops the path
+        // from the registry, then our own `remove_file` is the only deleter).
+        crate::tempfile_registry::unregister(&self.private);
+        if let Some(c) = &self.cert {
+            crate::tempfile_registry::unregister(c);
+        }
         // Best-effort: a failed removal (e.g. tmp cleared mid-flight) is
         // swallowed so Drop never panics. Both files are wiped so neither the
         // private key nor the certificate outlives the connection.
@@ -344,6 +361,9 @@ pub fn launch(
     let status = cmd.status().map_err(SshrackError::from)?;
 
     if let Some(p) = pw_file {
+        // Unregister before removing (see KeyArtifact::drop for the rationale:
+        // keeps the registry and disk in sync under a racing cleanup_all).
+        crate::tempfile_registry::unregister(&p);
         // Defense in depth: the askpass role already deleted it on read.
         let _ = std::fs::remove_file(p);
     }
