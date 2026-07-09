@@ -41,6 +41,16 @@ pub enum HelpContext {
     QueueManager,
 }
 
+/// The live Help overlay: which surface it documents + how far it has scrolled.
+/// An independent global layer on `App` (NOT inside the at-most-one `Overlay`
+/// enum), so opening Help never disturbs the screen/overlay underneath and
+/// `F1` is reachable from every surface.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HelpState {
+    pub(crate) context: HelpContext,
+    pub(crate) scroll: u16,
+}
+
 /// Bold section heading.
 fn section(heading: &'static str) -> Line<'static> {
     Line::from(vec![Span::styled(

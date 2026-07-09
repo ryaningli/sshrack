@@ -154,6 +154,10 @@ pub enum Outcome {
 /// (no dark scrim — terminals cannot do translucency; [`draw_dialog`] clears
 /// the dialog area instead). At most one overlay is open at a time.
 ///
+/// Help is NOT here: it is an independent global layer (`App::help`) so `F1`
+/// can overlay ANY surface (launcher, transfer, even this overlay) without
+/// disturbing it, and so `F1` is reachable from the transfer screen.
+///
 /// `Clone`: `on_key` `take()`s the overlay to route a key into it without a
 /// borrow conflict, then stashes it back unless the overlay signaled a
 /// terminal outcome (save / cancel). Carrying the wizard forms inside their
@@ -161,13 +165,11 @@ pub enum Outcome {
 /// `Option<HostForm>` field.
 //
 // `large_enum_variant`: the wizard variants carry full forms while
-// Help/StorePicker are near-ZSTs — the enum is box-free by intent
+// StorePicker is a near-ZST — the enum is box-free by intent
 // (a single live overlay, cloned only on OpenOverlay).
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub enum Overlay {
-    /// The Help keymap reference (F1). Static text — no carried state.
-    Help,
     /// Host add/edit wizard. The form lives inside the overlay so its state
     /// survives across keystrokes.
     HostWizard(HostForm),

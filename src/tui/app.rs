@@ -20,7 +20,7 @@ use ulid::Ulid;
 use super::CredentialNames;
 use super::cred_panel::CredPanel;
 use super::dialog::draw_dialog;
-use super::help::{HelpContext, draw_help_dialog, help_lines};
+use super::help::{HelpContext, HelpState, draw_help_dialog, help_lines};
 use super::intent::{Outcome, Overlay, Status};
 use super::launcher::Launcher;
 use super::settings::SettingsPanel;
@@ -32,8 +32,10 @@ use super::wizard::{CredForm, HostForm};
 
 /// TUI application state. The shell (brand + tab bar + footer) is always on
 /// screen; [`App::active_tab`] selects which panel fills the middle band, and
-/// [`App::overlay`] layers a dialog (help / host wizard / cred wizard / store
-/// picker / delete confirm) on top when set.
+/// [`App::overlay`] layers a dialog (host wizard / cred wizard / store picker)
+/// on top when set. The `F1` Help reference is an independent global layer
+/// ([`App::help`]) on top of everything, not an `Overlay`, so it can open over
+/// any surface without disturbing it.
 ///
 /// `App` owns the data (config, frecency, credential-name lookup) loaded once
 /// at startup from core, and the on-disk config path so the wizard save path
@@ -97,14 +99,12 @@ pub struct App {
     /// credential's name is captured here (not its id) because the core delete
     /// fn is name-keyed and the panel's cursor already resolved to a name.
     pub(super) pending_delete_cred: Option<String>,
-    /// Vertical scroll offset of the Help overlay, in lines. Reset to 0 each
-    /// time Help opens (so reopening lands at the top). Bumped by ↑↓/j/k/PgUp/
-    /// PgDn while Help is the active overlay, clamped to
-    /// [`help::help_lines().len()`][super::help::help_lines] — the largest value
-    /// [`help::max_scroll`][super::help::max_scroll] can return across all body
-    /// sizes — so the tail stays reachable on short terminals. The renderer
-    /// re-clamps the offset to the real body height each frame.
-    pub(super) help_scroll: u16,
+    /// The independent global Help overlay (`F1`), layered on top of whatever
+    /// surface is underneath (launcher, transfer, or another overlay). `None`
+    /// when Help is closed. Carrying the context here means scrolling does not
+    /// re-read live state; opening Help snapshots the surface via
+    /// [`current_help_context`](Self::current_help_context).
+    pub(super) help: Option<HelpState>,
     /// The full-screen dual-pane transfer view, when `sshrack sftp` is active.
     /// When `Some`, [`App::on_key`] routes every key to it via
     /// [`App::route_transfer`] and [`App::draw`] renders it full-screen instead
@@ -182,7 +182,7 @@ impl App {
             pending_connect: None,
             pending_delete: None,
             pending_delete_cred: None,
-            help_scroll: 0,
+            help: None,
             transfer: None,
             transfer_worker: None,
             transfer_key_artifact: None,
@@ -234,12 +234,6 @@ impl App {
                 Overlay::CredWizard(f) if f.file_picker.is_some() => HelpContext::FilePicker,
                 Overlay::HostWizard(_) | Overlay::CredWizard(_) => HelpContext::WizardForm,
                 Overlay::StorePicker => HelpContext::StorePicker,
-                // Task 1 only: Help still lives in the Overlay enum, so when it
-                // is the active overlay the surface underneath (the launcher)
-                // is what we document. Task 2 removes this variant entirely.
-                Overlay::Help => HelpContext::Launcher {
-                    tab: self.active_tab,
-                },
             };
         }
         HelpContext::Launcher {
@@ -603,40 +597,103 @@ impl App {
     /// I/O — no reads, no writes, no terminal access — so it is safe to call
     /// from a unit test without an event source.
     ///
-    /// Three layers, evaluated in order:
-    /// 1. **Global** — `F1` toggles the Help overlay (always reachable, even
-    ///    mid-wizard). `Ctrl-C` is global ONLY from the launcher: with an
-    ///    overlay open it falls through to Layer 2 so the active overlay can
-    ///    cancel/discard (matching each overlay's `Esc` and the KeyPaste
-    ///    popup's "Ctrl-C discard" hint) instead of quitting the whole app.
-    /// 2. **Overlay** — when an overlay is open it owns the key. Help dismisses
-    ///    on `F1`/`Esc`/`q`; a wizard's `on_key` returns `SaveHost`/`SaveCred`/
-    ///    `Cancel`/`Continue`; the store picker delegates to the stashed
-    ///    `StoreView::on_key` (Up/Down/Enter/Esc). Deletes are not overlays:
-    ///    `Ctrl-D` returns `Outcome::DeleteHost`/`DeleteCred`, which the loop
-    ///    drives through `confirm_popup` (no overlay is opened for them).
-    /// 3. **Panel/tab** — when no overlay is open: `tab_key_decision` switches
+    /// Layers, evaluated in order:
+    /// 0. **Global Help** — when `self.help` is `Some`, Help is modal: scroll
+    ///    keys (`↑↓`/`j`/`k`/`PgUp`/`PgDn`) bump `help.scroll`, dismiss keys
+    ///    (`F1`/`Esc`/`q`/`Ctrl-C`) close it, and every other key is swallowed
+    ///    (`Outcome::Continue`). When Help is closed, `F1` opens it (snapshotting
+    ///    the active surface via [`current_help_context`](Self::current_help_context)).
+    ///    This block sits ABOVE Layer 0 so the transfer screen can no longer
+    ///    swallow `F1` (the old SFTP dead key), and Help lives on `self.help`
+    ///    (not the at-most-one `Overlay` enum) so opening it never overwrites an
+    ///    open wizard.
+    /// 1. **Transfer** — when the transfer screen is open it owns every key
+    ///    (Tab flips focus, Esc cancels/closes, Ctrl-C closes).
+    /// 2. **Global launcher keys** — `Ctrl-C` quits ONLY from the launcher
+    ///    (with an overlay open it falls through so the overlay can
+    ///    cancel/discard); `Ctrl-T` opens the SFTP screen.
+    /// 3. **Overlay** — when an overlay is open it owns the key. A wizard's
+    ///    `on_key` returns `SaveHost`/`SaveCred`/`Cancel`/`Continue`; the store
+    ///    picker delegates to the stashed `StoreView::on_key`. Deletes are not
+    ///    overlays: `Ctrl-D` returns `Outcome::DeleteHost`/`DeleteCred`, which
+    ///    the loop drives through `confirm_popup`.
+    /// 4. **Panel/tab** — when no overlay is open: `tab_key_decision` switches
     ///    tabs (Tab / Shift-Tab), then `Ctrl-A/E/D` + `Enter` + `Esc`, then
     ///    the active panel consumes printable chars / arrows.
     pub fn on_key(&mut self, key: KeyEvent) -> Outcome {
         use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 
-        // Layer 0 — the transfer screen, when open, owns every key. The shell's
-        // global keys (Ctrl-C quit, F1 help, Tab cycle) do NOT fire from the
-        // transfer screen: its own on_key handles Tab (focus flip), Esc
-        // (cancel-or-close), and Ctrl-C (close). Take the screen out of self
-        // so we can borrow the rest of App mutably inside route_transfer, then
-        // stash it back unless the outcome is terminal (CloseTransfer).
+        // Global Help layer — independent of the screen/overlay stack. F1
+        // toggles it from EVERY surface (launcher, transfer, overlays); while
+        // open, Help is modal — scroll/dismiss keys are consumed here and all
+        // other keys are swallowed so the surface underneath is frozen. This
+        // block sits above Layer 0 (transfer) so the transfer screen can no
+        // longer swallow F1 (the old SFTP dead key), and Help is stored on
+        // `self.help` (not in the at-most-one Overlay enum) so opening it never
+        // disturbs what is underneath (the old wizard-overwrite hazard).
+        if let Some(h) = self.help.as_mut() {
+            if key.kind != KeyEventKind::Press {
+                return Outcome::Continue;
+            }
+            let ctrl_c = key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c');
+            match key.code {
+                KeyCode::F(1) | KeyCode::Esc | KeyCode::Char('q') if key.modifiers.is_empty() => {
+                    self.help = None;
+                    return Outcome::Continue;
+                }
+                KeyCode::Char('c') if ctrl_c => {
+                    self.help = None;
+                    return Outcome::Continue;
+                }
+                KeyCode::Down | KeyCode::Char('j') if key.modifiers.is_empty() => {
+                    let m = help_lines(&h.context).len() as u16;
+                    h.scroll = h.scroll.saturating_add(1).min(m);
+                    return Outcome::Continue;
+                }
+                KeyCode::Up | KeyCode::Char('k') if key.modifiers.is_empty() => {
+                    h.scroll = h.scroll.saturating_sub(1);
+                    return Outcome::Continue;
+                }
+                KeyCode::PageDown if key.modifiers.is_empty() => {
+                    let m = help_lines(&h.context).len() as u16;
+                    h.scroll = h.scroll.saturating_add(5).min(m);
+                    return Outcome::Continue;
+                }
+                KeyCode::PageUp if key.modifiers.is_empty() => {
+                    h.scroll = h.scroll.saturating_sub(5);
+                    return Outcome::Continue;
+                }
+                _ => return Outcome::Continue, // modal: swallow every other key
+            }
+        }
+        // F1 opens Help (none open yet) — from any surface. Snapshot the
+        // active surface so the right binding set shows.
+        if key.kind == KeyEventKind::Press && key.modifiers.is_empty() && key.code == KeyCode::F(1)
+        {
+            self.help = Some(HelpState {
+                context: self.current_help_context(),
+                scroll: 0,
+            });
+            return Outcome::Continue;
+        }
+
+        // Layer 0 — the transfer screen, when open, owns every key EXCEPT those
+        // already consumed by the global Help layer above. Its own on_key
+        // handles Tab (focus flip), Esc (cancel-or-close), and Ctrl-C (close).
+        // Take the screen out of self so we can borrow the rest of App mutably
+        // inside route_transfer, then stash it back unless the outcome is
+        // terminal (CloseTransfer).
         if let Some(screen) = self.transfer.take() {
             return self.route_transfer(key, screen);
         }
 
-        // Layer 1 — global keys. F1 is global with or without an overlay
-        // (always reachable). Ctrl-C quits ONLY from the launcher — with an
+        // Layer 1 — global keys. Ctrl-C quits ONLY from the launcher — with an
         // overlay open it falls through to Layer 2 so the overlay can
-        // cancel/discard rather than bringing down the app. Ctrl-C must be
-        // EXACTLY Control+c — `contains` would wrongly treat Ctrl-Shift-C
-        // (terminal paste) as quit.
+        // cancel/discard rather than bringing down the app. (F1 Help and its
+        // modal scroll/dismiss are handled by the global Help layer above Layer
+        // 0, so they are reachable from every surface including the transfer
+        // screen.) Ctrl-C must be EXACTLY Control+c — `contains` would wrongly
+        // treat Ctrl-Shift-C (terminal paste) as quit.
         if key.kind == KeyEventKind::Press
             && key.modifiers == KeyModifiers::CONTROL
             && key.code == KeyCode::Char('c')
@@ -665,57 +722,6 @@ impl App {
             // redundant noise.
             return Outcome::Continue;
         }
-        if key.kind == KeyEventKind::Press && key.modifiers.is_empty() && key.code == KeyCode::F(1)
-        {
-            // Toggle help: open if none, close if Help is already up.
-            if matches!(self.overlay, Some(Overlay::Help)) {
-                self.overlay = None;
-                return Outcome::CloseOverlay;
-            }
-            // Reopen at the top so a prior scroll position does not carry over
-            // across close/reopen cycles.
-            self.help_scroll = 0;
-            self.overlay = Some(Overlay::Help);
-            return Outcome::OpenOverlay(Overlay::Help);
-        }
-
-        // Layer 1.5 — when the Help overlay is up, scroll keys (↑↓/j/k/PgUp/
-        // PgDn) bump `help_scroll` and short-circuit BEFORE the generic overlay
-        // close path below. F1 already closed Help via the Layer 1 toggle above;
-        // Esc / q fall through to `route_overlay`'s Help arm so dismiss still
-        // works. Up/Down here MUST NOT navigate panel fields — Help owns them.
-        if key.kind == KeyEventKind::Press
-            && key.modifiers.is_empty()
-            && self
-                .overlay
-                .as_ref()
-                .is_some_and(|o| matches!(o, Overlay::Help))
-        {
-            // help_lines().len() is the largest value max_scroll(body) can
-            // return across all screen sizes (it's lines − body, maximized when
-            // the body is smallest), so the offset can reach the tail on a
-            // short screen. The renderer re-clamps per render to the real body.
-            let m = help_lines(&self.current_help_context()).len() as u16;
-            match key.code {
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.help_scroll = self.help_scroll.saturating_add(1).min(m);
-                    return Outcome::Continue;
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.help_scroll = self.help_scroll.saturating_sub(1);
-                    return Outcome::Continue;
-                }
-                KeyCode::PageDown => {
-                    self.help_scroll = self.help_scroll.saturating_add(5).min(m);
-                    return Outcome::Continue;
-                }
-                KeyCode::PageUp => {
-                    self.help_scroll = self.help_scroll.saturating_sub(5);
-                    return Outcome::Continue;
-                }
-                _ => {} // Esc / q / other keys fall through to the overlay path.
-            }
-        }
 
         // Layer 2 — an open overlay owns the key. take() it so we can borrow
         // `self` mutably inside route_overlay without a borrow conflict, then
@@ -736,25 +742,7 @@ impl App {
     /// by [`on_key`]; this stashes it back unless the outcome is terminal
     /// (`Cancel`/`CloseOverlay`), so the form state survives across keystrokes.
     fn route_overlay(&mut self, key: KeyEvent, ov: Overlay) -> Outcome {
-        use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
         match ov {
-            Overlay::Help => {
-                // Esc / F1 / q close Help; so does Ctrl-C (Plan B: Ctrl-C
-                // cancels the active overlay rather than quitting — the
-                // launcher's Ctrl-C = quit is gated on `overlay.is_none()`
-                // in Layer 1, so it reaches here with Help open).
-                let ctrl_c = key.kind == KeyEventKind::Press
-                    && key.modifiers == KeyModifiers::CONTROL
-                    && key.code == KeyCode::Char('c');
-                if key.kind == KeyEventKind::Press
-                    && (matches!(key.code, KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('q'))
-                        || ctrl_c)
-                {
-                    return Outcome::CloseOverlay;
-                }
-                self.overlay = Some(Overlay::Help);
-                Outcome::Continue
-            }
             Overlay::HostWizard(mut form) => {
                 let out = form.on_key(key);
                 // SaveHost/Continue need the form stashed back so the loop can
@@ -1063,6 +1051,14 @@ impl App {
         }
     }
 
+    /// The launcher query string. Test accessor for asserting the modal Help
+    /// layer swallows unknown keys (the query must not change while Help is
+    /// open). The production loop reads `self.launcher.query` directly.
+    #[cfg(test)]
+    pub(super) fn launcher_query(&self) -> &str {
+        &self.launcher.query
+    }
+
     /// The active panel's query string (for Esc-clears-query). Hosts → the
     /// launcher query; Credentials → the cred panel query; Settings has an
     /// empty "query".
@@ -1098,44 +1094,46 @@ impl App {
     /// Render current state to the frame. Only writes to the frame (no stdout
     /// access of its own). When the transfer screen is open it owns the whole
     /// frame; otherwise the three-band shell is drawn, the active panel into
-    /// the middle band, and the overlay (if any) on top.
+    /// the middle band, and the overlay (if any) on top. The Help layer (`F1`)
+    /// is independent of both and renders last, over everything underneath.
     pub fn draw(&self, frame: &mut Frame) {
-        // Layer 0: the transfer screen, when open, replaces the shell entirely.
-        // No brand/tab bar/footer — the screen has its own title and hotkey
-        // footer bands.
         if let Some(screen) = self.transfer.as_ref() {
             screen.draw(frame, frame.area());
-            return;
+        } else {
+            let area = frame.area();
+            let footer = self.footer_hints();
+            let panel_area = draw_shell(frame, area, self.active_tab, &footer);
+            match self.active_tab {
+                Tab::Hosts => self.launcher.draw_in_shell(
+                    frame,
+                    panel_area,
+                    &self.config.hosts,
+                    &self.frecency,
+                    &self.config.credentials,
+                    &self.status,
+                    self.overlay.is_none(),
+                ),
+                Tab::Credentials => self.cred_panel.draw_in_shell(
+                    frame,
+                    panel_area,
+                    &self.config.credentials,
+                    &self.status,
+                    self.overlay.is_none(),
+                ),
+                Tab::Settings => self.settings_panel.draw_in_shell(
+                    frame,
+                    panel_area,
+                    self.current_store_mode_label(),
+                    &self.status,
+                ),
+            }
+            if let Some(ov) = &self.overlay {
+                self.draw_overlay(frame, ov);
+            }
         }
-        let area = frame.area();
-        let footer = self.footer_hints();
-        let panel_area = draw_shell(frame, area, self.active_tab, &footer);
-        match self.active_tab {
-            Tab::Hosts => self.launcher.draw_in_shell(
-                frame,
-                panel_area,
-                &self.config.hosts,
-                &self.frecency,
-                &self.config.credentials,
-                &self.status,
-                self.overlay.is_none(),
-            ),
-            Tab::Credentials => self.cred_panel.draw_in_shell(
-                frame,
-                panel_area,
-                &self.config.credentials,
-                &self.status,
-                self.overlay.is_none(),
-            ),
-            Tab::Settings => self.settings_panel.draw_in_shell(
-                frame,
-                panel_area,
-                self.current_store_mode_label(),
-                &self.status,
-            ),
-        }
-        if let Some(ov) = &self.overlay {
-            self.draw_overlay(frame, ov);
+        // Help is a global layer over EVERYTHING (launcher, transfer, overlays).
+        if let Some(h) = &self.help {
+            draw_help_dialog(frame, &h.context, h.scroll);
         }
     }
 
@@ -1166,15 +1164,13 @@ impl App {
     }
 
     /// Render the active overlay on top of the shell. Wizards draw their field
-    /// rows into the body rect [`draw_dialog`] hands them; Help is the static
-    /// keymap reference; StorePicker draws the three-mode list into the dialog
-    /// body via [`StoreView::draw_in_dialog`]. Deletes are not overlays and so
+    /// rows into the body rect [`draw_dialog`] hands them; StorePicker draws the
+    /// three-mode list into the dialog body via [`StoreView::draw_in_dialog`].
+    /// Help is NOT an overlay — it renders independently in [`App::draw`] so it
+    /// can layer over the transfer screen too. Deletes are not overlays and so
     /// are not rendered here — the loop drives them via `confirm_popup`.
     fn draw_overlay(&self, frame: &mut Frame, ov: &Overlay) {
         match ov {
-            Overlay::Help => {
-                draw_help_dialog(frame, &self.current_help_context(), self.help_scroll)
-            }
             Overlay::HostWizard(form) => {
                 let body = draw_dialog(
                     frame,
@@ -1307,17 +1303,17 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_in_help_overlay_closes_it_instead_of_quitting() {
+    fn ctrl_c_in_help_closes_it_instead_of_quitting() {
         let mut app = app_with_host("web");
-        // F1 opens the Help overlay.
+        // F1 opens the Help layer.
         let _ = app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
-        assert!(matches!(app.overlay, Some(Overlay::Help)));
+        assert!(app.help.is_some());
         let outcome = app.on_key(press(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(
-            matches!(outcome, Outcome::CloseOverlay),
-            "Ctrl-C in Help must close it (expected Outcome::CloseOverlay)"
+            matches!(outcome, Outcome::Continue),
+            "Ctrl-C in Help closes it (modal swallow returns Continue)"
         );
-        assert!(app.overlay.is_none(), "Ctrl-C must close Help");
+        assert!(app.help.is_none(), "Ctrl-C must close Help");
         assert!(!app.should_quit);
     }
 
@@ -1848,20 +1844,132 @@ mod tests {
     }
 
     // ===============================================================
-    // Task 20: help overlay (F1 only) + consolidated status.
+    // Global Help layer (F1): independent of the screen/overlay stack.
     // ===============================================================
 
     #[test]
-    fn f1_in_launcher_opens_help_overlay_then_esc_closes_it() {
+    fn f1_opens_help_with_launcher_context_on_hosts_tab() {
         let mut app = app_with_host("web");
-        // F1 opens the Help overlay; both the outcome and the stashed overlay agree.
+        assert!(app.help.is_none(), "Help starts closed");
+        app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
+        let help = app
+            .help
+            .as_ref()
+            .expect("F1 must open Help from the launcher");
+        assert_eq!(
+            help.context,
+            crate::tui::help::HelpContext::Launcher {
+                tab: crate::tui::tab::Tab::Hosts
+            }
+        );
+        assert_eq!(help.scroll, 0, "Help opens at the top");
+    }
+
+    #[test]
+    fn f1_toggles_help_closed_on_a_second_press() {
+        let mut app = app_with_host("web");
+        app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
+        assert!(app.help.is_some());
+        app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
+        assert!(app.help.is_none(), "a second F1 closes Help");
+    }
+
+    #[test]
+    fn f1_opens_help_from_the_transfer_screen_fixing_the_dead_key() {
+        // The transfer screen takes every key in Layer 0; before this task F1
+        // never reached the global handler, so it was a dead key during SFTP.
+        let mut app = app_with_host("web");
+        let screen = TransferScreen::new(PathBuf::from("/local"), PathBuf::from("/remote"));
+        app.transfer = Some(screen);
+        app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
+        let help = app
+            .help
+            .as_ref()
+            .expect("F1 must open Help from the transfer screen");
+        assert_eq!(
+            help.context,
+            crate::tui::help::HelpContext::Sftp,
+            "Help on the transfer screen must document SFTP bindings"
+        );
+        // The transfer screen must still be intact underneath.
+        assert!(
+            app.transfer.is_some(),
+            "opening Help must not close transfer"
+        );
+    }
+
+    #[test]
+    fn f1_does_not_disturb_an_open_wizard() {
+        // Before this task, F1 sat in the at-most-one Overlay enum, so pressing
+        // it with a wizard open OVERWROTE and dropped the form. Help is now an
+        // independent layer, so the wizard survives.
+        let mut app = app_with_host("web");
+        app.open_host_wizard_add();
+        assert!(app.overlay.is_some(), "fixture: wizard is open");
+        app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
+        assert!(app.help.is_some(), "F1 opens Help");
+        assert!(
+            app.overlay.is_some(),
+            "the wizard must still be open underneath Help"
+        );
+        assert_eq!(
+            app.help.as_ref().unwrap().context,
+            crate::tui::help::HelpContext::WizardForm,
+            "Help over a wizard must document the wizard form"
+        );
+    }
+
+    #[test]
+    fn help_is_modal_unknown_keys_are_swallowed() {
+        let mut app = app_with_host("web");
+        app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
+        // A random printable while Help is up must NOT reach the launcher query.
+        let before = app.launcher_query().to_string();
+        app.on_key(press(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(
+            app.launcher_query(),
+            before,
+            "Help is modal: 'x' is swallowed"
+        );
+        assert!(app.help.is_some(), "unknown key does not close Help");
+    }
+
+    #[test]
+    fn help_dismiss_keys_are_f1_esc_q_and_ctrl_c() {
+        let dismiss = |code: KeyCode, mods: KeyModifiers| {
+            let mut app = app_with_host("web");
+            app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
+            assert!(app.help.is_some());
+            app.on_key(press(code, mods));
+            assert!(app.help.is_none(), "{code:?} must close Help");
+        };
+        dismiss(KeyCode::F(1), KeyModifiers::NONE);
+        dismiss(KeyCode::Esc, KeyModifiers::NONE);
+        dismiss(KeyCode::Char('q'), KeyModifiers::NONE);
+        dismiss(KeyCode::Char('c'), KeyModifiers::CONTROL);
+    }
+
+    #[test]
+    fn help_scroll_keys_bump_help_state_scroll() {
+        let mut app = app_with_host("web");
+        app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
+        app.on_key(press(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.help.as_ref().unwrap().scroll, 1);
+        app.on_key(press(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.help.as_ref().unwrap().scroll, 0, "Up saturates at 0");
+    }
+
+    #[test]
+    fn f1_in_launcher_opens_help_layer_then_esc_closes_it() {
+        let mut app = app_with_host("web");
+        // F1 opens the Help layer (returns Continue, sets self.help).
         let outcome = app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
-        assert!(matches!(outcome, Outcome::OpenOverlay(Overlay::Help)));
-        assert!(matches!(app.overlay(), Some(Overlay::Help)));
-        // Esc closes it and clears the overlay.
+        assert!(matches!(outcome, Outcome::Continue));
+        assert!(app.help.is_some());
+        // Esc closes it.
         let after = app.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(matches!(after, Outcome::CloseOverlay));
-        assert!(app.overlay().is_none());
+        assert!(matches!(after, Outcome::Continue));
+        assert!(app.help.is_none());
     }
 
     #[test]
@@ -1891,11 +1999,9 @@ mod tests {
     }
 
     #[test]
-    fn f1_opens_help_from_inside_wizard_then_esc_closes_overlay() {
-        // Help is reachable mid-wizard (you should not have to back out to read
-        // a binding). In the new single-overlay model F1 REPLACES the
-        // HostWizard overlay with Help; Esc closes Help, leaving no overlay
-        // (back at the launcher, not the wizard — there is no overlay stacking).
+    fn f1_over_wizard_then_esc_closes_help_leaving_wizard_intact() {
+        // Help is reachable mid-wizard and is now an independent layer: F1 does
+        // NOT replace the wizard, and closing Help leaves the wizard open.
         let mut app = app_with_host("web");
         app.on_key(press(KeyCode::Char('a'), KeyModifiers::CONTROL)); // -> HostWizard overlay
         assert!(
@@ -1903,55 +2009,30 @@ mod tests {
             "host wizard overlay open"
         );
         let outcome = app.on_key(press(KeyCode::F(1), KeyModifiers::NONE)); // -> Help
-        assert!(matches!(outcome, Outcome::OpenOverlay(Overlay::Help)));
-        assert!(matches!(app.overlay(), Some(Overlay::Help)));
-        // Esc dismisses the Help overlay.
+        assert!(matches!(outcome, Outcome::Continue));
+        assert!(app.help.is_some(), "Help layer open");
+        assert!(
+            matches!(app.overlay(), Some(Overlay::HostWizard(_))),
+            "the wizard must survive underneath Help"
+        );
+        // Esc dismisses Help only — the wizard stays.
         let outcome = app.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(matches!(outcome, Outcome::CloseOverlay));
-        assert!(app.overlay().is_none(), "Esc closed the help overlay");
-    }
-
-    #[test]
-    fn help_dismiss_keys_are_f1_esc_and_q() {
-        for key in [
-            press(KeyCode::F(1), KeyModifiers::NONE),
-            press(KeyCode::Esc, KeyModifiers::NONE),
-            press(KeyCode::Char('q'), KeyModifiers::NONE),
-        ] {
-            let mut app = app_with_host("web");
-            app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
-            assert!(matches!(app.overlay(), Some(Overlay::Help)));
-            let outcome = app.on_key(key);
-            assert!(
-                matches!(outcome, Outcome::CloseOverlay),
-                "dismiss key must close the help overlay"
-            );
-            assert!(app.overlay().is_none(), "overlay cleared after dismiss");
-        }
+        assert!(matches!(outcome, Outcome::Continue));
+        assert!(app.help.is_none(), "Esc closed Help");
+        assert!(
+            matches!(app.overlay(), Some(Overlay::HostWizard(_))),
+            "wizard still open after Help closed"
+        );
     }
 
     #[test]
     fn f1_inside_help_dismisses_does_not_stack() {
-        // A second F1 toggles Help off rather than nesting a second overlay.
+        // A second F1 toggles Help off rather than nesting.
         let mut app = app_with_host("web");
         app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
-        assert!(matches!(app.overlay(), Some(Overlay::Help)));
-        let outcome = app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
-        assert!(matches!(outcome, Outcome::CloseOverlay));
-        assert!(app.overlay().is_none());
-    }
-
-    #[test]
-    fn help_other_keys_continue_without_dismissing() {
-        // Random keys inside the help overlay must NOT dismiss or change it.
-        let mut app = app_with_host("web");
+        assert!(app.help.is_some());
         app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
-        let outcome = app.on_key(press(KeyCode::Char('x'), KeyModifiers::NONE));
-        assert!(matches!(outcome, Outcome::Continue));
-        assert!(
-            matches!(app.overlay(), Some(Overlay::Help)),
-            "x must not dismiss help"
-        );
+        assert!(app.help.is_none());
     }
 
     #[test]
@@ -1961,34 +2042,43 @@ mod tests {
         let release =
             KeyEvent::new_with_kind(KeyCode::Esc, KeyModifiers::NONE, KeyEventKind::Release);
         app.on_key(release);
-        assert!(
-            matches!(app.overlay(), Some(Overlay::Help)),
-            "release must not dismiss help"
+        assert!(app.help.is_some(), "release must not dismiss help");
+    }
+
+    // ===============================================================
+    // Help scroll keys (↑↓/j/k/PgUp/PgDn) bump help.scroll.
+    // ===============================================================
+
+    #[test]
+    fn f1_opening_help_starts_scroll_at_zero() {
+        // A fresh open always lands at the top: the context is snapshotted and
+        // scroll is initialized to 0 in the new HelpState.
+        let mut app = app_with_host("web");
+        app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
+        assert_eq!(
+            app.help.as_ref().unwrap().scroll,
+            0,
+            "F1 must open Help at the top"
+        );
+        // Scroll down, close, reopen — scroll resets to 0.
+        app.on_key(press(KeyCode::Down, KeyModifiers::NONE));
+        app.on_key(press(KeyCode::F(1), KeyModifiers::NONE)); // close
+        app.on_key(press(KeyCode::F(1), KeyModifiers::NONE)); // reopen
+        assert_eq!(
+            app.help.as_ref().unwrap().scroll,
+            0,
+            "reopening Help must reset scroll to the top"
         );
     }
 
-    // ===============================================================
-    // Task 4: Help overlay scroll keys (↑↓/j/k/PgUp/PgDn).
-    // ===============================================================
-
     #[test]
-    fn f1_opening_help_resets_scroll_to_zero() {
-        // Reopening Help lands at the top even if a prior session scrolled down.
-        let mut app = app_with_host("web");
-        app.help_scroll = 7; // simulate leftover state from a prior open
-        let outcome = app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
-        assert!(matches!(outcome, Outcome::OpenOverlay(Overlay::Help)));
-        assert_eq!(app.help_scroll, 0, "F1 must reopen Help at the top");
-    }
-
-    #[test]
-    fn help_down_increments_scroll_and_keeps_overlay_open() {
+    fn help_down_increments_scroll_and_keeps_help_open() {
         let mut app = app_with_host("web");
         app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
         let outcome = app.on_key(press(KeyCode::Down, KeyModifiers::NONE));
         assert!(matches!(outcome, Outcome::Continue));
-        assert!(matches!(app.overlay(), Some(Overlay::Help)));
-        assert_eq!(app.help_scroll, 1);
+        assert!(app.help.is_some());
+        assert_eq!(app.help.as_ref().unwrap().scroll, 1);
     }
 
     #[test]
@@ -1997,7 +2087,7 @@ mod tests {
         app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
         let outcome = app.on_key(press(KeyCode::Char('j'), KeyModifiers::NONE));
         assert!(matches!(outcome, Outcome::Continue));
-        assert_eq!(app.help_scroll, 1);
+        assert_eq!(app.help.as_ref().unwrap().scroll, 1);
     }
 
     #[test]
@@ -2006,7 +2096,11 @@ mod tests {
         app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
         let outcome = app.on_key(press(KeyCode::Up, KeyModifiers::NONE));
         assert!(matches!(outcome, Outcome::Continue));
-        assert_eq!(app.help_scroll, 0, "Up at the top must saturate, not panic");
+        assert_eq!(
+            app.help.as_ref().unwrap().scroll,
+            0,
+            "Up at the top must saturate, not panic"
+        );
     }
 
     #[test]
@@ -2015,34 +2109,34 @@ mod tests {
         app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
         app.on_key(press(KeyCode::Char('j'), KeyModifiers::NONE));
         app.on_key(press(KeyCode::Char('j'), KeyModifiers::NONE));
-        assert_eq!(app.help_scroll, 2);
+        assert_eq!(app.help.as_ref().unwrap().scroll, 2);
         app.on_key(press(KeyCode::Char('k'), KeyModifiers::NONE));
-        assert_eq!(app.help_scroll, 1);
+        assert_eq!(app.help.as_ref().unwrap().scroll, 1);
     }
 
     #[test]
     fn help_page_down_jumps_five_then_clamps_to_max() {
         // The cap is help_lines().len() — the largest max_scroll across body
-        // sizes — NOT the old max_scroll(MAX_H − 3) = 10, so the Help tail
-        // stays reachable on a short terminal. PgDn steps 5 each time and
-        // clamps at that cap.
+        // sizes — so the Help tail stays reachable on a short terminal. PgDn
+        // steps 5 each time and clamps at that cap.
         let max = help_lines(&HelpContext::Launcher { tab: Tab::Hosts }).len() as u16;
         let mut app = app_with_host("web");
         app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
         // PgDn from 0 → 5.
         app.on_key(press(KeyCode::PageDown, KeyModifiers::NONE));
-        assert_eq!(app.help_scroll, 5);
+        assert_eq!(app.help.as_ref().unwrap().scroll, 5);
         // Keep paging until we saturate at the cap.
         for _ in 0..10 {
             app.on_key(press(KeyCode::PageDown, KeyModifiers::NONE));
         }
         assert_eq!(
-            app.help_scroll, max,
+            app.help.as_ref().unwrap().scroll,
+            max,
             "PgDn must clamp at help_lines().len()"
         );
         // One more PgDn past the cap stays clamped — no overflow.
         app.on_key(press(KeyCode::PageDown, KeyModifiers::NONE));
-        assert_eq!(app.help_scroll, max);
+        assert_eq!(app.help.as_ref().unwrap().scroll, max);
         assert!(max > 10, "cap must exceed the old MAX_H-3 ceiling of 10");
     }
 
@@ -2052,13 +2146,13 @@ mod tests {
         app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
         app.on_key(press(KeyCode::PageDown, KeyModifiers::NONE));
         app.on_key(press(KeyCode::PageDown, KeyModifiers::NONE));
-        assert_eq!(app.help_scroll, 10);
+        assert_eq!(app.help.as_ref().unwrap().scroll, 10);
         // PgUp from 10 → 5.
         app.on_key(press(KeyCode::PageUp, KeyModifiers::NONE));
-        assert_eq!(app.help_scroll, 5);
+        assert_eq!(app.help.as_ref().unwrap().scroll, 5);
         // PgUp from 5 → 0 (saturating).
         app.on_key(press(KeyCode::PageUp, KeyModifiers::NONE));
-        assert_eq!(app.help_scroll, 0);
+        assert_eq!(app.help.as_ref().unwrap().scroll, 0);
     }
 
     #[test]
@@ -2073,7 +2167,8 @@ mod tests {
             app.on_key(press(KeyCode::Down, KeyModifiers::NONE));
         }
         assert_eq!(
-            app.help_scroll, max,
+            app.help.as_ref().unwrap().scroll,
+            max,
             "Down must clamp at help_lines().len()"
         );
     }
@@ -2082,78 +2177,87 @@ mod tests {
     fn help_scroll_reaches_past_old_cap_of_ten() {
         // Regression: the cap used to be max_scroll(MAX_H − 3) = 10, which kept
         // the Help tail unreachable on short terminals. The cap is now
-        // help_lines().len(), so Down can push help_scroll past 10 — the
-        // renderer clamps to the real body per frame.
+        // help_lines().len(), so Down can push scroll past 10 — the renderer
+        // clamps to the real body per frame.
         let mut app = app_with_host("web");
         app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
         for _ in 0..15 {
             app.on_key(press(KeyCode::Down, KeyModifiers::NONE));
         }
+        let scroll = app.help.as_ref().unwrap().scroll;
         assert!(
-            app.help_scroll > 10,
-            "Down past 10 presses must exceed the old cap, got {}",
-            app.help_scroll
+            scroll > 10,
+            "Down past 10 presses must exceed the old cap, got {scroll}"
         );
     }
 
     #[test]
     fn help_scroll_keys_ignore_modifier_combos() {
         // Ctrl-J / Ctrl-K (and any non-empty modifier combo) must NOT scroll —
-        // only bare ↑↓/j/k/PgUp/PgDn do. Guards against surprise-scrolling when
-        // a user holds Ctrl.
+        // only bare ↑↓/j/k/PgUp/PgDn do. The modal handler's scroll arms gate on
+        // `modifiers.is_empty()`, so a held Ctrl falls to the `_` swallow arm.
         let mut app = app_with_host("web");
         app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
         app.on_key(press(KeyCode::Char('j'), KeyModifiers::CONTROL));
-        assert_eq!(app.help_scroll, 0, "Ctrl-J must not scroll Help");
+        assert_eq!(
+            app.help.as_ref().unwrap().scroll,
+            0,
+            "Ctrl-J must not scroll Help"
+        );
         app.on_key(press(KeyCode::Char('k'), KeyModifiers::CONTROL));
-        assert_eq!(app.help_scroll, 0, "Ctrl-K must not scroll Help");
+        assert_eq!(
+            app.help.as_ref().unwrap().scroll,
+            0,
+            "Ctrl-K must not scroll Help"
+        );
         app.on_key(press(KeyCode::Down, KeyModifiers::SHIFT));
-        assert_eq!(app.help_scroll, 0, "Shift-Down must not scroll Help");
+        assert_eq!(
+            app.help.as_ref().unwrap().scroll,
+            0,
+            "Shift-Down must not scroll Help"
+        );
         assert!(
-            matches!(app.overlay(), Some(Overlay::Help)),
+            app.help.is_some(),
             "modifier combos must not dismiss Help either"
         );
     }
 
     #[test]
-    fn help_scroll_keys_do_not_dismiss_overlay() {
-        // Scrolling must NOT close Help — only F1/Esc/q do. After a down/up
-        // cycle the overlay is still Help and help_scroll is back at 0.
+    fn help_scroll_keys_do_not_dismiss_help() {
+        // Scrolling must NOT close Help — only F1/Esc/q/Ctrl-C do. After a
+        // down/j/PgDn cycle Help is still open.
         let mut app = app_with_host("web");
         app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
         app.on_key(press(KeyCode::Down, KeyModifiers::NONE));
         app.on_key(press(KeyCode::Char('j'), KeyModifiers::NONE));
         app.on_key(press(KeyCode::PageDown, KeyModifiers::NONE));
-        assert!(matches!(app.overlay(), Some(Overlay::Help)));
-        // F1 still dismisses after scrolling (Layer 1 toggle path).
-        let outcome = app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
-        assert!(matches!(outcome, Outcome::CloseOverlay));
-        assert!(app.overlay().is_none());
+        assert!(app.help.is_some());
+        // F1 still dismisses after scrolling.
+        app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
+        assert!(app.help.is_none());
     }
 
     #[test]
     fn help_esc_still_closes_after_scrolling() {
-        // Esc must reach the dismiss path even after scrolling. The scroll
-        // handler's `_` arm falls through to route_overlay's Help arm.
+        // Esc must reach the dismiss arm even after scrolling.
         let mut app = app_with_host("web");
         app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
         app.on_key(press(KeyCode::PageDown, KeyModifiers::NONE));
-        assert_eq!(app.help_scroll, 5);
+        assert_eq!(app.help.as_ref().unwrap().scroll, 5);
         let outcome = app.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(matches!(outcome, Outcome::CloseOverlay));
-        assert!(app.overlay().is_none());
+        assert!(matches!(outcome, Outcome::Continue));
+        assert!(app.help.is_none());
     }
 
     #[test]
     fn help_q_still_closes_after_scrolling() {
-        // The existing q-dismiss path must survive the scroll handler (q is not
-        // j/k, so it falls through).
+        // The q-dismiss arm must survive scrolling (q is not j/k).
         let mut app = app_with_host("web");
         app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
         app.on_key(press(KeyCode::Down, KeyModifiers::NONE));
         let outcome = app.on_key(press(KeyCode::Char('q'), KeyModifiers::NONE));
-        assert!(matches!(outcome, Outcome::CloseOverlay));
-        assert!(app.overlay().is_none());
+        assert!(matches!(outcome, Outcome::Continue));
+        assert!(app.help.is_none());
     }
 
     #[test]
