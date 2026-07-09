@@ -199,6 +199,7 @@ impl SftpWorker {
                     .status();
                 drop(sock);
                 if let Some(p) = pw_file {
+                    crate::tempfile_registry::unregister(&p);
                     let _ = std::fs::remove_file(p);
                 }
                 let reason = match outcome {
@@ -256,6 +257,7 @@ impl SftpWorker {
                 let _ = master_child.wait();
                 drop(sock);
                 if let Some(p) = pw_file {
+                    crate::tempfile_registry::unregister(&p);
                     let _ = std::fs::remove_file(p);
                 }
                 return Err(format!("sftp worker thread spawn failed: {e}"));
@@ -332,6 +334,7 @@ impl Drop for SftpWorker {
 
         // 6. Remove the password temp file if we created one.
         if let Some(p) = self.pw_file.take() {
+            crate::tempfile_registry::unregister(&p);
             let _ = std::fs::remove_file(p);
         }
     }

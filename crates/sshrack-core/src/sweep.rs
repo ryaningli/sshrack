@@ -28,7 +28,10 @@ const STALE_THRESHOLD: Duration = Duration::from_secs(300);
 
 /// Exposed so the threshold can be pinned by a unit test (a future bump should
 /// be a conscious decision, since it bounds how long a leaked key sits on disk).
-pub fn stale_threshold() -> Duration {
+/// Test-only: nothing in production reads this (production uses `STALE_THRESHOLD`
+/// directly via `sweep_default`), hence the `#[cfg(test)]` gate.
+#[cfg(test)]
+pub(crate) fn stale_threshold() -> Duration {
     STALE_THRESHOLD
 }
 

@@ -503,6 +503,7 @@ mod tests {
 
     #[test]
     fn write_password_file_is_0600_and_round_trips() {
+        let _g = crate::tempfile_registry::TEST_LOCK.lock().unwrap();
         use std::os::unix::fs::PermissionsExt;
         let pw = Zeroizing::new("s3cret".into());
         let path = write_password_file(&pw).unwrap();
@@ -517,6 +518,7 @@ mod tests {
 
     #[test]
     fn key_artifact_writes_private_and_cert_siblings_then_cleanup_removes_both() {
+        let _g = crate::tempfile_registry::TEST_LOCK.lock().unwrap();
         // ssh -i <private> auto-loads <private>-cert.pub, so the cert must sit
         // beside the private key with that exact suffix. Drop must remove both
         // temp files so the plaintext does not outlive the connection.
@@ -557,6 +559,7 @@ mod tests {
 
     #[test]
     fn key_artifact_private_only_when_no_certificate() {
+        let _g = crate::tempfile_registry::TEST_LOCK.lock().unwrap();
         // No certificate: only the private temp file is created, and Drop
         // removes just that one.
         let priv_text = Zeroizing::new("ONLY-KEY".into());
@@ -572,6 +575,7 @@ mod tests {
 
     #[test]
     fn key_artifact_private_file_is_0600() {
+        let _g = crate::tempfile_registry::TEST_LOCK.lock().unwrap();
         use std::os::unix::fs::PermissionsExt;
         let priv_text = Zeroizing::new("K".into());
         let a = KeyArtifact::write(&priv_text, None).unwrap();
@@ -600,6 +604,7 @@ mod tests {
 
     #[test]
     fn materialize_inline_key_writes_temp_and_fills_key_path() {
+        let _g = crate::tempfile_registry::TEST_LOCK.lock().unwrap();
         // An inline-key body: materialize_inline_key must write the private key
         // to a 0600 temp file, fill key_path with that path, and return the
         // artifact (so the caller can hold it across launch). Drop of the
@@ -635,6 +640,7 @@ mod tests {
 
     #[test]
     fn materialize_inline_key_writes_cert_sibling_alongside_private() {
+        let _g = crate::tempfile_registry::TEST_LOCK.lock().unwrap();
         // With a certificate: the cert lands beside the private key as
         // <private>-cert.pub so ssh -i auto-loads it. Both temp files share the
         // artifact's lifetime.
@@ -666,6 +672,7 @@ mod tests {
 
     #[test]
     fn materialize_inline_key_is_noop_for_path_key_body() {
+        let _g = crate::tempfile_registry::TEST_LOCK.lock().unwrap();
         // A path-key (or no-key) body has inline_key = None: materialize must be
         // a no-op, returning None and leaving key_path untouched.
         use crate::credential::ResolvedAuth;

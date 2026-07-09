@@ -26,6 +26,11 @@ pub fn install() {
             Ok(s) => s,
             Err(_) => return,
         };
+        // If spawn fails after Signals::new succeeded, `signals` is dropped on
+        // the spot (it is moved into the closure): signal-hook unregisters, the
+        // OS default disposition for SIGINT/SIGTERM is restored, so Ctrl-C still
+        // kills the process — SIGINT is not silently swallowed. The startup
+        // `sweep` remains the on-disk backstop either way.
         let _ = std::thread::Builder::new()
             .name("sshrack-signal-cleanup".into())
             .spawn(move || {

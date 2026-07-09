@@ -25,12 +25,19 @@ pub struct Overrides {
 }
 
 /// The ssh connection options shared by the interactive `ssh` argv and the
-/// SFTP master/sftp argv: `-l <user> -p <port> (-i <key>)?`. Pure.
+/// SFTP master/sftp argv: `-l <user> -p <port> (-i <key>)?`, plus an optional
+/// key-only tail (see below). Pure.
 ///
 /// `resolved` supplies the auth identity (user, key). `host` supplies the
 /// network endpoint (`port`). Overrides win over both. The identity is
 /// `override > resolved.key_path` (ssh-agent covers the rest); absent when
 /// neither is set.
+///
+/// When an identity is present AND [`crate::credential::PasswordSource::None`],
+/// the function also appends `-o IdentitiesOnly=yes -o PasswordAuthentication=no`
+/// so a bad/unreadable key fails fast instead of degrading to an interactive
+/// password prompt (which is the prompt users Ctrl-C out of, leaking the
+/// inline-key temp file).
 pub fn connect_opts(resolved: &ResolvedAuth, host: &Host, overrides: &Overrides) -> Vec<String> {
     let mut opts: Vec<String> = Vec::new();
 
