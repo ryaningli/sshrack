@@ -800,8 +800,8 @@ impl App {
     /// The transfer screen owns every key in this layer: Tab flips focus, Esc
     /// cancels an in-flight transfer or closes the screen, Ctrl-C always
     /// closes, and the rest route into the focused pane (arrows, Space, etc.).
-    /// The shell's global Ctrl-C/F1/Tab do NOT fire while the transfer screen
-    /// is open.
+    /// The shell's global Ctrl-C/Tab do NOT fire while the transfer screen is
+    /// open — F1 is the exception, handled by the global Help layer above Layer 0.
     fn route_transfer(&mut self, key: KeyEvent, mut screen: TransferScreen) -> Outcome {
         // Auto-clear stale status on each transfer keypress, mirroring the
         // launcher's panel layer (`route_panel` clears `self.status` before
@@ -2620,7 +2620,8 @@ mod tests {
     // ===============================================================
     // Task 10: sftp transfer screen wiring. The screen is a full-screen
     // App view (not an Overlay) — when `App::transfer` is Some it owns every
-    // key and the shell's global Ctrl-C/F1 do NOT fire. The launcher emits
+    // key; the shell's global Ctrl-C does NOT fire — F1 is the exception,
+    // intercepted by the global Help layer above Layer 0. The launcher emits
     // Outcome::OpenTransfer on Ctrl-T (Hosts tab, host selected); the loop
     // runs open_transfer and assigns App::transfer + App::transfer_worker.
     // ===============================================================
