@@ -49,6 +49,22 @@ pub fn connect_opts(resolved: &ResolvedAuth, host: &Host, overrides: &Overrides)
         opts.push(k.to_string_lossy().into_owned());
     }
 
+    // Key-only host (identity present, no account password): restrict ssh so a
+    // bad/unreadable key fails fast with "Permission denied (publickey)" rather
+    // than silently degrading to an interactive password prompt — which is the
+    // prompt users Ctrl-C out of, leaking the inline-key temp file. We disable
+    // the `password` method only (not keyboard-interactive), so key-then-2FA
+    // flows still work; the host has no password secret anyway. IdentitiesOnly
+    // additionally stops ssh dragging in unrelated ssh-agent keys.
+    let has_identity = identity.is_some();
+    let no_password = matches!(resolved.password, crate::credential::PasswordSource::None);
+    if has_identity && no_password {
+        opts.push("-o".into());
+        opts.push("IdentitiesOnly=yes".into());
+        opts.push("-o".into());
+        opts.push("PasswordAuthentication=no".into());
+    }
+
     opts
 }
 
@@ -147,6 +163,9 @@ mod tests {
         // The shared connection-option tokens reused by the SFTP master argv:
         // exactly `-l <user> -p <port> -i <key>` in this order, with no `ssh`
         // prefix and no host/command tail (those are the caller's concern).
+        // The key-only-no-password tail (`-o IdentitiesOnly=yes
+        // -o PasswordAuthentication=no`) is asserted separately; see
+        // `connect_opts_key_only_no_password_restricts_to_publickey`.
         let opts = connect_opts(&resolved(), &host(), &Overrides::default());
         assert_eq!(
             opts,
@@ -157,6 +176,10 @@ mod tests {
                 "2222".to_string(),
                 "-i".to_string(),
                 "~/.ssh/id_ed25519".to_string(),
+                "-o".to_string(),
+                "IdentitiesOnly=yes".to_string(),
+                "-o".to_string(),
+                "PasswordAuthentication=no".to_string(),
             ]
         );
     }
@@ -197,7 +220,50 @@ mod tests {
                 "22000".to_string(),
                 "-i".to_string(),
                 "/other-key".to_string(),
+                "-o".to_string(),
+                "IdentitiesOnly=yes".to_string(),
+                "-o".to_string(),
+                "PasswordAuthentication=no".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn connect_opts_key_only_no_password_restricts_to_publickey() {
+        // A key-only host (identity present, PasswordSource::None) must restrict
+        // ssh so a bad/unreadable key fails fast instead of degrading to a
+        // password prompt. IdentitiesOnly=yes + PasswordAuthentication=no.
+        let opts = connect_opts(&resolved(), &host(), &Overrides::default());
+        assert!(
+            opts.windows(2)
+                .any(|w| w == ["-o".to_string(), "IdentitiesOnly=yes".to_string()]),
+            "key-only host must set IdentitiesOnly=yes, got {opts:?}"
+        );
+        assert!(
+            opts.windows(2)
+                .any(|w| w == ["-o".to_string(), "PasswordAuthentication=no".to_string()]),
+            "key-only host must set PasswordAuthentication=no, got {opts:?}"
+        );
+    }
+
+    #[test]
+    fn connect_opts_key_plus_password_does_not_restrict() {
+        // A host with BOTH a key and a password keeps password fallback — do not
+        // add the publickey-only restrictions.
+        let mut r = resolved();
+        r.password = PasswordSource::Inline(zeroize::Zeroizing::new("pw".into()));
+        let opts = connect_opts(&r, &host(), &Overrides::default());
+        assert!(!opts.iter().any(|a| a == "PasswordAuthentication=no"));
+        assert!(!opts.iter().any(|a| a == "IdentitiesOnly=yes"));
+    }
+
+    #[test]
+    fn connect_opts_no_key_no_password_no_restrictions() {
+        // No identity at all (agent / password-less) → no -i and no restrictions.
+        let mut r = resolved();
+        r.key_path = None;
+        let opts = connect_opts(&r, &host(), &Overrides::default());
+        assert!(!opts.contains(&"-i".to_string()));
+        assert!(!opts.iter().any(|a| a == "PasswordAuthentication=no"));
     }
 }
