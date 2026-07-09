@@ -279,7 +279,11 @@ pub fn read_secret_file(path: &Path) -> Result<Secret> {
         .with_context(|| format!("failed to read identity file {}", path.display()))?;
     let text = String::from_utf8(bytes)
         .with_context(|| format!("identity file {} is not valid UTF-8", path.display()))?;
-    Ok(Secret::Plain(text))
+    // Normalize the trailing newline so a key whose `-----END ...-----` line is
+    // not followed by '\n' does not later fail in ssh with "error in libcrypto".
+    Ok(Secret::Plain(
+        sshrack_core::connect::ensure_trailing_newline(&text),
+    ))
 }
 
 /// Read all of `reader` into a plaintext [`Secret`]. Used for `--identity-stdin`
@@ -291,7 +295,9 @@ pub fn read_secret_stdin(reader: &mut dyn Read) -> Result<Secret> {
         .read_to_end(&mut bytes)
         .context("failed to read identity from stdin")?;
     let text = String::from_utf8(bytes).context("stdin identity is not valid UTF-8")?;
-    Ok(Secret::Plain(text))
+    Ok(Secret::Plain(
+        sshrack_core::connect::ensure_trailing_newline(&text),
+    ))
 }
 
 /// The inline-key import flags shared by `cred add/edit` and `host add/edit`
@@ -357,7 +363,9 @@ mod tests {
         let keyfile = dir.path().join("read_secret_file_plain");
         std::fs::write(&keyfile, "KEY-CONTENTS").unwrap();
         let s = read_secret_file(&keyfile).unwrap();
-        assert_eq!(s.as_plain(), Some("KEY-CONTENTS"));
+        // Ingest normalizes a trailing newline so a hand-edited file without one
+        // still yields a Secret whose text ends in '\n'.
+        assert_eq!(s.as_plain(), Some("KEY-CONTENTS\n"));
     }
 
     #[test]
@@ -366,7 +374,26 @@ mod tests {
         let input = "STDIN-KEY-CONTENTS";
         let mut cursor = Cursor::new(input);
         let s = read_secret_stdin(&mut cursor).unwrap();
-        assert_eq!(s.as_plain(), Some("STDIN-KEY-CONTENTS"));
+        assert_eq!(s.as_plain(), Some("STDIN-KEY-CONTENTS\n"));
+    }
+
+    #[test]
+    fn read_secret_file_normalizes_missing_trailing_newline() {
+        // A key file without a trailing newline still yields a Secret whose text
+        // ends in '\n' — defense at the ingest boundary so what gets sealed (and
+        // later materialized) is already correct.
+        let dir = tempfile::tempdir().unwrap();
+        let keyfile = dir.path().join("read_secret_file_no_newline");
+        std::fs::write(&keyfile, "-----END KEY-----").unwrap();
+        let s = read_secret_file(&keyfile).unwrap();
+        assert_eq!(s.as_plain(), Some("-----END KEY-----\n"));
+    }
+
+    #[test]
+    fn read_secret_stdin_normalizes_missing_trailing_newline() {
+        let mut cursor = Cursor::new("-----END KEY-----");
+        let s = read_secret_stdin(&mut cursor).unwrap();
+        assert_eq!(s.as_plain(), Some("-----END KEY-----\n"));
     }
 
     #[test]
@@ -420,7 +447,7 @@ mod tests {
             .expect("inline source present");
         assert_eq!(
             ik.private_key.as_ref().and_then(Secret::as_plain),
-            Some("PRIVATE-KEY-TEXT")
+            Some("PRIVATE-KEY-TEXT\n")
         );
         assert!(ik.certificate.is_none());
     }
@@ -443,7 +470,7 @@ mod tests {
             .expect("inline source present");
         assert_eq!(
             ik.private_key.as_ref().and_then(Secret::as_plain),
-            Some("PRIVATE-KEY-TEXT\nCERT-MATERIAL")
+            Some("PRIVATE-KEY-TEXT\nCERT-MATERIAL\n")
         );
         assert!(ik.certificate.is_none());
     }
@@ -469,11 +496,11 @@ mod tests {
         .expect("inline source present");
         assert_eq!(
             ik.private_key.as_ref().and_then(Secret::as_plain),
-            Some("FILE-PRIVATE")
+            Some("FILE-PRIVATE\n")
         );
         assert_eq!(
             ik.certificate.as_ref().and_then(Secret::as_plain),
-            Some("FILE-CERT")
+            Some("FILE-CERT\n")
         );
     }
 
