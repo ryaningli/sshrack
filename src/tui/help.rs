@@ -133,7 +133,7 @@ fn wizard_lines() -> Vec<Line<'static>> {
     vec![
         section("Form wizard"),
         binding("Tab / Shift-Tab", "next / previous field"),
-        binding("Up / Down", "cycle a chooser field's options"),
+        binding("← / →", "cycle a chooser field's options"),
         binding("type", "edit the focused text field"),
         binding("Ctrl-S", "save (validates first)"),
         binding("Esc / Ctrl-C", "cancel, return to the tab"),
@@ -149,6 +149,7 @@ fn file_picker_lines() -> Vec<Line<'static>> {
         section("File picker"),
         binding("Up / Down", "move selection"),
         binding("type", "filter the path list"),
+        binding("Left", "up to the parent directory"),
         binding("Right", "enter the selected directory"),
         binding("Enter", "resolve path (dir enters · file picks)"),
         binding("Esc / Ctrl-C", "cancel, return to the form"),
@@ -172,6 +173,7 @@ fn queue_manager_lines() -> Vec<Line<'static>> {
         binding("Enter · r", "retry the selected task"),
         binding("d · Delete", "remove the selected task"),
         binding("c", "cancel the in-flight task"),
+        binding("p", "pause / resume the queue"),
         binding("Esc", "close"),
     ]
 }
