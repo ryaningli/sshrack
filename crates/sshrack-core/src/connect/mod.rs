@@ -221,7 +221,13 @@ impl KeyArtifact {
             .mode(0o600)
             .open(&private_path)
             .map_err(private_err)?;
-        f.write_all(private.as_bytes()).map_err(|e| {
+        // Normalize the trailing newline: a private key whose final
+        // `-----END ...-----` line is not followed by '\n' is rejected by
+        // OpenSSH/libcrypto with "error in libcrypto". Ingest normalizes too,
+        // but this is the load-bearing fallback that also repairs any
+        // pre-existing stored material missing the newline (no migration).
+        let private_bytes = Zeroizing::new(ensure_trailing_newline(private.as_str()));
+        f.write_all(private_bytes.as_bytes()).map_err(|e| {
             // Best-effort cleanup so a partial private file never survives.
             let _ = std::fs::remove_file(&private_path);
             private_err(e)
@@ -255,7 +261,8 @@ impl KeyArtifact {
                         source: e,
                     }
                 })?;
-            cf.write_all(cert.as_bytes()).map_err(|e| {
+            let cert_bytes = Zeroizing::new(ensure_trailing_newline(cert.as_str()));
+            cf.write_all(cert_bytes.as_bytes()).map_err(|e| {
                 let _ = std::fs::remove_file(&private_path);
                 let _ = std::fs::remove_file(&cp);
                 cert_err(e)
@@ -302,6 +309,22 @@ impl Drop for KeyArtifact {
             let _ = std::fs::remove_file(c);
         }
     }
+}
+
+/// Ensure `s` ends with exactly one `'\n'`: strip trailing newlines/carriage
+/// returns, then append a single `'\n'`. Returns an owned [`String`].
+///
+/// OpenSSH rejects an `-----END OPENSSH PRIVATE KEY-----` line that is not
+/// followed by a newline with `Load key "...": error in libcrypto` (libcrypto's
+/// PEM decoder will not finalize the block). A pasted or imported key can lose
+/// its trailing newline at ingest — a textarea's `lines().join("\n")` drops it,
+/// and a hand-edited file may omit it — so both the ingest boundary and
+/// [`KeyArtifact::write`] normalize through this helper. Pure.
+pub fn ensure_trailing_newline(s: &str) -> String {
+    let mut t = String::with_capacity(s.len() + 1);
+    t.push_str(s.trim_end_matches(['\n', '\r']));
+    t.push('\n');
+    t
 }
 
 /// Materialize a resolved identity's inline key (if any) to a `0600` temp file
@@ -541,14 +564,14 @@ mod tests {
                 "cert sibling must exist at {cert_sibling:?}"
             );
             *paths.borrow_mut() = vec![p, cert_sibling];
-            // Files carry the material exactly.
+            // Files carry the material with a guaranteed trailing newline.
             assert_eq!(
                 std::fs::read_to_string(&paths.borrow()[0]).unwrap(),
-                "PRIVATE-KEY-TEXT"
+                "PRIVATE-KEY-TEXT\n"
             );
             assert_eq!(
                 std::fs::read_to_string(&paths.borrow()[1]).unwrap(),
-                "CERTIFICATE-TEXT"
+                "CERTIFICATE-TEXT\n"
             );
         }
         // After Drop (scope exit), both temp files are gone.
@@ -623,8 +646,8 @@ mod tests {
             );
             assert_eq!(
                 std::fs::read_to_string(&p).unwrap(),
-                "PRIVATE-MATERIAL",
-                "temp file must hold the private key text exactly"
+                "PRIVATE-MATERIAL\n",
+                "temp file holds the private key text with a guaranteed trailing newline"
             );
             p
         };
@@ -659,7 +682,8 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(&cert_sibling).unwrap(),
-            "CERT-MATERIAL"
+            "CERT-MATERIAL\n",
+            "cert sibling also gets a guaranteed trailing newline"
         );
         // Both files removed when the artifact drops.
         drop(artifact);
@@ -688,6 +712,44 @@ mod tests {
             resolved.key_path,
             Some(PathBuf::from("/home/u/.ssh/id_ed25519")),
             "existing key_path must be preserved"
+        );
+    }
+
+    // ---- ensure_trailing_newline: the libcrypto-error root cause ----
+
+    #[test]
+    fn ensure_trailing_newline_appends_when_missing() {
+        assert_eq!(ensure_trailing_newline("abc"), "abc\n");
+    }
+
+    #[test]
+    fn ensure_trailing_newline_preserves_single() {
+        assert_eq!(ensure_trailing_newline("abc\n"), "abc\n");
+    }
+
+    #[test]
+    fn ensure_trailing_newline_collapses_many_to_one() {
+        assert_eq!(ensure_trailing_newline("abc\n\n\n"), "abc\n");
+    }
+
+    #[test]
+    fn ensure_trailing_newline_normalizes_crlf_tail() {
+        assert_eq!(ensure_trailing_newline("abc\r\n"), "abc\n");
+    }
+
+    #[test]
+    fn materialize_inline_key_appends_newline_when_missing() {
+        let _g = crate::tempfile_registry::TEST_LOCK.lock().unwrap();
+        // Regression for the ets-135 failure: a private key stored WITHOUT a
+        // trailing newline (e.g. pasted via a textarea whose lines().join("\n")
+        // drops it) must STILL get one in the materialized temp file, or ssh
+        // rejects it with "Load key ...: error in libcrypto".
+        let mut resolved = resolved_with_inline("-----END OPENSSH PRIVATE KEY-----", None);
+        let _artifact = materialize_inline_key(&mut resolved).unwrap().unwrap();
+        let p = resolved.key_path.as_deref().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(p).unwrap(),
+            "-----END OPENSSH PRIVATE KEY-----\n"
         );
     }
 

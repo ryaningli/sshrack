@@ -224,7 +224,17 @@ impl KeyPaste {
         // whether a blank buffer writes back (it does not — preserves the
         // original key on edit).
         if key.code == KeyCode::Esc {
-            return PasteOutcome::Done(self.textarea.lines().join("\n"));
+            // Close and hand the joined buffer back. `lines().join("\n")` drops
+            // a trailing newline the user pasted, and an `-----END ...-----` not
+            // followed by '\n' fails in ssh with "error in libcrypto" — so re-
+            // attach one. A truly empty buffer stays empty (the caller treats
+            // blank as "no change").
+            let joined = self.textarea.lines().join("\n");
+            return PasteOutcome::Done(if joined.is_empty() {
+                joined
+            } else {
+                sshrack_core::connect::ensure_trailing_newline(&joined)
+            });
         }
         // Ctrl-C: close and discard (the popup buffer never reaches the form).
         if ctrl && key.code == KeyCode::Char('c') {
@@ -361,7 +371,23 @@ mod tests {
         }
         assert_eq!(
             p.on_key(press(KeyCode::Esc)),
-            PasteOutcome::Done("lineA\nlineB".into())
+            PasteOutcome::Done("lineA\nlineB\n".into())
+        );
+    }
+
+    #[test]
+    fn esc_re_attaches_trailing_newline_dropped_by_join() {
+        // Regression for the ets-135 failure: a textarea splits the pasted key
+        // into lines and `join("\n")` drops the final newline, which made ssh
+        // reject the materialized key with "error in libcrypto". on_key must
+        // re-attach that newline.
+        let mut p = KeyPaste::new(PasteKind::Private, 0);
+        for c in "-----END OPENSSH PRIVATE KEY-----".chars() {
+            let _ = p.on_key(press(KeyCode::Char(c)));
+        }
+        assert_eq!(
+            p.on_key(press(KeyCode::Esc)),
+            PasteOutcome::Done("-----END OPENSSH PRIVATE KEY-----\n".into())
         );
     }
 
@@ -389,7 +415,7 @@ mod tests {
         let _ = p.on_key(press(KeyCode::Char('x')));
         assert_eq!(
             p.on_key(press(KeyCode::Esc)),
-            PasteOutcome::Done("\nx".into())
+            PasteOutcome::Done("\nx\n".into())
         );
     }
 
@@ -404,7 +430,7 @@ mod tests {
         }
         assert_eq!(
             p.on_key(press(KeyCode::Esc)),
-            PasteOutcome::Done("hi".into())
+            PasteOutcome::Done("hi\n".into())
         );
     }
 
@@ -492,7 +518,7 @@ mod tests {
         }
         assert_eq!(
             p.on_key(press(KeyCode::Esc)),
-            PasteOutcome::Done("lineA\nlineB".into())
+            PasteOutcome::Done("lineA\nlineB\n".into())
         );
     }
 

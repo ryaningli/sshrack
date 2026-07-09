@@ -2017,7 +2017,7 @@ mod tests {
         // Esc closes and writes the non-blank buffer back.
         let _ = f.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
         assert!(f.key_paste.is_none());
-        assert_eq!(f.inline_private, "PRIVATE-KEY-TEXT");
+        assert_eq!(f.inline_private, "PRIVATE-KEY-TEXT\n");
     }
 
     #[test]
@@ -2075,7 +2075,7 @@ mod tests {
             let _ = f.on_key(press(KeyCode::Char(c), KeyModifiers::NONE));
         }
         let _ = f.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
-        assert_eq!(f.inline_private, "line1\nline2");
+        assert_eq!(f.inline_private, "line1\nline2\n");
     }
 
     #[test]
@@ -2093,7 +2093,7 @@ mod tests {
         }
         let _ = f.on_key(press(KeyCode::Backspace, KeyModifiers::NONE));
         let _ = f.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
-        assert_eq!(f.inline_cert, "ab");
+        assert_eq!(f.inline_cert, "ab\n");
     }
 
     #[test]
