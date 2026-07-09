@@ -1071,6 +1071,77 @@ mod tests {
     }
 
     // ===============================================================
+    // The transfer screen's status line must auto-clear on the next
+    // keypress, mirroring the launcher's panel layer (route_panel clears
+    // self.status before every panel key). The transfer screen routes
+    // through Layer 0 (route_transfer), which never reaches route_panel,
+    // so without an explicit clear a list/transfer error lingers on the
+    // footer while the user searches, moves the cursor, or navigates.
+    // ===============================================================
+    #[test]
+    fn transfer_status_auto_clears_on_next_keypress() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+        use std::fs;
+        let dir = tempfile::tempdir().expect("temp dir");
+        fs::write(dir.path().join("alpha.txt"), b"").expect("write file");
+        let origin = dir.path().to_path_buf();
+
+        let mut app = app_with_host("web");
+        let screen = TransferScreen::new(origin.clone(), PathBuf::from("/remote"));
+        app.transfer = Some(screen);
+        let rc = Rc::new(RefCell::new(stdout_tui()));
+        let handle: TerminalHandle = Rc::downgrade(&rc);
+
+        // Seed the local pane, then navigate to a nonexistent path so the
+        // local list fails and surfaces an error status (the user's scenario).
+        app.transfer.as_mut().unwrap().pending_list = Some((Side::Local, origin.clone()));
+        drain_transfer_events(&mut app, &handle);
+        let bad = PathBuf::from("/nonexistent/sshrack-auto-clear-7781");
+        assert!(!bad.exists(), "fixture: the bad path must not exist");
+        app.transfer.as_mut().unwrap().pending_list = Some((Side::Local, bad));
+        drain_transfer_events(&mut app, &handle);
+        assert!(
+            app.transfer.as_ref().unwrap().status.is_error,
+            "fixture: the failed list must seed an error status first"
+        );
+
+        // Any subsequent keypress (cursor-down on the local pane here) must
+        // clear the stale error — status is a per-action hint, not a banner.
+        let down = KeyEvent::new_with_kind(KeyCode::Down, KeyModifiers::NONE, KeyEventKind::Press);
+        app.on_key(down);
+
+        let status = &app.transfer.as_ref().unwrap().status;
+        assert!(
+            !status.is_error && status.message.is_none(),
+            "stale error status must clear on the next keypress, got: {:?}",
+            status.message
+        );
+    }
+
+    // The clear is Press-gated, matching the launcher's Press-only key
+    // handling. A Release event must leave the status untouched.
+    #[test]
+    fn transfer_status_clear_is_press_only_not_release() {
+        use crate::tui::intent::Status;
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+        let mut app = app_with_host("web");
+        let mut screen = TransferScreen::new(PathBuf::from("/local"), PathBuf::from("/remote"));
+        screen.set_status(Status::error("seeded error"));
+        app.transfer = Some(screen);
+
+        let release =
+            KeyEvent::new_with_kind(KeyCode::Down, KeyModifiers::NONE, KeyEventKind::Release);
+        app.on_key(release);
+
+        let status = &app.transfer.as_ref().unwrap().status;
+        assert!(
+            status.is_error && status.message.as_deref() == Some("seeded error"),
+            "Release must not clear the status, got: {:?}",
+            status.message
+        );
+    }
+
+    // ===============================================================
     // End-to-end regression for the user-reported bug: type a nonexistent
     // path on the LOCAL pane (Enter → list fails), switch to remote, mark a
     // file, Ctrl-S. The download dst must use local's REVERTED cwd — not the

@@ -784,6 +784,17 @@ impl App {
     /// The shell's global Ctrl-C/F1/Tab do NOT fire while the transfer screen
     /// is open.
     fn route_transfer(&mut self, key: KeyEvent, mut screen: TransferScreen) -> Outcome {
+        // Auto-clear stale status on each transfer keypress, mirroring the
+        // launcher's panel layer (`route_panel` clears `self.status` before
+        // every panel key): a status line is a transient per-action hint, not
+        // a persistent banner. The transfer screen routes through Layer 0 and
+        // never reaches `route_panel`, so without this a list/transfer error
+        // lingers on the footer until some later action overwrites it. A new
+        // status set during THIS keypress's drain (a list error, queue
+        // feedback) is written AFTER this clear, so it still surfaces.
+        if key.kind == crossterm::event::KeyEventKind::Press {
+            screen.set_status(Status::empty());
+        }
         let out = screen.on_key(key);
         match out {
             ScreenOutcome::Continue => {
