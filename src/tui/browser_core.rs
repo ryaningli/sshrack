@@ -77,6 +77,14 @@ pub(crate) struct BrowserCore {
     /// cwd's remembered cursor instead of resetting to 0. Separates a
     /// dir-switch from an in-place refresh.
     pending_restore: bool,
+    /// The cwd captured by `begin_switch` before the caller advances `cwd` to
+    /// the switch target. When the target then fails to list, the component
+    /// calls [`Self::revert_switch`] to restore `cwd` to this origin so the
+    /// pane never sits on an unreachable path with the previous directory's
+    /// entries still on screen (the "wrong directory" transfer bug). `None`
+    /// between switches — `finish_switch` and `commit_switch` clear it on a
+    /// successful adopt.
+    switch_origin: Option<PathBuf>,
 }
 
 impl BrowserCore {
@@ -93,6 +101,7 @@ impl BrowserCore {
             marked: HashSet::new(),
             history: HashMap::new(),
             pending_restore: false,
+            switch_origin: None,
         }
     }
 
@@ -167,6 +176,9 @@ impl BrowserCore {
     /// `pending_restore`. The caller then sets `cwd` to the new path, fetches
     /// the listing, and calls [`Self::finish_switch`]. Pure.
     pub(crate) fn begin_switch(&mut self) {
+        // Capture the origin cwd BEFORE the caller advances `cwd` to the
+        // target, so a failed listing can `revert_switch` back here.
+        self.switch_origin = Some(self.cwd.clone());
         if let Some(cursor) = self.selected_entry().map(|e| e.path.clone()) {
             self.history.insert(self.cwd.clone(), cursor);
         }
@@ -194,6 +206,7 @@ impl BrowserCore {
         } else {
             self.selected = 0;
         }
+        self.switch_origin = None;
     }
 
     /// Atomic switch for synchronous sources (e.g. local fs): snapshot
@@ -214,6 +227,34 @@ impl BrowserCore {
         if let Some(parent) = self.cwd.parent() {
             self.history.insert(parent.to_path_buf(), self.cwd.clone());
         }
+        self.switch_origin = None;
+    }
+
+    /// Undo an in-progress switch begun by [`Self::begin_switch`] and advanced
+    /// by the caller (which set `cwd` to a target that then failed to list).
+    /// Restores `cwd` to the origin captured at `begin_switch`, re-derives
+    /// `ranked` from the unchanged `entries` (which still belong to the origin
+    /// directory), and restores the origin's remembered cursor — so the pane
+    /// lands back in a consistent (cwd ↔ entries) state instead of sitting on
+    /// an unreachable path with the previous listing still visible. The query
+    /// is cleared (the typed path is now known bad) and marks are dropped (the
+    /// switch attempt invalidated them). No-op when no switch is in progress.
+    /// Pure.
+    pub(crate) fn revert_switch(&mut self) {
+        if self.switch_origin.is_none() {
+            return;
+        }
+        self.cwd = self
+            .switch_origin
+            .take()
+            .expect("invariant: checked Some above");
+        self.query.clear();
+        self.marked.clear();
+        self.pending_restore = false;
+        self.recompute();
+        self.selected =
+            remembered_cursor_index(&self.history, &self.cwd, &self.ranked, &self.entries);
+        self.clamp_selected();
     }
 
     /// Apply one unambiguous navigation/edit key and return the decision for
@@ -505,6 +546,89 @@ mod tests {
             entry("b", Path::new("/x"), false),
         ]);
         assert_eq!(c.selected, 0, "in-place refresh resets cursor");
+    }
+
+    // ---- revert_switch (failed-listing rollback) ----
+
+    #[test]
+    fn revert_switch_restores_cwd_and_keeps_entries_consistent() {
+        // Simulate a failed switch: begin_switch, advance cwd to a target that
+        // fails to list, then revert. cwd must return to the origin AND the
+        // origin's entries must still be present (the listing was never
+        // replaced), leaving the pane consistent again.
+        let mut c = core_with("/home/real", &[("docs", true), ("alpha", false)]);
+        c.begin_switch();
+        c.cwd = PathBuf::from("/home/ghost"); // target that fails to list
+        assert_eq!(c.cwd, PathBuf::from("/home/ghost"), "fixture: cwd advanced");
+        c.revert_switch();
+        assert_eq!(c.cwd, PathBuf::from("/home/real"), "cwd reverted to origin");
+        assert_eq!(c.matched_count(), 2, "origin entries still present");
+        // Both origin entries survive — rank order is the fuzzy engine's
+        // (alphabetical), not the entries order, so assert membership only.
+        let names: Vec<&str> = (0..c.matched_count())
+            .filter_map(|i| c.entry_at_rank(i).map(|e| e.name.as_str()))
+            .collect();
+        assert!(names.contains(&"docs/"), "docs still listed: {names:?}");
+        assert!(names.contains(&"alpha"), "alpha still listed: {names:?}");
+    }
+
+    #[test]
+    fn revert_switch_restores_remembered_cursor_position() {
+        // Cursor was on "beta" before a failed navigation; revert must land
+        // back on "beta" (as if the switch never happened), not reset to 0.
+        let mut c = core_with("/real", &[("alpha", false), ("beta", false)]);
+        c.move_cursor(1); // cursor on "beta"
+        c.begin_switch();
+        c.cwd = PathBuf::from("/ghost");
+        c.revert_switch();
+        assert_eq!(
+            c.selected_entry().map(|e| e.name.as_str()),
+            Some("beta"),
+            "cursor restored to its pre-switch position"
+        );
+    }
+
+    #[test]
+    fn revert_switch_clears_query_and_marks() {
+        let mut c = core_with("/real", &[("alpha", false)]);
+        c.query = "stale".to_string();
+        let _ = c.toggle_mark_selected(); // mark alpha
+        c.begin_switch();
+        c.cwd = PathBuf::from("/ghost");
+        c.revert_switch();
+        assert!(c.query.is_empty(), "typed path cleared");
+        assert!(c.marked.is_empty(), "marks cleared");
+    }
+
+    #[test]
+    fn revert_switch_noop_without_begin_switch() {
+        // No switch in progress → revert is a no-op (does not touch anything).
+        let mut c = core_with("/real", &[("alpha", false)]);
+        c.query = "keep".to_string();
+        c.revert_switch();
+        assert_eq!(c.cwd, PathBuf::from("/real"), "cwd untouched");
+        assert_eq!(c.query, "keep", "query untouched");
+        assert_eq!(c.matched_count(), 1, "entries untouched");
+    }
+
+    #[test]
+    fn finish_switch_clears_switch_origin() {
+        let mut c = core_with("/real", &[("alpha", false)]);
+        c.begin_switch();
+        c.cwd = PathBuf::from("/real");
+        assert!(c.switch_origin.is_some(), "begin captured origin");
+        c.finish_switch(vec![entry("alpha", Path::new("/real"), false)]);
+        assert!(c.switch_origin.is_none(), "finish clears origin on success");
+    }
+
+    #[test]
+    fn commit_switch_clears_switch_origin() {
+        let mut c = core_with("/real", &[("alpha", false)]);
+        c.commit_switch(
+            PathBuf::from("/real"),
+            vec![entry("alpha", Path::new("/real"), false)],
+        );
+        assert!(c.switch_origin.is_none(), "commit clears origin");
     }
 
     // ---- apply_nav_key ----

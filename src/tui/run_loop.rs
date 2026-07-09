@@ -488,9 +488,19 @@ fn drain_transfer_events(app: &mut App, handle: &TerminalHandle) {
                 if let Some(screen) = app.transfer.as_mut() {
                     match listing {
                         Ok(entries) => screen.local_mut().set_entries(entries),
-                        Err(msg) => screen.set_status(super::intent::Status::error(format!(
-                            "local list failed: {msg}"
-                        ))),
+                        Err(msg) => {
+                            // The listing failed (the typed path does not exist
+                            // or is unreadable): roll the pane back to the
+                            // pre-switch cwd + entries so it never sits on an
+                            // unreachable path with the previous listing still
+                            // visible — the root cause of the "wrong directory"
+                            // transfer bug. Without this, a later enqueue would
+                            // build dst from the stale bad cwd.
+                            screen.local.revert_switch();
+                            screen.set_status(super::intent::Status::error(format!(
+                                "local list failed: {msg}"
+                            )));
+                        }
                     }
                 }
             }
@@ -525,20 +535,7 @@ fn drain_transfer_events(app: &mut App, handle: &TerminalHandle) {
         match ev {
             WorkerEvent::Listing(cwd, res) => {
                 if let Some(screen) = app.transfer.as_mut() {
-                    match res {
-                        Ok(entries) => {
-                            // The user may have navigated further by the time
-                            // this listing lands — only feed it back when its
-                            // cwd still matches the pane's cwd.
-                            let still_current = screen.remote.core.cwd == cwd;
-                            if still_current {
-                                screen.remote_mut().set_entries(entries);
-                            }
-                        }
-                        Err(msg) => screen.set_status(super::intent::Status::error(format!(
-                            "remote list failed: {msg}"
-                        ))),
-                    }
+                    screen.apply_remote_listing(cwd, res);
                 }
             }
             WorkerEvent::Progress(p) => {
@@ -1008,6 +1005,145 @@ mod tests {
                 .iter()
                 .any(|e| e.name.as_str() == "alpha.txt"),
             "alpha.txt must be listed"
+        );
+    }
+
+    // ===============================================================
+    // Failed local listing rolls the pane back to the pre-switch cwd +
+    // entries. Regression for the "wrong directory" transfer bug: typing a
+    // nonexistent path and pressing Enter used to leave local.cwd on the bad
+    // path while the old listing stayed on screen — a later enqueue then
+    // built dst from that stale bad cwd (e.g. the user's
+    // `open local "/home/dasdas/.Xauthority": No such file or directory`).
+    // ===============================================================
+    #[test]
+    fn drain_local_list_failure_reverts_cwd_and_keeps_entries() {
+        use std::fs;
+        let dir = tempfile::tempdir().expect("temp dir");
+        fs::write(dir.path().join("alpha.txt"), b"").expect("write file");
+        let origin = dir.path().to_path_buf();
+
+        let mut app = app_with_host("web");
+        let screen = TransferScreen::new(origin.clone(), PathBuf::from("/remote"));
+        app.transfer = Some(screen);
+        let rc = Rc::new(RefCell::new(stdout_tui()));
+        let handle: TerminalHandle = Rc::downgrade(&rc);
+
+        // Seed the local pane by listing the origin once (the user is already
+        // viewing it).
+        app.transfer.as_mut().unwrap().pending_list = Some((Side::Local, origin.clone()));
+        drain_transfer_events(&mut app, &handle);
+
+        // Navigate to a path that does not exist on disk → list fails.
+        let bad = PathBuf::from("/nonexistent/sshrack-bad-path-4172");
+        assert!(!bad.exists(), "fixture: the bad path must not exist");
+        app.transfer.as_mut().unwrap().pending_list = Some((Side::Local, bad));
+        drain_transfer_events(&mut app, &handle);
+
+        let screen = app.transfer.as_ref().expect("transfer screen present");
+        assert_eq!(
+            screen.local.core.cwd, origin,
+            "cwd reverted to origin (not left on the bad path)"
+        );
+        assert!(
+            screen
+                .local
+                .core
+                .entries
+                .iter()
+                .any(|e| e.name.as_str() == "alpha.txt"),
+            "origin entries kept consistent after the failed switch"
+        );
+        assert!(
+            screen.status.is_error,
+            "failure surfaced as an error status"
+        );
+        assert!(
+            screen
+                .status
+                .message
+                .as_deref()
+                .unwrap_or("")
+                .contains("local list failed"),
+            "status names the failure: {:?}",
+            screen.status.message
+        );
+    }
+
+    // ===============================================================
+    // End-to-end regression for the user-reported bug: type a nonexistent
+    // path on the LOCAL pane (Enter → list fails), switch to remote, mark a
+    // file, Ctrl-S. The download dst must use local's REVERTED cwd — not the
+    // stale bad path. Before the fix this produced
+    // `open local "/home/dasdas/.Xauthority": No such file or directory`
+    // because enqueue built dst from local.cwd which was still the bad path.
+    // ===============================================================
+    #[test]
+    fn enqueue_dst_uses_reverted_local_cwd_after_failed_local_nav() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use sshrack_core::connect::sftp::proto::Direction;
+        use sshrack_core::dirsource::DirEntry;
+        use std::fs;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let origin = dir.path().to_path_buf();
+        fs::write(origin.join("alpha.txt"), b"").expect("write local file");
+
+        let mut app = app_with_host("web");
+        let mut screen = TransferScreen::new(origin.clone(), PathBuf::from("/remote"));
+        screen.focus = Side::Remote;
+        // Remote pane shows a file the user will pull down.
+        screen.remote.set_entries(vec![DirEntry {
+            name: ".Xauthority".into(),
+            path: PathBuf::from("/remote/.Xauthority"),
+            is_dir: false,
+            is_symlink: false,
+            size: None,
+            modified: None,
+        }]);
+        app.transfer = Some(screen);
+        let rc = Rc::new(RefCell::new(stdout_tui()));
+        let handle: TerminalHandle = Rc::downgrade(&rc);
+
+        // Seed the local pane (list origin), then navigate to a bad path.
+        app.transfer.as_mut().unwrap().pending_list = Some((Side::Local, origin.clone()));
+        drain_transfer_events(&mut app, &handle);
+        let bad = PathBuf::from("/nonexistent/sshrack-bad-9913");
+        app.transfer.as_mut().unwrap().pending_list = Some((Side::Local, bad.clone()));
+        drain_transfer_events(&mut app, &handle);
+        assert_eq!(
+            app.transfer.as_ref().unwrap().local.core.cwd,
+            origin,
+            "fixture: local cwd reverted after the failed navigation"
+        );
+
+        // Mark the remote file and enqueue (focus = Remote → Download).
+        app.transfer
+            .as_mut()
+            .unwrap()
+            .remote
+            .core
+            .marked
+            .insert(PathBuf::from("/remote/.Xauthority"));
+        let out = app
+            .transfer
+            .as_mut()
+            .unwrap()
+            .on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(
+            matches!(out, crate::tui::transfer::screen::ScreenOutcome::Enqueue),
+            "Ctrl-S on a marked remote file enqueues"
+        );
+        let job = &app.transfer.as_ref().unwrap().ledger.tasks[0].job;
+        assert_eq!(job.direction, Direction::Download);
+        assert_eq!(
+            job.dst,
+            origin.join(".Xauthority"),
+            "dst uses local's REVERTED cwd, not the stale bad path"
+        );
+        assert!(
+            !job.dst.starts_with(&bad),
+            "dst must not fall under the bad path: {:?}",
+            job.dst
         );
     }
 

@@ -94,6 +94,17 @@ impl Pane {
         self.core.begin_switch();
     }
 
+    /// Revert a switch whose listing failed: restore `core.cwd` to the
+    /// pre-switch directory, keep that directory's entries, and restore the
+    /// remembered cursor — as if the navigation never happened. The run loop
+    /// calls this when a `pending_list` resolves to a list error (local fs or
+    /// remote worker) so the pane cannot sit on an unreachable path while still
+    /// showing the previous listing (the "wrong directory" transfer bug).
+    /// Delegates to [`BrowserCore::revert_switch`]. Pure.
+    pub fn revert_switch(&mut self) {
+        self.core.revert_switch();
+    }
+
     /// Pure key handler. Mutates only the core and returns the side effect the
     /// screen should perform. Performs no I/O and reads no env except `HOME`
     /// (for `~`-expansion of a path-like `Enter`). `Space` is intercepted here
