@@ -1175,3 +1175,80 @@ fn empty_view_shows_the_no_tasks_placeholder() {
         "empty view shows placeholder: {view}"
     );
 }
+
+// ---- apply_remote_listing: Ok adopt / Ok stale-drop / Err revert ----
+
+#[test]
+fn apply_remote_listing_ok_adopted_when_cwd_matches() {
+    // Fresh listing whose cwd matches the pane's cwd → entries are adopted,
+    // replacing the previous listing.
+    let remote_cwd = PathBuf::from("/remote/here");
+    let mut screen = TransferScreen::new(PathBuf::from("/local"), remote_cwd.clone());
+    screen
+        .remote
+        .set_entries(vec![entry("old", &remote_cwd, false)]);
+    let listed = vec![entry("fresh", &remote_cwd, false)];
+    screen.apply_remote_listing(remote_cwd.clone(), Ok(listed));
+    assert!(
+        screen.remote.core.entries.iter().any(|e| e.name == "fresh"),
+        "matching cwd → fresh entries adopted"
+    );
+    assert!(
+        !screen.remote.core.entries.iter().any(|e| e.name == "old"),
+        "old entries replaced"
+    );
+}
+
+#[test]
+fn apply_remote_listing_ok_dropped_when_user_navigated_away() {
+    // The user navigated further while the listing was in flight: the pane's
+    // cwd no longer matches the listed cwd, so the stale result is dropped.
+    let mut screen = TransferScreen::new(PathBuf::from("/local"), PathBuf::from("/remote/here"));
+    screen.remote.core.cwd = PathBuf::from("/remote/elsewhere"); // navigated away
+    let listed = vec![entry("stale", &PathBuf::from("/remote/here"), false)];
+    screen.apply_remote_listing(PathBuf::from("/remote/here"), Ok(listed));
+    assert!(
+        !screen.remote.core.entries.iter().any(|e| e.name == "stale"),
+        "stale listing (cwd mismatch) must be dropped, not adopted"
+    );
+}
+
+#[test]
+fn apply_remote_listing_err_reverts_cwd_and_surfaces_failure() {
+    // Regression for the remote arm of the "wrong directory" bug: a failed
+    // remote listing must roll the pane back to its pre-switch cwd + entries
+    // (not leave it on the unreachable path) and surface the error.
+    let remote_cwd = PathBuf::from("/remote/start");
+    let mut screen = TransferScreen::new(PathBuf::from("/local"), remote_cwd.clone());
+    screen
+        .remote
+        .set_entries(vec![entry("file", &remote_cwd, false)]);
+    // Simulate a navigation into a path that then fails to list: on_step
+    // captures the origin, the caller advances cwd to the target.
+    screen.remote.on_step();
+    screen.remote.core.cwd = PathBuf::from("/remote/ghost");
+    screen.apply_remote_listing(
+        PathBuf::from("/remote/ghost"),
+        Err("no such directory".to_string()),
+    );
+    assert_eq!(
+        screen.remote.core.cwd,
+        PathBuf::from("/remote/start"),
+        "cwd reverted to origin (not left on the unreachable path)"
+    );
+    assert!(
+        screen.remote.core.entries.iter().any(|e| e.name == "file"),
+        "origin entries kept consistent after the failed switch"
+    );
+    assert!(screen.status.is_error, "failure surfaced as an error");
+    assert!(
+        screen
+            .status
+            .message
+            .as_deref()
+            .unwrap_or("")
+            .contains("remote list failed"),
+        "status names the failure: {:?}",
+        screen.status.message
+    );
+}

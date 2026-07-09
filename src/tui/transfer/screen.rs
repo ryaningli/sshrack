@@ -30,6 +30,7 @@ use ratatui::{
 use sshrack_core::connect::sftp::proto::{
     Direction, OverwritePolicy, Progress, TransferJob, TransferOutcome,
 };
+use sshrack_core::dirsource::DirEntry;
 
 use crate::tui::intent::Status;
 use crate::tui::theme;
@@ -158,9 +159,35 @@ impl TransferScreen {
         &mut self.local
     }
 
-    /// Mutable accessor for the remote pane. See [`Self::local_mut`].
-    pub fn remote_mut(&mut self) -> &mut Pane {
-        &mut self.remote
+    /// Apply a remote listing result drained from a `WorkerEvent::Listing`.
+    ///
+    /// - `Ok`: adopt the entries only when the listed cwd still matches the
+    ///   pane's cwd — the user may have navigated further while the listing
+    ///   was in flight, in which case the now-stale result is dropped.
+    /// - `Err`: the listing failed (the path does not exist or is unreachable
+    ///   over SFTP). Revert the pane to its pre-switch cwd + entries and
+    ///   surface the failure, mirroring the local arm so the pane never sits
+    ///   on an unreachable path with the previous listing still visible — the
+    ///   "wrong directory" transfer bug.
+    ///
+    /// Pure: no I/O. Extracted from the run loop so the Err-revert path is
+    /// unit-testable without a live `SftpWorker` (which spawns a real master).
+    pub fn apply_remote_listing(
+        &mut self,
+        listed_cwd: PathBuf,
+        res: Result<Vec<DirEntry>, String>,
+    ) {
+        match res {
+            Ok(entries) => {
+                if self.remote.core.cwd == listed_cwd {
+                    self.remote.set_entries(entries);
+                }
+            }
+            Err(msg) => {
+                self.remote.revert_switch();
+                self.status = Status::error(format!("remote list failed: {msg}"));
+            }
+        }
     }
 
     /// Pure key router. Mirrors the app's three-layer discipline
