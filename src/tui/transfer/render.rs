@@ -295,7 +295,7 @@ fn draw_pane_row(
         let mtime_str = fmt_mtime(entry.modified);
         let meta = format!("{size_str}  {mtime_str}");
         let used = 2 + 2 + name_w;
-        let fill = (width as usize).saturating_sub(used + meta.chars().count());
+        let fill = (width as usize).saturating_sub(used + cells(&meta));
         let meta_style = if focused_pane && is_cursor {
             base
         } else {
@@ -1372,25 +1372,37 @@ mod tests {
 
     #[test]
     fn draw_pane_row_cjk_name_aligns_by_display_width() {
-        // A CJK glyph is 2 cells. Two rows — one CJK (4 cells for 2 glyphs),
-        // one ASCII (4 cells for 4 chars) — must pad so their meta columns
-        // start at the same column. Pinned by checking the CJK row's name span
-        // occupies exactly name_w cells.
-        let e_cjk = entry("中文", false, None);
-        let line = draw_pane_row(&e_cjk, "", false, false, true, 8, 30, false);
-        // "中文" is 4 cells; padded to name_w=8 => 4 trailing spaces.
-        let name_span = line
+        // A CJK glyph is 2 cells. "中文" is 4 display cells; with name_w=8 the
+        // name must pad by 4 (display width) so the meta column starts at the
+        // same offset as an ASCII row of the same cell width. With the old
+        // char-count pad, "中文" (2 chars) would pad 6, yielding 10 cells !=
+        // name_w=8 — this assertion catches that regression.
+        let name_w = 8usize;
+        let width = 40u16;
+        let e_cjk = entry("中文", false, Some(1024));
+        let line = draw_pane_row(&e_cjk, "", false, false, true, name_w, width, true);
+        // Span layout: [mark, focus, name..., pad, fill, meta]. The fill span
+        // (pure spaces) sits right before meta; name+pad is spans[2..fill_idx).
+        let meta_idx = line
             .spans
             .iter()
-            .find(|s| s.content.contains('中'))
-            .expect("cjk name span");
-        let trailing = name_span.content.chars().filter(|c| *c == ' ').count();
-        // The highlight spans split the name across spans; collect all content
-        // up to the meta gap and assert total cell width == name_w.
-        let _ = trailing; // (kept simple: the point is no panic + fits width)
+            .position(|s| s.content.contains("1.0K"))
+            .expect("meta span carrying the size");
+        let name_pad: String = line.spans[2..meta_idx - 1]
+            .iter()
+            .map(|s| &*s.content)
+            .collect();
+        assert_eq!(
+            crate::tui::fit::cells(&name_pad),
+            name_w,
+            "name+pad must be exactly name_w display cells; got {:?} ({} cells)",
+            name_pad,
+            crate::tui::fit::cells(&name_pad),
+        );
+        // Whole row still fits the allotted width.
         let s = format!("{line}");
         assert!(
-            crate::tui::fit::cells(&s) <= 30,
+            crate::tui::fit::cells(&s) <= width as usize,
             "cjk row fits width: {s:?}"
         );
     }
