@@ -39,13 +39,10 @@ const NAME_COL_CAP: usize = 24;
 /// Minimum name column width kept before numeric segments are dropped. Below
 /// this the name is starved and we degrade the row instead of rendering a
 /// 2-character sliver.
-#[allow(dead_code)] // wired in Task 2 (draw_active_transfer consumes this)
 const NAME_MIN: usize = 6;
 /// Gauge width bounds: ~1/3 of the row, never narrower than this (else the
 /// `██░░ N%` label is unreadable) nor wider than this (else it dominates).
-#[allow(dead_code)] // wired in Task 2 (draw_active_transfer consumes this)
 const GAUGE_MIN: u16 = 10;
-#[allow(dead_code)] // wired in Task 2 (draw_active_transfer consumes this)
 const GAUGE_MAX: u16 = 30;
 
 /// Paint one pane into `area` as a titled bordered block: focus = accent
@@ -298,11 +295,18 @@ fn draw_pane_row(
     Line::from(spans)
 }
 
-/// Render row 1 of the progress panel: the active transfer's text summary plus
-/// a `Gauge`, or `"<name> <dir> <done> transferred…"` (no gauge) when
-/// `bytes_total` is `None`, or the dim "no transfer in flight" placeholder
-/// when `active` is `None`. The row is split horizontally — text on the left,
-/// gauge on the right — so a long name cannot push the gauge off the row.
+/// Render row 1 of the progress panel: the active transfer as a three-column
+/// row — `[name ↑/↓]` left, the surviving numeric segments (`size rate eta`)
+/// right-aligned against the gauge, and a `Gauge` hard against the right edge.
+/// An unknown total renders no gauge (just name + bytes-done + rate). `None`
+/// paints the dim "no transfer in flight" placeholder.
+///
+/// Width handling is delegated to [`plan_active_row`]: the name is truncated
+/// with `…` (never silently clipped), numeric segments drop in priority order
+/// (eta → rate → size) as the row narrows, and the gauge is dropped only when
+/// even a minimal name + gauge no longer fit. The percent appears once, in the
+/// gauge label. The right edge is always the gauge (or the last segment) — no
+/// wasted trailing space.
 pub fn draw_active_transfer(frame: &mut Frame, area: Rect, active: Option<&Progress>) {
     let Some(prog) = active else {
         frame.render_widget(
@@ -315,58 +319,74 @@ pub fn draw_active_transfer(frame: &mut Frame, area: Rect, active: Option<&Progr
         return;
     };
 
+    let plan = plan_active_row(
+        &prog.name,
+        prog.bytes_done,
+        prog.bytes_total,
+        prog.rate_bps,
+        prog.eta_secs,
+        area.width,
+    );
+
     let dir_glyph = match prog.direction {
         Direction::Upload => "↑",
         Direction::Download => "↓",
     };
 
-    match prog.bytes_total {
-        Some(total) if total > 0 => {
-            let percent = u16::try_from(prog.bytes_done.saturating_mul(100) / total)
-                .unwrap_or(100)
-                .min(100);
-            let text = format!(
-                "{} {} {}% {}/{} {}/s eta:{}",
-                prog.name,
-                dir_glyph,
-                percent,
-                fmt_size(prog.bytes_done),
-                fmt_size(total),
-                fmt_rate(prog.rate_bps),
-                fmt_eta(prog.eta_secs),
-            );
-            // Split: text on the left (clamped to leave at least 10 cells for
-            // the gauge), gauge on the right. A tiny area just renders text.
-            let text_w = text.chars().count() as u16;
-            let avail = area.width;
-            let want_gauge_w = avail.saturating_sub(text_w.min(avail / 2));
-            if want_gauge_w < 5 {
-                frame.render_widget(Paragraph::new(text), area);
-                return;
-            }
-            let [text_area, gauge_area] =
-                Layout::horizontal([Constraint::Min(0), Constraint::Length(want_gauge_w)])
-                    .areas(area);
-            frame.render_widget(Paragraph::new(text), text_area);
-            frame.render_widget(
-                Gauge::default()
-                    .gauge_style(theme::accent())
-                    .percent(percent)
-                    .label(format!("{percent}%")),
-                gauge_area,
-            );
-        }
-        _ => {
-            // Unknown total: render the indeterminate form with no gauge.
-            let text = format!(
-                "{} {} {} transferred…",
-                prog.name,
-                dir_glyph,
-                fmt_size(prog.bytes_done),
-            );
-            frame.render_widget(Paragraph::new(text), area);
-        }
+    // Name column: truncated name + a spaced direction glyph, left-aligned.
+    let name_line = Line::from(vec![
+        Span::raw(plan.name_shown.clone()),
+        Span::styled(format!(" {dir_glyph}"), theme::accent()),
+    ]);
+
+    // Segments column: surviving segments right-aligned so they hug the gauge.
+    let mut seg_spans: Vec<Span> = Vec::new();
+    if plan.show_size {
+        seg_spans.push(Span::raw(format!(" {}", plan.size_seg)));
     }
+    if plan.show_rate {
+        seg_spans.push(Span::raw(format!(" {}", plan.rate_seg)));
+    }
+    if plan.show_eta {
+        seg_spans.push(Span::raw(format!(" {}", plan.eta_seg)));
+    }
+
+    if plan.gauge_w == 0 {
+        // No gauge: name fills the row, segments trail it. Still no silent
+        // clip — the plan already truncated the name to fit `area.width`.
+        let [name_area, segs_area] =
+            Layout::horizontal([Constraint::Min(0), Constraint::Length(plan.segs_w)]).areas(area);
+        frame.render_widget(Paragraph::new(name_line), name_area);
+        if plan.segs_w > 0 {
+            frame.render_widget(
+                Paragraph::new(Line::from(seg_spans)).alignment(Alignment::Right),
+                segs_area,
+            );
+        }
+        return;
+    }
+
+    let [name_area, segs_area, gauge_area] = Layout::horizontal([
+        Constraint::Min(0),
+        Constraint::Length(plan.segs_w),
+        Constraint::Length(plan.gauge_w),
+    ])
+    .areas(area);
+
+    frame.render_widget(Paragraph::new(name_line), name_area);
+    if plan.segs_w > 0 {
+        frame.render_widget(
+            Paragraph::new(Line::from(seg_spans)).alignment(Alignment::Right),
+            segs_area,
+        );
+    }
+    frame.render_widget(
+        Gauge::default()
+            .gauge_style(theme::accent())
+            .percent(plan.percent)
+            .label(plan.gauge_label.clone().unwrap_or_default()),
+        gauge_area,
+    );
 }
 
 /// Build the 2-row status band's summary line: `done X/Y · fail Z [· paused]`
@@ -597,7 +617,6 @@ fn fmt_mtime(t: Option<SystemTime>) -> String {
 /// width-driven degradation here keeps every rung of the ladder (drop eta →
 /// rate → size → gauge; truncate the name) unit-testable without ratatui.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // constructed only in tests for now; Task 2 wires draw_active_transfer
 pub(crate) struct ActiveRowPlan {
     /// Name truncated to its cell budget (with `…` when cut).
     pub name_shown: String,
@@ -634,7 +653,6 @@ pub(crate) struct ActiveRowPlan {
 /// longer fit is the gauge dropped. An unknown total means no gauge, no
 /// percent, and no eta, but size + rate remain.
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)] // wired in Task 2 (draw_active_transfer consumes this)
 pub(crate) fn plan_active_row(
     name: &str,
     done: u64,
@@ -844,24 +862,6 @@ mod tests {
 
     // ---- plan_active_row (width-driven degradation ladder) ----
 
-    #[allow(dead_code)]
-    fn prog(
-        name: &str,
-        done: u64,
-        total: Option<u64>,
-        rate: Option<u64>,
-        eta: Option<u64>,
-    ) -> Progress {
-        Progress {
-            name: name.into(),
-            direction: Direction::Upload,
-            bytes_done: done,
-            bytes_total: total,
-            rate_bps: rate,
-            eta_secs: eta,
-        }
-    }
-
     #[test]
     fn plan_active_row_wide_shows_all_segments_and_gauge() {
         // avail=100 is plenty: name uncut, all three numeric segments shown,
@@ -956,6 +956,151 @@ mod tests {
         let p = plan_active_row("big.bin", 9_999_999_999, None, None, None, 120);
         assert!(p.gauge_label.is_none());
         assert_eq!(p.gauge_w, 0);
+    }
+
+    // ---- draw_active_transfer: render-alignment regression ----
+
+    /// Read row 0 of a TestBackend buffer as a trimmed String.
+    fn row_text(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+        let buf = term.backend().buffer();
+        let s: String = (0..buf.area.width)
+            .map(|col| {
+                buf.cell((col, 0u16))
+                    .map(|c| c.symbol())
+                    .unwrap_or(" ")
+                    .to_string()
+            })
+            .collect();
+        s.trim_end().to_string()
+    }
+
+    #[test]
+    fn draw_active_transfer_renders_rate_with_one_per_sec() {
+        // `fmt_rate` already returns `<size>/s`; the active-transfer text must
+        // not append another `/s` (the `13.4M/s/s` regression that surfaced
+        // once upload progress actually started updating).
+        use ratatui::{Terminal, backend::TestBackend};
+        use sshrack_core::connect::sftp::proto::{Direction, Progress};
+
+        let prog = Progress {
+            name: "file.bin".into(),
+            direction: Direction::Upload,
+            bytes_done: 1_024,
+            bytes_total: Some(4_096),
+            rate_bps: Some(1_024),
+            eta_secs: Some(3),
+        };
+        let mut term = Terminal::new(TestBackend::new(100, 1)).unwrap();
+        term.draw(|f| draw_active_transfer(f, f.area(), Some(&prog)))
+            .unwrap();
+        let text = row_text(&term);
+        assert!(text.contains("1.0K/s"), "rate should appear once: {text:?}");
+        assert!(
+            !text.contains("/s/s"),
+            "rate must not double the /s suffix: {text:?}"
+        );
+    }
+
+    #[test]
+    fn draw_active_transfer_wide_shows_name_segments_and_gauge() {
+        use ratatui::{Terminal, backend::TestBackend};
+        use sshrack_core::connect::sftp::proto::{Direction, Progress};
+        let prog = Progress {
+            name: "file.bin".into(),
+            direction: Direction::Upload,
+            bytes_done: 1_024,
+            bytes_total: Some(4_096),
+            rate_bps: Some(1_024),
+            eta_secs: Some(3),
+        };
+        let mut term = Terminal::new(TestBackend::new(100, 1)).unwrap();
+        term.draw(|f| draw_active_transfer(f, f.area(), Some(&prog)))
+            .unwrap();
+        let text = row_text(&term);
+        assert!(text.contains("file.bin"), "name shown: {text:?}");
+        assert!(text.contains("1.0K/4.0K"), "size shown: {text:?}");
+        assert!(text.contains("1.0K/s"), "rate shown: {text:?}");
+        assert!(text.contains("3s"), "eta shown: {text:?}");
+        assert!(text.contains("25%"), "gauge percent shown: {text:?}");
+        // The gauge hugs the right edge: the last non-space cell is part of the
+        // gauge label (a digit or `%`), not a truncated text char.
+        let last = text.chars().last().expect("non-empty row");
+        assert!(
+            last == '%' || last.is_ascii_digit(),
+            "right edge is the gauge label: {text:?}"
+        );
+    }
+
+    #[test]
+    fn draw_active_transfer_narrow_truncates_name_and_keeps_gauge_at_right() {
+        use ratatui::{Terminal, backend::TestBackend};
+        use sshrack_core::connect::sftp::proto::{Direction, Progress};
+        let prog = Progress {
+            name: "funasr_encoder_adaptor_dynamic.onnx".into(),
+            direction: Direction::Upload,
+            bytes_done: 2_000_000_000,
+            bytes_total: Some(10_000_000_000),
+            rate_bps: Some(14_000_000),
+            eta_secs: Some(55),
+        };
+        let mut term = Terminal::new(TestBackend::new(30, 1)).unwrap();
+        term.draw(|f| draw_active_transfer(f, f.area(), Some(&prog)))
+            .unwrap();
+        let text = row_text(&term);
+        assert!(text.contains('…'), "long name truncated with …: {text:?}");
+        // No silent clipping past the right edge: row never exceeds 30 cells.
+        assert!(
+            crate::tui::fit::cells(&text) <= 30,
+            "row fits the area: {text:?}"
+        );
+        // Percent still present (gauge survives at width 30).
+        assert!(text.contains('%'), "gauge label present: {text:?}");
+    }
+
+    #[test]
+    fn draw_active_transfer_indeterminate_has_no_gauge_or_percent() {
+        use ratatui::{Terminal, backend::TestBackend};
+        use sshrack_core::connect::sftp::proto::{Direction, Progress};
+        let prog = Progress {
+            name: "stream.bin".into(),
+            direction: Direction::Download,
+            bytes_done: 5_000_000,
+            bytes_total: None,
+            rate_bps: Some(2_000_000),
+            eta_secs: None,
+        };
+        let mut term = Terminal::new(TestBackend::new(80, 1)).unwrap();
+        term.draw(|f| draw_active_transfer(f, f.area(), Some(&prog)))
+            .unwrap();
+        let text = row_text(&term);
+        assert!(text.contains("stream.bin"), "name shown: {text:?}");
+        assert!(
+            !text.contains('%'),
+            "no percent when total unknown: {text:?}"
+        );
+        assert!(text.contains("1.9M/s"), "rate shown: {text:?}");
+    }
+
+    #[test]
+    fn draw_active_transfer_percent_appears_exactly_once() {
+        // The percent must live in the gauge label only — never also printed in
+        // the text segment (the old `{}% ... {}/{} ...` format doubled it).
+        use ratatui::{Terminal, backend::TestBackend};
+        use sshrack_core::connect::sftp::proto::{Direction, Progress};
+        let prog = Progress {
+            name: "file.bin".into(),
+            direction: Direction::Upload,
+            bytes_done: 1_024,
+            bytes_total: Some(4_096),
+            rate_bps: Some(1_024),
+            eta_secs: Some(3),
+        };
+        let mut term = Terminal::new(TestBackend::new(100, 1)).unwrap();
+        term.draw(|f| draw_active_transfer(f, f.area(), Some(&prog)))
+            .unwrap();
+        let text = row_text(&term);
+        let pct_count = text.matches('%').count();
+        assert_eq!(pct_count, 1, "percent appears exactly once: {text:?}");
     }
 
     // ---- draw_pane_row: render-alignment regression ----
