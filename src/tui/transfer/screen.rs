@@ -523,8 +523,9 @@ impl TransferScreen {
     }
 
     /// Hotkey footer: one dot-separated hint line. Keys take the accent color;
-    /// labels are dim. Mirrors [`crate::tui::shell::draw_shell`]'s footer
-    /// styling so the transfer screen reads as part of the app.
+    /// labels are dim. On a narrow terminal, trailing hints are dropped (via
+    /// [`render::fit_hint_count`]) and a dim `…` marks the truncation, so the
+    /// footer degrades gracefully instead of being silently clipped.
     fn draw_footer(&self, frame: &mut Frame, area: Rect) {
         let hints: &[(&str, &str)] = &[
             ("Tab", "switch"),
@@ -538,8 +539,9 @@ impl TransferScreen {
             ("^C", "close"),
             ("F1", "help"),
         ];
+        let count = render::fit_hint_count(hints, area.width);
         let mut spans: Vec<Span> = Vec::with_capacity(hints.len() * 3);
-        for (i, (k, label)) in hints.iter().enumerate() {
+        for (i, (k, label)) in hints.iter().take(count).enumerate() {
             if i > 0 {
                 spans.push(Span::styled(" · ", Style::new().dim()));
             }
@@ -548,6 +550,9 @@ impl TransferScreen {
                 theme::accent().add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::styled(format!(" {label}"), Style::new().dim()));
+        }
+        if count < hints.len() {
+            spans.push(Span::styled(" …", Style::new().dim()));
         }
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }

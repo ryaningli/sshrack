@@ -36,6 +36,15 @@ use crate::tui::transfer::queue_overlay::QueueView;
 /// / credential panel cap so all three list surfaces line up.
 const NAME_COL_CAP: usize = 24;
 
+/// Minimum name column width kept before numeric segments are dropped. Below
+/// this the name is starved and we degrade the row instead of rendering a
+/// 2-character sliver.
+const NAME_MIN: usize = 6;
+/// Gauge width bounds: ~1/3 of the row, never narrower than this (else the
+/// `██░░ N%` label is unreadable) nor wider than this (else it dominates).
+const GAUGE_MIN: u16 = 10;
+const GAUGE_MAX: u16 = 30;
+
 /// Paint one pane into `area` as a titled bordered block: focus = accent
 /// border + bold title, non-focus = dim border + dim title (mirrors sshelf and
 /// keeps sshrack's dim-the-non-focused-pane language). Inside the block: a
@@ -181,15 +190,28 @@ fn draw_pane_list(frame: &mut Frame, area: Rect, pane: &Pane, focused: bool) {
     let rows = area.height as usize;
     let win = pane.visible_window(rows);
 
-    // Adaptive name column width across the VISIBLE rows (not the whole
-    // listing) so a very long off-screen name cannot squeeze the meta column.
-    let name_w = win
-        .clone()
-        .filter_map(|i| pane.entry_at_rank(i))
-        .map(|e| strip_control_chars(&e.name).chars().count())
+    // Plan the name column from the VISIBLE rows' display widths (not the whole
+    // listing, so an off-screen giant name can't squeeze the meta column). Meta
+    // width is the widest visible "<size>  <mtime>" so the plan accounts for
+    // the row that needs the most room.
+    let visible: Vec<&DirEntry> = win.clone().filter_map(|i| pane.entry_at_rank(i)).collect();
+    let visible_max = visible
+        .iter()
+        .map(|e| cells(&strip_control_chars(&e.name)))
         .max()
-        .unwrap_or(0)
-        .min(NAME_COL_CAP);
+        .unwrap_or(0);
+    let meta_w = visible
+        .iter()
+        .map(|e| {
+            cells(&format!(
+                "{}  {}",
+                fmt_size_opt(e.size),
+                fmt_mtime(e.modified)
+            ))
+        })
+        .max()
+        .unwrap_or(0);
+    let plan = plan_name_col(visible_max, meta_w, area.width);
 
     let mut lines: Vec<Line> = Vec::with_capacity(win.end.saturating_sub(win.start));
     for i in win {
@@ -204,18 +226,20 @@ fn draw_pane_list(frame: &mut Frame, area: Rect, pane: &Pane, focused: bool) {
             is_cursor,
             is_marked,
             focused,
-            name_w,
+            plan.name_w,
             area.width,
+            plan.show_meta,
         ));
     }
     frame.render_widget(Paragraph::new(lines), area);
 }
 
 /// Build one list row: `[●|  ]` mark glyph + `theme::focus_marker(cursor)` +
-/// fuzzy-highlighted name padded to `name_w` + right-aligned dim
-/// `<size>  <mtime>`. The mark glyph and the focus marker together are the
-/// 4-cell leading prefix that every row aligns under. Pure: returns a `Line`
-/// the caller renders.
+/// fuzzy-highlighted name truncated/padded to `name_w` (display cells) +, when
+/// `show_meta`, a right-aligned dim `<size>  <mtime>`. The mark glyph and the
+/// focus marker together are the 4-cell leading prefix every row aligns under.
+/// Pure: returns a `Line` the caller renders.
+#[allow(clippy::too_many_arguments)]
 fn draw_pane_row(
     entry: &DirEntry,
     query: &str,
@@ -224,11 +248,11 @@ fn draw_pane_row(
     focused_pane: bool,
     name_w: usize,
     width: u16,
+    show_meta: bool,
 ) -> Line<'static> {
     // The focused pane's cursor row highlights the WHOLE row (accent + bold),
-    // matching the identity-key picker — name, size, and mtime read as one
-    // selected row, not just a leading arrow. Other rows stay plain; the
-    // non-focused pane dims everything so it never competes with the highlight.
+    // matching the identity-key picker. Other rows stay plain; the non-focused
+    // pane dims everything so it never competes with the highlight.
     let base = if focused_pane && is_cursor {
         theme::accent().add_modifier(Modifier::BOLD)
     } else if focused_pane {
@@ -239,9 +263,7 @@ fn draw_pane_row(
 
     let mut spans: Vec<Span> = Vec::with_capacity(8);
 
-    // Leading mark glyph: `● ` accented when marked, two spaces otherwise. The
-    // accent is dimmed on the non-focused pane so it does not out-shout the
-    // focused pane's marks.
+    // Leading mark glyph: `● ` accented when marked, two spaces otherwise.
     if is_marked {
         let mark_style = if focused_pane {
             theme::accent().add_modifier(Modifier::BOLD)
@@ -253,44 +275,51 @@ fn draw_pane_row(
         spans.push(Span::raw("  "));
     }
 
-    // Focus marker (2 cells either way) keeps the name column aligned across
-    // selected and unselected rows. Pass `focused_pane && is_cursor` so the
-    // non-focused pane never paints an accented arrow that competes with the
-    // focused pane's.
     spans.push(theme::focus_marker(focused_pane && is_cursor));
 
-    // Name: control-char-stripped + fuzzy-highlighted against the query.
+    // Name: control-char-stripped, truncated to name_w cells (with `…`), then
+    // fuzzy-highlighted against the query, then padded by DISPLAY width so CJK
+    // and ASCII rows align under the same meta column.
     let cleaned = strip_control_chars(&entry.name);
-    spans.extend(panel::highlighted_spans(&cleaned, query, base));
-    spans.push(Span::raw(
-        " ".repeat(name_w.saturating_sub(cleaned.chars().count())),
-    ));
-
-    // Right-aligned dim `<size>  <mtime>` meta column. The leading gap is the
-    // remaining fill so the meta sticks to the right edge.
-    let size_str = fmt_size_opt(entry.size);
-    let mtime_str = fmt_mtime(entry.modified);
-    let meta = format!("{size_str}  {mtime_str}");
-    let used = 2 + 2 + name_w;
-    let fill = (width as usize).saturating_sub(used + meta.chars().count());
-    // Meta (size + mtime): dim on plain rows, but on the focused cursor row it
-    // inherits the accent+bold highlight so the whole row reads as one.
-    let meta_style = if focused_pane && is_cursor {
-        base
+    let truncated = if cells(&cleaned) > name_w {
+        truncate_cells(&cleaned, name_w)
     } else {
-        Style::new().dim()
+        cleaned.clone()
     };
-    spans.push(Span::raw(" ".repeat(fill)));
-    spans.push(Span::styled(meta, meta_style));
+    spans.extend(panel::highlighted_spans(&truncated, query, base));
+    let pad = name_w.saturating_sub(cells(&truncated));
+    spans.push(Span::raw(" ".repeat(pad)));
+
+    if show_meta {
+        let size_str = fmt_size_opt(entry.size);
+        let mtime_str = fmt_mtime(entry.modified);
+        let meta = format!("{size_str}  {mtime_str}");
+        let used = 2 + 2 + name_w;
+        let fill = (width as usize).saturating_sub(used + cells(&meta));
+        let meta_style = if focused_pane && is_cursor {
+            base
+        } else {
+            Style::new().dim()
+        };
+        spans.push(Span::raw(" ".repeat(fill)));
+        spans.push(Span::styled(meta, meta_style));
+    }
 
     Line::from(spans)
 }
 
-/// Render row 1 of the progress panel: the active transfer's text summary plus
-/// a `Gauge`, or `"<name> <dir> <done> transferred…"` (no gauge) when
-/// `bytes_total` is `None`, or the dim "no transfer in flight" placeholder
-/// when `active` is `None`. The row is split horizontally — text on the left,
-/// gauge on the right — so a long name cannot push the gauge off the row.
+/// Render row 1 of the progress panel: the active transfer as a three-column
+/// row — `[name ↑/↓]` left, the surviving numeric segments (`size rate eta`)
+/// right-aligned against the gauge, and a `Gauge` hard against the right edge.
+/// An unknown total renders no gauge (just name + bytes-done + rate). `None`
+/// paints the dim "no transfer in flight" placeholder.
+///
+/// Width handling is delegated to [`plan_active_row`]: the name is truncated
+/// with `…` (never silently clipped), numeric segments drop in priority order
+/// (eta → rate → size) as the row narrows, and the gauge is dropped only when
+/// even a minimal name + gauge no longer fit. The percent appears once, in the
+/// gauge label. The right edge is always the gauge (or the last segment) — no
+/// wasted trailing space.
 pub fn draw_active_transfer(frame: &mut Frame, area: Rect, active: Option<&Progress>) {
     let Some(prog) = active else {
         frame.render_widget(
@@ -303,58 +332,74 @@ pub fn draw_active_transfer(frame: &mut Frame, area: Rect, active: Option<&Progr
         return;
     };
 
+    let plan = plan_active_row(
+        &prog.name,
+        prog.bytes_done,
+        prog.bytes_total,
+        prog.rate_bps,
+        prog.eta_secs,
+        area.width,
+    );
+
     let dir_glyph = match prog.direction {
         Direction::Upload => "↑",
         Direction::Download => "↓",
     };
 
-    match prog.bytes_total {
-        Some(total) if total > 0 => {
-            let percent = u16::try_from(prog.bytes_done.saturating_mul(100) / total)
-                .unwrap_or(100)
-                .min(100);
-            let text = format!(
-                "{} {} {}% {}/{} {} eta:{}",
-                prog.name,
-                dir_glyph,
-                percent,
-                fmt_size(prog.bytes_done),
-                fmt_size(total),
-                fmt_rate(prog.rate_bps),
-                fmt_eta(prog.eta_secs),
-            );
-            // Split: text on the left (clamped to leave at least 10 cells for
-            // the gauge), gauge on the right. A tiny area just renders text.
-            let text_w = text.chars().count() as u16;
-            let avail = area.width;
-            let want_gauge_w = avail.saturating_sub(text_w.min(avail / 2));
-            if want_gauge_w < 5 {
-                frame.render_widget(Paragraph::new(text), area);
-                return;
-            }
-            let [text_area, gauge_area] =
-                Layout::horizontal([Constraint::Min(0), Constraint::Length(want_gauge_w)])
-                    .areas(area);
-            frame.render_widget(Paragraph::new(text), text_area);
-            frame.render_widget(
-                Gauge::default()
-                    .gauge_style(theme::accent())
-                    .percent(percent)
-                    .label(format!("{percent}%")),
-                gauge_area,
-            );
-        }
-        _ => {
-            // Unknown total: render the indeterminate form with no gauge.
-            let text = format!(
-                "{} {} {} transferred…",
-                prog.name,
-                dir_glyph,
-                fmt_size(prog.bytes_done),
-            );
-            frame.render_widget(Paragraph::new(text), area);
-        }
+    // Name column: truncated name + a spaced direction glyph, left-aligned.
+    let name_line = Line::from(vec![
+        Span::raw(plan.name_shown.clone()),
+        Span::styled(format!(" {dir_glyph}"), theme::accent()),
+    ]);
+
+    // Segments column: surviving segments right-aligned so they hug the gauge.
+    let mut seg_spans: Vec<Span> = Vec::new();
+    if plan.show_size {
+        seg_spans.push(Span::raw(format!(" {}", plan.size_seg)));
     }
+    if plan.show_rate {
+        seg_spans.push(Span::raw(format!(" {}", plan.rate_seg)));
+    }
+    if plan.show_eta {
+        seg_spans.push(Span::raw(format!(" {}", plan.eta_seg)));
+    }
+
+    if plan.gauge_w == 0 {
+        // No gauge: name fills the row, segments trail it. Still no silent
+        // clip — the plan already truncated the name to fit `area.width`.
+        let [name_area, segs_area] =
+            Layout::horizontal([Constraint::Min(0), Constraint::Length(plan.segs_w)]).areas(area);
+        frame.render_widget(Paragraph::new(name_line), name_area);
+        if plan.segs_w > 0 {
+            frame.render_widget(
+                Paragraph::new(Line::from(seg_spans)).alignment(Alignment::Right),
+                segs_area,
+            );
+        }
+        return;
+    }
+
+    let [name_area, segs_area, gauge_area] = Layout::horizontal([
+        Constraint::Min(0),
+        Constraint::Length(plan.segs_w),
+        Constraint::Length(plan.gauge_w),
+    ])
+    .areas(area);
+
+    frame.render_widget(Paragraph::new(name_line), name_area);
+    if plan.segs_w > 0 {
+        frame.render_widget(
+            Paragraph::new(Line::from(seg_spans)).alignment(Alignment::Right),
+            segs_area,
+        );
+    }
+    frame.render_widget(
+        Gauge::default()
+            .gauge_style(theme::accent())
+            .percent(plan.percent)
+            .label(plan.gauge_label.clone().unwrap_or_default()),
+        gauge_area,
+    );
 }
 
 /// Build the 2-row status band's summary line: `done X/Y · fail Z [· paused]`
@@ -580,6 +625,218 @@ fn fmt_mtime(t: Option<SystemTime>) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// Laid-out active-transfer row, produced by [`plan_active_row`]. Pure —
+/// [`draw_active_transfer`] consumes these fields verbatim. Centralizing the
+/// width-driven degradation here keeps every rung of the ladder (drop eta →
+/// rate → size → gauge; truncate the name) unit-testable without ratatui.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActiveRowPlan {
+    /// Name truncated to its cell budget (with `…` when cut).
+    pub name_shown: String,
+    /// `"<done>/<total>"` when the total is known, else `"<done>"` (bytes moved).
+    pub size_seg: String,
+    /// `"<rate>/s"` or `—`.
+    pub rate_seg: String,
+    /// `"<n>s"` / `"<m>n s"` / `—`.
+    pub eta_seg: String,
+    pub show_size: bool,
+    pub show_rate: bool,
+    pub show_eta: bool,
+    /// Total cell width of the shown numeric segments, each including its one
+    /// leading space. 0 when none are shown. Used to size the right-aligned
+    /// segment column so it hugs the gauge with no gap.
+    pub segs_w: u16,
+    /// Gauge width in cells. 0 ⇒ no gauge (indeterminate total, or row too
+    /// narrow even for `GAUGE_MIN` + `NAME_MIN`).
+    pub gauge_w: u16,
+    /// `Some("N%")` when a gauge is shown, else `None`.
+    pub gauge_label: Option<String>,
+    /// Integer percent 0..=100 for the `Gauge` widget. 0 when indeterminate.
+    pub percent: u16,
+}
+
+/// Plan the active-transfer row for a `avail`-wide area. Pure.
+///
+/// Layout (left → right): `[name][ ↑/↓][ <size>][ <rate>][ <eta>]` left/center,
+/// `[gauge N%]` hard against the right edge. The name is the most compressible
+/// field: it is truncated to whatever budget remains after the surviving
+/// numeric segments and the gauge. As `avail` shrinks, segments are dropped in
+/// priority order — eta first (it depends on a known total anyway), then rate,
+/// then size — and only when even a bare `NAME_MIN` name + `GAUGE_MIN` gauge no
+/// longer fit is the gauge dropped. An unknown total means no gauge, no
+/// percent, and no eta, but size + rate remain.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_active_row(
+    name: &str,
+    done: u64,
+    total: Option<u64>,
+    rate: Option<u64>,
+    eta: Option<u64>,
+    avail: u16,
+) -> ActiveRowPlan {
+    let avail = avail as usize;
+    let glyph_w = 2usize; // " ↑" / " ↓" — a space + the arrow, for legibility
+
+    let total_known = total.filter(|t| *t > 0);
+    let (percent, gauge_label) = match total_known {
+        Some(t) => {
+            let pct = u16::try_from(done.saturating_mul(100) / t)
+                .unwrap_or(100)
+                .min(100);
+            (pct, Some(format!("{pct}%")))
+        }
+        None => (0u16, None),
+    };
+
+    let size_seg = match total_known {
+        Some(t) => format!("{}/{}", fmt_size(done), fmt_size(t)),
+        None => fmt_size(done),
+    };
+    let rate_seg = fmt_rate(rate);
+    let eta_seg = fmt_eta(eta);
+
+    let size_w = cells(&size_seg) + 1; // +1 leading space
+    let rate_w = cells(&rate_seg) + 1;
+    let eta_w = cells(&eta_seg) + 1;
+
+    // Gauge only when the total is known AND the row can hold gauge + NAME_MIN.
+    let mut gauge_w: usize = if total_known.is_some() {
+        let g = (avail / 3).clamp(GAUGE_MIN as usize, GAUGE_MAX as usize);
+        if avail >= GAUGE_MIN as usize + NAME_MIN + 2 {
+            g
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    let mut gauge_used = if gauge_w > 0 { gauge_w + 1 } else { 0 }; // +1 sep before gauge
+
+    // eta is only meaningful with a known total.
+    let mut show_eta = total_known.is_some();
+    let mut show_size = true;
+    let mut show_rate = true;
+
+    let mut segs_w = size_w + if show_rate { rate_w } else { 0 } + if show_eta { eta_w } else { 0 };
+    let mut name_budget = avail.saturating_sub(glyph_w + segs_w + gauge_used);
+
+    // Degrade: eta → rate → size → gauge, until the name keeps NAME_MIN.
+    if name_budget < NAME_MIN && show_eta {
+        show_eta = false;
+        segs_w = size_w + if show_rate { rate_w } else { 0 };
+        name_budget = avail.saturating_sub(glyph_w + segs_w + gauge_used);
+    }
+    if name_budget < NAME_MIN && show_rate {
+        show_rate = false;
+        segs_w = size_w;
+        name_budget = avail.saturating_sub(glyph_w + segs_w + gauge_used);
+    }
+    if name_budget < NAME_MIN && show_size {
+        show_size = false;
+        segs_w = 0;
+        name_budget = avail.saturating_sub(glyph_w + segs_w + gauge_used);
+    }
+    if name_budget < NAME_MIN && gauge_w > 0 {
+        gauge_w = 0;
+        gauge_used = 0;
+        name_budget = avail.saturating_sub(glyph_w + segs_w + gauge_used);
+    }
+
+    let name_shown = truncate_cells(name, name_budget.max(1));
+
+    ActiveRowPlan {
+        name_shown,
+        size_seg,
+        rate_seg,
+        eta_seg,
+        show_size,
+        show_rate,
+        show_eta,
+        segs_w: segs_w as u16,
+        gauge_w: gauge_w as u16,
+        gauge_label: gauge_label.filter(|_| gauge_w > 0),
+        percent,
+    }
+}
+
+/// Pane-row column plan: the name-column width and whether the meta column
+/// survives the width budget. Pure — produced by [`plan_name_col`], consumed
+/// by [`draw_pane_list`] / [`draw_pane_row`]. Centralizing this keeps the
+/// "shrink name before dropping meta, never silently clip" rule unit-testable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NameColPlan {
+    pub name_w: usize,
+    pub show_meta: bool,
+}
+
+/// Decide the name-column width and meta visibility for a pane row of `width`
+/// inner cells, given the widest visible name (`visible_max`, in display cells)
+/// and the meta string's width (`meta_w`, in display cells). Pure.
+///
+/// The 4-cell leading prefix (mark glyph + focus marker) is reserved first.
+/// The name column is capped at [`NAME_COL_CAP`] and, when the row is narrow,
+/// shrunk before meta is dropped — down to [`NAME_MIN`]. Only when even
+/// `NAME_MIN` + meta won't fit is meta dropped and the name given the full
+/// remaining width (capped). This guarantees a long name truncates with `…`
+/// instead of overflowing into / silently clipping the meta column.
+pub(crate) fn plan_name_col(visible_max: usize, meta_w: usize, width: u16) -> NameColPlan {
+    const PREFIX: usize = 4; // mark glyph (2) + focus_marker (2)
+    let width = width as usize;
+    if width <= PREFIX {
+        // Degenerate: not even room for the prefix. Give the name whatever is
+        // left; meta cannot survive.
+        return NameColPlan {
+            name_w: width.max(1),
+            show_meta: false,
+        };
+    }
+    let avail = width - PREFIX;
+    let cap = NAME_COL_CAP.min(avail);
+    let mut name_w = visible_max.min(cap);
+    let mut show_meta = true;
+
+    let meta_with_gap = meta_w + 1; // 1-cell gap before the right-aligned meta
+    if name_w + meta_with_gap > avail {
+        let shrunk = avail.saturating_sub(meta_with_gap);
+        if shrunk >= NAME_MIN {
+            name_w = shrunk;
+        } else {
+            // Can't keep meta alongside a usable name: drop meta, give the name
+            // the full avail (still capped).
+            show_meta = false;
+            name_w = avail.min(NAME_COL_CAP);
+        }
+    }
+    NameColPlan { name_w, show_meta }
+}
+
+/// How many of `hints` (in order) fit a `width`-wide row when rendered as
+/// `"<key> <label>"` joined by `" · "`. Pure. The renderer draws exactly this
+/// many leading hints and appends a `…` when fewer than the total fit, so the
+/// footer degrades by dropping the least-important (trailing) hints instead of
+/// being silently clipped. Always keeps at least the first hint (unless there
+/// are none) so the footer is never blank on a narrow terminal.
+pub(crate) fn fit_hint_count(hints: &[(&str, &str)], width: u16) -> usize {
+    let width = width as usize;
+    let mut w = 0usize;
+    let mut count = 0usize;
+    for (i, (k, label)) in hints.iter().enumerate() {
+        // First hint: "key label"; later hints add a " · " separator prefix.
+        let seg = if i == 0 {
+            format!("{k} {label}")
+        } else {
+            format!(" · {k} {label}")
+        };
+        let seg_w = cells(&seg);
+        if w + seg_w > width {
+            break;
+        }
+        w += seg_w;
+        count += 1;
+    }
+    count.max(if hints.is_empty() { 0 } else { 1 })
+}
+
 /// Howard Hinnant's `civil_from_days`: convert days since 1970-01-01 to a
 /// `(year, month, day)` triple. Pure. Input can be negative (pre-epoch).
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
@@ -694,6 +951,249 @@ mod tests {
         assert_eq!(fmt_mtime(Some(t)), "2000-02-29");
     }
 
+    // ---- plan_active_row (width-driven degradation ladder) ----
+
+    #[test]
+    fn plan_active_row_wide_shows_all_segments_and_gauge() {
+        // avail=100 is plenty: name uncut, all three numeric segments shown,
+        // gauge ~1/3 of the row clamped to [10,30] => 30, percent label present.
+        let p = plan_active_row("file.bin", 1024, Some(4096), Some(1024), Some(3), 100);
+        assert_eq!(p.name_shown, "file.bin", "name fits uncut");
+        assert!(
+            p.show_size && p.show_rate && p.show_eta,
+            "all segments shown"
+        );
+        assert_eq!(p.gauge_w, 30, "gauge clamps to GAUGE_MAX");
+        assert_eq!(p.gauge_label.as_deref(), Some("25%"), "1024/4096 = 25%");
+        assert_eq!(p.percent, 25);
+        // segs_w = ("1.0K/4.0K"+1) + ("1.0K/s"+1) + ("3s"+1) = 10 + 7 + 3 = 20
+        assert_eq!(p.segs_w, 20);
+    }
+
+    #[test]
+    fn plan_active_row_narrow_drops_eta_before_rate_and_size() {
+        // avail=42: name_budget drops below NAME_MIN with all segs, so eta
+        // (lowest priority) is dropped first; size + rate + gauge survive.
+        let p = plan_active_row("file.bin", 1024, Some(4096), Some(1024), Some(3), 42);
+        assert!(!p.show_eta, "eta dropped first");
+        assert!(p.show_size && p.show_rate, "size + rate kept");
+        assert!(p.gauge_w > 0, "gauge kept");
+        assert_eq!(
+            p.name_shown, "file.bin",
+            "name still fits after dropping eta"
+        );
+    }
+
+    #[test]
+    fn plan_active_row_very_narrow_drops_everything_then_gauge() {
+        // avail=15: cannot hold gauge + NAME_MIN, so gauge goes; then all segs
+        // go; only a truncated name remains. No percent label without a gauge.
+        let p = plan_active_row("file.bin", 1024, Some(4096), Some(1024), Some(3), 15);
+        assert!(
+            !p.show_size && !p.show_rate && !p.show_eta,
+            "all segs dropped"
+        );
+        assert_eq!(p.gauge_w, 0, "gauge dropped");
+        assert!(p.gauge_label.is_none(), "no label without gauge");
+        assert_eq!(p.name_shown, "file.bin", "name fits in the freed space");
+    }
+
+    #[test]
+    fn plan_active_row_long_name_truncates_with_ellipsis() {
+        // A 34-cell name in a 50-wide row: name must be cut to its budget and
+        // carry `…`. The numeric segments that fit stay; gauge stays.
+        let p = plan_active_row(
+            "funasr_encoder_adaptor_dynamic.onnx",
+            100,
+            Some(1000),
+            Some(10),
+            Some(5),
+            50,
+        );
+        assert!(
+            p.name_shown.ends_with('…'),
+            "truncated name ends with …: {}",
+            p.name_shown
+        );
+        assert!(
+            p.name_shown.starts_with("funasr"),
+            "keeps the prefix: {}",
+            p.name_shown
+        );
+        assert!(crate::tui::fit::cells(&p.name_shown) <= 50, "fits the row");
+        assert!(p.gauge_w > 0, "gauge still shown");
+    }
+
+    #[test]
+    fn plan_active_row_indeterminate_has_no_gauge_or_eta() {
+        // Unknown total: no gauge, no percent, no eta. Size (bytes done) and
+        // rate still carry information, so they stay when width allows.
+        let p = plan_active_row("file.bin", 1024, None, Some(1024), None, 80);
+        assert_eq!(p.gauge_w, 0, "no gauge when total unknown");
+        assert!(
+            p.gauge_label.is_none(),
+            "no percent label when total unknown"
+        );
+        assert!(!p.show_eta, "eta meaningless without a total");
+        assert!(p.show_size && p.show_rate, "size + rate still shown");
+        // size_seg is just bytes done (no /total) when total is unknown
+        assert_eq!(p.size_seg, "1.0K");
+    }
+
+    #[test]
+    fn plan_active_row_indeterminate_shows_no_percent_in_label() {
+        // Belt-and-suspenders: an indeterminate transfer must never synthesize
+        // a percent label, even on a wide row.
+        let p = plan_active_row("big.bin", 9_999_999_999, None, None, None, 120);
+        assert!(p.gauge_label.is_none());
+        assert_eq!(p.gauge_w, 0);
+    }
+
+    // ---- draw_active_transfer: render-alignment regression ----
+
+    /// Read row 0 of a TestBackend buffer as a trimmed String.
+    fn row_text(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+        let buf = term.backend().buffer();
+        let s: String = (0..buf.area.width)
+            .map(|col| {
+                buf.cell((col, 0u16))
+                    .map(|c| c.symbol())
+                    .unwrap_or(" ")
+                    .to_string()
+            })
+            .collect();
+        s.trim_end().to_string()
+    }
+
+    #[test]
+    fn draw_active_transfer_renders_rate_with_one_per_sec() {
+        // `fmt_rate` already returns `<size>/s`; the active-transfer text must
+        // not append another `/s` (the `13.4M/s/s` regression that surfaced
+        // once upload progress actually started updating).
+        use ratatui::{Terminal, backend::TestBackend};
+        use sshrack_core::connect::sftp::proto::{Direction, Progress};
+
+        let prog = Progress {
+            name: "file.bin".into(),
+            direction: Direction::Upload,
+            bytes_done: 1_024,
+            bytes_total: Some(4_096),
+            rate_bps: Some(1_024),
+            eta_secs: Some(3),
+        };
+        let mut term = Terminal::new(TestBackend::new(100, 1)).unwrap();
+        term.draw(|f| draw_active_transfer(f, f.area(), Some(&prog)))
+            .unwrap();
+        let text = row_text(&term);
+        assert!(text.contains("1.0K/s"), "rate should appear once: {text:?}");
+        assert!(
+            !text.contains("/s/s"),
+            "rate must not double the /s suffix: {text:?}"
+        );
+    }
+
+    #[test]
+    fn draw_active_transfer_wide_shows_name_segments_and_gauge() {
+        use ratatui::{Terminal, backend::TestBackend};
+        use sshrack_core::connect::sftp::proto::{Direction, Progress};
+        let prog = Progress {
+            name: "file.bin".into(),
+            direction: Direction::Upload,
+            bytes_done: 1_024,
+            bytes_total: Some(4_096),
+            rate_bps: Some(1_024),
+            eta_secs: Some(3),
+        };
+        let mut term = Terminal::new(TestBackend::new(100, 1)).unwrap();
+        term.draw(|f| draw_active_transfer(f, f.area(), Some(&prog)))
+            .unwrap();
+        let text = row_text(&term);
+        assert!(text.contains("file.bin"), "name shown: {text:?}");
+        assert!(text.contains("1.0K/4.0K"), "size shown: {text:?}");
+        assert!(text.contains("1.0K/s"), "rate shown: {text:?}");
+        assert!(text.contains("3s"), "eta shown: {text:?}");
+        assert!(text.contains("25%"), "gauge percent shown: {text:?}");
+        // The gauge hugs the right edge: the last non-space cell is part of the
+        // gauge label (a digit or `%`), not a truncated text char.
+        let last = text.chars().last().expect("non-empty row");
+        assert!(
+            last == '%' || last.is_ascii_digit(),
+            "right edge is the gauge label: {text:?}"
+        );
+    }
+
+    #[test]
+    fn draw_active_transfer_narrow_truncates_name_and_keeps_gauge_at_right() {
+        use ratatui::{Terminal, backend::TestBackend};
+        use sshrack_core::connect::sftp::proto::{Direction, Progress};
+        let prog = Progress {
+            name: "funasr_encoder_adaptor_dynamic.onnx".into(),
+            direction: Direction::Upload,
+            bytes_done: 2_000_000_000,
+            bytes_total: Some(10_000_000_000),
+            rate_bps: Some(14_000_000),
+            eta_secs: Some(55),
+        };
+        let mut term = Terminal::new(TestBackend::new(30, 1)).unwrap();
+        term.draw(|f| draw_active_transfer(f, f.area(), Some(&prog)))
+            .unwrap();
+        let text = row_text(&term);
+        assert!(text.contains('…'), "long name truncated with …: {text:?}");
+        // No silent clipping past the right edge: row never exceeds 30 cells.
+        assert!(
+            crate::tui::fit::cells(&text) <= 30,
+            "row fits the area: {text:?}"
+        );
+        // Percent still present (gauge survives at width 30).
+        assert!(text.contains('%'), "gauge label present: {text:?}");
+    }
+
+    #[test]
+    fn draw_active_transfer_indeterminate_has_no_gauge_or_percent() {
+        use ratatui::{Terminal, backend::TestBackend};
+        use sshrack_core::connect::sftp::proto::{Direction, Progress};
+        let prog = Progress {
+            name: "stream.bin".into(),
+            direction: Direction::Download,
+            bytes_done: 5_000_000,
+            bytes_total: None,
+            rate_bps: Some(2_000_000),
+            eta_secs: None,
+        };
+        let mut term = Terminal::new(TestBackend::new(80, 1)).unwrap();
+        term.draw(|f| draw_active_transfer(f, f.area(), Some(&prog)))
+            .unwrap();
+        let text = row_text(&term);
+        assert!(text.contains("stream.bin"), "name shown: {text:?}");
+        assert!(
+            !text.contains('%'),
+            "no percent when total unknown: {text:?}"
+        );
+        assert!(text.contains("1.9M/s"), "rate shown: {text:?}");
+    }
+
+    #[test]
+    fn draw_active_transfer_percent_appears_exactly_once() {
+        // The percent must live in the gauge label only — never also printed in
+        // the text segment (the old `{}% ... {}/{} ...` format doubled it).
+        use ratatui::{Terminal, backend::TestBackend};
+        use sshrack_core::connect::sftp::proto::{Direction, Progress};
+        let prog = Progress {
+            name: "file.bin".into(),
+            direction: Direction::Upload,
+            bytes_done: 1_024,
+            bytes_total: Some(4_096),
+            rate_bps: Some(1_024),
+            eta_secs: Some(3),
+        };
+        let mut term = Terminal::new(TestBackend::new(100, 1)).unwrap();
+        term.draw(|f| draw_active_transfer(f, f.area(), Some(&prog)))
+            .unwrap();
+        let text = row_text(&term);
+        let pct_count = text.matches('%').count();
+        assert_eq!(pct_count, 1, "percent appears exactly once: {text:?}");
+    }
+
     // ---- draw_pane_row: render-alignment regression ----
 
     /// Build a fixture `DirEntry` with the given name.
@@ -716,7 +1216,7 @@ mod tests {
     #[test]
     fn draw_pane_row_marked_leads_with_accented_dot() {
         let e = entry("alpha.txt", false, Some(1024));
-        let line = draw_pane_row(&e, "", true, true, true, 12, 50);
+        let line = draw_pane_row(&e, "", true, true, true, 12, 50, true);
         let s = format!("{line}");
         assert!(s.starts_with('●'), "marked row must lead with ●: {s}");
     }
@@ -724,7 +1224,7 @@ mod tests {
     #[test]
     fn draw_pane_row_unmarked_leads_with_spaces() {
         let e = entry("alpha.txt", false, Some(1024));
-        let line = draw_pane_row(&e, "", true, false, true, 12, 50);
+        let line = draw_pane_row(&e, "", true, false, true, 12, 50, true);
         let s = format!("{line}");
         assert!(
             s.starts_with("  "),
@@ -735,7 +1235,7 @@ mod tests {
     #[test]
     fn draw_pane_row_cursor_on_focused_pane_paints_focus_arrow() {
         let e = entry("alpha.txt", false, Some(1024));
-        let line = draw_pane_row(&e, "", true, false, true, 12, 50);
+        let line = draw_pane_row(&e, "", true, false, true, 12, 50, true);
         let s = format!("{line}");
         assert!(s.contains('▶'), "focused cursor must show ▶: {s}");
     }
@@ -745,7 +1245,7 @@ mod tests {
         // Non-focused pane: no accented arrow (the cursor is shown only by the
         // absence of the arrow on the dim row, matching the launcher pattern).
         let e = entry("alpha.txt", false, Some(1024));
-        let line = draw_pane_row(&e, "", true, false, false, 12, 50);
+        let line = draw_pane_row(&e, "", true, false, false, 12, 50, true);
         let s = format!("{line}");
         assert!(!s.contains('▶'), "dim cursor must not show ▶: {s}");
     }
@@ -754,7 +1254,7 @@ mod tests {
     fn draw_pane_row_strips_fake_control_chars_from_name() {
         let mut e = entry("evil", false, None);
         e.name = "foo\x1b[2Jbar".into();
-        let line = draw_pane_row(&e, "", false, false, true, 12, 50);
+        let line = draw_pane_row(&e, "", false, false, true, 12, 50, true);
         let s = format!("{line}");
         assert!(!s.contains('\u{1b}'), "ESC leaked into row: {s}");
         assert!(s.contains("foo?"), "control char not replaced: {s}");
@@ -770,7 +1270,7 @@ mod tests {
             size: Some(2048),
             modified: Some(UNIX_EPOCH + Duration::from_secs(86_400 * 18_262)),
         };
-        let line = draw_pane_row(&e, "", false, false, true, 12, 50);
+        let line = draw_pane_row(&e, "", false, false, true, 12, 50, true);
         let s = format!("{line}");
         assert!(s.contains("2.0K"), "size column missing: {s}");
         assert!(s.contains("2020-01-01"), "mtime column missing: {s}");
@@ -789,7 +1289,7 @@ mod tests {
             size: Some(2048),
             modified: Some(UNIX_EPOCH + Duration::from_secs(86_400 * 18_262)),
         };
-        let line = draw_pane_row(&e, "", true, false, true, 12, 50);
+        let line = draw_pane_row(&e, "", true, false, true, 12, 50, true);
         let meta_span = line
             .spans
             .iter()
@@ -818,7 +1318,7 @@ mod tests {
             size: Some(2048),
             modified: None,
         };
-        let line = draw_pane_row(&e, "", false, false, true, 12, 50);
+        let line = draw_pane_row(&e, "", false, false, true, 12, 50, true);
         let meta_span = line
             .spans
             .iter()
@@ -828,6 +1328,143 @@ mod tests {
             !meta_span.style.add_modifier.contains(Modifier::BOLD),
             "non-cursor meta must not be bold: {:?}",
             meta_span.style
+        );
+    }
+
+    // ---- plan_name_col (pane row width planning) ----
+
+    #[test]
+    fn plan_name_col_wide_keeps_full_name_and_meta() {
+        // visible_max 12, meta 19, width 50: plenty — name_w = min(12, CAP=24) = 12, meta shown.
+        let p = plan_name_col(12, 19, 50);
+        assert_eq!(p.name_w, 12);
+        assert!(p.show_meta);
+    }
+
+    #[test]
+    fn plan_name_col_caps_at_name_col_cap() {
+        // A 40-cell visible name is capped at NAME_COL_CAP (24), not 40.
+        let p = plan_name_col(40, 19, 80);
+        assert_eq!(p.name_w, NAME_COL_CAP);
+        assert!(p.show_meta);
+    }
+
+    #[test]
+    fn plan_name_col_narrow_shrinks_name_to_keep_meta() {
+        // width 30, prefix 4, meta 19+1 gap = 20: name_w would be 30-4-20 = 6 == NAME_MIN, meta kept.
+        let p = plan_name_col(12, 19, 30);
+        assert!(p.show_meta, "meta kept when name can shrink to NAME_MIN");
+        assert_eq!(p.name_w, 6);
+    }
+
+    #[test]
+    fn plan_name_col_too_narrow_drops_meta() {
+        // width 20, prefix 4 → avail 16. meta 20 won't fit alongside NAME_MIN:
+        // meta dropped, name gets the full avail (capped).
+        let p = plan_name_col(12, 19, 20);
+        assert!(!p.show_meta, "meta dropped when it can't share the row");
+        assert_eq!(p.name_w, 16, "name takes the full avail");
+    }
+
+    // ---- fit_hint_count (footer hint budget) ----
+
+    #[test]
+    fn fit_hint_count_wide_keeps_all_hints() {
+        let hints: &[(&str, &str)] = &[("Tab", "switch"), ("↑↓", "move"), ("F1", "help")];
+        // Each hint renders as "<key> <label>", joined by " · ".
+        // "Tab switch" = 10, " · ↑↓ move" = 10, " · F1 help" = 10 → 30 cells.
+        assert_eq!(fit_hint_count(hints, 40), 3);
+        assert_eq!(fit_hint_count(hints, 30), 3);
+    }
+
+    #[test]
+    fn fit_hint_count_narrow_drops_trailing_hints() {
+        let hints: &[(&str, &str)] = &[("Tab", "switch"), ("↑↓", "move"), ("F1", "help")];
+        // Only room for the first hint (10 cells) + the `…` sentinel is drawn
+        // by the renderer, not counted here. width=15 fits hint 0 + part of
+        // the gap but not hint 1 fully → count = 1.
+        assert_eq!(fit_hint_count(hints, 15), 1);
+    }
+
+    #[test]
+    fn fit_hint_count_always_keeps_at_least_one() {
+        let hints: &[(&str, &str)] = &[("Tab", "switch"), ("F1", "help")];
+        // Even on a tiny row, the first hint survives so the footer is never
+        // blank.
+        assert_eq!(fit_hint_count(hints, 5), 1);
+    }
+
+    #[test]
+    fn fit_hint_count_empty_hints_returns_zero() {
+        let hints: &[(&str, &str)] = &[];
+        assert_eq!(fit_hint_count(hints, 80), 0);
+    }
+
+    #[test]
+    fn draw_pane_row_long_name_truncates_with_ellipsis() {
+        // A name longer than name_w is truncated to name_w cells with `…`, and
+        // does NOT overflow into the meta column.
+        let e = entry(
+            "a_really_long_filename_that_exceeds_the_column.onnx",
+            false,
+            Some(1024),
+        );
+        let line = draw_pane_row(&e, "", false, false, true, 12, 60, true);
+        let s = format!("{line}");
+        assert!(s.contains('…'), "long name truncated: {s}");
+        assert!(
+            crate::tui::fit::cells(&s) <= 60,
+            "row never exceeds width: {s:?}"
+        );
+    }
+
+    #[test]
+    fn draw_pane_row_no_meta_when_plan_says_so() {
+        // show_meta=false: the size/mtime column is omitted entirely (the row
+        // is just marker + focus + name, padded out).
+        let e = entry("alpha.txt", false, Some(2048));
+        let line = draw_pane_row(&e, "", false, false, true, 12, 20, false);
+        let s = format!("{line}");
+        assert!(
+            !s.contains("2.0K"),
+            "size column hidden when show_meta=false: {s}"
+        );
+    }
+
+    #[test]
+    fn draw_pane_row_cjk_name_aligns_by_display_width() {
+        // A CJK glyph is 2 cells. "中文" is 4 display cells; with name_w=8 the
+        // name must pad by 4 (display width) so the meta column starts at the
+        // same offset as an ASCII row of the same cell width. With the old
+        // char-count pad, "中文" (2 chars) would pad 6, yielding 10 cells !=
+        // name_w=8 — this assertion catches that regression.
+        let name_w = 8usize;
+        let width = 40u16;
+        let e_cjk = entry("中文", false, Some(1024));
+        let line = draw_pane_row(&e_cjk, "", false, false, true, name_w, width, true);
+        // Span layout: [mark, focus, name..., pad, fill, meta]. The fill span
+        // (pure spaces) sits right before meta; name+pad is spans[2..fill_idx).
+        let meta_idx = line
+            .spans
+            .iter()
+            .position(|s| s.content.contains("1.0K"))
+            .expect("meta span carrying the size");
+        let name_pad: String = line.spans[2..meta_idx - 1]
+            .iter()
+            .map(|s| &*s.content)
+            .collect();
+        assert_eq!(
+            crate::tui::fit::cells(&name_pad),
+            name_w,
+            "name+pad must be exactly name_w display cells; got {:?} ({} cells)",
+            name_pad,
+            crate::tui::fit::cells(&name_pad),
+        );
+        // Whole row still fits the allotted width.
+        let s = format!("{line}");
+        assert!(
+            crate::tui::fit::cells(&s) <= width as usize,
+            "cjk row fits width: {s:?}"
         );
     }
 
@@ -892,43 +1529,6 @@ mod tests {
         term.draw(|f| draw_pane(f, f.area(), &pane, true, "local"))
             .unwrap();
         insta::assert_snapshot!(term.backend());
-    }
-
-    #[test]
-    fn draw_active_transfer_renders_rate_with_one_per_sec() {
-        // `fmt_rate` already returns `<size>/s`; the active-transfer text must
-        // not append another `/s` (the `13.4M/s/s` regression that surfaced
-        // once upload progress actually started updating).
-        use ratatui::{Terminal, backend::TestBackend};
-        use sshrack_core::connect::sftp::proto::{Direction, Progress};
-
-        let prog = Progress {
-            name: "file.bin".into(),
-            direction: Direction::Upload,
-            bytes_done: 1_024,
-            bytes_total: Some(4_096),
-            rate_bps: Some(1_024),
-            eta_secs: Some(3),
-        };
-        let backend = TestBackend::new(100, 1);
-        let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| draw_active_transfer(f, f.area(), Some(&prog)))
-            .unwrap();
-        let buf = term.backend().buffer();
-        let text: String = (0..buf.area.width)
-            .map(|col| {
-                buf.cell((col, 0u16))
-                    .map(|c| c.symbol())
-                    .unwrap_or(" ")
-                    .to_string()
-            })
-            .collect();
-        let text = text.trim();
-        assert!(text.contains("1.0K/s"), "rate should appear once: {text:?}");
-        assert!(
-            !text.contains("/s/s"),
-            "rate must not double the /s suffix: {text:?}"
-        );
     }
 }
 

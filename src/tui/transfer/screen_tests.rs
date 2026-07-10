@@ -193,8 +193,9 @@ fn draw_renders_summary_when_idle() {
 
 #[test]
 fn draw_handles_unknown_total_without_gauge_panic() {
-    // `bytes_total` = None must render the "transferred…" form without a
-    // Gauge (a missing percent would have panicked `Gauge::percent`).
+    // `bytes_total` = None must render the indeterminate form without a
+    // Gauge (a missing percent would have panicked `Gauge::percent`). The
+    // row shows the name + bytes-done segment + rate segment, but no `%`.
     let backend = TestBackend::new(70, 20);
     let mut term = Terminal::new(backend).expect("test backend");
     let mut screen = canned_screen();
@@ -221,10 +222,9 @@ fn draw_handles_unknown_total_without_gauge_panic() {
     let res = term.draw(|f| screen.draw(f, f.area()));
     assert!(res.is_ok(), "draw returned error: {:?}", res.err());
     let view = buffer_view(term.backend().buffer());
-    assert!(
-        view.contains("stream.bin") && view.contains("transferred"),
-        "unknown-total row missing: {view}"
-    );
+    assert!(view.contains("stream.bin"), "name shown: {view}");
+    assert!(!view.contains('%'), "no gauge when total unknown: {view}");
+    assert!(view.contains("4.0K"), "bytes-done segment shown: {view}");
 }
 
 /// Small-terminal pin: on a 60×12 backend with focus on the remote pane's
@@ -1268,4 +1268,23 @@ fn apply_remote_listing_err_reverts_cwd_and_surfaces_failure() {
         "status names the failure: {:?}",
         screen.status.message
     );
+}
+
+#[test]
+fn draw_footer_narrow_drops_trailing_hints_with_ellipsis() {
+    // A 25-wide footer cannot fit all 10 hints; trailing ones are dropped via
+    // `render::fit_hint_count` and a dim `…` marks the truncation. The first
+    // hint (`Tab`) must survive; the last (`F1 help`) must not.
+    let backend = TestBackend::new(25, 1);
+    let mut term = Terminal::new(backend).expect("test backend");
+    let screen = canned_screen();
+    term.draw(|f| screen.draw_footer(f, f.area()))
+        .expect("draw");
+    let view = buffer_view(term.backend().buffer());
+    assert!(
+        view.contains('…'),
+        "narrow footer shows … truncation: {view:?}"
+    );
+    assert!(view.contains("Tab"), "first hint kept: {view:?}");
+    assert!(!view.contains("help"), "trailing hint dropped: {view:?}");
 }
