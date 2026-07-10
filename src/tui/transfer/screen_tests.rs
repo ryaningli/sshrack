@@ -160,6 +160,23 @@ fn draw_paints_title_panes_progress_and_footer() {
 }
 
 #[test]
+fn transfer_footer_advertises_f1_help() {
+    // The full hint strip (Tab … ^C close · F1 help) only fits on a wide
+    // terminal — at 80 cols the footer paragraph clips before F1, so use a
+    // 120-col backend where the whole row renders. Pins that F1 is advertised
+    // alongside the other transfer hotkeys now that Help is a global layer.
+    let backend = TestBackend::new(120, 24);
+    let mut term = Terminal::new(backend).expect("test backend");
+    let screen = TransferScreen::new(PathBuf::from("/local"), PathBuf::from("/remote"));
+    term.draw(|f| screen.draw(f, f.area())).expect("draw");
+    let view = buffer_view(term.backend().buffer());
+    assert!(
+        view.contains("F1") && view.contains("help"),
+        "footer must advertise F1 help, got: {view}"
+    );
+}
+
+#[test]
 fn draw_renders_summary_when_idle() {
     let backend = TestBackend::new(70, 20);
     let mut term = Terminal::new(backend).expect("test backend");

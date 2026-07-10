@@ -13,7 +13,7 @@ event routing.
 
 ## Overlays
 
-`Overlay` enum (at most one open at a time): host add/edit wizard, credential add/edit wizard, store-mode picker, and the F1 help reference are all **dialogs** (`dialog.rs` chrome: titled bordered area + hotkey footer, no dark scrim) layered on top of the shell — not full-screen modes. Dialogs size to their content and scroll to keep the focused field (and, for Help, every binding row) visible on small terminals. `Esc`/`Ctrl-C` inside an overlay closes it; the shell keeps rendering behind it.
+`Overlay` enum (at most one open at a time): host add/edit wizard, credential add/edit wizard, and the store-mode picker are all **dialogs** (`dialog.rs` chrome: titled bordered area + hotkey footer, no dark scrim) layered on top of the shell — not full-screen modes. The **F1 help reference is NOT an `Overlay`**: it is an independent global layer (`App::help: Option<HelpState>`) so `F1` is reachable from every surface (launcher, SFTP transfer, even over a wizard) and so opening it never disturbs what is underneath. Its content is **context-sensitive** — it shows the bindings of the surface it was opened from (launcher tab / SFTP / wizard / file picker / store picker / queue manager) plus a shared "Everywhere" section (lazygit's `?` model). While open it is modal: `↑↓/j/k/PgUp/PgDn` scroll, `F1`/`Esc`/`q`/`Ctrl-C` close, every other key is swallowed. `Esc`/`Ctrl-C` inside an overlay closes it; the shell keeps rendering behind it.
 
 ## Host Wizard Auth
 

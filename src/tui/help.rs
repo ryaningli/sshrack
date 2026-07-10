@@ -1,12 +1,11 @@
-//! Help overlay (`F1`): a centered dialog with the static keybinding reference
-//! for the three-band shell + tabs + overlays. Dismisses on `F1` / `Esc` / `q`
-//! (handled in [`super::app::App::route_overlay`]).
+//! Help overlay (`F1`): a centered dialog with a **context-sensitive**
+//! keybinding reference. The bindings follow the surface the user opened Help
+//! from (launcher tab / SFTP / wizard / picker / queue) plus a shared
+//! "Everywhere" section — the lazygit `?` model, not one static list. Dismiss
+//! and scroll handling live in [`super::app::App::on_key`]'s global Help layer.
 //!
-//! The text is static (no live state), so this module is pure render: it takes
-//! a frame and writes the reference inside the dialog body that
-//! [`draw_dialog`](super::dialog::draw_dialog) returns. The only logic worth
-//! unit-testing is that `help_lines()` documents every surface and drops the
-//! removed bindings (`c` / `Shift-C` / `F2` / `?`).
+//! The text is static per context (no live state beyond which surface is open),
+//! so this module is pure render + a pure context→lines table.
 
 use ratatui::{
     Frame,
@@ -16,31 +15,77 @@ use ratatui::{
 };
 
 use super::dialog::draw_dialog;
+use super::tab::Tab;
 
-/// The static keybinding reference, grouped by surface. Bare letters and digits
-/// never appear as bindings here: they reach the active panel's search box, so
-/// the keymap deliberately has no single-char hotkeys (the conflict fix). Newlines
-/// between sections give visual breathing room.
+/// Which surface the user is on when they open Help (`F1`). Help is
+/// context-sensitive: each surface shows its own bindings plus the shared
+/// "Everywhere" section, instead of one static list that is wrong for most
+/// surfaces. Snapshotted at open time ([`App::current_help_context`]) so
+/// scrolling does not re-read live state.
 ///
-/// `on_key` uses the line count as the theoretical maximum scroll offset (the
-/// largest value [`max_scroll`] can return across all body sizes) so the tail is
-/// reachable even on short terminals; the renderer then re-clamps to the real
-/// body height each frame.
-pub fn help_lines() -> Vec<Line<'static>> {
-    let section = |heading: &'static str| {
-        Line::from(vec![Span::styled(
-            heading,
-            Style::new().add_modifier(Modifier::BOLD),
-        )])
-    };
-    let binding = |k: &'static str, desc: &'static str| {
-        Line::from(vec![
-            Span::styled(format!("  {k:<14}"), Style::new()),
-            Span::raw(desc),
-        ])
-    };
+/// [`App::current_help_context`]: super::app::App::current_help_context
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelpContext {
+    /// The launcher shell. `tab` picks the `Enter` noun and whether
+    /// add/edit/delete apply (Settings has only `Enter`).
+    Launcher { tab: Tab },
+    /// The full-screen SFTP transfer view (dual pane).
+    Sftp,
+    /// A host/credential wizard form (add/edit overlay).
+    WizardForm,
+    /// The identity-key path picker (nested inside a wizard form).
+    FilePicker,
+    /// The storage-mode picker (Settings → Enter).
+    StorePicker,
+    /// The transfer queue-manager overlay (`Ctrl-Q` inside the SFTP screen).
+    QueueManager,
+}
 
+/// The live Help overlay: which surface it documents + how far it has scrolled.
+/// An independent global layer on `App` (NOT inside the at-most-one `Overlay`
+/// enum), so opening Help never disturbs the screen/overlay underneath and
+/// `F1` is reachable from every surface.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HelpState {
+    pub(crate) context: HelpContext,
+    pub(crate) scroll: u16,
+}
+
+/// Bold section heading.
+fn section(heading: &'static str) -> Line<'static> {
+    Line::from(vec![Span::styled(
+        heading,
+        Style::new().add_modifier(Modifier::BOLD),
+    )])
+}
+
+/// One keybinding row: `  <key padded to 14>` + description. Bare letters and
+/// digits never appear as a binding key here — they reach the search box.
+fn binding(k: &'static str, desc: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("  {k:<14}"), Style::new()),
+        Span::raw(desc.to_string()),
+    ])
+}
+
+/// The shared footer: keys available on every surface.
+fn everywhere_section() -> Vec<Line<'static>> {
     vec![
+        Line::from(""),
+        section("Everywhere"),
+        binding("F1", "open / close this help"),
+    ]
+}
+
+/// Launcher bindings. `Enter` and the add/edit/delete nouns follow `tab`;
+/// Settings has only `Enter`.
+fn launcher_lines(tab: Tab) -> Vec<Line<'static>> {
+    let (enter, noun) = match tab {
+        Tab::Hosts => ("connect to the selected host", "host"),
+        Tab::Credentials => ("edit the selected credential", "credential"),
+        Tab::Settings => ("edit the storage-mode row", ""),
+    };
+    let mut v = vec![
         section("Tabs"),
         binding(
             "Tab / Shift-Tab",
@@ -50,191 +95,250 @@ pub fn help_lines() -> Vec<Line<'static>> {
         binding("Up / Down", "move selection (wraps)"),
         binding("Ctrl-N / Ctrl-P", "move selection (wraps)"),
         Line::from(""),
-        section("Hosts panel"),
-        binding("Enter", "connect to the selected host"),
-        binding("Ctrl-A", "add (current tab)"),
-        binding("Ctrl-E", "edit the selected host"),
-        binding("Ctrl-D", "delete the selected host (confirm)"),
-        Line::from(""),
-        section("Credentials panel"),
-        binding("Enter", "edit the selected credential"),
-        binding("Ctrl-A", "add (current tab)"),
-        binding("Ctrl-E", "edit the selected credential"),
-        binding("Ctrl-D", "delete the selected credential (confirm)"),
-        Line::from(""),
-        section("Settings panel"),
-        binding("Enter", "edit the storage-mode row"),
-        Line::from(""),
-        section("Overlays (wizards / store-picker)"),
-        binding("Tab / Shift-Tab", "next / previous field"),
-        binding("Up / Down", "cycle a chooser field's options"),
-        binding("Ctrl-S", "save (validates first)"),
-        binding("Esc / Ctrl-C", "cancel, return to the tab"),
-        Line::from(""),
-        section("Everywhere"),
-        binding("F1", "open / close this help overlay"),
-        binding("Esc", "clear query / close overlay / quit"),
-        binding("Ctrl-C", "quit"),
+        section(match tab {
+            Tab::Hosts => "Hosts panel",
+            Tab::Credentials => "Credentials panel",
+            Tab::Settings => "Settings panel",
+        }),
+        binding("Enter", enter),
+    ];
+    if !noun.is_empty() {
+        v.push(binding("Ctrl-A", &format!("add a {noun}")));
+        v.push(binding("Ctrl-E", &format!("edit the selected {noun}")));
+        v.push(binding(
+            "Ctrl-D",
+            &format!("delete the selected {noun} (confirm)"),
+        ));
+    }
+    v
+}
+
+fn sftp_lines() -> Vec<Line<'static>> {
+    vec![
+        section("SFTP transfer"),
+        binding("Tab", "switch pane (focus = direction)"),
+        binding("Up / Down", "move selection"),
+        binding("Left", "up to the parent directory"),
+        binding("Right", "open the selected directory"),
+        binding("Space", "mark entry (batch, single-shot)"),
+        binding("Ctrl-S", "transfer marked/selected (dirs recurse)"),
+        binding("Enter", "file: enqueue · directory: enter"),
+        binding("Ctrl-Q", "queue manager (retry / remove / cancel)"),
+        binding("Esc", "cancel in-flight transfer · close"),
+        binding("Ctrl-C", "close"),
     ]
 }
 
-/// Max scroll offset that still shows the last help line, given the body
+fn wizard_lines() -> Vec<Line<'static>> {
+    vec![
+        section("Form wizard"),
+        binding("Tab / Shift-Tab", "next / previous field"),
+        binding("← / →", "cycle a chooser field's options"),
+        binding("type", "edit the focused text field"),
+        binding("Ctrl-S", "save (validates first)"),
+        binding("Esc / Ctrl-C", "cancel, return to the tab"),
+        Line::from(""),
+        section("Field hints"),
+        binding("▸", "trigger (chooser / picker / password)"),
+        binding("¶▸", "multi-line text (paste large values)"),
+    ]
+}
+
+fn file_picker_lines() -> Vec<Line<'static>> {
+    vec![
+        section("File picker"),
+        binding("Up / Down", "move selection"),
+        binding("type", "filter the path list"),
+        binding("Left", "up to the parent directory"),
+        binding("Right", "enter the selected directory"),
+        binding("Enter", "resolve path (dir enters · file picks)"),
+        binding("Esc / Ctrl-C", "cancel, return to the form"),
+    ]
+}
+
+fn store_picker_lines() -> Vec<Line<'static>> {
+    vec![
+        section("Storage mode"),
+        binding("Up / Down", "select a mode"),
+        binding("Enter", "switch to the selected mode"),
+        binding("Esc / Ctrl-C", "cancel"),
+    ]
+}
+
+fn queue_manager_lines() -> Vec<Line<'static>> {
+    vec![
+        section("Queue manager"),
+        binding("Tab / Shift-Tab", "cycle view (Active / Failed / Done)"),
+        binding("Up / Down · j / k", "move selection"),
+        binding("Enter · r", "retry the selected task"),
+        binding("d · Delete", "remove the selected task"),
+        binding("c", "cancel the in-flight task"),
+        binding("p", "pause / resume the queue"),
+        binding("Esc", "close"),
+    ]
+}
+
+/// The full keybinding reference for `ctx`, ending with the shared "Everywhere"
+/// section. Pure: the context→lines table is static.
+pub fn help_lines(ctx: &HelpContext) -> Vec<Line<'static>> {
+    let mut body = match ctx {
+        HelpContext::Launcher { tab } => launcher_lines(*tab),
+        HelpContext::Sftp => sftp_lines(),
+        HelpContext::WizardForm => wizard_lines(),
+        HelpContext::FilePicker => file_picker_lines(),
+        HelpContext::StorePicker => store_picker_lines(),
+        HelpContext::QueueManager => queue_manager_lines(),
+    };
+    body.append(&mut everywhere_section());
+    body
+}
+
+/// Max scroll offset that still shows the last line for `ctx`, given the body
 /// height the dialog actually got. Returns 0 when the body fits every line;
-/// otherwise the number of lines hidden past the bottom. Pure: consumed by
-/// [`App::on_key`][super::app::App::on_key] to clamp `help_scroll`, and by
-/// [`draw_help_dialog`] to clamp the render-side scroll.
-pub fn max_scroll(body_height: u16) -> u16 {
-    let lines = help_lines().len() as u16;
+/// otherwise the number of lines hidden past the bottom. Pure.
+pub fn max_scroll(body_height: u16, ctx: &HelpContext) -> u16 {
+    let lines = help_lines(ctx).len() as u16;
     lines.saturating_sub(body_height)
 }
 
-/// Render the help overlay as a centered dialog: a titled bordered area with a
-/// `↑↓ · scroll` + `F1/Esc · close` hotkey footer, and the keymap reference
-/// left-aligned in the body. The body is scrolled by `scroll` rows (clamped to
-/// [`max_scroll`] of the rendered body height so it never scrolls past the last
-/// line). Pure render — no I/O, no key handling.
-pub fn draw_help_dialog(frame: &mut Frame, scroll: u16) {
+/// Render the Help overlay for `ctx` as a centered dialog: titled bordered
+/// area + `↑↓ scroll` / `F1/Esc close` footer, bindings left-aligned in the
+/// body, scrolled by `scroll` rows (clamped to [`max_scroll`] of the rendered
+/// body height so it never scrolls past the last line). Pure render.
+pub fn draw_help_dialog(frame: &mut Frame, ctx: &HelpContext, scroll: u16) {
+    let lines = help_lines(ctx);
     let body = draw_dialog(
         frame,
         " help ",
-        help_lines().len() as u16,
+        lines.len() as u16,
         &[("↑↓", "scroll"), ("F1/Esc", "close")],
     );
-    let lines = help_lines();
-    let clamped = scroll.min(max_scroll(body.height));
+    let clamped = scroll.min(max_scroll(body.height, ctx));
     frame.render_widget(Paragraph::new(lines).scroll((clamped, 0)), body);
 }
 
 #[cfg(test)]
 mod tests {
-    //! The overlay is pure render; the only logic worth pinning is that
-    //! `help_lines()` documents every surface, keeps the dismiss hint, drops
-    //! the removed bindings (`c` / `Shift-C` / `F2` / `?`), and that
-    //! `max_scroll` + `draw_help_dialog` clamp scroll without panicking.
+    //! The overlay is pure render; pin that each context documents its own
+    //! key surface, that the "Everywhere" footer and the dismiss hint are
+    //! always present, that the removed single-char hotkeys never reappear,
+    //! and that `max_scroll` + `draw_help_dialog` clamp scroll without panicking.
 
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
 
-    #[test]
-    fn help_lines_cover_every_surface_and_dismiss_hint() {
-        let lines = help_lines();
-        let joined: String = lines
+    fn joined(ctx: &HelpContext) -> String {
+        help_lines(ctx)
             .iter()
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
-            .join("\n");
-        // Every surface has at least one binding documented.
-        assert!(joined.contains("cycle tabs"), "tabs section");
-        assert!(
-            joined.contains("connect to the selected host"),
-            "hosts panel"
-        );
-        assert!(
-            joined.contains("edit the selected credential"),
-            "credentials panel"
-        );
-        assert!(
-            joined.contains("edit the storage-mode row"),
-            "settings panel"
-        );
-        assert!(joined.contains("save (validates first)"), "wizards");
-        assert!(
-            joined.contains("open / close this help overlay"),
-            "F1 entry"
-        );
-        // The new keymap is tab/add/edit/delete driven — these removed bindings
-        // must NOT be documented (they now reach the query or are gone entirely).
-        assert!(!joined.contains("switch storage mode"), "F2 is gone");
-        assert!(
-            !joined.contains("add credential") && !joined.contains("Shift-C"),
-            "c / Shift-C are gone"
-        );
-        assert!(
-            !joined.contains("(in help) dismiss the overlay"),
-            "old q-only dismiss hint reworded"
-        );
+            .join("\n")
     }
 
     #[test]
-    fn help_lines_keep_bare_chars_out_of_bindings() {
-        // Conflict-fix invariant: no single-char hotkeys. The keymap must not
-        // document a bare `c`, `?`, `F2`, or `Shift-C` as a binding.
-        let joined: String = help_lines()
-            .iter()
-            .map(|l| l.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(!joined.contains("Shift-C"), "Shift-C removed");
-        assert!(!joined.contains("F2"), "F2 removed");
-        // Bare `c` and `?` only ever appear as part of "Ctrl-C" / punctuation,
-        // never as standalone bindings — assert the old `c` add-credential entry
-        // is gone.
+    fn launcher_help_follows_the_active_tab() {
+        let hosts = joined(&HelpContext::Launcher { tab: Tab::Hosts });
+        assert!(hosts.contains("connect to the selected host"));
         assert!(
-            !joined.contains("\n  c             "),
-            "bare c add-credential binding removed"
+            hosts.contains("add a host") && hosts.contains("delete the selected host (confirm)")
         );
+
+        let creds = joined(&HelpContext::Launcher {
+            tab: Tab::Credentials,
+        });
+        assert!(creds.contains("edit the selected credential"));
+        assert!(creds.contains("add a credential"));
+
+        let settings = joined(&HelpContext::Launcher { tab: Tab::Settings });
+        assert!(settings.contains("edit the storage-mode row"));
+        // Settings has no add/edit/delete — those nouns must not leak in.
+        assert!(!settings.contains("add a host"));
+        assert!(!settings.contains("add a credential"));
+    }
+
+    #[test]
+    fn sftp_help_documents_the_transfer_bindings() {
+        let s = joined(&HelpContext::Sftp);
+        assert!(s.contains("switch pane (focus = direction)"));
+        assert!(s.contains("transfer marked/selected (dirs recurse)"));
+        assert!(s.contains("queue manager"));
+    }
+
+    #[test]
+    fn wizard_help_documents_save_and_field_hints() {
+        let w = joined(&HelpContext::WizardForm);
+        assert!(w.contains("save (validates first)"));
+        assert!(w.contains("multi-line text"));
+    }
+
+    #[test]
+    fn each_overlay_context_has_its_own_bindings() {
+        assert!(joined(&HelpContext::FilePicker).contains("filter the path list"));
+        assert!(joined(&HelpContext::StorePicker).contains("switch to the selected mode"));
+        assert!(joined(&HelpContext::QueueManager).contains("retry the selected task"));
+    }
+
+    #[test]
+    fn every_context_carries_the_everywhere_footer_and_dismiss_hint() {
+        for ctx in [
+            HelpContext::Launcher { tab: Tab::Hosts },
+            HelpContext::Sftp,
+            HelpContext::WizardForm,
+            HelpContext::FilePicker,
+            HelpContext::StorePicker,
+            HelpContext::QueueManager,
+        ] {
+            let j = joined(&ctx);
+            assert!(
+                j.contains("Everywhere"),
+                "{ctx:?} missing Everywhere section"
+            );
+            assert!(
+                j.contains("open / close this help"),
+                "{ctx:?} missing F1 dismiss hint"
+            );
+        }
+    }
+
+    #[test]
+    fn help_keeps_bare_chars_out_of_bindings() {
+        // The no-bare-hotkey invariant: `c`, `?`, `F2`, `Shift-C` never appear
+        // as standalone binding keys (they reach the search box).
+        let j = joined(&HelpContext::Launcher { tab: Tab::Hosts });
+        assert!(!j.contains("Shift-C"));
+        assert!(!j.contains("\n  c             "));
     }
 
     #[test]
     fn max_scroll_is_zero_when_body_fits_all_lines() {
-        // 31 help lines fit in a 40-row body → no scroll needed.
-        assert_eq!(max_scroll(40), 0);
+        let ctx = HelpContext::Launcher { tab: Tab::Hosts };
+        assert_eq!(max_scroll(200, &ctx), 0);
     }
 
     #[test]
     fn max_scroll_is_excess_lines_when_body_too_short() {
-        // 31 lines in a 21-row body → 10 lines hidden, scroll 10 to reveal the
-        // last one.
-        assert_eq!(max_scroll(21), 10);
+        let ctx = HelpContext::Launcher { tab: Tab::Hosts };
+        let lines = help_lines(&ctx).len() as u16;
+        assert_eq!(max_scroll(lines - 5, &ctx), 5);
     }
 
     #[test]
-    fn max_scroll_is_zero_when_body_exceeds_line_count() {
-        // Body taller than the line list → still 0 (never scroll past the end).
-        assert_eq!(max_scroll(100), 0);
-    }
-
-    #[test]
-    fn draw_help_dialog_renders_without_panic_and_clamps_scroll() {
-        // Render at a typical terminal size. A `scroll` value larger than the
-        // body's max (10 for a 21-row body) must be silently clamped by
-        // `draw_help_dialog` — no panic, no overflow.
-        let backend = TestBackend::new(100, 40);
-        let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| {
-            draw_help_dialog(f, 999);
-        })
-        .unwrap();
-    }
-
-    #[test]
-    fn draw_help_dialog_renders_without_panic_on_short_screen() {
-        // A short terminal shrinks the dialog body, which changes max_scroll.
-        // The renderer must still not panic for any scroll value.
-        let backend = TestBackend::new(80, 12);
-        let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| {
-            draw_help_dialog(f, 0);
-            draw_help_dialog(f, 50);
-        })
-        .unwrap();
-    }
-
-    #[test]
-    fn draw_help_dialog_renders_first_page() {
-        // Snapshot the help overlay at scroll 0. The dialog chrome (MAX_H=24
-        // in `dialog`) caps the body at ~20 rows regardless of terminal size,
-        // so this locks the dialog GEOMETRY (centering / border / " help "
-        // title / "↑↓ scroll · F1/Esc close" footer) and the FIRST keymap page
-        // (Tabs through Settings) — not the full keymap. The complete keymap
-        // text is already covered by `help_lines_cover_every_surface_*` above;
-        // this snapshot's job is render regression (layout, footer wording,
-        // first-page bindings). Accept intentional changes via
-        // `cargo insta review` (or, for this pilot, `INSTA_UPDATE=always cargo
-        // test ...`).
-        let backend = TestBackend::new(100, 40);
-        let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| draw_help_dialog(f, 0)).unwrap();
-        insta::assert_snapshot!(term.backend());
+    fn draw_help_dialog_renders_without_panic_for_every_context() {
+        for ctx in [
+            HelpContext::Launcher { tab: Tab::Hosts },
+            HelpContext::Sftp,
+            HelpContext::WizardForm,
+            HelpContext::FilePicker,
+            HelpContext::StorePicker,
+            HelpContext::QueueManager,
+        ] {
+            let backend = TestBackend::new(100, 40);
+            let mut term = Terminal::new(backend).unwrap();
+            term.draw(|f| {
+                draw_help_dialog(f, &ctx, 0);
+                draw_help_dialog(f, &ctx, 999);
+            })
+            .unwrap();
+        }
     }
 }
