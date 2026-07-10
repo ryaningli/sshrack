@@ -753,4 +753,92 @@ mod tests {
             "cursor clamped after removing the last row"
         );
     }
+    // ---- draw: smoke (no panic) + snapshot ----
+
+    /// A ledger seeded with one task per terminal state so the overlay has
+    /// rows to render in every tab. Built one-at-a-time (dispatch → finish)
+    /// so the ledger's concurrency=1 invariant holds — never two inflight.
+    /// Final layout: Completed(1), Failed(2: one Failed + one Cancelled),
+    /// Active(2: one InFlight + one Queued).
+    fn canned_ledger() -> TransferLedger {
+        let mut l = TransferLedger::new();
+        // Completed tab.
+        l.enqueue(job("done-ok"));
+        l.next_to_dispatch();
+        l.finish_inflight(TransferOutcome::Ok);
+        // Failed tab: one Failed + one Cancelled.
+        l.enqueue(job("failed-task"));
+        l.next_to_dispatch();
+        l.finish_inflight(TransferOutcome::Failed("boom".into()));
+        l.enqueue(job("cancelled-task"));
+        l.next_to_dispatch();
+        l.finish_inflight(TransferOutcome::Cancelled);
+        // Active tab: one InFlight + one Queued (the queued one waits since
+        // concurrency=1 and the inflight slot is occupied).
+        l.enqueue(job("inflight-task"));
+        l.next_to_dispatch();
+        l.enqueue(job("queued-task"));
+        l
+    }
+
+    #[test]
+    fn draw_active_view_renders_without_panic_80x24_and_narrow() {
+        let l = canned_ledger();
+        let ov = QueueOverlay::new(); // Active view
+        // 80x24.
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut term = ratatui::Terminal::new(backend).expect("test backend");
+        let res = term.draw(|f| ov.draw(f, &l));
+        assert!(res.is_ok(), "80x24 draw returned error: {:?}", res.err());
+        // Narrow 40x8 (dialog clamps down; must not panic or overflow).
+        let backend = ratatui::backend::TestBackend::new(40, 8);
+        let mut term = ratatui::Terminal::new(backend).expect("test backend");
+        let res = term.draw(|f| ov.draw(f, &l));
+        assert!(res.is_ok(), "40x8 draw returned error: {:?}", res.err());
+    }
+
+    #[test]
+    fn draw_failed_view_renders_without_panic() {
+        let l = canned_ledger();
+        let mut ov = QueueOverlay::new();
+        ov.view = QueueView::Failed;
+        let backend = ratatui::backend::TestBackend::new(40, 8);
+        let mut term = ratatui::Terminal::new(backend).expect("test backend");
+        let res = term.draw(|f| ov.draw(f, &l));
+        assert!(res.is_ok(), "Failed view 40x8 draw: {:?}", res.err());
+    }
+
+    #[test]
+    fn draw_completed_view_renders_without_panic() {
+        let l = canned_ledger();
+        let mut ov = QueueOverlay::new();
+        ov.view = QueueView::Completed;
+        let backend = ratatui::backend::TestBackend::new(40, 8);
+        let mut term = ratatui::Terminal::new(backend).expect("test backend");
+        let res = term.draw(|f| ov.draw(f, &l));
+        assert!(res.is_ok(), "Completed view 40x8 draw: {:?}", res.err());
+    }
+
+    #[test]
+    fn draw_empty_view_renders_the_no_tasks_placeholder_without_panic() {
+        let l = TransferLedger::new(); // empty
+        let ov = QueueOverlay::new();
+        let backend = ratatui::backend::TestBackend::new(40, 8);
+        let mut term = ratatui::Terminal::new(backend).expect("test backend");
+        let res = term.draw(|f| ov.draw(f, &l));
+        assert!(res.is_ok(), "empty view draw: {:?}", res.err());
+    }
+
+    #[test]
+    fn draw_active_view_snapshot_80x24() {
+        // Snapshot the default (Active) view at 80x24 with a seeded ledger so
+        // the tab strip, row layout, and focus styling stay stable. Hermetic:
+        // TestBackend in memory, fixed names, no timestamps.
+        let l = canned_ledger();
+        let ov = QueueOverlay::new(); // Active view
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut term = ratatui::Terminal::new(backend).expect("test backend");
+        term.draw(|f| ov.draw(f, &l)).expect("draw");
+        insta::assert_snapshot!(term.backend());
+    }
 }
