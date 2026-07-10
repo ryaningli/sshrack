@@ -759,6 +759,51 @@ pub(crate) fn plan_active_row(
     }
 }
 
+/// One cell of the active-transfer gauge bar. Pure — [`plan_gauge`] produces a
+/// `Vec<GaugeCell>` and [`draw_active_transfer`] maps each to a styled span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum GaugeCell {
+    /// Filled portion: `█` in the accent color.
+    Filled,
+    /// Unfilled track: `░` dimmed. Makes the bar's full width (and thus its
+    /// 100% endpoint) visible, instead of the blank-space track ratatui's
+    /// `Gauge` widget leaves.
+    Track,
+    /// A label char (from the centered `N%` overlay), replacing the bar char
+    /// that would otherwise sit beneath it.
+    Label(char),
+}
+
+/// Lay out a `gauge_w`-cell progress bar at `percent` (clamped to 0..=100) with
+/// `label` (e.g. `"7%"`) overlaid centered. Pure — the renderer maps each
+/// [`GaugeCell`] to a styled span. The first `filled = percent*gauge_w/100`
+/// cells are [`GaugeCell::Filled`], the rest are [`GaugeCell::Track`], and the
+/// label chars sit centered (left-biased), replacing the bar chars beneath
+/// them. When the label is empty or at least as wide as the bar, no overlay is
+/// applied (the bar is just filled + track) so a too-wide label never overflows.
+#[allow(dead_code)]
+pub(crate) fn plan_gauge(gauge_w: u16, percent: u16, label: &str) -> Vec<GaugeCell> {
+    let w = gauge_w as usize;
+    let filled = (percent.min(100) as usize * w / 100).min(w);
+    let chars: Vec<char> = label.chars().collect();
+    let lc = chars.len();
+    let overlay = lc > 0 && lc < w;
+    let start = if overlay { (w - lc) / 2 } else { 0 };
+    let end = if overlay { start + lc } else { 0 };
+    (0..w)
+        .map(|i| {
+            if overlay && (start..end).contains(&i) {
+                GaugeCell::Label(chars[i - start])
+            } else if i < filled {
+                GaugeCell::Filled
+            } else {
+                GaugeCell::Track
+            }
+        })
+        .collect()
+}
+
 /// Pane-row column plan: the name-column width and whether the meta column
 /// survives the width budget. Pure — produced by [`plan_name_col`], consumed
 /// by [`draw_pane_list`] / [`draw_pane_row`]. Centralizing this keeps the
@@ -1047,6 +1092,144 @@ mod tests {
         let p = plan_active_row("big.bin", 9_999_999_999, None, None, None, 120);
         assert!(p.gauge_label.is_none());
         assert_eq!(p.gauge_w, 0);
+    }
+
+    // ---- plan_gauge: pure bar-layout helper ----
+
+    #[test]
+    fn plan_gauge_half_width_10_label_50pct() {
+        // 50% of 10 = 5 filled; label "50%" (3 chars) centered at start=3.
+        // Cells: [0,3) Filled, [3,6) Label, [6,10) Track.
+        use super::{GaugeCell, plan_gauge};
+        let cells = plan_gauge(10, 50, "50%");
+        assert_eq!(
+            cells,
+            vec![
+                GaugeCell::Filled,
+                GaugeCell::Filled,
+                GaugeCell::Filled,
+                GaugeCell::Label('5'),
+                GaugeCell::Label('0'),
+                GaugeCell::Label('%'),
+                GaugeCell::Track,
+                GaugeCell::Track,
+                GaugeCell::Track,
+                GaugeCell::Track,
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_gauge_zero_pct_all_track_with_centered_label() {
+        // 0% → no filled; "0%" centered in width 8 (start=3).
+        use super::{GaugeCell, plan_gauge};
+        let cells = plan_gauge(8, 0, "0%");
+        assert_eq!(
+            cells,
+            vec![
+                GaugeCell::Track,
+                GaugeCell::Track,
+                GaugeCell::Track,
+                GaugeCell::Label('0'),
+                GaugeCell::Label('%'),
+                GaugeCell::Track,
+                GaugeCell::Track,
+                GaugeCell::Track,
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_gauge_full_pct_all_filled_with_centered_label() {
+        // 100% → all filled; "100%" (4 chars) centered in width 8 (start=2).
+        use super::{GaugeCell, plan_gauge};
+        let cells = plan_gauge(8, 100, "100%");
+        assert_eq!(
+            cells,
+            vec![
+                GaugeCell::Filled,
+                GaugeCell::Filled,
+                GaugeCell::Label('1'),
+                GaugeCell::Label('0'),
+                GaugeCell::Label('0'),
+                GaugeCell::Label('%'),
+                GaugeCell::Filled,
+                GaugeCell::Filled,
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_gauge_seven_pct_width_30_counts() {
+        // The screenshot case: 7% of 30 = 2 filled; "7%" centered at start=14.
+        let cells = super::plan_gauge(30, 7, "7%");
+        let filled = cells
+            .iter()
+            .filter(|c| matches!(c, super::GaugeCell::Filled))
+            .count();
+        let track = cells
+            .iter()
+            .filter(|c| matches!(c, super::GaugeCell::Track))
+            .count();
+        let label = cells
+            .iter()
+            .filter(|c| matches!(c, super::GaugeCell::Label(_)))
+            .count();
+        assert_eq!(filled, 2, "7% of 30 = 2 filled cells");
+        assert_eq!(label, 2, "\"7%\" = 2 label cells");
+        assert_eq!(track, 26, "remainder is track");
+        assert_eq!(cells.len(), 30, "fills gauge_w exactly");
+        // Label sits centered (start 14): cells 14 and 15.
+        assert!(matches!(cells[14], super::GaugeCell::Label('7')));
+        assert!(matches!(cells[15], super::GaugeCell::Label('%')));
+    }
+
+    #[test]
+    fn plan_gauge_empty_label_no_overlay() {
+        // Empty label → no overlay, just filled + track.
+        use super::{GaugeCell, plan_gauge};
+        let cells = plan_gauge(6, 50, "");
+        assert_eq!(
+            cells,
+            vec![
+                GaugeCell::Filled,
+                GaugeCell::Filled,
+                GaugeCell::Filled,
+                GaugeCell::Track,
+                GaugeCell::Track,
+                GaugeCell::Track,
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_gauge_label_wider_than_bar_no_overlay() {
+        // Label "100%" (4) >= width 3 → drop overlay; 50% of 3 = 1 filled.
+        use super::{GaugeCell, plan_gauge};
+        let cells = plan_gauge(3, 50, "100%");
+        assert_eq!(
+            cells,
+            vec![GaugeCell::Filled, GaugeCell::Track, GaugeCell::Track]
+        );
+    }
+
+    #[test]
+    fn plan_gauge_zero_width_empty() {
+        // Degenerate: zero-width gauge yields no cells (caller skips rendering).
+        assert!(super::plan_gauge(0, 50, "50%").is_empty());
+    }
+
+    #[test]
+    fn plan_gauge_clamps_percent_above_100() {
+        // Defensive: percent > 100 must not overflow or over-fill.
+        let cells = super::plan_gauge(10, 150, "100%");
+        let filled = cells
+            .iter()
+            .filter(|c| matches!(c, super::GaugeCell::Filled))
+            .count();
+        assert_eq!(cells.len(), 10);
+        // 150 clamped to 100 → 10 filled minus the 4 label cells overlapping = 6 Filled.
+        assert_eq!(filled, 6);
     }
 
     // ---- draw_active_transfer: render-alignment regression ----
