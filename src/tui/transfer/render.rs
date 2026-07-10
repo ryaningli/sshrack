@@ -17,7 +17,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, Paragraph},
+    widgets::{Block, Borders, Paragraph},
 };
 use sshrack_core::connect::sftp::parse::strip_control_chars;
 use sshrack_core::connect::sftp::proto::{Direction, Progress};
@@ -393,13 +393,22 @@ pub fn draw_active_transfer(frame: &mut Frame, area: Rect, active: Option<&Progr
             segs_area,
         );
     }
-    frame.render_widget(
-        Gauge::default()
-            .gauge_style(theme::accent())
-            .percent(plan.percent)
-            .label(plan.gauge_label.clone().unwrap_or_default()),
-        gauge_area,
-    );
+    // Manual bar render: a visible `█`/`░` track filling gauge_w exactly, with
+    // the percent overlaid centered. ratatui's `Gauge` widget leaves the
+    // unfilled portion as blank space (invisible endpoint + trailing waste);
+    // rendering the track ourselves fixes both. See `plan_gauge`.
+    let label_str = plan.gauge_label.as_deref().unwrap_or("");
+    let bar_spans: Vec<Span> = plan_gauge(plan.gauge_w, plan.percent, label_str)
+        .into_iter()
+        .map(|cell| match cell {
+            GaugeCell::Filled => Span::styled("█", theme::accent()),
+            GaugeCell::Track => Span::styled("░", Style::new().dim()),
+            GaugeCell::Label(ch) => {
+                Span::styled(ch.to_string(), Style::new().add_modifier(Modifier::BOLD))
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(Line::from(bar_spans)), gauge_area);
 }
 
 /// Build the 2-row status band's summary line: `done X/Y · fail Z [· paused]`
@@ -762,7 +771,6 @@ pub(crate) fn plan_active_row(
 /// One cell of the active-transfer gauge bar. Pure — [`plan_gauge`] produces a
 /// `Vec<GaugeCell>` and [`draw_active_transfer`] maps each to a styled span.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum GaugeCell {
     /// Filled portion: `█` in the accent color.
     Filled,
@@ -782,7 +790,6 @@ pub(crate) enum GaugeCell {
 /// label chars sit centered (left-biased), replacing the bar chars beneath
 /// them. When the label is empty or at least as wide as the bar, no overlay is
 /// applied (the bar is just filled + track) so a too-wide label never overflows.
-#[allow(dead_code)]
 pub(crate) fn plan_gauge(gauge_w: u16, percent: u16, label: &str) -> Vec<GaugeCell> {
     let w = gauge_w as usize;
     let filled = (percent.min(100) as usize * w / 100).min(w);
@@ -1296,13 +1303,15 @@ mod tests {
         assert!(text.contains("1.0K/s"), "rate shown: {text:?}");
         assert!(text.contains("3s"), "eta shown: {text:?}");
         assert!(text.contains("25%"), "gauge percent shown: {text:?}");
-        // The gauge hugs the right edge: the last non-space cell is part of the
-        // gauge label (a digit or `%`), not a truncated text char.
+        // The bar fills the gauge width to the right edge: the last cell is a
+        // bar cell (`█` filled or `░` track), never blank — no trailing waste.
         let last = text.chars().last().expect("non-empty row");
         assert!(
-            last == '%' || last.is_ascii_digit(),
-            "right edge is the gauge label: {text:?}"
+            last == '█' || last == '░',
+            "right edge is a bar cell (no trailing waste): {text:?}"
         );
+        // The unfilled track is visible — the 100% endpoint is no longer blank.
+        assert!(text.contains('░'), "visible track below 100%: {text:?}");
     }
 
     #[test]
@@ -1375,6 +1384,83 @@ mod tests {
         let text = row_text(&term);
         let pct_count = text.matches('%').count();
         assert_eq!(pct_count, 1, "percent appears exactly once: {text:?}");
+    }
+
+    #[test]
+    fn draw_active_transfer_bar_shows_visible_track_below_100pct() {
+        // The whole point: below 100% the unfilled portion is a visible `░`
+        // track, not blank space, so the bar's endpoint is visible.
+        use ratatui::{Terminal, backend::TestBackend};
+        use sshrack_core::connect::sftp::proto::{Direction, Progress};
+        let prog = Progress {
+            name: "file.bin".into(),
+            direction: Direction::Upload,
+            bytes_done: 1_024,
+            bytes_total: Some(4_096),
+            rate_bps: Some(1_048_576),
+            eta_secs: Some(3),
+        };
+        let mut term = Terminal::new(TestBackend::new(100, 1)).unwrap();
+        term.draw(|f| draw_active_transfer(f, f.area(), Some(&prog)))
+            .unwrap();
+        let text = row_text(&term);
+        assert!(text.contains('█'), "filled portion present: {text:?}");
+        assert!(text.contains('░'), "visible track present: {text:?}");
+        assert!(text.contains("25%"), "percent overlaid: {text:?}");
+    }
+
+    #[test]
+    fn draw_active_transfer_full_pct_has_no_track() {
+        // At 100% the bar is entirely filled — no `░` track remains.
+        use ratatui::{Terminal, backend::TestBackend};
+        use sshrack_core::connect::sftp::proto::{Direction, Progress};
+        let prog = Progress {
+            name: "file.bin".into(),
+            direction: Direction::Upload,
+            bytes_done: 4_096,
+            bytes_total: Some(4_096),
+            rate_bps: Some(1_048_576),
+            eta_secs: Some(0),
+        };
+        let mut term = Terminal::new(TestBackend::new(100, 1)).unwrap();
+        term.draw(|f| draw_active_transfer(f, f.area(), Some(&prog)))
+            .unwrap();
+        let text = row_text(&term);
+        assert!(text.contains('█'), "filled bar present: {text:?}");
+        assert!(!text.contains('░'), "no track at 100%: {text:?}");
+        assert!(text.contains("100%"), "percent overlaid: {text:?}");
+    }
+
+    #[test]
+    fn draw_active_transfer_bar_fills_to_right_edge_no_trailing_waste() {
+        // The bar must reach the right edge of the area — the rightmost buffer
+        // cell is a bar/label cell, never a space. This is the "no wasted
+        // right-side space" guarantee (row_text trims trailing spaces, so check
+        // the raw buffer cell at the last column directly).
+        use ratatui::{Terminal, backend::TestBackend};
+        use sshrack_core::connect::sftp::proto::{Direction, Progress};
+        let prog = Progress {
+            name: "file.bin".into(),
+            direction: Direction::Upload,
+            bytes_done: 1_024,
+            bytes_total: Some(4_096),
+            rate_bps: Some(1_024),
+            eta_secs: Some(3),
+        };
+        let mut term = Terminal::new(TestBackend::new(100, 1)).unwrap();
+        term.draw(|f| draw_active_transfer(f, f.area(), Some(&prog)))
+            .unwrap();
+        let buf = term.backend().buffer();
+        let last = buf
+            .cell((99u16, 0u16))
+            .expect("rightmost cell")
+            .symbol()
+            .to_string();
+        assert!(
+            last == "█" || last == "░" || last == "%" || last.chars().all(|c| c.is_ascii_digit()),
+            "rightmost cell is a bar/label cell, not blank: {last:?}"
+        );
+        assert_ne!(last, " ", "no trailing blank at the right edge");
     }
 
     // ---- draw_pane_row: render-alignment regression ----
