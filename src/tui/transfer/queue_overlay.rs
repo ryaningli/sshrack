@@ -323,7 +323,8 @@ impl QueueOverlay {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::transfer::ledger::TransferLedger;
+    use crate::tui::transfer::ledger::{TaskState, TransferLedger};
+    use crossterm::event::KeyModifiers;
     use sshrack_core::connect::sftp::proto::{Direction, TransferJob, TransferOutcome};
 
     fn job(name: &str) -> TransferJob {
@@ -448,5 +449,308 @@ mod tests {
         ov.view = QueueView::Failed;
         ov.clamp(&l);
         assert_eq!(ov.current_cursor(), 0, "empty view -> cursor 0");
+    }
+
+    // ---- on_key: direct drive across views and actions ----
+    //
+    // The preceding tests cover the pure helpers (`task_indices_for`, view
+    // cycling, cursor, `clamp`). These feed real `KeyEvent`s into `on_key`
+    // directly (not via `TransferScreen`) so the key→action routing is pinned
+    // at the source, mirroring `screen_tests`'s overlay tests but without the
+    // screen layer in between.
+
+    /// A `KeyEvent::Press` with `code`, no modifiers (matches the overlay's
+    /// Press-only gate and the documented keymap).
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new_with_kind(code, KeyModifiers::NONE, KeyEventKind::Press)
+    }
+
+    #[test]
+    fn on_key_tab_cycles_active_failed_completed_and_back() {
+        let mut l = TransferLedger::new();
+        let mut ov = QueueOverlay::new();
+        assert_eq!(ov.view, QueueView::Active);
+        let _ = ov.on_key(press(KeyCode::Tab), &mut l);
+        assert_eq!(ov.view, QueueView::Failed);
+        let _ = ov.on_key(press(KeyCode::Tab), &mut l);
+        assert_eq!(ov.view, QueueView::Completed);
+        let _ = ov.on_key(press(KeyCode::Tab), &mut l);
+        assert_eq!(ov.view, QueueView::Active, "wraps back to Active");
+    }
+
+    #[test]
+    fn on_key_backtab_cycles_backward() {
+        let mut l = TransferLedger::new();
+        let mut ov = QueueOverlay::new();
+        let _ = ov.on_key(press(KeyCode::BackTab), &mut l);
+        assert_eq!(
+            ov.view,
+            QueueView::Completed,
+            "BackTab: Active -> Completed"
+        );
+        let _ = ov.on_key(press(KeyCode::BackTab), &mut l);
+        assert_eq!(ov.view, QueueView::Failed);
+        let _ = ov.on_key(press(KeyCode::BackTab), &mut l);
+        assert_eq!(ov.view, QueueView::Active);
+    }
+
+    #[test]
+    fn on_key_down_moves_cursor_and_clamps_at_end() {
+        let mut l = TransferLedger::new();
+        l.enqueue(job("a"));
+        l.enqueue(job("b"));
+        l.enqueue(job("c"));
+        let mut ov = QueueOverlay::new();
+        assert_eq!(ov.current_cursor(), 0);
+        let out = ov.on_key(press(KeyCode::Down), &mut l);
+        assert_eq!(out, ScreenOutcome::Continue);
+        assert_eq!(ov.current_cursor(), 1);
+        let _ = ov.on_key(press(KeyCode::Down), &mut l);
+        assert_eq!(ov.current_cursor(), 2);
+        // Past the end: clamps (no overflow, stays at last index).
+        let out = ov.on_key(press(KeyCode::Down), &mut l);
+        assert_eq!(out, ScreenOutcome::Continue);
+        assert_eq!(ov.current_cursor(), 2, "clamped at last index");
+    }
+
+    #[test]
+    fn on_key_up_moves_cursor_and_clamps_at_zero() {
+        let mut l = TransferLedger::new();
+        l.enqueue(job("a"));
+        l.enqueue(job("b"));
+        let mut ov = QueueOverlay::new();
+        ov.set_current_cursor(1);
+        let out = ov.on_key(press(KeyCode::Up), &mut l);
+        assert_eq!(out, ScreenOutcome::Continue);
+        assert_eq!(ov.current_cursor(), 0);
+        // At 0: stays 0 (no underflow).
+        let _ = ov.on_key(press(KeyCode::Up), &mut l);
+        assert_eq!(ov.current_cursor(), 0, "clamped at 0");
+    }
+
+    #[test]
+    fn on_key_j_and_k_mirror_down_and_up() {
+        let mut l = TransferLedger::new();
+        l.enqueue(job("a"));
+        l.enqueue(job("b"));
+        let mut ov = QueueOverlay::new();
+        // j moves down.
+        let _ = ov.on_key(press(KeyCode::Char('j')), &mut l);
+        assert_eq!(ov.current_cursor(), 1, "j moves down");
+        // k moves up.
+        let _ = ov.on_key(press(KeyCode::Char('k')), &mut l);
+        assert_eq!(ov.current_cursor(), 0, "k moves up");
+    }
+
+    #[test]
+    fn on_key_d_on_inflight_returns_cancel_active_and_keeps_task() {
+        let mut l = TransferLedger::new();
+        l.enqueue(job("a"));
+        l.next_to_dispatch(); // a -> InFlight
+        let mut ov = QueueOverlay::new();
+        let out = ov.on_key(press(KeyCode::Char('d')), &mut l);
+        assert_eq!(out, ScreenOutcome::CancelActive);
+        // The in-flight task is NOT removed by `d` (the worker-cancel path
+        // owns the lifecycle; `remove` refuses InFlight).
+        assert_eq!(l.total(), 1, "inflight task not removed by 'd'");
+    }
+
+    #[test]
+    fn on_key_delete_on_inflight_also_returns_cancel_active() {
+        let mut l = TransferLedger::new();
+        l.enqueue(job("a"));
+        l.next_to_dispatch();
+        let mut ov = QueueOverlay::new();
+        let out = ov.on_key(press(KeyCode::Delete), &mut l);
+        assert_eq!(out, ScreenOutcome::CancelActive);
+    }
+
+    #[test]
+    fn on_key_d_on_queued_removes_from_ledger() {
+        let mut l = TransferLedger::new();
+        l.enqueue(job("a"));
+        l.enqueue(job("b"));
+        let mut ov = QueueOverlay::new();
+        let before = l.total();
+        let out = ov.on_key(press(KeyCode::Char('d')), &mut l);
+        assert_eq!(out, ScreenOutcome::Continue, "queued 'd' is a pure remove");
+        assert_eq!(l.total(), before - 1, "queued task removed");
+    }
+
+    #[test]
+    fn on_key_c_on_inflight_returns_cancel_active() {
+        let mut l = TransferLedger::new();
+        l.enqueue(job("a"));
+        l.next_to_dispatch();
+        let mut ov = QueueOverlay::new();
+        let out = ov.on_key(press(KeyCode::Char('c')), &mut l);
+        assert_eq!(out, ScreenOutcome::CancelActive);
+    }
+
+    #[test]
+    fn on_key_c_on_queued_falls_through_to_remove() {
+        let mut l = TransferLedger::new();
+        l.enqueue(job("a"));
+        let mut ov = QueueOverlay::new();
+        let out = ov.on_key(press(KeyCode::Char('c')), &mut l);
+        assert_eq!(out, ScreenOutcome::Continue);
+        assert_eq!(l.total(), 0, "queued task removed via 'c'");
+    }
+
+    #[test]
+    fn on_key_enter_retries_failed_task_and_signals_enqueue() {
+        let mut l = TransferLedger::new();
+        l.enqueue(job("a"));
+        l.next_to_dispatch();
+        l.finish_inflight(TransferOutcome::Failed("boom".into())); // a Done(Failed)
+        let mut ov = QueueOverlay::new();
+        // a is now in the Failed view; switch to it.
+        let _ = ov.on_key(press(KeyCode::Tab), &mut l); // Active -> Failed
+        let out = ov.on_key(press(KeyCode::Enter), &mut l);
+        assert_eq!(out, ScreenOutcome::Enqueue, "retry signals advance");
+        assert!(
+            matches!(l.tasks[0].state, TaskState::Queued),
+            "failed task re-queued"
+        );
+    }
+
+    #[test]
+    fn on_key_r_retries_cancelled_task() {
+        let mut l = TransferLedger::new();
+        l.enqueue(job("a"));
+        l.next_to_dispatch();
+        l.finish_inflight(TransferOutcome::Cancelled);
+        let mut ov = QueueOverlay::new();
+        let _ = ov.on_key(press(KeyCode::Tab), &mut l); // -> Failed
+        let out = ov.on_key(press(KeyCode::Char('r')), &mut l);
+        assert_eq!(out, ScreenOutcome::Enqueue);
+        assert!(matches!(l.tasks[0].state, TaskState::Queued));
+    }
+
+    #[test]
+    fn on_key_enter_on_empty_view_is_a_continue_noop() {
+        let mut l = TransferLedger::new();
+        let mut ov = QueueOverlay::new();
+        let out = ov.on_key(press(KeyCode::Enter), &mut l);
+        assert_eq!(out, ScreenOutcome::Continue, "nothing selected -> no-op");
+    }
+
+    #[test]
+    fn on_key_p_pause_then_resume_with_pending_idle_signals_enqueue() {
+        let mut l = TransferLedger::new();
+        l.enqueue(job("a")); // Queued: pending=1, no inflight
+        let mut ov = QueueOverlay::new();
+        // First 'p': pause. Now paused → Continue (not Enqueue).
+        let out = ov.on_key(press(KeyCode::Char('p')), &mut l);
+        assert_eq!(out, ScreenOutcome::Continue, "pausing -> Continue");
+        assert!(l.is_paused());
+        // Second 'p': resume. pending>0, no inflight → Enqueue.
+        let out = ov.on_key(press(KeyCode::Char('p')), &mut l);
+        assert_eq!(
+            out,
+            ScreenOutcome::Enqueue,
+            "resume with pending+idle -> Enqueue"
+        );
+        assert!(!l.is_paused());
+    }
+
+    #[test]
+    fn on_key_p_resume_with_inflight_does_not_signal_enqueue() {
+        // When an inflight task is active, resuming must not signal Enqueue
+        // (the loop is already busy; a second dispatch would double-start).
+        let mut l = TransferLedger::new();
+        l.enqueue(job("a"));
+        l.next_to_dispatch(); // a InFlight
+        let mut ov = QueueOverlay::new();
+        let _ = ov.on_key(press(KeyCode::Char('p')), &mut l); // pause
+        assert!(l.is_paused());
+        let out = ov.on_key(press(KeyCode::Char('p')), &mut l); // resume, but inflight
+        assert_eq!(
+            out,
+            ScreenOutcome::Continue,
+            "resume while inflight -> Continue (no double-dispatch)"
+        );
+    }
+
+    #[test]
+    fn on_key_p_resume_with_no_pending_is_continue() {
+        let mut l = TransferLedger::new();
+        l.set_paused(true);
+        let mut ov = QueueOverlay::new();
+        let out = ov.on_key(press(KeyCode::Char('p')), &mut l);
+        assert_eq!(
+            out,
+            ScreenOutcome::Continue,
+            "resume with no pending -> Continue"
+        );
+        assert!(!l.is_paused());
+    }
+
+    #[test]
+    fn on_key_esc_sets_closed_and_returns_continue() {
+        let mut l = TransferLedger::new();
+        let mut ov = QueueOverlay::new();
+        assert!(!ov.closed);
+        let out = ov.on_key(press(KeyCode::Esc), &mut l);
+        assert_eq!(out, ScreenOutcome::Continue);
+        assert!(ov.closed, "Esc marks the overlay closed");
+    }
+
+    #[test]
+    fn on_key_non_press_event_is_ignored() {
+        let mut l = TransferLedger::new();
+        l.enqueue(job("a"));
+        let mut ov = QueueOverlay::new();
+        let release =
+            KeyEvent::new_with_kind(KeyCode::Tab, KeyModifiers::NONE, KeyEventKind::Release);
+        let out = ov.on_key(release, &mut l);
+        assert_eq!(out, ScreenOutcome::Continue);
+        assert_eq!(ov.view, QueueView::Active, "release did not cycle view");
+    }
+
+    #[test]
+    fn on_key_neutral_key_is_continue_and_does_not_mutate() {
+        let mut l = TransferLedger::new();
+        l.enqueue(job("a"));
+        let mut ov = QueueOverlay::new();
+        let out = ov.on_key(press(KeyCode::Char('x')), &mut l);
+        assert_eq!(out, ScreenOutcome::Continue);
+        assert_eq!(l.total(), 1, "neutral key does not remove anything");
+        assert!(!ov.closed, "neutral key does not close");
+    }
+
+    #[test]
+    fn on_key_tab_into_smaller_view_clamps_cursor() {
+        // Cursor in Active (2 items) at index 1; switching to Failed (empty)
+        // clamps the cursor to 0 so a later selection can not read OOB.
+        let mut l = TransferLedger::new();
+        l.enqueue(job("a"));
+        l.enqueue(job("b"));
+        let mut ov = QueueOverlay::new();
+        ov.set_current_cursor(1);
+        let _ = ov.on_key(press(KeyCode::Tab), &mut l); // Active -> Failed (empty)
+        assert_eq!(
+            ov.current_cursor(),
+            0,
+            "Tab into an empty view clamps the cursor to 0"
+        );
+    }
+
+    #[test]
+    fn on_key_d_removes_cursor_stays_in_bounds() {
+        // Remove the selected queued task; the cursor must clamp to the new
+        // last index (not point past the end on the next keypress).
+        let mut l = TransferLedger::new();
+        l.enqueue(job("a"));
+        l.enqueue(job("b"));
+        let mut ov = QueueOverlay::new();
+        ov.set_current_cursor(1); // on b
+        let _ = ov.on_key(press(KeyCode::Char('d')), &mut l); // remove b
+        assert_eq!(l.total(), 1);
+        assert_eq!(
+            ov.current_cursor(),
+            0,
+            "cursor clamped after removing the last row"
+        );
     }
 }
