@@ -195,6 +195,126 @@ fn sftp_round_trip_local_sshd() {
     drop(worker);
 }
 
+/// Diagnostic: upload + download a ~30MB file with `size_total=Some`, collecting
+/// every `Progress` event's `bytes_done`. Decides whether the active-transfer
+/// row would actually advance: if `bytes_done` grows here the worker is fine
+/// and the bug is in the TUI drain/draw; if it stays 0 the bug is in
+/// `poll_dst_size`. `#[ignore]`'d like the round-trip test — needs sshd.
+#[test]
+#[ignore = "requires a local sshd; see module docs for setup"]
+fn sftp_progress_grows_local_sshd() {
+    let Some((host, port, user, identity)) = e2e_env() else {
+        eprintln!("sftp_e2e: SSHRACK_E2E_IDENTITY missing — skipping (run setup first)");
+        return;
+    };
+    let host_obj = e2e_host(&host, port);
+    let resolved = e2e_resolved(&user, &identity);
+    let overrides = Overrides::default();
+    let self_exe = std::env::current_exe().expect("current_exe");
+    let (worker, _home) = SftpWorker::open(
+        resolved,
+        host_obj,
+        overrides,
+        &self_exe,
+        PasswordSource::None,
+        None,
+    )
+    .expect("master open");
+
+    // A large local file so the transfer spans enough PROGRESS_POLL ticks to
+    // observe growth (a few hundred ms on loopback). Sparse-allocated to avoid
+    // writing 200MB of real data — sftp still ships 200MB over the wire.
+    let big_dir = tempfile::tempdir().expect("temp dir for big file");
+    let big_local = big_dir.path().join("big.bin");
+    std::fs::File::create(&big_local)
+        .expect("create big.bin")
+        .set_len(200 * 1024 * 1024)
+        .expect("set_len");
+    let size = std::fs::metadata(&big_local).expect("big.bin meta").len();
+    let remote_dst = PathBuf::from(format!(
+        "/tmp/sshrack-e2e-upload-{}.bin",
+        std::process::id()
+    ));
+
+    // ---- UPLOAD a large local file to the remote ----
+    worker.send(WorkerCmd::Transfer(
+        TransferJob {
+            direction: Direction::Upload,
+            src: big_local.clone(),
+            dst: remote_dst.clone(),
+            name: "big-upload".into(),
+            size_total: Some(size),
+            recursive: false,
+        },
+        OverwritePolicy::Overwrite,
+    ));
+    let up_seq = collect_progress(&worker, Duration::from_secs(60));
+    eprintln!("UPLOAD progress samples ({}): {:?}", up_seq.len(), up_seq);
+
+    // ---- DOWNLOAD it back ----
+    let dn_tmp = tempfile::tempdir().expect("temp dir");
+    let local_back = dn_tmp.path().join("back.bin");
+    worker.send(WorkerCmd::Transfer(
+        TransferJob {
+            direction: Direction::Download,
+            src: remote_dst.clone(),
+            dst: local_back.clone(),
+            name: "big-download".into(),
+            size_total: Some(size),
+            recursive: false,
+        },
+        OverwritePolicy::Overwrite,
+    ));
+    let dn_seq = collect_progress(&worker, Duration::from_secs(60));
+    eprintln!("DOWNLOAD progress samples ({}): {:?}", dn_seq.len(), dn_seq);
+
+    let _ = std::process::Command::new("rm")
+        .arg("-f")
+        .arg(&remote_dst)
+        .status();
+    drop(worker);
+
+    fn grew(seq: &[u64]) -> bool {
+        seq.len() >= 2 && seq.last().copied().unwrap_or(0) > seq.first().copied().unwrap_or(0)
+    }
+    assert!(!up_seq.is_empty(), "upload emitted no Progress events");
+    assert!(!dn_seq.is_empty(), "download emitted no Progress events");
+    assert!(grew(&up_seq), "upload bytes_done never grew: {up_seq:?}");
+    assert!(grew(&dn_seq), "download bytes_done never grew: {dn_seq:?}");
+}
+
+/// Drain `Progress` events (printing each) until `Done` arrives or the deadline
+/// passes. Returns the collected `bytes_done` sequence.
+fn collect_progress(worker: &SftpWorker, deadline: Duration) -> Vec<u64> {
+    use sshrack_core::connect::sftp::proto::WorkerEvent;
+    let stop = Instant::now() + deadline;
+    let mut seq: Vec<u64> = Vec::new();
+    while Instant::now() < stop {
+        let mut got_done = false;
+        while let Some(ev) = worker.try_event() {
+            match ev {
+                WorkerEvent::Progress(p) => {
+                    eprintln!(
+                        "  prog done={} total={:?} rate={:?} eta={:?}",
+                        p.bytes_done, p.bytes_total, p.rate_bps, p.eta_secs
+                    );
+                    seq.push(p.bytes_done);
+                }
+                WorkerEvent::Done(o) => {
+                    eprintln!("  done: {o:?}");
+                    got_done = true;
+                }
+                _ => {}
+            }
+        }
+        if got_done {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    seq
+}
+
 /// Poll `try_event` until `matches` returns true for some event, or the
 /// deadline passes. Returns the matching event, or `None` on timeout.
 fn wait_for_event<F>(

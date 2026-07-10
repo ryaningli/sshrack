@@ -22,14 +22,18 @@ pub fn parse_remote_home(stdout: &str) -> Option<PathBuf> {
     })
 }
 
-/// Parse the size field out of a single `ls -l` row (the first non-blank line).
-/// Used by upload progress polling to read the partial remote file size.
-/// Returns `None` when the row is a directory or unparseable. Pure (the `now`
-/// is only used for year inference inside [`parse_ls_line`]; size does not
-/// depend on it).
+/// Parse the size field out of the first parseable `ls -l` file row in
+/// `stdout`. Used by upload progress polling to read the partial remote file
+/// size. Skips non-file lines — critically the `sftp> <command>` prompt echo
+/// that `sftp -b -` writes to stdout before the result, which would otherwise
+/// be the first non-blank line and parse as `None`, leaving upload progress
+/// stuck at 0% for the whole transfer. Returns `None` when no file row is
+/// found. Pure (the `now` is only used for year inference inside
+/// [`parse_ls_line`]; size does not depend on it).
 pub(crate) fn parse_size_from_ls(stdout: &str, now: SystemTime) -> Option<u64> {
-    let line = stdout.lines().find(|l| !l.trim().is_empty())?;
-    parse_ls_line(line, now)?.size
+    stdout
+        .lines()
+        .find_map(|line| parse_ls_line(line, now)?.size)
 }
 
 /// What [`run_transfer`] should do with a command that arrived mid-transfer.
@@ -167,6 +171,22 @@ mod tests {
     fn parse_size_from_ls_none_on_empty_or_unparseable() {
         assert_eq!(parse_size_from_ls("", SystemTime::now()), None);
         assert_eq!(parse_size_from_ls("total 8\n", SystemTime::now()), None);
+    }
+
+    #[test]
+    fn parse_size_from_ls_skips_sftp_prompt_echo() {
+        // `sftp -b -` echoes the `sftp> <command>` prompt line to stdout
+        // before the result row. The FIRST non-blank line is the prompt echo,
+        // not the ls row — parse must skip it and read the file row's size, or
+        // upload progress polling reads 0 for the whole transfer (the
+        // "active-transfer row stays at 0% until done" bug).
+        let stdout = "sftp> ls -l \"/tmp/foo.bin\"\n\
+                      -rw-r--r--    ? ryan     ryan     81469440 Jul 10 11:25 /tmp/foo.bin\n\
+                      sftp> quit\n";
+        assert_eq!(
+            parse_size_from_ls(stdout, SystemTime::now()),
+            Some(81469440)
+        );
     }
 
     #[test]
