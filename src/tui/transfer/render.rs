@@ -1082,6 +1082,37 @@ mod queue_row_tests {
     }
 
     #[test]
+    fn queue_row_inflight_percent_grows_across_snapshots() {
+        // The queue row's percent must track the progress snapshot as it
+        // advances — the "queue refreshes" guarantee. Two snapshots of the
+        // same job at 40% and 70% must render their respective percents, so a
+        // stuck-at-0% queue row regressions is caught.
+        let mut t40 = task("big.tar", TaskState::InFlight, false);
+        t40.progress = Some(Progress {
+            name: "big.tar".into(),
+            direction: Direction::Upload,
+            bytes_done: 40,
+            bytes_total: Some(100),
+            rate_bps: Some(5),
+            eta_secs: Some(12),
+        });
+        let s40 = text(&queue_row(&t40, 60, false));
+        assert!(s40.contains("40%"), "40% snapshot: {s40}");
+
+        let mut t70 = task("big.tar", TaskState::InFlight, false);
+        t70.progress = Some(Progress {
+            name: "big.tar".into(),
+            direction: Direction::Upload,
+            bytes_done: 70,
+            bytes_total: Some(100),
+            rate_bps: Some(8),
+            eta_secs: Some(6),
+        });
+        let s70 = text(&queue_row(&t70, 60, false));
+        assert!(s70.contains("70%"), "70% snapshot: {s70}");
+    }
+
+    #[test]
     fn queue_row_folder_shows_folder_label_when_indeterminate() {
         let t = task("src/", TaskState::Queued, true);
         let s = text(&queue_row(&t, 60, false));

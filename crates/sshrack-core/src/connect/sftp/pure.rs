@@ -190,6 +190,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_size_from_ls_skips_total_line_then_file() {
+        // `ls -l` emits a `total N` summary header before the file rows. The
+        // parser must skip it (total parses as None) and read the file row's
+        // size — existing tests only cover `total 8\n` alone (→ None), not the
+        // header-followed-by-file shape that real upload polling sees.
+        let stdout = "total 8\n-rw-r--r-- 1 u g 1234 Jan 2 03:04 /a\n";
+        assert_eq!(parse_size_from_ls(stdout, SystemTime::now()), Some(1234));
+    }
+
+    #[test]
     fn parse_size_from_ls_uses_first_non_blank_line() {
         // A multi-line stdout: the first non-blank row's size wins.
         let stdout = "\n-rw-r--r-- 1 u g 99 Jan 2 03:04 /a\n-rw-r--r-- 1 u g 1 Jan 2 03:04 /b\n";
