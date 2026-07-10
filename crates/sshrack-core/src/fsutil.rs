@@ -78,3 +78,34 @@ fn atomic_temp_path(path: &Path) -> PathBuf {
     name.push(format!(".tmp.{pid}.{nanos}"));
     path.with_file_name(name)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atomic_temp_path_embeds_file_name_and_tmp_marker() {
+        // The temp path is a sibling of the target whose name embeds the
+        // original file name plus a `.tmp.<pid>.<nanos>` suffix.
+        let tmp = atomic_temp_path(Path::new("/dir/host"));
+        let s = tmp.to_string_lossy();
+        assert!(
+            s.contains(".host.tmp."),
+            "expected the temp name to embed '.host.tmp.', got: {s}"
+        );
+        // The temp file lives alongside the target (same parent directory).
+        assert_eq!(tmp.parent(), Some(Path::new("/dir")));
+    }
+
+    #[test]
+    fn atomic_temp_path_falls_back_to_file_when_no_file_name() {
+        // A path with no file_name component (e.g. the root) falls back to the
+        // generic name "file" rather than panicking or producing an empty base.
+        let tmp = atomic_temp_path(Path::new("/"));
+        let s = tmp.to_string_lossy();
+        assert!(
+            s.contains("file"),
+            "expected the fallback name to contain 'file', got: {s}"
+        );
+    }
+}

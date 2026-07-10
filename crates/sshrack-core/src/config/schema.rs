@@ -1285,4 +1285,54 @@ keyring = true
         assert!(back.is_vault());
         assert!(back.vault_meta().is_some());
     }
+
+    #[test]
+    fn vault_meta_supports_kdf_only_for_argon2id() {
+        // The supported KDF is exactly "argon2id"; any other tag is rejected.
+        let mut m = VaultMeta::default_argon2id("AA==");
+        assert!(m.supports_kdf(), "argon2id must be supported");
+        m.kdf = "pbkdf2".into();
+        assert!(
+            !m.supports_kdf(),
+            "a non-argon2id KDF tag must not be supported"
+        );
+    }
+
+    #[test]
+    fn inline_key_in_keyring_tracks_inline_marker() {
+        // An inline key carrying the keyring marker (sealed form under keyring
+        // storage) reports true.
+        let marked = CredentialBody {
+            user: "u".into(),
+            password: None,
+            key: Some(KeySource::Inline(InlineKey {
+                private_key: None,
+                certificate: None,
+                keyring: true,
+            })),
+            keyring: false,
+        };
+        assert!(marked.inline_key_in_keyring());
+
+        // An inline key without the marker reports false.
+        let unmarked = CredentialBody {
+            user: "u".into(),
+            password: None,
+            key: Some(KeySource::Inline(InlineKey {
+                private_key: Some(Secret::Plain("k".into())),
+                certificate: None,
+                keyring: false,
+            })),
+            keyring: false,
+        };
+        assert!(!unmarked.inline_key_in_keyring());
+
+        // A path key reports false.
+        let path_key = CredentialBody::new("u").with_key("/k");
+        assert!(!path_key.inline_key_in_keyring());
+
+        // A body with no key at all reports false.
+        let no_key = CredentialBody::new("u");
+        assert!(!no_key.inline_key_in_keyring());
+    }
 }

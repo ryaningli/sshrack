@@ -121,4 +121,17 @@ mod tests {
         assert_eq!(leftovers.len(), 1, "only the target file should remain");
         assert_eq!(leftovers[0].to_string_lossy(), "config.toml");
     }
+
+    #[test]
+    fn load_returns_config_parse_error_for_garbage_toml() {
+        // A file that exists but is not valid TOML surfaces as a ConfigParse
+        // error carrying the path, not as a silent default or a raw io error.
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "this is not toml {{{{").unwrap();
+        let err = load(tmp.path()).unwrap_err();
+        assert!(
+            matches!(err, SshrackError::ConfigParse { .. }),
+            "expected ConfigParse, got {err:?}"
+        );
+    }
 }
