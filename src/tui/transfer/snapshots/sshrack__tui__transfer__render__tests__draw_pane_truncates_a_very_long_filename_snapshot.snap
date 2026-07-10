@@ -5,7 +5,7 @@ expression: term.backend()
 "┌ local ───────────────────────────────┐"
 "│/home/u/project                       │"
 "│❯                                  1/1│"
-"│  ▶ this-is-an-extremely-long-filename│"
+"│  ▶ this-is-an-extremely-lo…   1.0K  ?│"
 "│                                      │"
 "│                                      │"
 "│                                      │"

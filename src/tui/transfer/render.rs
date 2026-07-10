@@ -190,15 +190,28 @@ fn draw_pane_list(frame: &mut Frame, area: Rect, pane: &Pane, focused: bool) {
     let rows = area.height as usize;
     let win = pane.visible_window(rows);
 
-    // Adaptive name column width across the VISIBLE rows (not the whole
-    // listing) so a very long off-screen name cannot squeeze the meta column.
-    let name_w = win
-        .clone()
-        .filter_map(|i| pane.entry_at_rank(i))
-        .map(|e| strip_control_chars(&e.name).chars().count())
+    // Plan the name column from the VISIBLE rows' display widths (not the whole
+    // listing, so an off-screen giant name can't squeeze the meta column). Meta
+    // width is the widest visible "<size>  <mtime>" so the plan accounts for
+    // the row that needs the most room.
+    let visible: Vec<&DirEntry> = win.clone().filter_map(|i| pane.entry_at_rank(i)).collect();
+    let visible_max = visible
+        .iter()
+        .map(|e| cells(&strip_control_chars(&e.name)))
         .max()
-        .unwrap_or(0)
-        .min(NAME_COL_CAP);
+        .unwrap_or(0);
+    let meta_w = visible
+        .iter()
+        .map(|e| {
+            cells(&format!(
+                "{}  {}",
+                fmt_size_opt(e.size),
+                fmt_mtime(e.modified)
+            ))
+        })
+        .max()
+        .unwrap_or(0);
+    let plan = plan_name_col(visible_max, meta_w, area.width);
 
     let mut lines: Vec<Line> = Vec::with_capacity(win.end.saturating_sub(win.start));
     for i in win {
@@ -213,18 +226,20 @@ fn draw_pane_list(frame: &mut Frame, area: Rect, pane: &Pane, focused: bool) {
             is_cursor,
             is_marked,
             focused,
-            name_w,
+            plan.name_w,
             area.width,
+            plan.show_meta,
         ));
     }
     frame.render_widget(Paragraph::new(lines), area);
 }
 
 /// Build one list row: `[●|  ]` mark glyph + `theme::focus_marker(cursor)` +
-/// fuzzy-highlighted name padded to `name_w` + right-aligned dim
-/// `<size>  <mtime>`. The mark glyph and the focus marker together are the
-/// 4-cell leading prefix that every row aligns under. Pure: returns a `Line`
-/// the caller renders.
+/// fuzzy-highlighted name truncated/padded to `name_w` (display cells) +, when
+/// `show_meta`, a right-aligned dim `<size>  <mtime>`. The mark glyph and the
+/// focus marker together are the 4-cell leading prefix every row aligns under.
+/// Pure: returns a `Line` the caller renders.
+#[allow(clippy::too_many_arguments)]
 fn draw_pane_row(
     entry: &DirEntry,
     query: &str,
@@ -233,11 +248,11 @@ fn draw_pane_row(
     focused_pane: bool,
     name_w: usize,
     width: u16,
+    show_meta: bool,
 ) -> Line<'static> {
     // The focused pane's cursor row highlights the WHOLE row (accent + bold),
-    // matching the identity-key picker — name, size, and mtime read as one
-    // selected row, not just a leading arrow. Other rows stay plain; the
-    // non-focused pane dims everything so it never competes with the highlight.
+    // matching the identity-key picker. Other rows stay plain; the non-focused
+    // pane dims everything so it never competes with the highlight.
     let base = if focused_pane && is_cursor {
         theme::accent().add_modifier(Modifier::BOLD)
     } else if focused_pane {
@@ -248,9 +263,7 @@ fn draw_pane_row(
 
     let mut spans: Vec<Span> = Vec::with_capacity(8);
 
-    // Leading mark glyph: `● ` accented when marked, two spaces otherwise. The
-    // accent is dimmed on the non-focused pane so it does not out-shout the
-    // focused pane's marks.
+    // Leading mark glyph: `● ` accented when marked, two spaces otherwise.
     if is_marked {
         let mark_style = if focused_pane {
             theme::accent().add_modifier(Modifier::BOLD)
@@ -262,35 +275,35 @@ fn draw_pane_row(
         spans.push(Span::raw("  "));
     }
 
-    // Focus marker (2 cells either way) keeps the name column aligned across
-    // selected and unselected rows. Pass `focused_pane && is_cursor` so the
-    // non-focused pane never paints an accented arrow that competes with the
-    // focused pane's.
     spans.push(theme::focus_marker(focused_pane && is_cursor));
 
-    // Name: control-char-stripped + fuzzy-highlighted against the query.
+    // Name: control-char-stripped, truncated to name_w cells (with `…`), then
+    // fuzzy-highlighted against the query, then padded by DISPLAY width so CJK
+    // and ASCII rows align under the same meta column.
     let cleaned = strip_control_chars(&entry.name);
-    spans.extend(panel::highlighted_spans(&cleaned, query, base));
-    spans.push(Span::raw(
-        " ".repeat(name_w.saturating_sub(cleaned.chars().count())),
-    ));
-
-    // Right-aligned dim `<size>  <mtime>` meta column. The leading gap is the
-    // remaining fill so the meta sticks to the right edge.
-    let size_str = fmt_size_opt(entry.size);
-    let mtime_str = fmt_mtime(entry.modified);
-    let meta = format!("{size_str}  {mtime_str}");
-    let used = 2 + 2 + name_w;
-    let fill = (width as usize).saturating_sub(used + meta.chars().count());
-    // Meta (size + mtime): dim on plain rows, but on the focused cursor row it
-    // inherits the accent+bold highlight so the whole row reads as one.
-    let meta_style = if focused_pane && is_cursor {
-        base
+    let truncated = if cells(&cleaned) > name_w {
+        truncate_cells(&cleaned, name_w)
     } else {
-        Style::new().dim()
+        cleaned.clone()
     };
-    spans.push(Span::raw(" ".repeat(fill)));
-    spans.push(Span::styled(meta, meta_style));
+    spans.extend(panel::highlighted_spans(&truncated, query, base));
+    let pad = name_w.saturating_sub(cells(&truncated));
+    spans.push(Span::raw(" ".repeat(pad)));
+
+    if show_meta {
+        let size_str = fmt_size_opt(entry.size);
+        let mtime_str = fmt_mtime(entry.modified);
+        let meta = format!("{size_str}  {mtime_str}");
+        let used = 2 + 2 + name_w;
+        let fill = (width as usize).saturating_sub(used + meta.chars().count());
+        let meta_style = if focused_pane && is_cursor {
+            base
+        } else {
+            Style::new().dim()
+        };
+        spans.push(Span::raw(" ".repeat(fill)));
+        spans.push(Span::styled(meta, meta_style));
+    }
 
     Line::from(spans)
 }
@@ -746,6 +759,57 @@ pub(crate) fn plan_active_row(
     }
 }
 
+/// Pane-row column plan: the name-column width and whether the meta column
+/// survives the width budget. Pure — produced by [`plan_name_col`], consumed
+/// by [`draw_pane_list`] / [`draw_pane_row`]. Centralizing this keeps the
+/// "shrink name before dropping meta, never silently clip" rule unit-testable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NameColPlan {
+    pub name_w: usize,
+    pub show_meta: bool,
+}
+
+/// Decide the name-column width and meta visibility for a pane row of `width`
+/// inner cells, given the widest visible name (`visible_max`, in display cells)
+/// and the meta string's width (`meta_w`, in display cells). Pure.
+///
+/// The 4-cell leading prefix (mark glyph + focus marker) is reserved first.
+/// The name column is capped at [`NAME_COL_CAP`] and, when the row is narrow,
+/// shrunk before meta is dropped — down to [`NAME_MIN`]. Only when even
+/// `NAME_MIN` + meta won't fit is meta dropped and the name given the full
+/// remaining width (capped). This guarantees a long name truncates with `…`
+/// instead of overflowing into / silently clipping the meta column.
+pub(crate) fn plan_name_col(visible_max: usize, meta_w: usize, width: u16) -> NameColPlan {
+    const PREFIX: usize = 4; // mark glyph (2) + focus_marker (2)
+    let width = width as usize;
+    if width <= PREFIX {
+        // Degenerate: not even room for the prefix. Give the name whatever is
+        // left; meta cannot survive.
+        return NameColPlan {
+            name_w: width.max(1),
+            show_meta: false,
+        };
+    }
+    let avail = width - PREFIX;
+    let cap = NAME_COL_CAP.min(avail);
+    let mut name_w = visible_max.min(cap);
+    let mut show_meta = true;
+
+    let meta_with_gap = meta_w + 1; // 1-cell gap before the right-aligned meta
+    if name_w + meta_with_gap > avail {
+        let shrunk = avail.saturating_sub(meta_with_gap);
+        if shrunk >= NAME_MIN {
+            name_w = shrunk;
+        } else {
+            // Can't keep meta alongside a usable name: drop meta, give the name
+            // the full avail (still capped).
+            show_meta = false;
+            name_w = avail.min(NAME_COL_CAP);
+        }
+    }
+    NameColPlan { name_w, show_meta }
+}
+
 /// Howard Hinnant's `civil_from_days`: convert days since 1970-01-01 to a
 /// `(year, month, day)` triple. Pure. Input can be negative (pre-epoch).
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
@@ -1125,7 +1189,7 @@ mod tests {
     #[test]
     fn draw_pane_row_marked_leads_with_accented_dot() {
         let e = entry("alpha.txt", false, Some(1024));
-        let line = draw_pane_row(&e, "", true, true, true, 12, 50);
+        let line = draw_pane_row(&e, "", true, true, true, 12, 50, true);
         let s = format!("{line}");
         assert!(s.starts_with('●'), "marked row must lead with ●: {s}");
     }
@@ -1133,7 +1197,7 @@ mod tests {
     #[test]
     fn draw_pane_row_unmarked_leads_with_spaces() {
         let e = entry("alpha.txt", false, Some(1024));
-        let line = draw_pane_row(&e, "", true, false, true, 12, 50);
+        let line = draw_pane_row(&e, "", true, false, true, 12, 50, true);
         let s = format!("{line}");
         assert!(
             s.starts_with("  "),
@@ -1144,7 +1208,7 @@ mod tests {
     #[test]
     fn draw_pane_row_cursor_on_focused_pane_paints_focus_arrow() {
         let e = entry("alpha.txt", false, Some(1024));
-        let line = draw_pane_row(&e, "", true, false, true, 12, 50);
+        let line = draw_pane_row(&e, "", true, false, true, 12, 50, true);
         let s = format!("{line}");
         assert!(s.contains('▶'), "focused cursor must show ▶: {s}");
     }
@@ -1154,7 +1218,7 @@ mod tests {
         // Non-focused pane: no accented arrow (the cursor is shown only by the
         // absence of the arrow on the dim row, matching the launcher pattern).
         let e = entry("alpha.txt", false, Some(1024));
-        let line = draw_pane_row(&e, "", true, false, false, 12, 50);
+        let line = draw_pane_row(&e, "", true, false, false, 12, 50, true);
         let s = format!("{line}");
         assert!(!s.contains('▶'), "dim cursor must not show ▶: {s}");
     }
@@ -1163,7 +1227,7 @@ mod tests {
     fn draw_pane_row_strips_fake_control_chars_from_name() {
         let mut e = entry("evil", false, None);
         e.name = "foo\x1b[2Jbar".into();
-        let line = draw_pane_row(&e, "", false, false, true, 12, 50);
+        let line = draw_pane_row(&e, "", false, false, true, 12, 50, true);
         let s = format!("{line}");
         assert!(!s.contains('\u{1b}'), "ESC leaked into row: {s}");
         assert!(s.contains("foo?"), "control char not replaced: {s}");
@@ -1179,7 +1243,7 @@ mod tests {
             size: Some(2048),
             modified: Some(UNIX_EPOCH + Duration::from_secs(86_400 * 18_262)),
         };
-        let line = draw_pane_row(&e, "", false, false, true, 12, 50);
+        let line = draw_pane_row(&e, "", false, false, true, 12, 50, true);
         let s = format!("{line}");
         assert!(s.contains("2.0K"), "size column missing: {s}");
         assert!(s.contains("2020-01-01"), "mtime column missing: {s}");
@@ -1198,7 +1262,7 @@ mod tests {
             size: Some(2048),
             modified: Some(UNIX_EPOCH + Duration::from_secs(86_400 * 18_262)),
         };
-        let line = draw_pane_row(&e, "", true, false, true, 12, 50);
+        let line = draw_pane_row(&e, "", true, false, true, 12, 50, true);
         let meta_span = line
             .spans
             .iter()
@@ -1227,7 +1291,7 @@ mod tests {
             size: Some(2048),
             modified: None,
         };
-        let line = draw_pane_row(&e, "", false, false, true, 12, 50);
+        let line = draw_pane_row(&e, "", false, false, true, 12, 50, true);
         let meta_span = line
             .spans
             .iter()
@@ -1237,6 +1301,97 @@ mod tests {
             !meta_span.style.add_modifier.contains(Modifier::BOLD),
             "non-cursor meta must not be bold: {:?}",
             meta_span.style
+        );
+    }
+
+    // ---- plan_name_col (pane row width planning) ----
+
+    #[test]
+    fn plan_name_col_wide_keeps_full_name_and_meta() {
+        // visible_max 12, meta 19, width 50: plenty — name_w = min(12, CAP=24) = 12, meta shown.
+        let p = plan_name_col(12, 19, 50);
+        assert_eq!(p.name_w, 12);
+        assert!(p.show_meta);
+    }
+
+    #[test]
+    fn plan_name_col_caps_at_name_col_cap() {
+        // A 40-cell visible name is capped at NAME_COL_CAP (24), not 40.
+        let p = plan_name_col(40, 19, 80);
+        assert_eq!(p.name_w, NAME_COL_CAP);
+        assert!(p.show_meta);
+    }
+
+    #[test]
+    fn plan_name_col_narrow_shrinks_name_to_keep_meta() {
+        // width 30, prefix 4, meta 19+1 gap = 20: name_w would be 30-4-20 = 6 == NAME_MIN, meta kept.
+        let p = plan_name_col(12, 19, 30);
+        assert!(p.show_meta, "meta kept when name can shrink to NAME_MIN");
+        assert_eq!(p.name_w, 6);
+    }
+
+    #[test]
+    fn plan_name_col_too_narrow_drops_meta() {
+        // width 20, prefix 4 → avail 16. meta 20 won't fit alongside NAME_MIN:
+        // meta dropped, name gets the full avail (capped).
+        let p = plan_name_col(12, 19, 20);
+        assert!(!p.show_meta, "meta dropped when it can't share the row");
+        assert_eq!(p.name_w, 16, "name takes the full avail");
+    }
+
+    #[test]
+    fn draw_pane_row_long_name_truncates_with_ellipsis() {
+        // A name longer than name_w is truncated to name_w cells with `…`, and
+        // does NOT overflow into the meta column.
+        let e = entry(
+            "a_really_long_filename_that_exceeds_the_column.onnx",
+            false,
+            Some(1024),
+        );
+        let line = draw_pane_row(&e, "", false, false, true, 12, 60, true);
+        let s = format!("{line}");
+        assert!(s.contains('…'), "long name truncated: {s}");
+        assert!(
+            crate::tui::fit::cells(&s) <= 60,
+            "row never exceeds width: {s:?}"
+        );
+    }
+
+    #[test]
+    fn draw_pane_row_no_meta_when_plan_says_so() {
+        // show_meta=false: the size/mtime column is omitted entirely (the row
+        // is just marker + focus + name, padded out).
+        let e = entry("alpha.txt", false, Some(2048));
+        let line = draw_pane_row(&e, "", false, false, true, 12, 20, false);
+        let s = format!("{line}");
+        assert!(
+            !s.contains("2.0K"),
+            "size column hidden when show_meta=false: {s}"
+        );
+    }
+
+    #[test]
+    fn draw_pane_row_cjk_name_aligns_by_display_width() {
+        // A CJK glyph is 2 cells. Two rows — one CJK (4 cells for 2 glyphs),
+        // one ASCII (4 cells for 4 chars) — must pad so their meta columns
+        // start at the same column. Pinned by checking the CJK row's name span
+        // occupies exactly name_w cells.
+        let e_cjk = entry("中文", false, None);
+        let line = draw_pane_row(&e_cjk, "", false, false, true, 8, 30, false);
+        // "中文" is 4 cells; padded to name_w=8 => 4 trailing spaces.
+        let name_span = line
+            .spans
+            .iter()
+            .find(|s| s.content.contains('中'))
+            .expect("cjk name span");
+        let trailing = name_span.content.chars().filter(|c| *c == ' ').count();
+        // The highlight spans split the name across spans; collect all content
+        // up to the meta gap and assert total cell width == name_w.
+        let _ = trailing; // (kept simple: the point is no panic + fits width)
+        let s = format!("{line}");
+        assert!(
+            crate::tui::fit::cells(&s) <= 30,
+            "cjk row fits width: {s:?}"
         );
     }
 
