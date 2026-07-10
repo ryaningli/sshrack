@@ -36,6 +36,18 @@ use crate::tui::transfer::queue_overlay::QueueView;
 /// / credential panel cap so all three list surfaces line up.
 const NAME_COL_CAP: usize = 24;
 
+/// Minimum name column width kept before numeric segments are dropped. Below
+/// this the name is starved and we degrade the row instead of rendering a
+/// 2-character sliver.
+#[allow(dead_code)] // wired in Task 2 (draw_active_transfer consumes this)
+const NAME_MIN: usize = 6;
+/// Gauge width bounds: ~1/3 of the row, never narrower than this (else the
+/// `██░░ N%` label is unreadable) nor wider than this (else it dominates).
+#[allow(dead_code)] // wired in Task 2 (draw_active_transfer consumes this)
+const GAUGE_MIN: u16 = 10;
+#[allow(dead_code)] // wired in Task 2 (draw_active_transfer consumes this)
+const GAUGE_MAX: u16 = 30;
+
 /// Paint one pane into `area` as a titled bordered block: focus = accent
 /// border + bold title, non-focus = dim border + dim title (mirrors sshelf and
 /// keeps sshrack's dim-the-non-focused-pane language). Inside the block: a
@@ -580,6 +592,142 @@ fn fmt_mtime(t: Option<SystemTime>) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// Laid-out active-transfer row, produced by [`plan_active_row`]. Pure —
+/// [`draw_active_transfer`] consumes these fields verbatim. Centralizing the
+/// width-driven degradation here keeps every rung of the ladder (drop eta →
+/// rate → size → gauge; truncate the name) unit-testable without ratatui.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // constructed only in tests for now; Task 2 wires draw_active_transfer
+pub(crate) struct ActiveRowPlan {
+    /// Name truncated to its cell budget (with `…` when cut).
+    pub name_shown: String,
+    /// `"<done>/<total>"` when the total is known, else `"<done>"` (bytes moved).
+    pub size_seg: String,
+    /// `"<rate>/s"` or `—`.
+    pub rate_seg: String,
+    /// `"<n>s"` / `"<m>n s"` / `—`.
+    pub eta_seg: String,
+    pub show_size: bool,
+    pub show_rate: bool,
+    pub show_eta: bool,
+    /// Total cell width of the shown numeric segments, each including its one
+    /// leading space. 0 when none are shown. Used to size the right-aligned
+    /// segment column so it hugs the gauge with no gap.
+    pub segs_w: u16,
+    /// Gauge width in cells. 0 ⇒ no gauge (indeterminate total, or row too
+    /// narrow even for `GAUGE_MIN` + `NAME_MIN`).
+    pub gauge_w: u16,
+    /// `Some("N%")` when a gauge is shown, else `None`.
+    pub gauge_label: Option<String>,
+    /// Integer percent 0..=100 for the `Gauge` widget. 0 when indeterminate.
+    pub percent: u16,
+}
+
+/// Plan the active-transfer row for a `avail`-wide area. Pure.
+///
+/// Layout (left → right): `[name][ ↑/↓][ <size>][ <rate>][ <eta>]` left/center,
+/// `[gauge N%]` hard against the right edge. The name is the most compressible
+/// field: it is truncated to whatever budget remains after the surviving
+/// numeric segments and the gauge. As `avail` shrinks, segments are dropped in
+/// priority order — eta first (it depends on a known total anyway), then rate,
+/// then size — and only when even a bare `NAME_MIN` name + `GAUGE_MIN` gauge no
+/// longer fit is the gauge dropped. An unknown total means no gauge, no
+/// percent, and no eta, but size + rate remain.
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // wired in Task 2 (draw_active_transfer consumes this)
+pub(crate) fn plan_active_row(
+    name: &str,
+    done: u64,
+    total: Option<u64>,
+    rate: Option<u64>,
+    eta: Option<u64>,
+    avail: u16,
+) -> ActiveRowPlan {
+    let avail = avail as usize;
+    let glyph_w = 2usize; // " ↑" / " ↓" — a space + the arrow, for legibility
+
+    let total_known = total.filter(|t| *t > 0);
+    let (percent, gauge_label) = match total_known {
+        Some(t) => {
+            let pct = u16::try_from(done.saturating_mul(100) / t)
+                .unwrap_or(100)
+                .min(100);
+            (pct, Some(format!("{pct}%")))
+        }
+        None => (0u16, None),
+    };
+
+    let size_seg = match total_known {
+        Some(t) => format!("{}/{}", fmt_size(done), fmt_size(t)),
+        None => fmt_size(done),
+    };
+    let rate_seg = fmt_rate(rate);
+    let eta_seg = fmt_eta(eta);
+
+    let size_w = cells(&size_seg) + 1; // +1 leading space
+    let rate_w = cells(&rate_seg) + 1;
+    let eta_w = cells(&eta_seg) + 1;
+
+    // Gauge only when the total is known AND the row can hold gauge + NAME_MIN.
+    let mut gauge_w: usize = if total_known.is_some() {
+        let g = (avail / 3).clamp(GAUGE_MIN as usize, GAUGE_MAX as usize);
+        if avail >= GAUGE_MIN as usize + NAME_MIN + 2 {
+            g
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    let mut gauge_used = if gauge_w > 0 { gauge_w + 1 } else { 0 }; // +1 sep before gauge
+
+    // eta is only meaningful with a known total.
+    let mut show_eta = total_known.is_some();
+    let mut show_size = true;
+    let mut show_rate = true;
+
+    let mut segs_w = size_w + if show_rate { rate_w } else { 0 } + if show_eta { eta_w } else { 0 };
+    let mut name_budget = avail.saturating_sub(glyph_w + segs_w + gauge_used);
+
+    // Degrade: eta → rate → size → gauge, until the name keeps NAME_MIN.
+    if name_budget < NAME_MIN && show_eta {
+        show_eta = false;
+        segs_w = size_w + if show_rate { rate_w } else { 0 };
+        name_budget = avail.saturating_sub(glyph_w + segs_w + gauge_used);
+    }
+    if name_budget < NAME_MIN && show_rate {
+        show_rate = false;
+        segs_w = size_w;
+        name_budget = avail.saturating_sub(glyph_w + segs_w + gauge_used);
+    }
+    if name_budget < NAME_MIN && show_size {
+        show_size = false;
+        segs_w = 0;
+        name_budget = avail.saturating_sub(glyph_w + segs_w + gauge_used);
+    }
+    if name_budget < NAME_MIN && gauge_w > 0 {
+        gauge_w = 0;
+        gauge_used = 0;
+        name_budget = avail.saturating_sub(glyph_w + segs_w + gauge_used);
+    }
+
+    let name_shown = truncate_cells(name, name_budget.max(1));
+
+    ActiveRowPlan {
+        name_shown,
+        size_seg,
+        rate_seg,
+        eta_seg,
+        show_size,
+        show_rate,
+        show_eta,
+        segs_w: segs_w as u16,
+        gauge_w: gauge_w as u16,
+        gauge_label: gauge_label.filter(|_| gauge_w > 0),
+        percent,
+    }
+}
+
 /// Howard Hinnant's `civil_from_days`: convert days since 1970-01-01 to a
 /// `(year, month, day)` triple. Pure. Input can be negative (pre-epoch).
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
@@ -692,6 +840,122 @@ mod tests {
         assert_eq!((y, m, d), (2000, 2, 29));
         // Round-trip via fmt_mtime so the format->days path stays covered too.
         assert_eq!(fmt_mtime(Some(t)), "2000-02-29");
+    }
+
+    // ---- plan_active_row (width-driven degradation ladder) ----
+
+    #[allow(dead_code)]
+    fn prog(
+        name: &str,
+        done: u64,
+        total: Option<u64>,
+        rate: Option<u64>,
+        eta: Option<u64>,
+    ) -> Progress {
+        Progress {
+            name: name.into(),
+            direction: Direction::Upload,
+            bytes_done: done,
+            bytes_total: total,
+            rate_bps: rate,
+            eta_secs: eta,
+        }
+    }
+
+    #[test]
+    fn plan_active_row_wide_shows_all_segments_and_gauge() {
+        // avail=100 is plenty: name uncut, all three numeric segments shown,
+        // gauge ~1/3 of the row clamped to [10,30] => 30, percent label present.
+        let p = plan_active_row("file.bin", 1024, Some(4096), Some(1024), Some(3), 100);
+        assert_eq!(p.name_shown, "file.bin", "name fits uncut");
+        assert!(
+            p.show_size && p.show_rate && p.show_eta,
+            "all segments shown"
+        );
+        assert_eq!(p.gauge_w, 30, "gauge clamps to GAUGE_MAX");
+        assert_eq!(p.gauge_label.as_deref(), Some("25%"), "1024/4096 = 25%");
+        assert_eq!(p.percent, 25);
+        // segs_w = ("1.0K/4.0K"+1) + ("1.0K/s"+1) + ("3s"+1) = 10 + 7 + 3 = 20
+        assert_eq!(p.segs_w, 20);
+    }
+
+    #[test]
+    fn plan_active_row_narrow_drops_eta_before_rate_and_size() {
+        // avail=42: name_budget drops below NAME_MIN with all segs, so eta
+        // (lowest priority) is dropped first; size + rate + gauge survive.
+        let p = plan_active_row("file.bin", 1024, Some(4096), Some(1024), Some(3), 42);
+        assert!(!p.show_eta, "eta dropped first");
+        assert!(p.show_size && p.show_rate, "size + rate kept");
+        assert!(p.gauge_w > 0, "gauge kept");
+        assert_eq!(
+            p.name_shown, "file.bin",
+            "name still fits after dropping eta"
+        );
+    }
+
+    #[test]
+    fn plan_active_row_very_narrow_drops_everything_then_gauge() {
+        // avail=15: cannot hold gauge + NAME_MIN, so gauge goes; then all segs
+        // go; only a truncated name remains. No percent label without a gauge.
+        let p = plan_active_row("file.bin", 1024, Some(4096), Some(1024), Some(3), 15);
+        assert!(
+            !p.show_size && !p.show_rate && !p.show_eta,
+            "all segs dropped"
+        );
+        assert_eq!(p.gauge_w, 0, "gauge dropped");
+        assert!(p.gauge_label.is_none(), "no label without gauge");
+        assert_eq!(p.name_shown, "file.bin", "name fits in the freed space");
+    }
+
+    #[test]
+    fn plan_active_row_long_name_truncates_with_ellipsis() {
+        // A 34-cell name in a 50-wide row: name must be cut to its budget and
+        // carry `…`. The numeric segments that fit stay; gauge stays.
+        let p = plan_active_row(
+            "funasr_encoder_adaptor_dynamic.onnx",
+            100,
+            Some(1000),
+            Some(10),
+            Some(5),
+            50,
+        );
+        assert!(
+            p.name_shown.ends_with('…'),
+            "truncated name ends with …: {}",
+            p.name_shown
+        );
+        assert!(
+            p.name_shown.starts_with("funasr"),
+            "keeps the prefix: {}",
+            p.name_shown
+        );
+        assert!(crate::tui::fit::cells(&p.name_shown) <= 50, "fits the row");
+        assert!(p.gauge_w > 0, "gauge still shown");
+    }
+
+    #[test]
+    fn plan_active_row_indeterminate_has_no_gauge_or_eta() {
+        // Unknown total: no gauge, no percent, no eta. Size (bytes done) and
+        // rate still carry information, so they stay when width allows.
+        let p = plan_active_row("file.bin", 1024, None, Some(1024), None, 80);
+        assert_eq!(p.gauge_w, 0, "no gauge when total unknown");
+        assert!(
+            p.gauge_label.is_none(),
+            "no percent label when total unknown"
+        );
+        assert!(!p.show_eta, "eta meaningless without a total");
+        assert!(p.show_size && p.show_rate, "size + rate still shown");
+        // size_seg is just bytes done (no /total) when total is unknown
+        assert_eq!(p.size_seg, "1.0K");
+    }
+
+    #[test]
+    fn plan_active_row_indeterminate_shows_no_percent_in_label() {
+        // Belt-and-suspenders: an indeterminate transfer must never synthesize
+        // a percent label, even on a wide row.
+        let p = plan_active_row("big.bin", 9_999_999_999, None, None, None, 120);
+        assert!(p.gauge_label.is_none());
+        assert_eq!(p.gauge_w, 0);
     }
 
     // ---- draw_pane_row: render-alignment regression ----
