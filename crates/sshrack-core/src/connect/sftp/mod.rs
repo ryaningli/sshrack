@@ -23,7 +23,7 @@
 
 pub mod argv;
 pub use argv::{
-    control_check_argv, control_exit_argv, control_socket_path, master_argv, runtime_dir,
+    SftpBin, control_check_argv, control_exit_argv, control_socket_path, master_argv, runtime_dir,
     sftp_batch_argv, sftp_target, shell_quote,
 };
 

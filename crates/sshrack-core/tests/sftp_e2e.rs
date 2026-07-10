@@ -112,6 +112,7 @@ fn sftp_round_trip_local_sshd() {
         &self_exe,
         PasswordSource::None,
         None,
+        sshrack_core::connect::sftp::SftpBin::default(),
     )
     .expect("master open");
 
@@ -218,6 +219,7 @@ fn sftp_progress_grows_local_sshd() {
         &self_exe,
         PasswordSource::None,
         None,
+        sshrack_core::connect::sftp::SftpBin::default(),
     )
     .expect("master open");
 
