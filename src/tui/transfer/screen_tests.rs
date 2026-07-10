@@ -1269,3 +1269,22 @@ fn apply_remote_listing_err_reverts_cwd_and_surfaces_failure() {
         screen.status.message
     );
 }
+
+#[test]
+fn draw_footer_narrow_drops_trailing_hints_with_ellipsis() {
+    // A 25-wide footer cannot fit all 10 hints; trailing ones are dropped via
+    // `render::fit_hint_count` and a dim `…` marks the truncation. The first
+    // hint (`Tab`) must survive; the last (`F1 help`) must not.
+    let backend = TestBackend::new(25, 1);
+    let mut term = Terminal::new(backend).expect("test backend");
+    let screen = canned_screen();
+    term.draw(|f| screen.draw_footer(f, f.area()))
+        .expect("draw");
+    let view = buffer_view(term.backend().buffer());
+    assert!(
+        view.contains('…'),
+        "narrow footer shows … truncation: {view:?}"
+    );
+    assert!(view.contains("Tab"), "first hint kept: {view:?}");
+    assert!(!view.contains("help"), "trailing hint dropped: {view:?}");
+}

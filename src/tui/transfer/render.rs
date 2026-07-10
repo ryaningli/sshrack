@@ -810,6 +810,33 @@ pub(crate) fn plan_name_col(visible_max: usize, meta_w: usize, width: u16) -> Na
     NameColPlan { name_w, show_meta }
 }
 
+/// How many of `hints` (in order) fit a `width`-wide row when rendered as
+/// `"<key> <label>"` joined by `" · "`. Pure. The renderer draws exactly this
+/// many leading hints and appends a `…` when fewer than the total fit, so the
+/// footer degrades by dropping the least-important (trailing) hints instead of
+/// being silently clipped. Always keeps at least the first hint (unless there
+/// are none) so the footer is never blank on a narrow terminal.
+pub(crate) fn fit_hint_count(hints: &[(&str, &str)], width: u16) -> usize {
+    let width = width as usize;
+    let mut w = 0usize;
+    let mut count = 0usize;
+    for (i, (k, label)) in hints.iter().enumerate() {
+        // First hint: "key label"; later hints add a " · " separator prefix.
+        let seg = if i == 0 {
+            format!("{k} {label}")
+        } else {
+            format!(" · {k} {label}")
+        };
+        let seg_w = cells(&seg);
+        if w + seg_w > width {
+            break;
+        }
+        w += seg_w;
+        count += 1;
+    }
+    count.max(if hints.is_empty() { 0 } else { 1 })
+}
+
 /// Howard Hinnant's `civil_from_days`: convert days since 1970-01-01 to a
 /// `(year, month, day)` triple. Pure. Input can be negative (pre-epoch).
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
@@ -1337,6 +1364,40 @@ mod tests {
         let p = plan_name_col(12, 19, 20);
         assert!(!p.show_meta, "meta dropped when it can't share the row");
         assert_eq!(p.name_w, 16, "name takes the full avail");
+    }
+
+    // ---- fit_hint_count (footer hint budget) ----
+
+    #[test]
+    fn fit_hint_count_wide_keeps_all_hints() {
+        let hints: &[(&str, &str)] = &[("Tab", "switch"), ("↑↓", "move"), ("F1", "help")];
+        // Each hint renders as "<key> <label>", joined by " · ".
+        // "Tab switch" = 10, " · ↑↓ move" = 10, " · F1 help" = 10 → 30 cells.
+        assert_eq!(fit_hint_count(hints, 40), 3);
+        assert_eq!(fit_hint_count(hints, 30), 3);
+    }
+
+    #[test]
+    fn fit_hint_count_narrow_drops_trailing_hints() {
+        let hints: &[(&str, &str)] = &[("Tab", "switch"), ("↑↓", "move"), ("F1", "help")];
+        // Only room for the first hint (10 cells) + the `…` sentinel is drawn
+        // by the renderer, not counted here. width=15 fits hint 0 + part of
+        // the gap but not hint 1 fully → count = 1.
+        assert_eq!(fit_hint_count(hints, 15), 1);
+    }
+
+    #[test]
+    fn fit_hint_count_always_keeps_at_least_one() {
+        let hints: &[(&str, &str)] = &[("Tab", "switch"), ("F1", "help")];
+        // Even on a tiny row, the first hint survives so the footer is never
+        // blank.
+        assert_eq!(fit_hint_count(hints, 5), 1);
+    }
+
+    #[test]
+    fn fit_hint_count_empty_hints_returns_zero() {
+        let hints: &[(&str, &str)] = &[];
+        assert_eq!(fit_hint_count(hints, 80), 0);
     }
 
     #[test]
