@@ -6,6 +6,20 @@
 
 use std::io::Write;
 
+/// Per-column width = max(header field len, body cell lens) for each column,
+/// computed independently. With an empty body each width collapses to the
+/// header field length. Extracted from `print_text_table` so the width rule
+/// is directly testable without locking stdout.
+fn col_widths(fields: &[&str], body: &[Vec<String>]) -> Vec<usize> {
+    (0..fields.len())
+        .map(|col| {
+            fields[col]
+                .len()
+                .max(body.iter().map(|r| r[col].len()).max().unwrap_or(0))
+        })
+        .collect()
+}
+
 /// Render the aligned-text table. `cell_fn` produces the value for one
 /// (field, row) pair.
 pub(crate) fn print_text_table<T, F>(rows: &[&T], fields: &[&str], cell_fn: F)
@@ -16,13 +30,7 @@ where
         .iter()
         .map(|r| fields.iter().map(|f| cell_fn(f, r)).collect())
         .collect();
-    let widths: Vec<usize> = (0..fields.len())
-        .map(|col| {
-            fields[col]
-                .len()
-                .max(body.iter().map(|r| r[col].len()).max().unwrap_or(0))
-        })
-        .collect();
+    let widths = col_widths(fields, &body);
     let header_row: Vec<String> = fields.iter().map(|f| f.to_uppercase()).collect();
     let mut out = std::io::stdout().lock();
     let _ = write_row(&mut out, &header_row, &widths);
@@ -155,5 +163,27 @@ mod tests {
                 "col1 misaligned on line {i}"
             );
         }
+    }
+
+    #[test]
+    fn col_widths_empty_body_yields_header_lens() {
+        // With no body rows the per-column width collapses to the header field
+        // length — the floor in `print_text_table`'s width rule.
+        let fields = ["name", "host"];
+        let body: Vec<Vec<String>> = vec![];
+        assert_eq!(col_widths(&fields, &body), vec![4, 4]);
+    }
+
+    #[test]
+    fn col_widths_mixed_wide_narrow_yields_per_column_max() {
+        // Width = max(header len, body cell lens) per column, computed
+        // independently. col0: max(1, "xxxx".len()=4, "z".len()=1) = 4 ;
+        // col1: max(2, "y".len()=1, "wwww".len()=4) = 4.
+        let fields = ["a", "bb"];
+        let body = vec![
+            vec!["xxxx".to_string(), "y".to_string()],
+            vec!["z".to_string(), "wwww".to_string()],
+        ];
+        assert_eq!(col_widths(&fields, &body), vec![4, 4]);
     }
 }
