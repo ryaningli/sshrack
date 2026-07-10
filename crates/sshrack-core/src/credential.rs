@@ -470,9 +470,10 @@ pub fn delete_credential_with_secret(
 
 /// Best-effort: if `src` is a keyring-mode credential, copy every keyring slot
 /// it owns (password + inline private/cert) from the source's id to `dst`'s
-/// fresh id so the copy connects immediately. A missing/unreachable entry is
-/// reported via the returned `Err` (carrying no secret); the caller
-/// logs-and-continues. Never materializes any secret outside the backend
+/// fresh id so the copy connects immediately. A missing entry is a silent
+/// no-op `Ok` (the slot is surfaced at connect time); only an unreachable
+/// backend (I/O error) propagates `Err` (carrying no secret). Never
+/// materializes any secret outside the backend
 /// round-trip. The per-slot copy lives in [`secret::copy_keyring_secret`] /
 /// [`secret::copy_inline_keyring_slots`]; this wrapper only reads the source
 /// body's markers and delegates.
