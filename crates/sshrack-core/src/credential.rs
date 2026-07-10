@@ -2242,4 +2242,381 @@ mod tests {
             Some("PRIV")
         );
     }
+
+    // ---- Task 1.2: resolve inline-key round-trip, failure naming, dangling,
+    // patch/validate edges, copy_keyring_entry mixed source ----
+
+    #[test]
+    fn resolve_inline_key_encrypted_round_trips_on_correct_vault_key() {
+        // The audit found resolve only exercised the Encrypted inline-key arm
+        // halfway: it checked VaultLocked when no key was supplied, but never the
+        // successful decrypt. Encrypt private + cert under a derived vault key,
+        // resolve with that key, and confirm the materialized text round-trips.
+        // Both the two-slot (priv + cert) and the cert-less shapes are covered.
+        use crate::config::schema::{InlineKey, KeySource, Secret};
+        use crate::secret::vault::{crypto, fast_meta};
+
+        let key = crypto::derive_key("pw", &fast_meta("AAAAAAAAAAAAAAAAAAAAAA==")).unwrap();
+        let enc_priv = crypto::encrypt(b"PRIV-TEXT", &key).unwrap();
+        let enc_cert = crypto::encrypt(b"CERT-TEXT", &key).unwrap();
+
+        // Two-slot body: private + certificate both encrypted.
+        let two_slot = inline_host(CredentialBody {
+            user: "u".into(),
+            password: None,
+            key: Some(KeySource::Inline(InlineKey {
+                private_key: Some(Secret::Encrypted(enc_priv)),
+                certificate: Some(Secret::Encrypted(enc_cert)),
+                keyring: false,
+            })),
+            keyring: false,
+        });
+        let r = resolve(
+            &two_slot,
+            &SshrackConfig::default(),
+            Some(&key),
+            &FakeBackend::new(),
+        )
+        .unwrap();
+        assert!(
+            r.key_path.is_none(),
+            "inline-key body must not set key_path"
+        );
+        let mat = r.inline_key.expect("inline material present");
+        assert_eq!(mat.private.as_str(), "PRIV-TEXT");
+        assert_eq!(
+            mat.certificate.as_ref().map(|c| c.as_str()),
+            Some("CERT-TEXT"),
+        );
+
+        // Cert-less body: certificate stays None.
+        let enc_priv2 = crypto::encrypt(b"PRIV-ONLY", &key).unwrap();
+        let cert_less = inline_host(CredentialBody {
+            user: "u".into(),
+            password: None,
+            key: Some(KeySource::Inline(InlineKey {
+                private_key: Some(Secret::Encrypted(enc_priv2)),
+                certificate: None,
+                keyring: false,
+            })),
+            keyring: false,
+        });
+        let r2 = resolve(
+            &cert_less,
+            &SshrackConfig::default(),
+            Some(&key),
+            &FakeBackend::new(),
+        )
+        .unwrap();
+        let mat2 = r2.inline_key.expect("inline material present");
+        assert_eq!(mat2.private.as_str(), "PRIV-ONLY");
+        assert!(mat2.certificate.is_none());
+    }
+
+    #[test]
+    fn resolve_inline_key_wrong_vault_key_names_credential() {
+        // A decryption failure must carry the OWNER's display name (never the
+        // secret or key text). For a Ref-auth host the owner is the referenced
+        // credential, so the error names the credential ("team-dev"), not the
+        // host. Encrypt with key A, resolve with a different key B.
+        use crate::config::schema::{InlineKey, KeySource, Secret};
+        use crate::secret::vault::{crypto, fast_meta};
+
+        // Two distinct keys: same fast salt, different passphrases. (Avoid a
+        // literal-'B' salt run: base64 0.22 rejects non-zero trailing bits in an
+        // `==` group — see crypto::tests::derive_key_changes_with_salt.)
+        let fast = fast_meta("AAAAAAAAAAAAAAAAAAAAAA==");
+        let key_a = crypto::derive_key("pw-a", &fast).unwrap();
+        let key_b = crypto::derive_key("pw-b", &fast).unwrap();
+        let enc = crypto::encrypt(b"PRIV", &key_a).unwrap();
+
+        let cid = Ulid::new();
+        let h = ref_host(cid);
+        let cfg = SshrackConfig {
+            credentials: vec![Credential {
+                id: cid,
+                name: "team-dev".into(),
+                body: CredentialBody {
+                    user: "deploy".into(),
+                    password: None,
+                    key: Some(KeySource::Inline(InlineKey {
+                        private_key: Some(Secret::Encrypted(enc)),
+                        certificate: None,
+                        keyring: false,
+                    })),
+                    keyring: false,
+                },
+            }],
+            ..Default::default()
+        };
+        let err = resolve(&h, &cfg, Some(&key_b), &FakeBackend::new()).unwrap_err();
+        match &err {
+            SshrackError::DecryptionFailed { name } => {
+                assert_eq!(
+                    name.as_str(),
+                    "team-dev",
+                    "must name the credential, not the host"
+                );
+                // Belt-and-suspenders: the error string must never carry key text.
+                let s = err.to_string();
+                assert!(!s.contains("PRIV"), "error leaked key text: {s}");
+            }
+            other => panic!("expected DecryptionFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_inline_key_with_no_private_material_is_rejected() {
+        // Design decision (investigation requested by the plan): a non-keyring
+        // inline key with NO private-key material (private_key: None) is
+        // malformed. The InlineKey.private_key doc states "None only in a
+        // keyring-marker form"; a non-keyring inline key with no text would
+        // otherwise materialize an EMPTY temp file fed to `ssh -i`, producing
+        // obscure "error in libcrypto" failures (the project has hit this exact
+        // class of bug before with trailing-newline truncation).
+        // CredentialBody::validate now rejects it as InvalidCredentialBody at
+        // resolve time — a clear, early error instead of a cryptic ssh message.
+        // (Keyring-marker inline keys with private_key: None remain valid: the
+        // text is read from the OS-keyring slots, not the body.)
+        use crate::config::schema::{InlineKey, KeySource};
+        let b = CredentialBody {
+            user: "u".into(),
+            password: None,
+            key: Some(KeySource::Inline(InlineKey {
+                private_key: None,
+                certificate: None,
+                keyring: false,
+            })),
+            keyring: false,
+        };
+        let h = inline_host(b);
+        let err = resolve(&h, &SshrackConfig::default(), None, &FakeBackend::new()).unwrap_err();
+        assert!(
+            matches!(err, SshrackError::InvalidCredentialBody { .. }),
+            "expected InvalidCredentialBody, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_ref_auth_inline_key_in_keyring_uses_credential_owner_kind() {
+        // A Ref-auth host whose credential carries a keyring-marker inline key
+        // must read the private/cert text from the CREDENTIAL owner's keyring
+        // slots (cred:<id>#ikpriv / #ikcert), not the host's. The owner kind for
+        // a referenced credential is OwnerKind::Credential.
+        use crate::config::schema::{InlineKey, KeySource, SecretStore};
+        let cid = Ulid::new();
+        let h = ref_host(cid);
+        let cfg = SshrackConfig {
+            credentials: vec![Credential {
+                id: cid,
+                name: "team-dev".into(),
+                body: CredentialBody {
+                    user: "deploy".into(),
+                    password: None,
+                    key: Some(KeySource::Inline(InlineKey {
+                        private_key: None,
+                        certificate: None,
+                        keyring: true,
+                    })),
+                    keyring: false,
+                },
+            }],
+            store: Some(SecretStore::Keyring),
+            ..Default::default()
+        };
+        let backend = FakeBackend::new();
+        backend
+            .set_at(
+                &crate::id::keyring_key_inline_priv(OwnerKind::Credential, &cid),
+                "CRED-PRIV",
+            )
+            .unwrap();
+        backend
+            .set_at(
+                &crate::id::keyring_key_inline_cert(OwnerKind::Credential, &cid),
+                "CRED-CERT",
+            )
+            .unwrap();
+        let r = resolve(&h, &cfg, None, &backend).unwrap();
+        let mat = r.inline_key.expect("inline material present");
+        assert_eq!(mat.private.as_str(), "CRED-PRIV");
+        assert_eq!(
+            mat.certificate.as_ref().map(|c| c.as_str()),
+            Some("CRED-CERT"),
+        );
+    }
+
+    #[test]
+    fn resolve_dangling_ref_name_is_ulid_string_and_hint_empty() {
+        // A dangling ref surfaces CredentialNotFound whose `name` is the
+        // stringified ULID the host referenced (resolve has no user-typed
+        // credential name), and whose did-you-mean hint is empty (no credential
+        // names to suggest from).
+        let cid = Ulid::new();
+        let h = ref_host(cid);
+        let err = resolve(&h, &SshrackConfig::default(), None, &FakeBackend::new()).unwrap_err();
+        match err {
+            SshrackError::CredentialNotFound { name, hint } => {
+                assert_eq!(name, cid.to_string());
+                assert!(
+                    hint.to_string().is_empty(),
+                    "hint must be empty for a ULID query, got: {hint}"
+                );
+            }
+            other => panic!("expected CredentialNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn credential_not_found_empty_table_and_no_near_name_yield_empty_hint() {
+        // No credentials -> no closest candidate -> empty hint.
+        let cfg = SshrackConfig::default();
+        let e = credential_not_found(&cfg, "nomatch");
+        match e {
+            SshrackError::CredentialNotFound { hint, .. } => {
+                assert!(hint.to_string().is_empty());
+            }
+            other => panic!("expected CredentialNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_credential_patch_clear_identity_on_keyring_marker_clears_marker() {
+        // clear_identity on a keyring-marker body yields a Default body: no key,
+        // no password, and the keyring marker cleared (so resolve does not later
+        // emit a stale Keyring source).
+        let orig = Credential {
+            id: new_id(),
+            name: "c".into(),
+            body: CredentialBody {
+                user: "u".into(),
+                password: None,
+                key: None,
+                keyring: true,
+            },
+        };
+        let opts = EditOptions {
+            clear_identity: true,
+            ..Default::default()
+        };
+        let out = apply_credential_patch(&orig, &opts).unwrap();
+        assert!(!out.body.keyring, "keyring marker must be cleared");
+        assert_eq!(out.body.secret_kind(), SecretKind::Default);
+        assert!(out.body.key.is_none());
+        assert!(out.body.password.is_none());
+    }
+
+    #[test]
+    fn merge_credential_validate_failure_propagates() {
+        // A body violating the key+password mutex is rejected inside
+        // merge_credential via body.validate(); the InvalidCredentialBody
+        // surfaces rather than being silently accepted.
+        use crate::config::schema::{KeySource, Secret};
+        let bad = CredentialBody {
+            user: "u".into(),
+            password: Some(Secret::Plain("p".into())),
+            key: Some(KeySource::Path(PathBuf::from("/k"))),
+            keyring: false,
+        };
+        assert!(matches!(
+            merge_credential(new_id(), "c", bad),
+            Err(SshrackError::InvalidCredentialBody { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_rename_credential_invalid_name_char_and_fresh_name_ok() {
+        // A forbidden char in the new name is rejected before any duplicate
+        // check; a genuinely fresh name passes.
+        let cfg = cfg_with_cred("a");
+        assert!(matches!(
+            validate_rename_credential(&cfg, "a", "a:b"),
+            Err(SshrackError::InvalidNameChar { .. })
+        ));
+        assert!(validate_rename_credential(&cfg, "a", "c").is_ok());
+    }
+
+    #[test]
+    fn validate_no_duplicate_credential_missing_name_is_ok() {
+        // An empty credentials table cannot duplicate anything, even without --force.
+        assert!(
+            validate_no_duplicate_credential(&SshrackConfig::default(), "anything", false).is_ok()
+        );
+    }
+
+    #[test]
+    fn copy_keyring_entry_marked_absent_is_ok_and_mixed_source_copies_only_inline_slots() {
+        // DECISION: a keyring-marked credential whose backend entry is absent is
+        // a silent no-op Ok — consistent with host::copy_keyring_entry, which is
+        // pinned by host.rs `copy_keyring_entry_noop_when_source_unavailable`
+        // ("never an error here"). The missing entry is surfaced later at connect
+        // time. The credential doc comment's "missing ... reported via Err" is
+        // stale aspirational text that was never implemented (the shared helper
+        // copy_keyring_secret returns Ok(false) on absent); the host side holds
+        // the authoritative, tested contract, and credential must match it.
+        let backend = FakeBackend::new();
+        let src = Credential {
+            id: new_id(),
+            name: "s".into(),
+            body: CredentialBody {
+                user: "u".into(),
+                password: None,
+                key: None,
+                keyring: true,
+            },
+        };
+        let dst = Credential {
+            id: new_id(),
+            name: "d".into(),
+            body: CredentialBody {
+                user: "u".into(),
+                password: None,
+                key: None,
+                keyring: true,
+            },
+        };
+        copy_keyring_entry(&src, &dst, &backend)
+            .expect("marked-but-absent is a no-op Ok (matches host.rs contract)");
+        assert!(
+            backend
+                .get(&keyring_key(OwnerKind::Credential, &dst.id))
+                .unwrap()
+                .is_none(),
+            "nothing copied when the source slot is absent"
+        );
+
+        // Mixed source: body-level keyring:false (no password slot to copy) but
+        // inline-key-in-keyring (ik.keyring == true) -> only the inline slots are
+        // copied; the password slot is never touched.
+        let src_id = new_id();
+        let src = keyring_inline_key_credential("s2", src_id);
+        let dst_id = new_id();
+        let dst = keyring_inline_key_credential("d2", dst_id);
+        let backend = FakeBackend::new();
+        backend
+            .set_at(
+                &crate::id::keyring_key_inline_priv(OwnerKind::Credential, &src_id),
+                "PRIV",
+            )
+            .unwrap();
+        copy_keyring_entry(&src, &dst, &backend).unwrap();
+        assert_eq!(
+            backend
+                .get(&crate::id::keyring_key_inline_priv(
+                    OwnerKind::Credential,
+                    &dst_id
+                ))
+                .unwrap()
+                .as_deref()
+                .map(String::as_str),
+            Some("PRIV")
+        );
+        assert!(
+            backend
+                .get(&keyring_key(OwnerKind::Credential, &dst_id))
+                .unwrap()
+                .is_none(),
+            "password slot must not be created when body keyring is false"
+        );
+    }
 }
