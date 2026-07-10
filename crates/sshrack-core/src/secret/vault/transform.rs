@@ -574,8 +574,9 @@ fn extract_plain(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::schema::{Auth, Credential, EncryptedSecret, Host, VaultMeta};
+    use crate::config::schema::{Auth, Credential, EncryptedSecret, Host, InlineKey, VaultMeta};
     use crate::id::keyring_key as derive_keyring_key;
+    use crate::secret::test_doubles::FakeBackend;
 
     const KEY: [u8; 32] = [9u8; 32];
 
@@ -1301,6 +1302,621 @@ mod tests {
                 .and_then(KeySource::as_path),
             Some(std::path::Path::new("/k")),
             "path key must be unchanged"
+        );
+    }
+
+    // ---- audit-driven safety / correctness backfill (Task 1.1) ----
+    //
+    // Migration atomicity, idempotency, inline-key two-slot decrypt, the
+    // finalize_secret/finalize_password contract parity, the migrate mode matrix
+    // (vault<->keyring<->plaintext, rekey), and a no-leak assertion that no
+    // vault/keyring error string ever carries the secret.
+
+    #[test]
+    fn decrypt_all_partial_failure_reports_only_failing_name_and_leaves_prior_body_half_migrated() {
+        // Two encrypted credentials: cred[0] under the correct key, cred[1] under
+        // a wrong key. `decrypt_all` uses `?` short-circuit: cred[1] fails and the
+        // loop stops, leaving cred[0] already mutated to Plain (non-atomic). This
+        // test PINS the current behavior so a later atomicity change must update
+        // it; it also asserts the failing name is cred[1]'s and the plaintext
+        // never enters the error.
+        let good_key: [u8; 32] = KEY;
+        let wrong_key: [u8; 32] = [7u8; 32];
+        let enc0 = crypto::encrypt(b"pw-zero", &good_key).unwrap();
+        // cred[1]'s secret is the leak-canary plaintext "hunter2".
+        let enc1 = crypto::encrypt(b"hunter2", &wrong_key).unwrap();
+        let cred0_name = "zero";
+        let cred1_name = "one";
+        let mut cfg = SshrackConfig {
+            credentials: vec![
+                Credential {
+                    id: ulid::Ulid::new(),
+                    name: cred0_name.into(),
+                    body: CredentialBody {
+                        user: "u".into(),
+                        password: Some(Secret::Encrypted(enc0)),
+                        key: None,
+                        keyring: false,
+                    },
+                },
+                Credential {
+                    id: ulid::Ulid::new(),
+                    name: cred1_name.into(),
+                    body: CredentialBody {
+                        user: "u".into(),
+                        password: Some(Secret::Encrypted(enc1)),
+                        key: None,
+                        keyring: false,
+                    },
+                },
+            ],
+            ..SshrackConfig::default()
+        };
+        let err = decrypt_all(&mut cfg, &good_key.into()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("hunter2"),
+            "error must not contain plaintext: {msg}"
+        );
+        match err {
+            SshrackError::DecryptionFailed { name } => {
+                assert_eq!(name, cred1_name, "error must name the failing credential");
+            }
+            other => panic!("expected DecryptionFailed, got {other:?}"),
+        }
+        // Non-atomic `?` short-circuit: cred[0] was already decrypted to Plain
+        // before cred[1] aborted. If a maintainer later makes decrypt_all atomic
+        // (e.g. decrypt into a scratch cfg then swap), this assertion must flip.
+        assert_eq!(
+            cfg.credentials[0].body.password_plain(),
+            Some("pw-zero"),
+            "cred[0] must already be Plain — pins the non-atomic short-circuit"
+        );
+    }
+
+    #[test]
+    fn decrypt_all_already_plaintext_is_noop_idempotent() {
+        // No Encrypted material anywhere → decrypt_all counts 0 and leaves every
+        // body unchanged (no spurious mutation of Plain bodies).
+        let mut cfg = SshrackConfig {
+            credentials: vec![
+                Credential {
+                    id: ulid::Ulid::new(),
+                    name: "a".into(),
+                    body: plain_body("u", "p1"),
+                },
+                Credential {
+                    id: ulid::Ulid::new(),
+                    name: "b".into(),
+                    body: plain_body("u", "p2"),
+                },
+            ],
+            hosts: vec![Host {
+                id: ulid::Ulid::new(),
+                name: "h".into(),
+                host: "x".into(),
+                port: 22,
+                auth: Auth::inline(plain_body("u", "p3")),
+            }],
+            ..SshrackConfig::default()
+        };
+        let n = decrypt_all(&mut cfg, &KEY.into()).unwrap();
+        assert_eq!(n, 0, "no encrypted bodies should be counted");
+        assert_eq!(cfg.credentials[0].body.password_plain(), Some("p1"));
+        assert_eq!(cfg.credentials[1].body.password_plain(), Some("p2"));
+        assert_eq!(
+            cfg.hosts[0].auth.inline_body().unwrap().password_plain(),
+            Some("p3")
+        );
+    }
+
+    #[test]
+    fn migrate_vault_to_vault_same_key_is_idempotent() {
+        // Re-sealing vault->vault under the SAME key is a no-op on the plaintext:
+        // the ciphertext is freshly re-encrypted (new nonce) but still decrypts
+        // to the original. Idempotent in the value sense, not the byte sense.
+        let mut cfg = keyring_cfg_one_plain("idem-v2v");
+        let backend = FakeBackend::new();
+        migrate(&mut cfg, &vault_target(), None, Some(&KEY.into()), &backend).unwrap();
+        // Now Encrypted under KEY.
+        assert!(matches!(
+            cfg.credentials[0].body.password,
+            Some(Secret::Encrypted(_))
+        ));
+        let n = migrate(
+            &mut cfg,
+            &vault_target(),
+            Some(&KEY.into()),
+            Some(&KEY.into()),
+            &backend,
+        )
+        .unwrap();
+        assert_eq!(n, 1, "vault->vault same key still counts as a re-seal pass");
+        // Round-trips under the same key after the re-seal.
+        decrypt_all(&mut cfg, &KEY.into()).unwrap();
+        assert_eq!(
+            cfg.credentials[0].body.password_plain(),
+            Some("hunter2"),
+            "value must survive vault->vault same-key re-seal"
+        );
+    }
+
+    #[test]
+    fn migrate_mixed_inline_and_ref_hosts_migrates_creds_once_skips_ref_hosts() {
+        // A Ref-auth host borrows its credential's secret — migrate must NOT
+        // double-count it (the cred is migrated once, the Ref host skipped). An
+        // inline host in the same config is migrated independently.
+        let cid = ulid::Ulid::new();
+        let ref_host_id = ulid::Ulid::new();
+        let inline_host_id = ulid::Ulid::new();
+        let mut cfg = SshrackConfig {
+            credentials: vec![Credential {
+                id: cid,
+                name: "C".into(),
+                body: plain_body("deploy", "hunter2"),
+            }],
+            hosts: vec![
+                Host {
+                    id: ref_host_id,
+                    name: "ref-host".into(),
+                    host: "x".into(),
+                    port: 22,
+                    auth: Auth::reference(cid),
+                },
+                Host {
+                    id: inline_host_id,
+                    name: "inline-host".into(),
+                    host: "y".into(),
+                    port: 22,
+                    auth: Auth::inline(plain_body("u", "inline-pw")),
+                },
+            ],
+            ..SshrackConfig::default()
+        };
+        let backend = FakeBackend::new();
+        let n = migrate(&mut cfg, &vault_target(), None, Some(&KEY.into()), &backend).unwrap();
+        // cred C + inline host = 2; the Ref host contributes nothing.
+        assert_eq!(n, 2, "count = cred C + inline host (Ref host skipped)");
+        // C migrated exactly once → Encrypted.
+        assert!(matches!(
+            cfg.credentials[0].body.password,
+            Some(Secret::Encrypted(_))
+        ));
+        // Ref host's auth is untouched (still a Ref at the same id).
+        assert_eq!(cfg.hosts[0].auth.credential_id(), Some(cid));
+        // Inline host migrated → Encrypted.
+        assert!(matches!(
+            cfg.hosts[1].auth.inline_body().unwrap().password,
+            Some(Secret::Encrypted(_))
+        ));
+    }
+
+    #[test]
+    fn decrypt_body_inline_key_two_slots_round_trips_and_tags_name_on_wrong_key() {
+        // Both inline-key slots Encrypted: decrypt_body must decrypt BOTH to Plain
+        // and round-trip the originals. A wrong key surfaces a name-tagged
+        // DecryptionFailed carrying only the label, never the key material.
+        let priv_enc = crypto::encrypt(b"PRIV-TEXT", &KEY).unwrap();
+        let cert_enc = crypto::encrypt(b"CERT-TEXT", &KEY).unwrap();
+        let body = CredentialBody {
+            user: "u".into(),
+            password: None,
+            key: Some(KeySource::Inline(InlineKey {
+                private_key: Some(Secret::Encrypted(priv_enc)),
+                certificate: Some(Secret::Encrypted(cert_enc)),
+                keyring: false,
+            })),
+            keyring: false,
+        };
+        let back = decrypt_body(&body, &KEY.into(), "ik-owner").unwrap();
+        let ik = match &back.key {
+            Some(KeySource::Inline(ik)) => ik,
+            other => panic!("expected Inline, got {other:?}"),
+        };
+        assert_eq!(
+            ik.private_key.as_ref().and_then(Secret::as_plain),
+            Some("PRIV-TEXT"),
+            "private_key must round-trip"
+        );
+        assert_eq!(
+            ik.certificate.as_ref().and_then(Secret::as_plain),
+            Some("CERT-TEXT"),
+            "certificate must round-trip"
+        );
+
+        // Wrong key: name-tagged failure, no key material in the message.
+        let err = decrypt_body(&body, &[0u8; 32].into(), "ik-owner").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("PRIV-TEXT") && !msg.contains("CERT-TEXT"),
+            "error leaked key material: {msg}"
+        );
+        match err {
+            SshrackError::DecryptionFailed { name } => assert_eq!(name, "ik-owner"),
+            other => panic!("expected DecryptionFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_plain_keyring_marker_body_without_backend_entry_is_keyring_no_entry() {
+        // A keyring-marker password body with no backend entry must surface
+        // KeyringNoEntry carrying the owner's account key (a non-sensitive label),
+        // never the plaintext. Driven through the public `migrate` so the whole
+        // extract_plain path is exercised.
+        let cid = ulid::Ulid::new();
+        let mut cfg = SshrackConfig {
+            credentials: vec![Credential {
+                id: cid,
+                name: "kr-missing".into(),
+                body: CredentialBody {
+                    user: "u".into(),
+                    password: None,
+                    key: None,
+                    keyring: true,
+                },
+            }],
+            ..SshrackConfig::default()
+        };
+        let backend = FakeBackend::new(); // empty — no entry for `cid`
+        let err =
+            migrate(&mut cfg, &vault_target(), None, Some(&KEY.into()), &backend).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("hunter2"),
+            "error must not contain plaintext: {msg}"
+        );
+        match err {
+            SshrackError::KeyringNoEntry { key } => {
+                assert_eq!(
+                    key,
+                    derive_keyring_key(OwnerKind::Credential, &cid),
+                    "key must be the owner's account key"
+                );
+            }
+            other => panic!("expected KeyringNoEntry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finalize_secret_matches_finalize_password_contract() {
+        // The two helpers must agree across the four (store, key) combinations.
+        // For vault+key both produce Encrypted ciphertexts that decrypt to the
+        // same plaintext (nonces differ, value does not).
+        let plain = "hunter2";
+        // (1) vault + key → both Encrypted, decrypt to `plain`.
+        let cfg_v = vault_cfg();
+        let sp = finalize_secret(plain, &cfg_v, Some(&KEY.into())).unwrap();
+        let pp = finalize_password(plain, &cfg_v, Some(&KEY.into())).unwrap();
+        match (&sp, &pp) {
+            (Secret::Encrypted(es), Secret::Encrypted(ep)) => {
+                assert_eq!(crypto::decrypt(es, &KEY).unwrap().as_str(), plain);
+                assert_eq!(crypto::decrypt(ep, &KEY).unwrap().as_str(), plain);
+            }
+            _ => panic!("both must be Encrypted, got sp={sp:?} pp={pp:?}"),
+        }
+        // (2) vault, no key → both VaultLocked.
+        assert!(matches!(
+            finalize_secret(plain, &cfg_v, None),
+            Err(SshrackError::VaultLocked)
+        ));
+        assert!(matches!(
+            finalize_password(plain, &cfg_v, None),
+            Err(SshrackError::VaultLocked)
+        ));
+        // (3) plaintext → both Plain with the same value.
+        let cfg_p = SshrackConfig {
+            store: Some(SecretStore::Plaintext),
+            ..SshrackConfig::default()
+        };
+        assert_eq!(
+            finalize_secret(plain, &cfg_p, None).unwrap().as_plain(),
+            Some(plain)
+        );
+        assert_eq!(
+            finalize_password(plain, &cfg_p, None).unwrap().as_plain(),
+            Some(plain)
+        );
+        // (4) undecided store → both Plain (caller resolves first-use mode).
+        let cfg_u = SshrackConfig::default();
+        assert_eq!(
+            finalize_secret(plain, &cfg_u, None).unwrap().as_plain(),
+            Some(plain)
+        );
+        assert_eq!(
+            finalize_password(plain, &cfg_u, None).unwrap().as_plain(),
+            Some(plain)
+        );
+    }
+
+    #[test]
+    fn migrate_password_vault_to_keyring() {
+        // An Encrypted (vault-representation) password body migrated to Keyring:
+        // decrypted with the source key, written to the backend under the owner's
+        // account key, the in-body password cleared, and the marker set.
+        let cid = ulid::Ulid::new();
+        let enc = crypto::encrypt(b"hunter2", &KEY).unwrap();
+        let mut cfg = SshrackConfig {
+            store: Some(vault_target()),
+            credentials: vec![Credential {
+                id: cid,
+                name: "vk".into(),
+                body: CredentialBody {
+                    user: "u".into(),
+                    password: Some(Secret::Encrypted(enc)),
+                    key: None,
+                    keyring: false,
+                },
+            }],
+            ..SshrackConfig::default()
+        };
+        let backend = FakeBackend::new();
+        let n = migrate(
+            &mut cfg,
+            &SecretStore::Keyring,
+            Some(&KEY.into()),
+            None,
+            &backend,
+        )
+        .unwrap();
+        assert_eq!(n, 1);
+        assert!(
+            cfg.credentials[0].body.keyring,
+            "marker must be set after entering keyring mode"
+        );
+        assert!(
+            cfg.credentials[0].body.password.is_none(),
+            "in-body password must be cleared"
+        );
+        // The plaintext now lives in the backend under the owner's account key.
+        assert_eq!(
+            backend
+                .get(&derive_keyring_key(OwnerKind::Credential, &cid))
+                .unwrap()
+                .as_deref()
+                .map(String::as_str),
+            Some("hunter2")
+        );
+    }
+
+    #[test]
+    fn migrate_password_keyring_to_plaintext() {
+        // A keyring-marker password body + seeded backend entry, migrated to
+        // Plaintext: the plaintext is read from the backend, written into the
+        // body as Plain, the marker clears, and the backend entry is deleted
+        // (no orphan on leaving keyring mode).
+        let cid = ulid::Ulid::new();
+        let mut cfg = SshrackConfig {
+            credentials: vec![Credential {
+                id: cid,
+                name: "kp".into(),
+                body: CredentialBody {
+                    user: "u".into(),
+                    password: None,
+                    key: None,
+                    keyring: true,
+                },
+            }],
+            ..SshrackConfig::default()
+        };
+        let backend = FakeBackend::new();
+        backend.set(OwnerKind::Credential, &cid, "hunter2").unwrap();
+        let n = migrate(&mut cfg, &SecretStore::Plaintext, None, None, &backend).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(
+            cfg.credentials[0].body.password_plain(),
+            Some("hunter2"),
+            "plaintext must be restored into the body"
+        );
+        assert!(
+            !cfg.credentials[0].body.keyring,
+            "marker must clear on leaving keyring"
+        );
+        assert!(
+            backend
+                .get(&derive_keyring_key(OwnerKind::Credential, &cid))
+                .unwrap()
+                .is_none(),
+            "backend entry must be deleted on leaving keyring (no orphan)"
+        );
+    }
+
+    #[test]
+    fn migrate_body_inline_key_keyring_to_plaintext_and_back() {
+        // Round-trip an inline key between keyring and plaintext in both
+        // directions: keyring → plaintext (slot read into body, slot deleted,
+        // marker cleared) then plaintext → keyring (in-body text cleared,
+        // marker set, slot re-populated).
+        let id = ulid::Ulid::new();
+        let mut cfg = SshrackConfig {
+            store: Some(SecretStore::Keyring),
+            hosts: vec![Host {
+                id,
+                name: "h".into(),
+                host: "x".into(),
+                port: 22,
+                auth: Auth::inline(CredentialBody {
+                    user: "u".into(),
+                    password: None,
+                    key: Some(KeySource::Inline(InlineKey {
+                        private_key: None,
+                        certificate: None,
+                        keyring: true,
+                    })),
+                    keyring: false,
+                }),
+            }],
+            ..SshrackConfig::default()
+        };
+        let backend = FakeBackend::new();
+        backend
+            .set_at(
+                &crate::id::keyring_key_inline_priv(OwnerKind::Host, &id),
+                "PRIV",
+            )
+            .unwrap();
+
+        // keyring → plaintext: slot read into the body, marker cleared, slot deleted.
+        migrate(&mut cfg, &SecretStore::Plaintext, None, None, &backend).unwrap();
+        let ik = match &cfg.hosts[0].auth.inline_body().unwrap().key {
+            Some(KeySource::Inline(ik)) => ik,
+            other => panic!("expected Inline, got {other:?}"),
+        };
+        assert!(!ik.keyring, "marker must clear after leaving keyring");
+        assert_eq!(
+            ik.private_key.as_ref().and_then(Secret::as_plain),
+            Some("PRIV"),
+            "private_key text must be restored into the body"
+        );
+        assert!(
+            backend
+                .get(&crate::id::keyring_key_inline_priv(OwnerKind::Host, &id))
+                .unwrap()
+                .is_none(),
+            "priv slot must be deleted after leaving keyring"
+        );
+
+        // plaintext → keyring: in-body text cleared, marker set, slot re-populated.
+        migrate(&mut cfg, &SecretStore::Keyring, None, None, &backend).unwrap();
+        let ik = match &cfg.hosts[0].auth.inline_body().unwrap().key {
+            Some(KeySource::Inline(ik)) => ik,
+            other => panic!("expected Inline, got {other:?}"),
+        };
+        assert!(ik.keyring, "marker must be set after entering keyring");
+        assert!(
+            ik.private_key.is_none(),
+            "in-body text must be cleared when entering keyring"
+        );
+        assert_eq!(
+            backend
+                .get(&crate::id::keyring_key_inline_priv(OwnerKind::Host, &id))
+                .unwrap()
+                .as_deref()
+                .map(String::as_str),
+            Some("PRIV"),
+            "priv slot must be re-populated when entering keyring"
+        );
+    }
+
+    #[test]
+    fn migrate_password_vault_to_vault_rekey() {
+        // Rekey: an Encrypted password under source key A is decrypted and
+        // re-encrypted under target key B. The result must decrypt under B and
+        // NOT under A.
+        let source_key: [u8; 32] = KEY;
+        let target_key: [u8; 32] = [7u8; 32];
+        let enc = crypto::encrypt(b"hunter2", &source_key).unwrap();
+        let mut cfg = SshrackConfig {
+            credentials: vec![Credential {
+                id: ulid::Ulid::new(),
+                name: "rekey-pw".into(),
+                body: CredentialBody {
+                    user: "u".into(),
+                    password: Some(Secret::Encrypted(enc)),
+                    key: None,
+                    keyring: false,
+                },
+            }],
+            ..SshrackConfig::default()
+        };
+        let backend = FakeBackend::new();
+        let n = migrate(
+            &mut cfg,
+            &vault_target(),
+            Some(&source_key.into()),
+            Some(&target_key.into()),
+            &backend,
+        )
+        .unwrap();
+        assert_eq!(n, 1);
+        let enc = match &cfg.credentials[0].body.password {
+            Some(Secret::Encrypted(e)) => e,
+            other => panic!("expected Encrypted after rekey, got {other:?}"),
+        };
+        assert_eq!(
+            crypto::decrypt(enc, &target_key).unwrap().as_str(),
+            "hunter2",
+            "must decrypt under the TARGET key after rekey"
+        );
+        assert!(
+            crypto::decrypt(enc, &source_key).is_err(),
+            "must NOT decrypt under the SOURCE key after rekey"
+        );
+    }
+
+    #[test]
+    fn extract_inline_text_encrypted_without_source_key_is_vault_locked() {
+        // An Encrypted inline-key slot migrated with no source_vault_key must
+        // error VaultLocked rather than silently dropping the stranded ciphertext.
+        // Driven through `migrate` so the full extract_inline_text path runs.
+        let priv_enc = crypto::encrypt(b"PRIV", &KEY).unwrap();
+        let mut cfg = SshrackConfig {
+            store: Some(vault_target()),
+            hosts: vec![Host {
+                id: ulid::Ulid::new(),
+                name: "h".into(),
+                host: "x".into(),
+                port: 22,
+                auth: Auth::inline(CredentialBody {
+                    user: "u".into(),
+                    password: None,
+                    key: Some(KeySource::Inline(InlineKey {
+                        private_key: Some(Secret::Encrypted(priv_enc)),
+                        certificate: None,
+                        keyring: false,
+                    })),
+                    keyring: false,
+                }),
+            }],
+            ..SshrackConfig::default()
+        };
+        let backend = FakeBackend::new();
+        let err = migrate(&mut cfg, &SecretStore::Plaintext, None, None, &backend).unwrap_err();
+        assert!(
+            matches!(err, SshrackError::VaultLocked),
+            "expected VaultLocked, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn decryption_failure_and_keyring_no_entry_errors_never_contain_secret() {
+        // The two transform error variants that could surface during a migrate
+        // must never embed the plaintext. Feed "hunter2" as the secret and assert
+        // the rendered error string is free of it for both variants.
+        // (1) DecryptionFailed: encrypt hunter2, decrypt with the wrong key.
+        let enc = crypto::encrypt(b"hunter2", &KEY).unwrap();
+        let body = CredentialBody {
+            user: "u".into(),
+            password: Some(Secret::Encrypted(enc)),
+            key: None,
+            keyring: false,
+        };
+        let err = decrypt_body(&body, &[0u8; 32].into(), "owner-label").unwrap_err();
+        assert!(
+            !err.to_string().contains("hunter2"),
+            "DecryptionFailed leaked plaintext: {err}"
+        );
+        // (2) KeyringNoEntry: a keyring-marker body whose plaintext WAS hunter2
+        // before it was moved; the missing-entry error must name only the key.
+        let cid = ulid::Ulid::new();
+        let mut cfg = SshrackConfig {
+            credentials: vec![Credential {
+                id: cid,
+                name: "kr-leak".into(),
+                body: CredentialBody {
+                    user: "u".into(),
+                    password: None,
+                    key: None,
+                    keyring: true,
+                },
+            }],
+            ..SshrackConfig::default()
+        };
+        let backend = FakeBackend::new();
+        let err =
+            migrate(&mut cfg, &vault_target(), None, Some(&KEY.into()), &backend).unwrap_err();
+        assert!(
+            !err.to_string().contains("hunter2"),
+            "KeyringNoEntry leaked plaintext: {err}"
         );
     }
 }
