@@ -310,7 +310,7 @@ fn draw_pane_row(
 
 /// Render row 1 of the progress panel: the active transfer as a three-column
 /// row — `[name ↑/↓]` left, the surviving numeric segments (`size rate eta`)
-/// right-aligned against the gauge, and a `Gauge` hard against the right edge.
+/// right-aligned against the gauge, and a visible-track bar hard against the right edge.
 /// An unknown total renders no gauge (just name + bytes-done + rate). `None`
 /// paints the dim "no transfer in flight" placeholder.
 ///
@@ -660,7 +660,7 @@ pub(crate) struct ActiveRowPlan {
     pub gauge_w: u16,
     /// `Some("N%")` when a gauge is shown, else `None`.
     pub gauge_label: Option<String>,
-    /// Integer percent 0..=100 for the `Gauge` widget. 0 when indeterminate.
+    /// Integer percent 0..=100 for the gauge bar. 0 when indeterminate.
     pub percent: u16,
 }
 
