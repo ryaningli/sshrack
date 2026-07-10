@@ -354,6 +354,55 @@ mod tests {
     }
 
     #[test]
+    fn set_inflight_progress_advances_across_snapshots() {
+        // Consecutive WorkerEvent::Progress events must each replace the
+        // active snapshot — the "active status refreshes" guarantee. If a later
+        // snapshot were dropped or stuck at an earlier value, the active row
+        // would freeze mid-transfer.
+        let mut l = TransferLedger::new();
+        l.enqueue(job("a", Direction::Upload, false));
+        l.next_to_dispatch();
+        for done in [0u64, 50, 100] {
+            l.set_inflight_progress(Progress {
+                name: "a".into(),
+                direction: Direction::Upload,
+                bytes_done: done,
+                bytes_total: Some(100),
+                rate_bps: Some(5),
+                eta_secs: Some(18),
+            });
+            assert_eq!(
+                l.active_progress().map(|p| p.bytes_done),
+                Some(done),
+                "snapshot bytes_done={done}"
+            );
+        }
+    }
+
+    #[test]
+    fn active_progress_grows_then_clears_on_done() {
+        // Progress grows to completion, then Done clears the snapshot so a
+        // stale value cannot stick to the active row after the task finishes.
+        let mut l = TransferLedger::new();
+        l.enqueue(job("a", Direction::Upload, false));
+        l.next_to_dispatch();
+        l.set_inflight_progress(Progress {
+            name: "a".into(),
+            direction: Direction::Upload,
+            bytes_done: 100,
+            bytes_total: Some(100),
+            rate_bps: Some(5),
+            eta_secs: Some(0),
+        });
+        assert_eq!(l.active_progress().map(|p| p.bytes_done), Some(100));
+        l.finish_inflight(TransferOutcome::Ok);
+        assert!(
+            l.active_progress().is_none(),
+            "Done must clear the active progress snapshot"
+        );
+    }
+
+    #[test]
     fn active_progress_is_none_when_idle() {
         let mut l = TransferLedger::new();
         assert!(l.active_progress().is_none());

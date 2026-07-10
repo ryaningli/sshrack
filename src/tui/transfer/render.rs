@@ -314,7 +314,7 @@ pub fn draw_active_transfer(frame: &mut Frame, area: Rect, active: Option<&Progr
                 .unwrap_or(100)
                 .min(100);
             let text = format!(
-                "{} {} {}% {}/{} {}/s eta:{}",
+                "{} {} {}% {}/{} {} eta:{}",
                 prog.name,
                 dir_glyph,
                 percent,
@@ -893,6 +893,43 @@ mod tests {
             .unwrap();
         insta::assert_snapshot!(term.backend());
     }
+
+    #[test]
+    fn draw_active_transfer_renders_rate_with_one_per_sec() {
+        // `fmt_rate` already returns `<size>/s`; the active-transfer text must
+        // not append another `/s` (the `13.4M/s/s` regression that surfaced
+        // once upload progress actually started updating).
+        use ratatui::{Terminal, backend::TestBackend};
+        use sshrack_core::connect::sftp::proto::{Direction, Progress};
+
+        let prog = Progress {
+            name: "file.bin".into(),
+            direction: Direction::Upload,
+            bytes_done: 1_024,
+            bytes_total: Some(4_096),
+            rate_bps: Some(1_024),
+            eta_secs: Some(3),
+        };
+        let backend = TestBackend::new(100, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw_active_transfer(f, f.area(), Some(&prog)))
+            .unwrap();
+        let buf = term.backend().buffer();
+        let text: String = (0..buf.area.width)
+            .map(|col| {
+                buf.cell((col, 0u16))
+                    .map(|c| c.symbol())
+                    .unwrap_or(" ")
+                    .to_string()
+            })
+            .collect();
+        let text = text.trim();
+        assert!(text.contains("1.0K/s"), "rate should appear once: {text:?}");
+        assert!(
+            !text.contains("/s/s"),
+            "rate must not double the /s suffix: {text:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1042,6 +1079,37 @@ mod queue_row_tests {
         let s = text(&queue_row(&t, 60, false));
         assert!(s.contains("big.tar"), "{s}");
         assert!(s.contains("40%"), "{s}");
+    }
+
+    #[test]
+    fn queue_row_inflight_percent_grows_across_snapshots() {
+        // The queue row's percent must track the progress snapshot as it
+        // advances — the "queue refreshes" guarantee. Two snapshots of the
+        // same job at 40% and 70% must render their respective percents, so a
+        // stuck-at-0% queue row regressions is caught.
+        let mut t40 = task("big.tar", TaskState::InFlight, false);
+        t40.progress = Some(Progress {
+            name: "big.tar".into(),
+            direction: Direction::Upload,
+            bytes_done: 40,
+            bytes_total: Some(100),
+            rate_bps: Some(5),
+            eta_secs: Some(12),
+        });
+        let s40 = text(&queue_row(&t40, 60, false));
+        assert!(s40.contains("40%"), "40% snapshot: {s40}");
+
+        let mut t70 = task("big.tar", TaskState::InFlight, false);
+        t70.progress = Some(Progress {
+            name: "big.tar".into(),
+            direction: Direction::Upload,
+            bytes_done: 70,
+            bytes_total: Some(100),
+            rate_bps: Some(8),
+            eta_secs: Some(6),
+        });
+        let s70 = text(&queue_row(&t70, 60, false));
+        assert!(s70.contains("70%"), "70% snapshot: {s70}");
     }
 
     #[test]
