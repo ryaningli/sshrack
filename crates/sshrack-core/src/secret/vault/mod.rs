@@ -1004,4 +1004,236 @@ mod tests {
             "no keyring entry must be created for a reference"
         );
     }
+
+    // ---- unlock: cache-hit positive path + env-passphrase no-fallback ----
+    //
+    // The existing `unlock_rejects_stale_cache_key` pins that a STALE cached key
+    // is rejected; the audit (#3) flagged that the matching positive path — a
+    // VALID cached key short-circuits the env/provider branches — had no test.
+    // A regression to "always fall through and re-derive" would pass every other
+    // test but silently defeat the cache. The two tests below close that hole.
+
+    /// Backend whose every read/write returns `Err`. Used to force a migration
+    /// failure inside `enable` so its store-unchanged invariant can be probed.
+    struct FailingBackend;
+
+    impl crate::secret::SecretBackend for FailingBackend {
+        fn set_at(&self, _key: &str, _secret: &str) -> Result<(), SshrackError> {
+            Err(SshrackError::KeyringIo { detail: "test" })
+        }
+        fn get(&self, _key: &str) -> Result<Option<Zeroizing<String>>, SshrackError> {
+            Err(SshrackError::KeyringIo { detail: "test" })
+        }
+        fn delete_at(&self, _key: &str) -> Result<(), SshrackError> {
+            Err(SshrackError::KeyringIo { detail: "test" })
+        }
+        fn available(&self) -> bool {
+            // Reported available so the failure is the I/O error, not a daemon
+            // check; mirrors a live-but-broken backend.
+            true
+        }
+    }
+
+    /// Provider whose every method panics. Used to prove a branch that should
+    /// never consult the provider in fact does not: if it did, the panic
+    /// propagates and fails the test. The test asserts `Err(VaultUnlockFailed)`,
+    /// so a passing result means the provider was never reached.
+    struct PanickingProvider;
+
+    impl crate::secret::PassphraseProvider for PanickingProvider {
+        fn passphrase(&self) -> Result<Zeroizing<String>, SshrackError> {
+            panic!("provider.passphrase must not be consulted on a cache hit / env value");
+        }
+        fn passphrase_confirm(&self) -> Result<Zeroizing<String>, SshrackError> {
+            panic!("provider.passphrase_confirm must not be consulted here");
+        }
+        fn confirm(&self, _text: &str) -> Result<bool, SshrackError> {
+            panic!("provider.confirm must not be consulted here");
+        }
+    }
+
+    #[test]
+    fn unlock_cache_hit_with_valid_key_returns_without_prompt() {
+        // A valid key written to the cache (matching the config's verifier)
+        // must short-circuit unlock: it returns the cached key and never
+        // consults the env-passphrase or the provider. PanickingProvider would
+        // fail the test if the cache branch were bypassed. Pins the positive
+        // counterpart to `unlock_rejects_stale_cache_key`.
+        let meta = meta_with_verifier("hunter2");
+        let cfg = SshrackConfig {
+            store: Some(SecretStore::Vault { meta: meta.clone() }),
+            ..SshrackConfig::default()
+        };
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let cached = crypto::derive_key("hunter2", &meta).unwrap();
+        cache::write_cache(tmp.path(), &cached, std::time::Duration::from_secs(1800)).unwrap();
+
+        let result = unlock(&cfg, Some(tmp.path()), None, &PanickingProvider);
+        let key = result
+            .expect("valid cache hit unlocks without prompt")
+            .expect("cache hit returns Some key");
+        assert!(
+            cached_key_is_valid(&key, &meta),
+            "returned key must decrypt the verifier"
+        );
+        assert_eq!(&*key, &*cached, "returned key must be the cached key");
+    }
+
+    #[test]
+    fn unlock_wrong_env_passphrase_does_not_fall_back_to_provider() {
+        // A wrong env-passphrase must fail with VaultUnlockFailed and NOT fall
+        // back to the provider. If a regression added a fallback (e.g. catching
+        // the wrong-passphrase error and retrying via the provider),
+        // PanickingProvider would propagate the panic, failing the test.
+        let meta = meta_with_verifier("correct");
+        let cfg = SshrackConfig {
+            store: Some(SecretStore::Vault { meta }),
+            ..SshrackConfig::default()
+        };
+        let wrong_env = Zeroizing::new("wrong-passphrase".to_string());
+        let result = unlock(&cfg, None, Some(&wrong_env), &PanickingProvider);
+        assert!(
+            matches!(result, Err(SshrackError::VaultUnlockFailed)),
+            "wrong env-passphrase must fail without provider fallback: {result:?}"
+        );
+    }
+
+    // ---- enable: store-unchanged invariant + full-strength round trip ----
+
+    #[test]
+    fn enable_leaves_cfg_store_unchanged_on_migration_failure() {
+        // Safety invariant: enable derives the key and migrates BEFORE flipping
+        // cfg.store. If the migration fails (here: a keyring-mode body whose
+        // backend read errors), cfg.store must remain the original mode — not be
+        // half-flipped to Vault, which would lose the password on the next save.
+        let original_store = SecretStore::Keyring;
+        let mut cfg = SshrackConfig {
+            credentials: vec![Credential {
+                id: ulid::Ulid::new(),
+                name: "a".into(),
+                // Keyring-marker body: the plaintext password "lives" in the
+                // backend. extract_plain reads it via backend.get; failing that
+                // forces migrate to error before enable touches cfg.store.
+                body: CredentialBody {
+                    user: "u".into(),
+                    password: None,
+                    key: None,
+                    keyring: true,
+                },
+            }],
+            store: Some(original_store),
+            ..SshrackConfig::default()
+        };
+        let err = enable(&mut cfg, "passphrase", None, &FailingBackend).unwrap_err();
+        assert!(
+            matches!(err, SshrackError::KeyringIo { .. }),
+            "migration must surface the backend error: {err:?}"
+        );
+        assert!(
+            matches!(cfg.store, Some(SecretStore::Keyring)),
+            "cfg.store must be unchanged (still Keyring) after migration failure, got {:?}",
+            cfg.store
+        );
+    }
+
+    #[test]
+    fn enable_round_trips_with_default_argon2id_strength() {
+        // enable writes a verifier under the real default_argon2id cost
+        // (64 MiB / 3 / 4), not the test-only fast_meta. Re-deriving the key
+        // from the same passphrase via unlock must yield a key that decrypts
+        // that verifier — proving the full-strength meta round-trips end to end.
+        // Catches a bug where enable's meta params drift from what unlock
+        // derives from (e.g. a salt/param mismatch). Deliberately slow.
+        let mut cfg = SshrackConfig {
+            credentials: vec![Credential {
+                id: ulid::Ulid::new(),
+                name: "a".into(),
+                body: CredentialBody::new("u").with_password("p"),
+            }],
+            ..SshrackConfig::default()
+        };
+        let backend = FakeBackend::new();
+        let produced = enable(&mut cfg, "real-passphrase", None, &backend).unwrap();
+        let meta = cfg
+            .vault_meta()
+            .expect("invariant: vault mode after enable");
+        // The produced meta carries the production cost, not fast_meta.
+        assert_eq!((meta.m, meta.t, meta.p), (65_536, 3, 4));
+        assert!(meta.verifier.is_some(), "verifier must be written");
+
+        // Re-derive via unlock with the same passphrase. A temp cache path keeps
+        // the write hermetic (cache_path=None would fall back to the real
+        // default cache location).
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let env_pw = Zeroizing::new("real-passphrase".to_string());
+        let unlocked = unlock(&cfg, Some(tmp.path()), Some(&env_pw), &PanickingProvider)
+            .expect("same passphrase unlocks the full-strength meta")
+            .expect("vault mode -> Some key");
+        assert!(
+            crypto::decrypt(meta.verifier.as_ref().unwrap(), &unlocked).is_ok(),
+            "unlocked key must decrypt the verifier"
+        );
+        assert_eq!(
+            unlocked.as_ref(),
+            produced.as_ref(),
+            "unlocked key must equal the enable-produced key"
+        );
+    }
+
+    // ---- seal edges: vault-missing-key + undecided store ----
+
+    #[test]
+    fn seal_inline_key_vault_missing_key_is_vault_locked() {
+        // Vault mode + an inline private key + no vault_key must error
+        // VaultLocked, NOT silently leave the key as plaintext. Mirrors
+        // `seal_body_vault_mode_without_key_is_locked` (which covers the password
+        // arm) for the inline-key arm.
+        let cfg = SshrackConfig {
+            store: Some(SecretStore::Vault {
+                meta: fast_meta("AA=="),
+            }),
+            ..SshrackConfig::default()
+        };
+        let backend = FakeBackend::new();
+        let body = CredentialBody::new("u").with_inline_key(Secret::Plain("PRIV".into()), None);
+        let err = seal_body(
+            body,
+            OwnerKind::Credential,
+            &ulid::Ulid::new(),
+            &cfg,
+            None,
+            &backend,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, SshrackError::VaultLocked),
+            "vault mode without key must refuse to seal inline key: {err:?}"
+        );
+    }
+
+    #[test]
+    fn seal_password_undecided_store_treated_as_plaintext() {
+        // cfg.store == None (fresh/undecided) must seal a freshly collected
+        // plaintext password as Secret::Plain with no keyring marker. This
+        // mirrors finalize_password's `None` arm and pins seal_body's dispatch
+        // (`Some(Plaintext) | None`): a body saved before first-use resolution
+        // must not be encrypted or marked keyring.
+        let cfg = SshrackConfig {
+            store: None,
+            ..SshrackConfig::default()
+        };
+        let backend = FakeBackend::new();
+        let id = ulid::Ulid::new();
+        let body = CredentialBody::new("root").with_password("hunter2");
+        let out = seal_body(body, OwnerKind::Host, &id, &cfg, None, &backend).unwrap();
+        assert_eq!(
+            out.password_plain(),
+            Some("hunter2"),
+            "undecided store must keep the password as plaintext"
+        );
+        assert!(
+            !out.keyring,
+            "undecided store must not set the keyring marker"
+        );
+    }
 }
