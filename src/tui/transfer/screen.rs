@@ -501,7 +501,7 @@ impl TransferScreen {
     }
 
     /// Progress + summary panel: a 2-row band. Row 1 holds the active transfer
-    /// text plus a `Gauge` (or the dim "no transfer in flight" placeholder when
+    /// text plus a visible-track bar (or the dim "no transfer in flight" placeholder when
     /// idle). Row 2 is the `done X/Y · fail Z [· paused]` summary with any
     /// transient status message appended — `summary_line` bounds the message so
     /// it can not push the counts off the row. The hotkey reference lives in

@@ -17,7 +17,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, Paragraph},
+    widgets::{Block, Borders, Paragraph},
 };
 use sshrack_core::connect::sftp::parse::strip_control_chars;
 use sshrack_core::connect::sftp::proto::{Direction, Progress};
@@ -310,7 +310,7 @@ fn draw_pane_row(
 
 /// Render row 1 of the progress panel: the active transfer as a three-column
 /// row — `[name ↑/↓]` left, the surviving numeric segments (`size rate eta`)
-/// right-aligned against the gauge, and a `Gauge` hard against the right edge.
+/// right-aligned against the gauge, and a visible-track bar hard against the right edge.
 /// An unknown total renders no gauge (just name + bytes-done + rate). `None`
 /// paints the dim "no transfer in flight" placeholder.
 ///
@@ -393,13 +393,22 @@ pub fn draw_active_transfer(frame: &mut Frame, area: Rect, active: Option<&Progr
             segs_area,
         );
     }
-    frame.render_widget(
-        Gauge::default()
-            .gauge_style(theme::accent())
-            .percent(plan.percent)
-            .label(plan.gauge_label.clone().unwrap_or_default()),
-        gauge_area,
-    );
+    // Manual bar render: a visible `█`/`░` track filling gauge_w exactly, with
+    // the percent right-aligned at the right edge. ratatui's `Gauge` widget leaves the
+    // unfilled portion as blank space (invisible endpoint + trailing waste);
+    // rendering the track ourselves fixes both. See `plan_gauge`.
+    let label_str = plan.gauge_label.as_deref().unwrap_or("");
+    let bar_spans: Vec<Span> = plan_gauge(plan.gauge_w, plan.percent, label_str)
+        .into_iter()
+        .map(|cell| match cell {
+            GaugeCell::Filled => Span::styled("█", theme::accent()),
+            GaugeCell::Track => Span::styled("░", Style::new().dim()),
+            GaugeCell::Label(ch) => {
+                Span::styled(ch.to_string(), Style::new().add_modifier(Modifier::BOLD))
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(Line::from(bar_spans)), gauge_area);
 }
 
 /// Build the 2-row status band's summary line: `done X/Y · fail Z [· paused]`
@@ -651,7 +660,7 @@ pub(crate) struct ActiveRowPlan {
     pub gauge_w: u16,
     /// `Some("N%")` when a gauge is shown, else `None`.
     pub gauge_label: Option<String>,
-    /// Integer percent 0..=100 for the `Gauge` widget. 0 when indeterminate.
+    /// Integer percent 0..=100 for the gauge bar. 0 when indeterminate.
     pub percent: u16,
 }
 
@@ -757,6 +766,51 @@ pub(crate) fn plan_active_row(
         gauge_label: gauge_label.filter(|_| gauge_w > 0),
         percent,
     }
+}
+
+/// One cell of the active-transfer gauge bar. Pure — [`plan_gauge`] produces a
+/// `Vec<GaugeCell>` and [`draw_active_transfer`] maps each to a styled span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GaugeCell {
+    /// Filled portion: `█` in the accent color.
+    Filled,
+    /// Unfilled track: `░` dimmed. Makes the bar's full width (and thus its
+    /// 100% endpoint) visible, instead of the blank-space track ratatui's
+    /// `Gauge` widget leaves.
+    Track,
+    /// A label char (from the right-aligned `N%` overlay), replacing the bar
+    /// char that would otherwise sit beneath it.
+    Label(char),
+}
+
+/// Lay out a `gauge_w`-cell progress bar at `percent` (clamped to 0..=100) with
+/// `label` (e.g. `"7%"`) overlaid flush against the right edge. Pure — the
+/// renderer maps each [`GaugeCell`] to a styled span. The first
+/// `filled = percent*gauge_w/100` cells are [`GaugeCell::Filled`], the rest are
+/// [`GaugeCell::Track`], and the label chars occupy the rightmost `lc` cells,
+/// replacing the bar chars beneath them. Right-aligning the label (not
+/// centering) keeps the `░` track contiguous — a centered label would interrupt
+/// it. When the label is empty or at least as wide as the bar, no overlay is
+/// applied (the bar is just filled + track) so a too-wide label never overflows.
+pub(crate) fn plan_gauge(gauge_w: u16, percent: u16, label: &str) -> Vec<GaugeCell> {
+    let w = gauge_w as usize;
+    let filled = (percent.min(100) as usize * w / 100).min(w);
+    let chars: Vec<char> = label.chars().collect();
+    let lc = chars.len();
+    let overlay = lc > 0 && lc < w;
+    let start = if overlay { w - lc } else { 0 };
+    let end = if overlay { start + lc } else { 0 };
+    (0..w)
+        .map(|i| {
+            if overlay && (start..end).contains(&i) {
+                GaugeCell::Label(chars[i - start])
+            } else if i < filled {
+                GaugeCell::Filled
+            } else {
+                GaugeCell::Track
+            }
+        })
+        .collect()
 }
 
 /// Pane-row column plan: the name-column width and whether the meta column
@@ -1049,6 +1103,144 @@ mod tests {
         assert_eq!(p.gauge_w, 0);
     }
 
+    // ---- plan_gauge: pure bar-layout helper ----
+
+    #[test]
+    fn plan_gauge_half_width_10_label_50pct() {
+        // 50% of 10 = 5 filled; label "50%" (3 chars) right-aligned at start=7.
+        // Cells: [0,5) Filled, [5,7) Track, [7,10) Label.
+        use super::{GaugeCell, plan_gauge};
+        let cells = plan_gauge(10, 50, "50%");
+        assert_eq!(
+            cells,
+            vec![
+                GaugeCell::Filled,
+                GaugeCell::Filled,
+                GaugeCell::Filled,
+                GaugeCell::Filled,
+                GaugeCell::Filled,
+                GaugeCell::Track,
+                GaugeCell::Track,
+                GaugeCell::Label('5'),
+                GaugeCell::Label('0'),
+                GaugeCell::Label('%'),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_gauge_zero_pct_all_track_with_right_aligned_label() {
+        // 0% → no filled; "0%" right-aligned in width 8 (start=6).
+        use super::{GaugeCell, plan_gauge};
+        let cells = plan_gauge(8, 0, "0%");
+        assert_eq!(
+            cells,
+            vec![
+                GaugeCell::Track,
+                GaugeCell::Track,
+                GaugeCell::Track,
+                GaugeCell::Track,
+                GaugeCell::Track,
+                GaugeCell::Track,
+                GaugeCell::Label('0'),
+                GaugeCell::Label('%'),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_gauge_full_pct_all_filled_with_right_aligned_label() {
+        // 100% → all filled; "100%" (4 chars) right-aligned in width 8 (start=4).
+        use super::{GaugeCell, plan_gauge};
+        let cells = plan_gauge(8, 100, "100%");
+        assert_eq!(
+            cells,
+            vec![
+                GaugeCell::Filled,
+                GaugeCell::Filled,
+                GaugeCell::Filled,
+                GaugeCell::Filled,
+                GaugeCell::Label('1'),
+                GaugeCell::Label('0'),
+                GaugeCell::Label('0'),
+                GaugeCell::Label('%'),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_gauge_seven_pct_width_30_counts() {
+        // The screenshot case: 7% of 30 = 2 filled; "7%" right-aligned at start=28.
+        let cells = super::plan_gauge(30, 7, "7%");
+        let filled = cells
+            .iter()
+            .filter(|c| matches!(c, super::GaugeCell::Filled))
+            .count();
+        let track = cells
+            .iter()
+            .filter(|c| matches!(c, super::GaugeCell::Track))
+            .count();
+        let label = cells
+            .iter()
+            .filter(|c| matches!(c, super::GaugeCell::Label(_)))
+            .count();
+        assert_eq!(filled, 2, "7% of 30 = 2 filled cells");
+        assert_eq!(label, 2, "\"7%\" = 2 label cells");
+        assert_eq!(track, 26, "remainder is track");
+        assert_eq!(cells.len(), 30, "fills gauge_w exactly");
+        // Label sits flush right (start 28): cells 28 and 29.
+        assert!(matches!(cells[28], super::GaugeCell::Label('7')));
+        assert!(matches!(cells[29], super::GaugeCell::Label('%')));
+    }
+
+    #[test]
+    fn plan_gauge_empty_label_no_overlay() {
+        // Empty label → no overlay, just filled + track.
+        use super::{GaugeCell, plan_gauge};
+        let cells = plan_gauge(6, 50, "");
+        assert_eq!(
+            cells,
+            vec![
+                GaugeCell::Filled,
+                GaugeCell::Filled,
+                GaugeCell::Filled,
+                GaugeCell::Track,
+                GaugeCell::Track,
+                GaugeCell::Track,
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_gauge_label_wider_than_bar_no_overlay() {
+        // Label "100%" (4) >= width 3 → drop overlay; 50% of 3 = 1 filled.
+        use super::{GaugeCell, plan_gauge};
+        let cells = plan_gauge(3, 50, "100%");
+        assert_eq!(
+            cells,
+            vec![GaugeCell::Filled, GaugeCell::Track, GaugeCell::Track]
+        );
+    }
+
+    #[test]
+    fn plan_gauge_zero_width_empty() {
+        // Degenerate: zero-width gauge yields no cells (caller skips rendering).
+        assert!(super::plan_gauge(0, 50, "50%").is_empty());
+    }
+
+    #[test]
+    fn plan_gauge_clamps_percent_above_100() {
+        // Defensive: percent > 100 must not overflow or over-fill.
+        let cells = super::plan_gauge(10, 150, "100%");
+        let filled = cells
+            .iter()
+            .filter(|c| matches!(c, super::GaugeCell::Filled))
+            .count();
+        assert_eq!(cells.len(), 10);
+        // 150 clamped to 100 → 10 filled minus the 4 label cells overlapping = 6 Filled.
+        assert_eq!(filled, 6);
+    }
+
     // ---- draw_active_transfer: render-alignment regression ----
 
     /// Read row 0 of a TestBackend buffer as a trimmed String.
@@ -1113,13 +1305,12 @@ mod tests {
         assert!(text.contains("1.0K/s"), "rate shown: {text:?}");
         assert!(text.contains("3s"), "eta shown: {text:?}");
         assert!(text.contains("25%"), "gauge percent shown: {text:?}");
-        // The gauge hugs the right edge: the last non-space cell is part of the
-        // gauge label (a digit or `%`), not a truncated text char.
-        let last = text.chars().last().expect("non-empty row");
-        assert!(
-            last == '%' || last.is_ascii_digit(),
-            "right edge is the gauge label: {text:?}"
-        );
+        // The percent sits flush against the right edge (right-aligned overlay,
+        // not centered): the whole "25%" label is the row's tail, preceded by a
+        // contiguous `░` track — no middle interruption, no trailing blank waste.
+        assert!(text.ends_with("25%"), "percent at the right edge: {text:?}");
+        // The unfilled track is visible — the 100% endpoint is no longer blank.
+        assert!(text.contains('░'), "visible track below 100%: {text:?}");
     }
 
     #[test]
@@ -1192,6 +1383,83 @@ mod tests {
         let text = row_text(&term);
         let pct_count = text.matches('%').count();
         assert_eq!(pct_count, 1, "percent appears exactly once: {text:?}");
+    }
+
+    #[test]
+    fn draw_active_transfer_bar_shows_visible_track_below_100pct() {
+        // The whole point: below 100% the unfilled portion is a visible `░`
+        // track, not blank space, so the bar's endpoint is visible.
+        use ratatui::{Terminal, backend::TestBackend};
+        use sshrack_core::connect::sftp::proto::{Direction, Progress};
+        let prog = Progress {
+            name: "file.bin".into(),
+            direction: Direction::Upload,
+            bytes_done: 1_024,
+            bytes_total: Some(4_096),
+            rate_bps: Some(1_048_576),
+            eta_secs: Some(3),
+        };
+        let mut term = Terminal::new(TestBackend::new(100, 1)).unwrap();
+        term.draw(|f| draw_active_transfer(f, f.area(), Some(&prog)))
+            .unwrap();
+        let text = row_text(&term);
+        assert!(text.contains('█'), "filled portion present: {text:?}");
+        assert!(text.contains('░'), "visible track present: {text:?}");
+        assert!(text.contains("25%"), "percent overlaid: {text:?}");
+    }
+
+    #[test]
+    fn draw_active_transfer_full_pct_has_no_track() {
+        // At 100% the bar is entirely filled — no `░` track remains.
+        use ratatui::{Terminal, backend::TestBackend};
+        use sshrack_core::connect::sftp::proto::{Direction, Progress};
+        let prog = Progress {
+            name: "file.bin".into(),
+            direction: Direction::Upload,
+            bytes_done: 4_096,
+            bytes_total: Some(4_096),
+            rate_bps: Some(1_048_576),
+            eta_secs: Some(0),
+        };
+        let mut term = Terminal::new(TestBackend::new(100, 1)).unwrap();
+        term.draw(|f| draw_active_transfer(f, f.area(), Some(&prog)))
+            .unwrap();
+        let text = row_text(&term);
+        assert!(text.contains('█'), "filled bar present: {text:?}");
+        assert!(!text.contains('░'), "no track at 100%: {text:?}");
+        assert!(text.contains("100%"), "percent overlaid: {text:?}");
+    }
+
+    #[test]
+    fn draw_active_transfer_bar_fills_to_right_edge_no_trailing_waste() {
+        // The bar must reach the right edge of the area — the rightmost buffer
+        // cell is a bar/label cell, never a space. This is the "no wasted
+        // right-side space" guarantee (row_text trims trailing spaces, so check
+        // the raw buffer cell at the last column directly).
+        use ratatui::{Terminal, backend::TestBackend};
+        use sshrack_core::connect::sftp::proto::{Direction, Progress};
+        let prog = Progress {
+            name: "file.bin".into(),
+            direction: Direction::Upload,
+            bytes_done: 1_024,
+            bytes_total: Some(4_096),
+            rate_bps: Some(1_024),
+            eta_secs: Some(3),
+        };
+        let mut term = Terminal::new(TestBackend::new(100, 1)).unwrap();
+        term.draw(|f| draw_active_transfer(f, f.area(), Some(&prog)))
+            .unwrap();
+        let buf = term.backend().buffer();
+        let last = buf
+            .cell((99u16, 0u16))
+            .expect("rightmost cell")
+            .symbol()
+            .to_string();
+        assert!(
+            last == "█" || last == "░" || last == "%" || last.chars().all(|c| c.is_ascii_digit()),
+            "rightmost cell is a bar/label cell, not blank: {last:?}"
+        );
+        assert_ne!(last, " ", "no trailing blank at the right edge");
     }
 
     // ---- draw_pane_row: render-alignment regression ----
