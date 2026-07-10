@@ -350,6 +350,23 @@ impl CredentialBody {
                 user: self.user.clone(),
             });
         }
+        // A non-keyring inline key with no private-key material is malformed:
+        // there is no in-body text to decrypt and no keyring slot to read, so
+        // resolve would materialize an empty file for `ssh -i` (an obscure
+        // "error in libcrypto" failure). The `InlineKey.private_key` field doc
+        // states "None only in a keyring-marker form"; enforce that invariant
+        // here so the bad body is rejected at every validate() choke point
+        // (resolve, merge_credential, add_credential, apply_credential_patch).
+        // A keyring-marker inline key (ik.keyring == true) legitimately carries
+        // no in-body text and is accepted by the check above.
+        if let Some(KeySource::Inline(ik)) = &self.key
+            && !ik.keyring
+            && ik.private_key.is_none()
+        {
+            return Err(SshrackError::InvalidCredentialBody {
+                user: self.user.clone(),
+            });
+        }
         Ok(())
     }
 
@@ -918,6 +935,31 @@ key = "/old/path"
             keyring: false,
         };
         assert!(body.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_non_keyring_inline_key_with_no_private_material() {
+        // A non-keyring inline key with no private-key material is malformed:
+        // there is no in-body text to decrypt and no keyring slot to read, so
+        // resolve would materialize an empty file for `ssh -i` (an obscure
+        // "error in libcrypto" failure). The `InlineKey.private_key` field doc
+        // states "None only in a keyring-marker form"; the complementary
+        // `validate_accepts_inline_key_in_keyring_marker_form` test covers the
+        // legitimate keyring-stored case.
+        let body = CredentialBody {
+            user: "u".into(),
+            password: None,
+            key: Some(KeySource::Inline(InlineKey {
+                private_key: None,
+                certificate: None,
+                keyring: false,
+            })),
+            keyring: false,
+        };
+        assert!(matches!(
+            body.validate(),
+            Err(SshrackError::InvalidCredentialBody { .. })
+        ));
     }
 
     #[test]
