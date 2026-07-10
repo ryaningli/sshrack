@@ -13,7 +13,7 @@
 //! path from its own location; the sftp-shim sleeps a fixed duration. No real
 //! `sshd`, `ssh`, or `sftp` process is contacted.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -184,6 +184,27 @@ fn download_job(dir: &Path, dst_name: &str, size_total: Option<u64>) -> Transfer
         size_total,
         recursive: false,
     }
+}
+
+/// Collect every `sshrack-askpass-*.pw` path in `dir` into a set. Used by the
+/// drop teardown test as a snapshot-delta over the shared temp dir: the set
+/// captured before `SftpWorker::open` vs after `drop(worker)` must not gain a
+/// new entry, proving Drop removed the pw-file `open` created. Pre-existing
+/// files (other test binaries, crashed prior runs) are present in both
+/// snapshots and so never cause a false failure.
+fn pw_files_in(dir: &Path) -> HashSet<PathBuf> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name().is_some_and(|n| {
+                let n = n.to_string_lossy();
+                n.starts_with("sshrack-askpass-") && n.ends_with(".pw")
+            })
+        })
+        .collect()
 }
 
 // ---- tests ----
@@ -383,6 +404,12 @@ fn sftp_run_transfer_cancel_kills_and_reaps_and_marks_cancelled() {
                         // failure of the cancel path — but retry by sending
                         // another cancel-only sequence is pointless. Assert the
                         // partial was still removed (it is for both outcomes).
+                        //
+                        // Under load the Cancelled-path assertion is best-effort:
+                        // the 3s sftp-shim sleep is far longer than the worker's
+                        // 200ms poll interval, so in practice the Cancel always
+                        // lands mid-transfer and the Ok branch here is the rare
+                        // losing race, not the expected outcome.
                         break;
                     }
                     other => panic!("expected Cancelled or Ok, got {other:?}"),
@@ -413,6 +440,10 @@ fn sftp_worker_drop_tears_down_master_socket_and_pw_file() {
 
     // Use an Inline password so a pw temp file is created and must be removed.
     let resolved = resolved_inline("hunter2");
+    // Snapshot the shared temp dir BEFORE open. The pw-file `open` creates lives
+    // in std::env::temp_dir() with a pid+nanos name; the after-drop snapshot (c)
+    // diffs against this set to prove Drop removed it.
+    let before: HashSet<PathBuf> = pw_files_in(&std::env::temp_dir());
     let (worker, _home) = SftpWorker::open(
         resolved,
         key_only_host(),
@@ -464,26 +495,27 @@ fn sftp_worker_drop_tears_down_master_socket_and_pw_file() {
             .collect::<Vec<_>>()
     );
 
-    // (c) No pw temp file left behind. The pw temp file path is not directly
-    // observable from outside the worker, so assert by counting: scan the temp
-    // dir for any `sshrack-askpass-*.pw` file. This is best-effort but catches
-    // a regression where Drop forgets to remove it.
-    let temp = std::env::temp_dir();
-    let leftover_pw_files: Vec<_> = std::fs::read_dir(&temp)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .starts_with("sshrack-askpass-")
-                && e.file_name().to_string_lossy().ends_with(".pw")
-        })
-        .collect();
-    // Best-effort: clean up any stragglers from other tests / this run so the
-    // assertion is stable. The Drop contract is that the file is removed; a
-    // leftover from a crashed prior test is not this test's fault.
-    for f in &leftover_pw_files {
-        let _ = std::fs::remove_file(f.path());
-    }
+    // (c) No pw temp file left behind. The pw-file path is not directly
+    // observable from outside the worker (it lives in std::env::temp_dir() with
+    // a pid+nanos name), so use a snapshot-delta over the shared temp dir:
+    // capture every `sshrack-askpass-*.pw` before open (above) and again after
+    // drop, then assert drop introduced no new file. `before` excludes
+    // pre-existing files (other test binaries, crashed prior runs) so the
+    // assertion is stable under parallel `cargo test`. This is a real
+    // assertion — unlike a bare scan-and-cleanup, it fails if the Drop
+    // pw-file removal (worker.rs step 6) is deleted: `after` then gains the
+    // one file `open` created and the difference is non-empty.
+    //
+    // Why the delta and not a content scan (assert no pw-file holds `hunter2`)?
+    // A content scan over all `sshrack-askpass-*.pw` in temp_dir is stricter
+    // but NOT stable: it would also fire on an orphaned pw-file left by a prior
+    // failed run, making this test non-hermetic across runs. The delta is both
+    // rigorous (proven to fail on a removed cleanup — see RED verification in
+    // the task-5.3 report) and stable (pre-existing files are in both sets).
+    let after: HashSet<PathBuf> = pw_files_in(&std::env::temp_dir());
+    let leaked: Vec<&PathBuf> = after.difference(&before).collect();
+    assert!(
+        leaked.is_empty(),
+        "drop must remove the askpass pw-file it created; new pw-files leaked after drop: {leaked:?}"
+    );
 }
