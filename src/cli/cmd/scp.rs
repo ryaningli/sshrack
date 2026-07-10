@@ -220,3 +220,142 @@ fn plan_host_name<'a>(
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the two pure helpers that shape scp's error messages and
+    //! operand resolution: `credential_msg` (dangling-credential wording) and
+    //! `plan_host_name` (reverse-lookup of the `name:path` operand that triggered
+    //! the error). Pure: feeds fixtures, asserts strings/`Option`.
+    use super::*;
+    use sshrack_core::config::schema::{Auth, CredentialBody, Host, SshrackConfig};
+    use sshrack_core::error::DidYouMean;
+    use ulid::Ulid;
+
+    /// Build a config registering the named hosts (each with an inline default
+    /// body; only `name` matters for `plan_host_name`).
+    fn cfg_with_hosts(names: &[&str]) -> SshrackConfig {
+        SshrackConfig {
+            hosts: names
+                .iter()
+                .map(|n| Host {
+                    id: Ulid::new(),
+                    name: (*n).into(),
+                    host: format!("{n}.internal"),
+                    port: 22,
+                    auth: Auth::Inline(CredentialBody::new("u")),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Convenience to build owned argv slices from `&str` literals.
+    fn args(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    // ---- credential_msg ----
+
+    #[test]
+    fn credential_msg_with_host_name_points_at_host() {
+        let msg = credential_msg("ghost", &DidYouMean::none(), Some("web1"));
+        assert!(
+            msg.contains("host 'web1' references an unknown credential"),
+            "got: {msg}"
+        );
+        // Must not fall through to the bare credential-not-found wording.
+        assert!(!msg.contains("credential not found"), "got: {msg}");
+    }
+
+    #[test]
+    fn credential_msg_without_host_name_falls_back_to_credential_not_found() {
+        let msg = credential_msg("ghost", &DidYouMean::none(), None);
+        assert!(msg.contains("credential not found: ghost"), "got: {msg}");
+        // Must not misattribute to a host.
+        assert!(!msg.contains("host '"), "got: {msg}");
+    }
+
+    #[test]
+    fn credential_msg_without_host_name_appends_hint() {
+        let hint = DidYouMean::from_option(Some("ops"));
+        let msg = credential_msg("ghost", &hint, None);
+        assert!(msg.contains("credential not found: ghost"), "got: {msg}");
+        assert!(
+            msg.contains("(did you mean 'ops'?)"),
+            "expected the suggestion rendered, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn credential_msg_with_host_name_appends_hint() {
+        let hint = DidYouMean::from_option(Some("team"));
+        let msg = credential_msg("ghost", &hint, Some("web1"));
+        assert!(
+            msg.contains("host 'web1' references an unknown credential"),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains("(did you mean 'team'?)"),
+            "expected the suggestion rendered, got: {msg}"
+        );
+    }
+
+    // ---- plan_host_name ----
+
+    #[test]
+    fn plan_host_name_registered_name_path_returns_name() {
+        let cfg = cfg_with_hosts(&["web1"]);
+        assert_eq!(
+            plan_host_name(&cfg, &args(&["web1:/tmp/file"])),
+            Some("web1")
+        );
+    }
+
+    #[test]
+    fn plan_host_name_first_match_wins_when_multiple_registered() {
+        let cfg = cfg_with_hosts(&["web1", "web2"]);
+        assert_eq!(
+            plan_host_name(&cfg, &args(&["web1:/a", "web2:/b"])),
+            Some("web1")
+        );
+    }
+
+    #[test]
+    fn plan_host_name_no_colon_is_skipped() {
+        // A bare operand with no colon (local path or a stray name) is skipped.
+        let cfg = cfg_with_hosts(&["web1"]);
+        assert_eq!(plan_host_name(&cfg, &args(&["web1"])), None);
+    }
+
+    #[test]
+    fn plan_host_name_user_at_host_is_skipped() {
+        // `user@host:path` is an ad-hoc literal, never a registered name.
+        let cfg = cfg_with_hosts(&["web1"]);
+        assert_eq!(plan_host_name(&cfg, &args(&["user@host:/tmp"])), None);
+    }
+
+    #[test]
+    fn plan_host_name_unregistered_name_returns_none() {
+        let cfg = cfg_with_hosts(&["web1"]);
+        // A name:path whose left side is not a registered host → None.
+        assert_eq!(plan_host_name(&cfg, &args(&["ghost:/a"])), None);
+    }
+
+    #[test]
+    fn plan_host_name_skipped_operands_fall_through_to_registered_match() {
+        // Ad-hoc (user@host) and colon-less operands are skipped, then a later
+        // registered name:path operand still resolves.
+        let cfg = cfg_with_hosts(&["web1"]);
+        assert_eq!(
+            plan_host_name(&cfg, &args(&["user@host:/a", "./local", "web1:/b"]),),
+            Some("web1")
+        );
+    }
+
+    #[test]
+    fn plan_host_name_empty_args_returns_none() {
+        let cfg = cfg_with_hosts(&["web1"]);
+        assert_eq!(plan_host_name(&cfg, &args(&[])), None);
+    }
+}
