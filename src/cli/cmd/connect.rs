@@ -172,15 +172,13 @@ pub fn run(cli: &Cli) -> i32 {
     };
 
     // ── Step 5: Host-key pre-flight. ─────────────────────────────────────────
-    // run_host_key_flow only calls the confirm closure for NEW keys; changed
-    // keys are rejected upstream by ssh. So returning `accept_new` accepts a
-    // first-seen key iff --accept-new was given (OR'd across top-level + ssh).
+    // `--accept-new` takes the Accept path: a first-seen key is auto-accepted
+    // (the confirm closure is never called). Without it on a tty, core calls
+    // the closure with the full fingerprint and we ask yes/no; without a tty
+    // the new key is rejected. Changed keys are always rejected upstream by ssh.
     let host_str = resolved_host.host.as_str();
     let accept_new = opts.accept_new;
     let has_tty = crate::cli::prompt::has_tty();
-    // On the Prompt path (has_tty && !accept_new) core hands us the full
-    // fingerprint text; show it and ask yes/no. The Accept path (accept_new)
-    // never calls this closure.
     let confirm = |fingerprint_text: &str| crate::cli::prompt::prompt_yes_no(fingerprint_text);
     if let Err(e) = hostkey::run_host_key_flow(host_str, port, has_tty, accept_new, confirm) {
         eprintln!("sshrack: host key: {e}");

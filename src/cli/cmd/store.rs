@@ -445,7 +445,7 @@ fn lock(cli: &Cli) -> i32 {
 }
 
 /// `sshrack store unlock`: pre-warm the cached master key so subsequent
-/// non-interactive invocations hit the cache. Idempotent. Errors `STORE` when
+/// scripted invocations hit the cache. Idempotent. Errors `STORE` when
 /// no vault is configured. The passphrase comes from `SSHRACK_PASSPHRASE` when
 /// set, otherwise a single-entry prompt on a tty.
 fn unlock(cli: &Cli) -> i32 {

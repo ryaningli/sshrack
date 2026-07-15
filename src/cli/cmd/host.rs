@@ -1,6 +1,6 @@
 //! `sshrack host …` handlers: add / ls / show / edit / rm / cp.
 //!
-//! Non-interactive surface. Each handler maps a [`HostAction`] to core pure
+//! Scriptable CRUD surface. Each handler maps a [`HostAction`] to core pure
 //! functions (`host::{add_host, apply_patch, finalize_body, …}`) and persists
 //! via [`config::store::save`]. Missing required fields error; there are no
 //! field prompts. `--format json|text` selects the output shape.

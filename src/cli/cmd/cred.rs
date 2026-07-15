@@ -1,6 +1,6 @@
 //! `sshrack cred …` handlers: add / ls / show / edit / rm.
 //!
-//! Non-interactive surface, same shape as [`super::host`] but for reusable
+//! Scriptable CRUD surface, same shape as [`super::host`] but for reusable
 //! `[[credentials]]` entries. `--credential` is N/A (a credential cannot
 //! reference another credential); the body is built from `--user`/`--identity`.
 //! A password credential cannot be created from the CLI (passwords never enter

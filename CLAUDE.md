@@ -16,7 +16,7 @@ sshrack is a terminal-native remote server management tool written in Rust (bina
 
 **Backend/frontend split** in a single binary:
 - **Backend** (`sshrack-core`, sole workspace member) — pure capability layer with **zero UI deps** (no `ratatui`/`crossterm`/`nucleo-matcher`/`console`). Compiler-enforced invariant.
-- **CLI** (`src/cli/`) — **non-interactive**, never prompts.
+- **CLI** (`src/cli/`) — defaults to interactive on a tty; per-scenario escape hatches (`--accept-new`, `--yes`, `SSHRACK_PASSPHRASE`) keep every command scriptable.
 - **TUI** (`src/tui/`) — interactive shell (ratatui 0.30 + crossterm + nucleo-matcher).
 
 Side effects (keyring I/O, passphrase source, host-key confirm) are **injected via traits** defined in core. Passwords at rest use one of three global modes (`[store] mode`): **keyring** (default, OS keyring, keyed by owner ULID), **vault** (Argon2id + XChaCha20-Poly1305 inline), or **plaintext** (`0600`).
@@ -48,7 +48,7 @@ cargo test -- --nocapture           # Run tests with stdout visible
 | `sshrack host edit <name>` (no edit flags) | TUI host-edit wizard |
 | `sshrack cred add` (no flags, no name) | TUI cred-add wizard |
 | `sshrack cred edit <name>` (no edit flags) | TUI cred-edit wizard |
-| anything else | CLI (non-interactive) |
+| anything else | CLI (interactive on a tty) |
 
 A flagged field is **always a CLI patch, never a wizard** — `host edit x --port 22` is the CLI; `host edit x` is the wizard. A name positional alone on `host add x` is the CLI (which then errors: missing `--host`); only a truly flag-less `host add` opens the wizard.
 
@@ -157,15 +157,15 @@ Hosts and credentials reference each other by **immutable ULID `id`**, not by na
 
 ## CLI Contract
 
-The CLI is **always non-interactive** — never prompts. Missing input is either rejected with an error or sourced from the environment, never a TTY.
+The CLI defaults to interactive when a TTY is present — it prompts for host-key confirmation, vault passphrase, and destructive-action confirmation. Non-interactive escape hatches (`--accept-new`, `--yes`, `SSHRACK_PASSPHRASE`) are always available and take precedence over the prompt. Without a TTY, the CLI falls back to the escape hatch or errors with a hint — it never hangs.
 
 | Capability | Behavior |
 |---|---|
-| Non-interactive by construction | No `--no-input` flag. Missing required flags ⇒ error + exit `2`/`6`. |
-| `--accept-new` | Accept a first-seen host key (global + per-subcommand). |
-| `--yes` (destructive) | Required for `host rm`, `cred rm`, `store use plaintext`. |
+| Interactive on a tty | Prompts for host-key / passphrase / destructive confirm. No `--no-input` flag — escape hatches are per-scenario, not a global toggle. Missing required *config* flags still error + exit `2`/`6`. |
+| `--accept-new` | Skip the host-key confirm prompt: accept a first-seen key (global + per-subcommand). |
+| `--yes` (destructive) | Skip the destructive-confirm prompt for `host rm`, `cred rm`, `store use plaintext` (required when there is no tty). |
 | `--format json` (global) | Structured JSON output (locked field names); default is text. |
-| `SSHRACK_PASSPHRASE` (env) | Vault passphrase on the CLI path (`store use vault`, `store rekey`). No CLI prompt — use the TUI for interactive. |
+| `SSHRACK_PASSPHRASE` (env) | Vault passphrase escape hatch (`store use vault`, `store rekey`); without it on a tty, the CLI prompts. |
 | `--identity-stdin`/`--identity-file` (+ `--certificate-*`) | Import identity-key/certificate **contents** as a sealed `Secret`, never in argv. `--identity <path>` is the unread path reference. Inline key renders as `"<inline>"`; key text never displayed. |
 | Stable exit codes | `0` ok · `2` usage · `4` not-found · `5` duplicate · `6` validation · `7` connect · `8` store. |
 
@@ -182,7 +182,7 @@ The CLI is **always non-interactive** — never prompts. Missing input is either
 - In keyring mode the main process never materializes a keyring password's plaintext — only the short-lived `SSH_ASKPASS` helper reads it.
 - Plaintext/vault mode stage the password in a `0600` temp file (atomic `create_new`) the helper reads and deletes.
 - Keyring lifecycle: removing a keyring-marked host/cred **deletes its keyring entry** (no orphans); `host cp` copies the entry to the new id; `host add --force` cleans up the old entry.
-- Proactive host-key pre-flight (`ssh-keyscan` + fingerprint confirm via the injected callback); reject silent `accept-new` trust. New key confirmed once; changed key rejected (delegated to ssh at connect time).
+- Proactive host-key pre-flight (`ssh-keyscan` + fingerprint confirm via the injected callback): a new key is shown with its fingerprint and confirmed once on a tty; `--accept-new` skips the prompt; a changed key is rejected (delegated to ssh at connect time).
 - Keep plaintext passwords in memory for the shortest possible lifetime; respect which storage path code is on (keyring vs vault/plaintext temp-file).
 
 ## Never Reimplement SSH
