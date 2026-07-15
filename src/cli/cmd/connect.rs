@@ -178,9 +178,10 @@ pub fn run(cli: &Cli) -> i32 {
     let host_str = resolved_host.host.as_str();
     let accept_new = opts.accept_new;
     let has_tty = crate::cli::prompt::has_tty();
-    // Temporary: still flag-only (the Prompt path returns false until Task 4
-    // swaps this closure for prompt_yes_no). Accept path already works via flag.
-    let confirm = move |_fingerprint: &str| accept_new;
+    // On the Prompt path (has_tty && !accept_new) core hands us the full
+    // fingerprint text; show it and ask yes/no. The Accept path (accept_new)
+    // never calls this closure.
+    let confirm = |fingerprint_text: &str| crate::cli::prompt::prompt_yes_no(fingerprint_text);
     if let Err(e) = hostkey::run_host_key_flow(host_str, port, has_tty, accept_new, confirm) {
         eprintln!("sshrack: host key: {e}");
         return exit_code::CONNECT;

@@ -153,4 +153,12 @@ mod tests {
         assert!(!parse_yes_no("yeah"));
         assert!(!parse_yes_no("true"));
     }
+
+    #[test]
+    fn prompt_yes_no_returns_false_without_tty() {
+        // Under `cargo test` stdin/stderr are pipes, not a tty: the prompt must
+        // decline rather than block. This is the guarantee the CLI relies on so
+        // scripts never hang on a host-key prompt.
+        assert!(!prompt_yes_no("irrelevant without a tty"));
+    }
 }
