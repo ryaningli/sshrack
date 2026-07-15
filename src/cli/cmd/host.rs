@@ -521,11 +521,14 @@ fn rm(cli: &Cli, name: Option<&str>, yes: bool) -> i32 {
         Err(ret) => return ret,
     };
 
-    // Require an explicit --yes (destructive confirmation). No interactive
-    // fallback — the TUI handles unattended-less flows.
-    if !yes {
+    // Destructive confirmation: --yes skips the prompt (script escape hatch);
+    // otherwise confirm on a tty, or error without one.
+    let confirmed = yes || crate::cli::prompt::tty_confirm(&format!("Remove host '{name}'?"));
+    if !confirmed {
         return fail(
-            &format!("sshrack: pass --yes to confirm removal of host '{name}'"),
+            &format!(
+                "sshrack: not removing host '{name}' (pass --yes, or run in a tty to confirm)"
+            ),
             exit_code::USAGE,
         );
     }

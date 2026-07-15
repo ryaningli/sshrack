@@ -427,22 +427,24 @@ fn rm(cli: &Cli, name: Option<&str>, yes: bool) -> i32 {
         .filter_map(|hid| cfg.find_host_by_id(hid).map(|h| h.name.clone()))
         .collect();
 
-    // Require an explicit --yes (destructive confirmation). No interactive
-    // fallback — the TUI handles unattended-less flows. The referrer warning
-    // still prints so the user sees what would be affected.
-    if !yes {
-        if !referrer_names.is_empty() {
-            println!(
-                "warning: credential '{name}' is referenced by host(s): {}",
-                referrer_names.join(", ")
-            );
-        }
+    if !referrer_names.is_empty() {
+        println!(
+            "warning: credential '{name}' is referenced by host(s): {}",
+            referrer_names.join(", ")
+        );
+    }
+    // --yes skips the prompt (escape hatch); otherwise confirm on a tty, or error.
+    let confirmed = yes || crate::cli::prompt::tty_confirm(&format!("Remove credential '{name}'?"));
+    if !confirmed {
         return fail(
-            &format!("sshrack: pass --yes to confirm removal of credential '{name}'"),
+            &format!(
+                "sshrack: not removing credential '{name}' (pass --yes, or run in a tty to confirm)"
+            ),
             exit_code::USAGE,
         );
-    } else if !referrer_names.is_empty() {
-        // Even with --yes, surface the dangling refs so the user knows.
+    }
+    if !referrer_names.is_empty() {
+        // Surface the now-dangling refs so the user knows.
         eprintln!(
             "warning: credential '{name}' was referenced by host(s): {} (references are now dangling)",
             referrer_names.join(", ")

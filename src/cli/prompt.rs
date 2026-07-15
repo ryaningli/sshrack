@@ -72,10 +72,10 @@ pub(crate) fn prompt_passphrase_confirm(
     confirm_prompt: &str,
 ) -> Result<Zeroizing<String>, SshrackError> {
     for _ in 0..3 {
-        let a = rpassword::prompt_password(new_prompt).unwrap_or_default();
-        let b = rpassword::prompt_password(confirm_prompt).unwrap_or_default();
-        if !a.is_empty() && a == b {
-            return Ok(Zeroizing::new(a));
+        let a = Zeroizing::new(rpassword::prompt_password(new_prompt).unwrap_or_default());
+        let b = Zeroizing::new(rpassword::prompt_password(confirm_prompt).unwrap_or_default());
+        if !a.is_empty() && a.as_str() == b.as_str() {
+            return Ok(a);
         }
         let _ = writeln!(std::io::stderr(), "passphrases did not match; try again");
     }

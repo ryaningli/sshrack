@@ -295,10 +295,14 @@ fn switch_to_plaintext(
         println!("already in plaintext mode");
         return Ok(exit_code::SUCCESS);
     }
-    // A destructive downgrade: require an explicit --yes.
-    if !yes {
+    // Security downgrade: --yes skips the prompt; otherwise confirm on a tty.
+    let confirmed = yes
+        || crate::cli::prompt::tty_confirm(
+            "Switching to plaintext stores all passwords unencrypted. Continue?",
+        );
+    if !confirmed {
         return Err((
-            "sshrack: switching to plaintext is a security downgrade; pass --yes to confirm".into(),
+            "sshrack: not switching to plaintext (pass --yes, or run in a tty to confirm)".into(),
             exit_code::USAGE,
         ));
     }

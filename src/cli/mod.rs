@@ -9,10 +9,6 @@ use clap::CommandFactory;
 
 pub mod args;
 pub mod cmd;
-// Foundation for the CLI's default-interactive mode (tasks T2-T7 wire the
-// consumers). `dead_code` is allowed at the module until the last consumer
-// lands, so this task can ship the focused interaction module on its own.
-#[allow(dead_code)]
 pub(crate) mod prompt;
 pub mod table;
 
