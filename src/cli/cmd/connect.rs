@@ -37,7 +37,6 @@ use sshrack_core::secret::OsKeyring;
 use sshrack_core::secret::vault;
 
 use crate::cli::args::{Cli, Command};
-use crate::cli::prompt::EnvPassphrase;
 use crate::shared::exit_code;
 
 /// Dispatch for the `Ssh`/`Connect` arms of the CLI.
@@ -116,12 +115,13 @@ pub fn run(cli: &Cli) -> i32 {
     let port = opts.port.unwrap_or(resolved_host.port);
 
     // ── Step 3: Vault unlock (no-op when not in vault mode). ─────────────────
-    // The passphrase must come from SSHRACK_PASSPHRASE; EnvPassphrase errors
-    // (Interrupted) if unset, surfaced here as a STORE error.
-    let passphrase_provider = EnvPassphrase;
+    // TtyPassphrase prompts when a human is present; EnvPassphrase reads
+    // SSHRACK_PASSPHRASE (errors Interrupted if unset). The env var still wins
+    // — ensure_unlocked_vault_key consults it before the provider.
+    let passphrase_provider = crate::cli::prompt::passphrase_provider();
     let env_pw = vault::passphrase_from_env();
     let vault_key =
-        match vault::ensure_unlocked_vault_key(&cfg, env_pw.as_ref(), &passphrase_provider) {
+        match vault::ensure_unlocked_vault_key(&cfg, env_pw.as_ref(), &*passphrase_provider) {
             Ok(k) => k,
             Err(e) => {
                 eprintln!("sshrack: vault unlock failed: {e}");

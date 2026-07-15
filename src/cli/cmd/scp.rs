@@ -38,7 +38,6 @@ use sshrack_core::secret::OsKeyring;
 use sshrack_core::secret::vault;
 
 use crate::cli::args::{Cli, Command};
-use crate::cli::prompt::EnvPassphrase;
 use crate::shared::exit_code;
 
 /// Dispatch for the `Scp` arm of the CLI.
@@ -92,10 +91,10 @@ pub fn run(cli: &Cli) -> i32 {
     // ── Step 2: config loaded above. ──────────────────────────────────────────
 
     // ── Step 3: Vault unlock (no-op when not in vault mode). ─────────────────
-    let passphrase_provider = EnvPassphrase;
+    let passphrase_provider = crate::cli::prompt::passphrase_provider();
     let env_pw = vault::passphrase_from_env();
     let vault_key =
-        match vault::ensure_unlocked_vault_key(&cfg, env_pw.as_ref(), &passphrase_provider) {
+        match vault::ensure_unlocked_vault_key(&cfg, env_pw.as_ref(), &*passphrase_provider) {
             Ok(k) => k,
             Err(e) => {
                 eprintln!("sshrack: vault unlock failed: {e}");

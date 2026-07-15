@@ -29,7 +29,6 @@ use sshrack_core::secret::OsKeyring;
 use sshrack_core::secret::vault;
 
 use crate::cli::args::SortMode;
-use crate::cli::prompt::EnvPassphrase;
 use crate::shared::exit_code;
 
 /// Load the config at `override_path` (or the XDG default). A missing file is
@@ -84,12 +83,13 @@ pub fn resolve_credential_name(
 
 /// Unlock the vault when vault mode is active, returning the master key (or
 /// `None` when not in vault mode). Used by `host/cred show --reveal`. The
-/// passphrase comes only from `SSHRACK_PASSPHRASE` (via [`EnvPassphrase`]);
-/// an unset env var surfaces as a `STORE` error.
+/// passphrase comes from `SSHRACK_PASSPHRASE` when set, otherwise prompted on
+/// a tty via [`crate::cli::prompt::passphrase_provider`]; an unset env var on
+/// a non-tty surfaces as a `STORE` error.
 pub fn unlock_vault_key(cfg: &SshrackConfig) -> Result<Option<vault::VaultKey>, (String, i32)> {
-    let provider = EnvPassphrase;
+    let provider = crate::cli::prompt::passphrase_provider();
     let env_pw = vault::passphrase_from_env();
-    vault::ensure_unlocked_vault_key(cfg, env_pw.as_ref(), &provider).map_err(|e| {
+    vault::ensure_unlocked_vault_key(cfg, env_pw.as_ref(), &*provider).map_err(|e| {
         (
             format!("sshrack: vault unlock failed: {e}"),
             exit_code::STORE,
