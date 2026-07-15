@@ -148,11 +148,15 @@ pub fn run(cli: &Cli) -> i32 {
     // run_host_key_flow only calls confirm for NEW keys; changed keys are
     // rejected upstream by ssh. `accept_new` (OR'd across top-level + scp)
     // accepts a first-seen key iff --accept-new was given. The closure is
-    // FnOnce, so rebuild it per iteration.
+    // FnOnce, so rebuild it per iteration. `has_tty` is a per-process fact, so
+    // compute it once before the loop.
     let accept_new = opts.accept_new;
+    let has_tty = crate::cli::prompt::has_tty();
     for (host_str, port) in &plan.remote_hosts {
+        // Temporary: still flag-only (the Prompt path returns false until Task 4
+        // swaps this closure for prompt_yes_no). Accept path already works via flag.
         let confirm = move |_fingerprint: &str| accept_new;
-        if let Err(e) = hostkey::run_host_key_flow(host_str, *port, confirm) {
+        if let Err(e) = hostkey::run_host_key_flow(host_str, *port, has_tty, accept_new, confirm) {
             eprintln!("sshrack: host key: {e}");
             return exit_code::CONNECT;
         }

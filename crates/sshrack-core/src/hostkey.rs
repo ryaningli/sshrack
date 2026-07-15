@@ -10,9 +10,9 @@
 //!
 //! The single orchestration entry is [`run_host_key_flow`]. Its only
 //! side-effect seam beyond the `ssh-keyscan`/`ssh-keygen` spawns is the
-//! injected `confirm` callback: the CLI passes a closure over `--accept-new`,
-//! the TUI passes a crossterm-based confirm, tests pass a closure. Core never
-//! depends on a UI crate.
+//! injected `confirm` callback. The caller passes `has_tty` and `accept_new`
+//! plus a `confirm` closure (CLI: tty-gated prompt or flag; TUI: a crossterm
+//! confirm; tests: a closure). Core never depends on a UI crate.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -278,36 +278,36 @@ pub fn append_to_known_hosts(
 
 /// Pre-flight host-key check. Call before `connect::launch`.
 ///
-/// This is the single orchestration entry for the host-key flow. The only
-/// side-effect seam beyond the `ssh-keyscan`/`ssh-keygen` spawns is the
-/// injected `confirm` callback — core never calls a UI crate directly. The
-/// caller decides how the "trust this new fingerprint?" question is answered
-/// (CLI: a closure over `--accept-new`; TUI: a crossterm-based confirm; tests: a closure).
+/// `has_tty` and `accept_new` are caller-supplied (core never probes the
+/// terminal itself). `confirm` is invoked only on the `Prompt` path; the only
+/// side-effect seam beyond the `ssh-keyscan`/`ssh-keygen` spawns is that
+/// callback — core never calls a UI crate directly.
 ///
-/// - known key            -> `Ok(())` (a changed key is detected and rejected
-///   by ssh itself at connect time; `ssh-keygen -F` only checks for presence,
-///   so a changed key still looks "known" here).
+/// - known key            -> `Ok(())` (a changed key is rejected by ssh itself).
+/// - `accept_new`         -> scan + append (no prompt) — explicit authorization.
 /// - new key + tty        -> scan, ask `confirm(&text)`, append on accept.
-/// - new key + no tty     -> `Err(HostKeyNotConfirmed)` (no human to confirm).
+/// - new key, no tty/flag -> `Err(HostKeyNotConfirmed)`.
 /// - `confirm` returns
-///   `false`              -> `Err(HostKeyNotConfirmed)` — the caller refused.
+///   `false`              -> `Err(HostKeyNotConfirmed)`.
 pub fn run_host_key_flow(
     host: &str,
     port: u16,
+    has_tty: bool,
+    accept_new: bool,
     confirm: impl FnOnce(&str) -> bool,
 ) -> Result<(), SshrackError> {
-    use std::io::IsTerminal;
-
     let known_hosts = known_hosts_path().ok_or(SshrackError::NoKnownHostsPath)?;
     let known = is_known(host, port, &known_hosts)?;
-    let has_tty = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
 
-    // TODO(task-3): thread real accept_new
-    match classify(known, has_tty, false) {
+    match classify(known, has_tty, accept_new) {
         HostKeyAction::Launch => Ok(()),
-        HostKeyAction::Accept => unreachable!(
-            "invariant: classify(_, _, false) never returns Accept; task-3 threads accept_new"
-        ),
+        HostKeyAction::Accept => {
+            // Flag is explicit authorization: append without prompting. tty is
+            // irrelevant here — this branch is what makes --accept-new work
+            // even in a script (no tty).
+            append_to_known_hosts(host, port, &known_hosts)?;
+            Ok(())
+        }
         HostKeyAction::Reject => Err(SshrackError::HostKeyNotConfirmed {
             host: host.to_string(),
         }),
@@ -491,8 +491,8 @@ garbage line with no fingerprint
     // `known_hosts` path, so it is hermetic with a temp file (no network, no
     // mutation of the user's `~/.ssh/known_hosts`). `scan_fingerprints` (runs
     // `ssh-keyscan` against a live host) and `run_host_key_flow` (hardcodes the
-    // real `known_hosts_path()` plus a tty check) are deliberately NOT covered
-    // here: they are network/terminal-bound and would need an injected seam to
+    // real `known_hosts_path()` and spawns `ssh-keyscan`) are deliberately NOT
+    // covered here: they are network-bound and would need an injected seam to
     // test hermetically. The pure decision matrix (`classify` /
     // `parse_fingerprints` / `pick_primary`) is already covered above.
 
