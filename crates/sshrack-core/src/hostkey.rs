@@ -10,9 +10,9 @@
 //!
 //! The single orchestration entry is [`run_host_key_flow`]. Its only
 //! side-effect seam beyond the `ssh-keyscan`/`ssh-keygen` spawns is the
-//! injected `confirm` callback: the CLI passes a closure over `--accept-new`,
-//! the TUI passes a crossterm-based confirm, tests pass a closure. Core never
-//! depends on a UI crate.
+//! injected `confirm` callback. The caller passes `has_tty` and `accept_new`
+//! plus a `confirm` closure (CLI: tty-gated prompt or flag; TUI: a crossterm
+//! confirm; tests: a closure). Core never depends on a UI crate.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -105,25 +105,31 @@ pub fn pick_primary(fps: &[Fingerprint]) -> Option<&Fingerprint> {
     fps.first()
 }
 
-/// What `run_host_key_flow` should do for a host, given whether its key is
-/// already trusted and whether a human can answer a prompt right now.
+/// What `run_host_key_flow` should do for a host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostKeyAction {
     /// Key already trusted — launch ssh directly.
     Launch,
-    /// New key, and a tty is available — scan + prompt.
+    /// New key, but `--accept-new` was given — scan + append without prompting
+    /// (the flag is explicit authorization; tty is irrelevant). This is the
+    /// branch that fixes `--accept-new` being ignored without a tty.
+    Accept,
+    /// New key, no flag, and a tty is available — scan + prompt.
     Prompt,
-    /// New key but no tty — cannot confirm; reject.
+    /// New key, no flag, no tty — cannot confirm; reject.
     Reject,
 }
 
-/// Decide the action from the two facts. Pure, so the tty/known checks stay
-/// out of the orchestration path and the matrix is unit-testable.
-pub fn classify(is_known: bool, has_tty: bool) -> HostKeyAction {
-    match (is_known, has_tty) {
-        (true, _) => HostKeyAction::Launch,
-        (false, true) => HostKeyAction::Prompt,
-        (false, false) => HostKeyAction::Reject,
+/// Decide the action from three facts. Pure, so the tty/known/flag matrix
+/// stays out of the orchestration path and is unit-testable. Flag (`accept_new`)
+/// wins over tty: a first-seen key is accepted with `--accept-new` whether or
+/// not a tty is present.
+pub fn classify(is_known: bool, has_tty: bool, accept_new: bool) -> HostKeyAction {
+    match (is_known, accept_new, has_tty) {
+        (true, _, _) => HostKeyAction::Launch,
+        (_, true, _) => HostKeyAction::Accept,
+        (false, false, true) => HostKeyAction::Prompt,
+        (false, false, false) => HostKeyAction::Reject,
     }
 }
 
@@ -272,32 +278,36 @@ pub fn append_to_known_hosts(
 
 /// Pre-flight host-key check. Call before `connect::launch`.
 ///
-/// This is the single orchestration entry for the host-key flow. The only
-/// side-effect seam beyond the `ssh-keyscan`/`ssh-keygen` spawns is the
-/// injected `confirm` callback — core never calls a UI crate directly. The
-/// caller decides how the "trust this new fingerprint?" question is answered
-/// (CLI: a closure over `--accept-new`; TUI: a crossterm-based confirm; tests: a closure).
+/// `has_tty` and `accept_new` are caller-supplied (core never probes the
+/// terminal itself). `confirm` is invoked only on the `Prompt` path; the only
+/// side-effect seam beyond the `ssh-keyscan`/`ssh-keygen` spawns is that
+/// callback — core never calls a UI crate directly.
 ///
-/// - known key            -> `Ok(())` (a changed key is detected and rejected
-///   by ssh itself at connect time; `ssh-keygen -F` only checks for presence,
-///   so a changed key still looks "known" here).
+/// - known key            -> `Ok(())` (a changed key is rejected by ssh itself).
+/// - `accept_new`         -> scan + append (no prompt) — explicit authorization.
 /// - new key + tty        -> scan, ask `confirm(&text)`, append on accept.
-/// - new key + no tty     -> `Err(HostKeyNotConfirmed)` (no human to confirm).
+/// - new key, no tty/flag -> `Err(HostKeyNotConfirmed)`.
 /// - `confirm` returns
-///   `false`              -> `Err(HostKeyNotConfirmed)` — the caller refused.
+///   `false`              -> `Err(HostKeyNotConfirmed)`.
 pub fn run_host_key_flow(
     host: &str,
     port: u16,
+    has_tty: bool,
+    accept_new: bool,
     confirm: impl FnOnce(&str) -> bool,
 ) -> Result<(), SshrackError> {
-    use std::io::IsTerminal;
-
     let known_hosts = known_hosts_path().ok_or(SshrackError::NoKnownHostsPath)?;
     let known = is_known(host, port, &known_hosts)?;
-    let has_tty = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
 
-    match classify(known, has_tty) {
+    match classify(known, has_tty, accept_new) {
         HostKeyAction::Launch => Ok(()),
+        HostKeyAction::Accept => {
+            // Flag is explicit authorization: append without prompting. tty is
+            // irrelevant here — this branch is what makes --accept-new work
+            // even in a script (no tty).
+            append_to_known_hosts(host, port, &known_hosts)?;
+            Ok(())
+        }
         HostKeyAction::Reject => Err(SshrackError::HostKeyNotConfirmed {
             host: host.to_string(),
         }),
@@ -408,19 +418,27 @@ garbage line with no fingerprint
     }
 
     #[test]
-    fn classify_known_launches() {
-        assert_eq!(classify(true, true), HostKeyAction::Launch);
-        assert_eq!(classify(true, false), HostKeyAction::Launch);
+    fn classify_known_always_launches_regardless_of_tty_or_flag() {
+        assert_eq!(classify(true, false, false), HostKeyAction::Launch);
+        assert_eq!(classify(true, true, false), HostKeyAction::Launch);
+        assert_eq!(classify(true, false, true), HostKeyAction::Launch);
     }
 
     #[test]
-    fn classify_unknown_with_tty_prompts() {
-        assert_eq!(classify(false, true), HostKeyAction::Prompt);
+    fn classify_accept_new_accepts_regardless_of_tty() {
+        // The bug fix: --accept-new wins even without a tty.
+        assert_eq!(classify(false, true, true), HostKeyAction::Accept);
+        assert_eq!(classify(false, false, true), HostKeyAction::Accept);
     }
 
     #[test]
-    fn classify_unknown_without_tty_rejects() {
-        assert_eq!(classify(false, false), HostKeyAction::Reject);
+    fn classify_new_key_with_tty_and_no_flag_prompts() {
+        assert_eq!(classify(false, true, false), HostKeyAction::Prompt);
+    }
+
+    #[test]
+    fn classify_new_key_without_tty_or_flag_rejects() {
+        assert_eq!(classify(false, false, false), HostKeyAction::Reject);
     }
 
     #[test]
@@ -473,8 +491,8 @@ garbage line with no fingerprint
     // `known_hosts` path, so it is hermetic with a temp file (no network, no
     // mutation of the user's `~/.ssh/known_hosts`). `scan_fingerprints` (runs
     // `ssh-keyscan` against a live host) and `run_host_key_flow` (hardcodes the
-    // real `known_hosts_path()` plus a tty check) are deliberately NOT covered
-    // here: they are network/terminal-bound and would need an injected seam to
+    // real `known_hosts_path()` and spawns `ssh-keyscan`) are deliberately NOT
+    // covered here: they are network-bound and would need an injected seam to
     // test hermetically. The pure decision matrix (`classify` /
     // `parse_fingerprints` / `pick_primary`) is already covered above.
 

@@ -124,7 +124,9 @@ pub fn connect_host(
     // the popup cancel used to be flattened to a host-key rejection).
     let host_str = resolved_host.host.as_str();
     let (confirm, interrupted) = host_key_confirm(handle);
-    hostkey::run_host_key_flow(host_str, port, confirm)?;
+    // The TUI always runs on a tty and has no --accept-new flag: a new key is
+    // confirmed solely via the popup (Prompt path).
+    hostkey::run_host_key_flow(host_str, port, true, false, confirm)?;
     if interrupted.get() {
         return Err(SshrackError::Interrupted);
     }

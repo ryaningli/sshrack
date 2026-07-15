@@ -40,8 +40,6 @@ use sshrack_core::secret::vault;
 use crate::cli::args::{Cli, Command};
 use crate::shared::exit_code;
 
-use super::shared::EnvPassphrase;
-
 /// Dispatch for the `Scp` arm of the CLI.
 ///
 /// Merges the top-level per-connection flags with those given after the `scp`
@@ -93,10 +91,10 @@ pub fn run(cli: &Cli) -> i32 {
     // ── Step 2: config loaded above. ──────────────────────────────────────────
 
     // ── Step 3: Vault unlock (no-op when not in vault mode). ─────────────────
-    let passphrase_provider = EnvPassphrase;
+    let passphrase_provider = crate::cli::prompt::passphrase_provider();
     let env_pw = vault::passphrase_from_env();
     let vault_key =
-        match vault::ensure_unlocked_vault_key(&cfg, env_pw.as_ref(), &passphrase_provider) {
+        match vault::ensure_unlocked_vault_key(&cfg, env_pw.as_ref(), &*passphrase_provider) {
             Ok(k) => k,
             Err(e) => {
                 eprintln!("sshrack: vault unlock failed: {e}");
@@ -149,11 +147,16 @@ pub fn run(cli: &Cli) -> i32 {
     // run_host_key_flow only calls confirm for NEW keys; changed keys are
     // rejected upstream by ssh. `accept_new` (OR'd across top-level + scp)
     // accepts a first-seen key iff --accept-new was given. The closure is
-    // FnOnce, so rebuild it per iteration.
+    // FnOnce, so rebuild it per iteration. `has_tty` is a per-process fact, so
+    // compute it once before the loop.
     let accept_new = opts.accept_new;
+    let has_tty = crate::cli::prompt::has_tty();
     for (host_str, port) in &plan.remote_hosts {
-        let confirm = move |_fingerprint: &str| accept_new;
-        if let Err(e) = hostkey::run_host_key_flow(host_str, *port, confirm) {
+        // On the Prompt path (has_tty && !accept_new) core hands us the full
+        // fingerprint text; show it and ask yes/no. The Accept path (accept_new)
+        // never calls this closure.
+        let confirm = |fingerprint_text: &str| crate::cli::prompt::prompt_yes_no(fingerprint_text);
+        if let Err(e) = hostkey::run_host_key_flow(host_str, *port, has_tty, accept_new, confirm) {
             eprintln!("sshrack: host key: {e}");
             return exit_code::CONNECT;
         }

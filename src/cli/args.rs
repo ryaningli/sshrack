@@ -54,9 +54,9 @@ pub struct ConnectOptions {
     pub ad_hoc: bool,
 
     /// Accept a host key seen for the first time (like ssh's `accept-new`).
-    /// Default refuses unknown keys. Changed keys are always rejected (ssh
-    /// upstream handles that). The only non-interactive way to accept a new
-    /// key.
+    /// Non-interactive escape hatch: without it, a new key is shown with its
+    /// fingerprint and confirmed on a tty. Changed keys are always rejected
+    /// (ssh upstream handles that).
     #[arg(long = "accept-new")]
     pub accept_new: bool,
 }
@@ -174,8 +174,8 @@ pub enum Command {
     },
 
     /// Interactive SFTP transfer screen: `sshrack sftp <name>`. Opens the
-    /// dual-pane view (system `sftp` over ControlMaster). Non-interactive
-    /// transfer remains `sshrack scp`.
+    /// dual-pane view (system `sftp` over ControlMaster). Scripted transfer
+    /// remains `sshrack scp`.
     Sftp {
         /// Per-connection flags given after the `sftp` token (overlay the
         /// top-level ones); must precede the name.
@@ -366,8 +366,8 @@ pub enum HostAction {
         clear_credential: bool,
     },
 
-    /// Remove a host from the config. Requires `--yes` (the destructive
-    /// confirmation). Interactive confirmation lives in the TUI.
+    /// Remove a host from the config. `--yes` skips the destructive-confirm
+    /// prompt and is required when there is no tty.
     Rm {
         /// Host name to remove. Required.
         name: Option<String>,
@@ -471,8 +471,8 @@ pub enum CredAction {
         #[arg(long)]
         rename: Option<String>,
     },
-    /// Remove a credential. Requires `--yes`. Interactive confirmation lives in
-    /// the TUI.
+    /// Remove a credential. `--yes` skips the destructive-confirm prompt and is
+    /// required when there is no tty.
     Rm {
         /// Credential name to remove. Required.
         name: Option<String>,
@@ -548,8 +548,8 @@ pub enum StoreAction {
     Rekey,
     /// Drop the cached master key so the next connect re-prompts (vault mode only).
     Lock,
-    /// Resolve and cache the master key ahead of a non-interactive session
-    /// (vault mode only).
+    /// Resolve and cache the master key ahead of a scripted session (vault mode
+    /// only).
     Unlock,
     /// Read or write non-secret vault runtime config (e.g. cache TTL).
     Config {

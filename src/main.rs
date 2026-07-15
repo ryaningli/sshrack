@@ -41,8 +41,8 @@ fn main() {
 ///
 /// A bare `sshrack`, or `host`/`cred` `add`/`edit` carrying no content flags,
 /// routes to the TUI (the interactive wizards); everything else — connect,
-/// scp, ls, show, rm, cp, store — runs the non-interactive CLI. `--help`/
-/// `--version` and usage errors are still owned by clap.
+/// scp, ls, show, rm, cp, store — runs the CLI. `--help`/`--version` and usage
+/// errors are still owned by clap.
 fn run_main() -> i32 {
     // Best-effort: clear sshrack temp files a prior crashed run left behind
     // (Ctrl-C / SIGKILL skip the connect path's Drop cleanup). Runs only on a
@@ -159,8 +159,8 @@ fn route_is_tui(cli: &cli::Cli) -> bool {
         Some(Command::Host { action }) => host_add_or_edit_is_empty(action),
         Some(Command::Cred { action }) => cred_add_or_edit_is_empty(action),
         // `sshrack sftp <name>` opens the TUI transfer screen directly (the
-        // dual-pane view is interactive-only). Non-interactive transfer stays
-        // on `sshrack scp` (CLI).
+        // dual-pane view is interactive-only). Scripted transfer stays on
+        // `sshrack scp` (CLI).
         Some(Command::Sftp { .. }) => true,
         _ => false,
     }

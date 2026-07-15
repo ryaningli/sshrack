@@ -39,8 +39,6 @@ use sshrack_core::secret::vault;
 use crate::cli::args::{Cli, Command};
 use crate::shared::exit_code;
 
-use super::shared::EnvPassphrase;
-
 /// Dispatch for the `Ssh`/`Connect` arms of the CLI.
 ///
 /// Merges the top-level `--port`/`--user`/`--identity`/`--credential`/
@@ -117,12 +115,13 @@ pub fn run(cli: &Cli) -> i32 {
     let port = opts.port.unwrap_or(resolved_host.port);
 
     // ── Step 3: Vault unlock (no-op when not in vault mode). ─────────────────
-    // The passphrase must come from SSHRACK_PASSPHRASE; EnvPassphrase errors
-    // (Interrupted) if unset, surfaced here as a STORE error.
-    let passphrase_provider = EnvPassphrase;
+    // TtyPassphrase prompts when a human is present; EnvPassphrase reads
+    // SSHRACK_PASSPHRASE (errors Interrupted if unset). The env var still wins
+    // — ensure_unlocked_vault_key consults it before the provider.
+    let passphrase_provider = crate::cli::prompt::passphrase_provider();
     let env_pw = vault::passphrase_from_env();
     let vault_key =
-        match vault::ensure_unlocked_vault_key(&cfg, env_pw.as_ref(), &passphrase_provider) {
+        match vault::ensure_unlocked_vault_key(&cfg, env_pw.as_ref(), &*passphrase_provider) {
             Ok(k) => k,
             Err(e) => {
                 eprintln!("sshrack: vault unlock failed: {e}");
@@ -173,13 +172,15 @@ pub fn run(cli: &Cli) -> i32 {
     };
 
     // ── Step 5: Host-key pre-flight. ─────────────────────────────────────────
-    // run_host_key_flow only calls the confirm closure for NEW keys; changed
-    // keys are rejected upstream by ssh. So returning `accept_new` accepts a
-    // first-seen key iff --accept-new was given (OR'd across top-level + ssh).
+    // `--accept-new` takes the Accept path: a first-seen key is auto-accepted
+    // (the confirm closure is never called). Without it on a tty, core calls
+    // the closure with the full fingerprint and we ask yes/no; without a tty
+    // the new key is rejected. Changed keys are always rejected upstream by ssh.
     let host_str = resolved_host.host.as_str();
     let accept_new = opts.accept_new;
-    let confirm = move |_fingerprint: &str| accept_new;
-    if let Err(e) = hostkey::run_host_key_flow(host_str, port, confirm) {
+    let has_tty = crate::cli::prompt::has_tty();
+    let confirm = |fingerprint_text: &str| crate::cli::prompt::prompt_yes_no(fingerprint_text);
+    if let Err(e) = hostkey::run_host_key_flow(host_str, port, has_tty, accept_new, confirm) {
         eprintln!("sshrack: host key: {e}");
         return exit_code::CONNECT;
     }

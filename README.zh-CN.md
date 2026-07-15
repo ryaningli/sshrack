@@ -1,6 +1,6 @@
 # sshrack
 
-> 终端原生的远程服务器管理工具。在系统 `ssh` / `scp` / `sftp` 之上叠加配置与凭据层，附带交互式 TUI 与可脚本化、非交互的 CLI。
+> 终端原生的远程服务器管理工具。在系统 `ssh` / `scp` / `sftp` 之上叠加配置与凭据层，附带交互式 TUI 与可脚本化的 CLI。
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust: 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/tools/install)
@@ -13,10 +13,10 @@
 
 - **配置 + 凭据层** —— 主机与凭据集中在一个 TOML 文件。一份凭据可被多个主机复用，改名或更新一处即处处生效，无需重复填写。优先使用密钥；密码作为兜底。
 - **三种存储模式** —— 密码静态存储可选 **OS keyring**（默认）、加密 **vault**（主密码保护）或 **plaintext**（`0600`）。随时可切换；`store use` 一键迁移全部密钥。
-- **非交互 CLI** —— 每条命令都可脚本化：`sshrack web1 df -h`、`sshrack scp ./app.tar web1:/tmp/`、`sshrack --format json host ls`。绝不交互提问；缺失输入即报错，而非发问。
+- **可脚本化 CLI** —— 每条命令都可脚本化：`sshrack web1 df -h`、`sshrack scp ./app.tar web1:/tmp/`、`sshrack --format json host ls`。在 tty 下会就主机密钥 / 密码短语 / 破坏性操作交互确认；`--accept-new`、`--yes`、`SSHRACK_PASSPHRASE` 可跳过提示，无 tty 时则报错并给出提示，绝不挂起。
 - **交互式 TUI** —— ratatui 外壳，含 Hosts / Credentials / Settings 三标签、模糊过滤、frecency 排序列表与完整的添加/编辑向导。裸 `sshrack` 即打开 TUI。
 - **SSH · SCP · SFTP** —— 驱动系统自带的 OpenSSH 二进制（**不**重新实现 SSH）。`connect` 开 shell、`scp` 脚本化传文件、`sftp` 开双面板传输屏。
-- **天然安全** —— 密码绝不进 argv / `ps`，也绝不记入日志、打印或写进错误信息。主动式主机密钥预检；拒绝静默的 `accept-new` 信任。
+- **天然安全** —— 密码绝不进 argv / `ps`，也绝不记入日志、打印或写进错误信息。主动式主机密钥预检：新密钥会展示指纹并确认，或通过显式的 `--accept-new` 接受。
 - **Frecency 排序** —— zoxide 式打分把你最常连的主机排到前面。使用记录在**连接之前**就落盘，连接卡死也不会丢。
 
 > sshrack 正在积极开发中（Alpha）。CLI、TUI 与 SFTP 传输屏均已可用，但仍可能有粗糙之处。
@@ -41,7 +41,7 @@ cargo build --release
 
 ## 🚀 使用
 
-### CLI（非交互）
+### CLI
 
 ```bash
 sshrack web1 df -h                       # 连接并跑一次性命令
@@ -111,7 +111,7 @@ sshrack 在单个二进制内采用 **严格的后端/前端分离**：
 
 ```
 sshrack-core（纯后端，零 UI 依赖）              ─▶  sshrack 二进制（前端）
-  config · credential · secret · connect            ├─ cli/   非交互，绝不提问
+  config · credential · secret · connect            ├─ cli/   tty 交互 + 逃生舱
   hostkey · frecency · askpass · error              └─ tui/   交互式 ratatui 外壳
    │                                                    │
    └─ 副作用通过 trait 注入                               └─ 注入 crossterm 实现

@@ -15,7 +15,7 @@ sshrack/
 ├── Cargo.toml                  # [workspace] members = ["crates/sshrack-core"]; [package] = the sshrack bin
 ├── src/                        # FRONTEND: the `sshrack` binary (single executable)
 │   ├── main.rs                 #   SSH_ASKPASS role dispatch + cli/tui routing (route_is_tui)
-│   ├── cli/                    #   NON-INTERACTIVE command surface (never prompts)
+│   ├── cli/                    #   command surface (tty-interactive + escape hatches)
 │   │   ├── args.rs             #     clap derive (Cli/Command/HostAction/CredAction/StoreAction)
 │   │   ├── table.rs            #     text table rendering for ls/show
 │   │   └── mod.rs              #     cmd handlers (connect/scp/host/cred/store) + run()
@@ -65,7 +65,7 @@ sshrack/
 ## Core Invariants
 
 - `sshrack-core/Cargo.toml` **never** lists `ratatui`, `crossterm`, `nucleo-matcher`, or `console`. UI crates are dependencies of the root package only. Adding any of them to core is a build failure by intent.
-- Side effects are injected via traits: core defines `secret::SecretBackend` (keyring set/get/delete/available), `secret::PassphraseProvider` (passphrase/passphrase_confirm/confirm), and `hostkey::run_host_key_flow` takes a `confirm: impl FnOnce(&str) -> bool` callback. The TUI injects crossterm-based impls; the CLI reads the vault passphrase from `SSHRACK_PASSPHRASE` (no prompt); tests inject fakes.
+- Side effects are injected via traits: core defines `secret::SecretBackend` (keyring set/get/delete/available), `secret::PassphraseProvider` (passphrase/passphrase_confirm/confirm), and `hostkey::run_host_key_flow` takes a `confirm: impl FnOnce(&str) -> bool` callback. The TUI injects crossterm-based impls; the CLI uses a tty prompt with `SSHRACK_PASSPHRASE` as the escape hatch; tests inject fakes.
 - The shipped `sshrack` binary is a **single executable** that doubles as its own `SSH_ASKPASS` helper: `main.rs` dispatches on `SSHRACK_ASKPASS_FILE` / `SSHRACK_KEYRING_KEY` to the askpass role, otherwise parses the CLI and routes cli vs tui.
 - The connect path **never sits in the ssh data stream**: `ssh`/`scp` are spawned with inherited stdio. There is no PTY pump.
 - `frecency` is persisted **before** spawning ssh, so a hung ssh never loses the usage record.

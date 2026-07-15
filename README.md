@@ -1,6 +1,6 @@
 # sshrack
 
-> Terminal-native remote server management. A config + credential layer over system `ssh` / `scp` / `sftp`, with an interactive TUI and a scriptable, non-interactive CLI.
+> Terminal-native remote server management. A config + credential layer over system `ssh` / `scp` / `sftp`, with an interactive TUI and a scriptable CLI.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust: 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/tools/install)
@@ -13,10 +13,10 @@
 
 - **Config + credential layer** — Hosts and credentials live in one TOML file. A credential is reusable across hosts, and a rename or update takes effect everywhere — no duplicated entries. Keys preferred; passwords the fallback.
 - **Three storage modes** — Passwords at rest in the **OS keyring** (default), an encrypted **vault** (master-passphrase protected), or **plaintext** (`0600`). Switch any time; `store use` migrates every secret.
-- **Non-interactive CLI** — Every command is scriptable: `sshrack web1 df -h`, `sshrack scp ./app.tar web1:/tmp/`, `sshrack --format json host ls`. Never prompts; missing input is an error, not a question.
+- **Scriptable CLI** — Every command is scriptable: `sshrack web1 df -h`, `sshrack scp ./app.tar web1:/tmp/`, `sshrack --format json host ls`. On a tty it prompts for host-key / passphrase / destructive confirms; `--accept-new`, `--yes`, and `SSHRACK_PASSPHRASE` skip the prompts, and without a tty it errors with a hint instead of hanging.
 - **Interactive TUI** — A ratatui shell with Hosts / Credentials / Settings tabs, fuzzy filter, frecency-ranked list, and full add/edit wizards. Bare `sshrack` opens it.
 - **SSH · SCP · SFTP** — Drives the system OpenSSH binaries (it does **not** reimplement SSH). Connect for a shell, `scp` for scripted transfer, `sftp` for a dual-pane transfer screen.
-- **Secure by construction** — Passwords never enter argv / `ps`, and are never logged, printed, or shown in errors. Proactive host-key pre-flight; silent `accept-new` trust is refused.
+- **Secure by construction** — Passwords never enter argv / `ps`, and are never logged, printed, or shown in errors. Proactive host-key pre-flight: a new key is shown with its fingerprint and confirmed, or accepted via an explicit `--accept-new`.
 - **Frecency ranking** — zoxide-style scoring surfaces the hosts you reach most. The usage record is saved *before* connecting, so a hung connection never loses it.
 
 > sshrack is under active development (Alpha). The CLI, TUI, and SFTP transfer screen are functional; expect rough edges.
@@ -41,7 +41,7 @@ cargo build --release
 
 ## 🚀 Usage
 
-### CLI (non-interactive)
+### CLI
 
 ```bash
 sshrack web1 df -h                       # connect, run a one-off command
@@ -111,7 +111,7 @@ sshrack has a **strict backend/frontend split** in a single binary:
 
 ```
 sshrack-core (pure backend, ZERO UI deps)        ─▶  sshrack binary (frontend)
-  config · credential · secret · connect              ├─ cli/   non-interactive, never prompts
+  config · credential · secret · connect              ├─ cli/   tty-interactive + escape hatches
   hostkey · frecency · askpass · error                └─ tui/   interactive ratatui shell
    │                                                      │
    └─ side effects injected via traits                    └─ injects crossterm impls

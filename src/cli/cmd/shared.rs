@@ -5,8 +5,9 @@
 //! [`Ulid`] before a pure core call, and ranking hosts by frecency for
 //! `host ls --sort frecency`.
 //!
-//! The only passphrase source in this layer is [`EnvPassphrase`] (the
-//! `SSHRACK_PASSPHRASE` env var). There are no TTY prompts anywhere here.
+//! Passphrase providers live in [`crate::cli::prompt`] (`TtyPassphrase` when a
+//! tty is present, `EnvPassphrase` for scripts/CI). This layer no longer owns a
+//! passphrase provider; it borrows one via [`prompt::passphrase_provider`].
 //!
 //! Nothing here prints, logs, or returns a password in an error message.
 
@@ -15,7 +16,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use ulid::Ulid;
-use zeroize::Zeroizing;
 
 use sshrack_core::config::path as config_path;
 use sshrack_core::config::schema::{
@@ -23,11 +23,9 @@ use sshrack_core::config::schema::{
 };
 use sshrack_core::config::store;
 use sshrack_core::credential;
-use sshrack_core::error::SshrackError;
 use sshrack_core::frecency;
 use sshrack_core::id::OwnerKind;
 use sshrack_core::secret::OsKeyring;
-use sshrack_core::secret::PassphraseProvider;
 use sshrack_core::secret::vault;
 
 use crate::cli::args::SortMode;
@@ -85,12 +83,13 @@ pub fn resolve_credential_name(
 
 /// Unlock the vault when vault mode is active, returning the master key (or
 /// `None` when not in vault mode). Used by `host/cred show --reveal`. The
-/// passphrase comes only from `SSHRACK_PASSPHRASE` (via [`EnvPassphrase`]);
-/// an unset env var surfaces as a `STORE` error.
+/// passphrase comes from `SSHRACK_PASSPHRASE` when set, otherwise prompted on
+/// a tty via [`crate::cli::prompt::passphrase_provider`]; an unset env var on
+/// a non-tty surfaces as a `STORE` error.
 pub fn unlock_vault_key(cfg: &SshrackConfig) -> Result<Option<vault::VaultKey>, (String, i32)> {
-    let provider = EnvPassphrase;
+    let provider = crate::cli::prompt::passphrase_provider();
     let env_pw = vault::passphrase_from_env();
-    vault::ensure_unlocked_vault_key(cfg, env_pw.as_ref(), &provider).map_err(|e| {
+    vault::ensure_unlocked_vault_key(cfg, env_pw.as_ref(), &*provider).map_err(|e| {
         (
             format!("sshrack: vault unlock failed: {e}"),
             exit_code::STORE,
@@ -139,26 +138,6 @@ pub fn seal_inline_body(
             exit_code::STORE,
         )
     })
-}
-
-/// The only passphrase source in the non-interactive CLI: the
-/// `SSHRACK_PASSPHRASE` env var. Errors if unset (mapped to
-/// [`SshrackError::Interrupted`] so the vault unlock path produces a clean
-/// "vault unlock failed" message rather than a TTY hang).
-pub struct EnvPassphrase;
-
-impl PassphraseProvider for EnvPassphrase {
-    fn passphrase(&self) -> Result<Zeroizing<String>, SshrackError> {
-        vault::passphrase_from_env().ok_or(SshrackError::Interrupted)
-    }
-
-    fn passphrase_confirm(&self) -> Result<Zeroizing<String>, SshrackError> {
-        self.passphrase()
-    }
-
-    fn confirm(&self, _text: &str) -> Result<bool, SshrackError> {
-        Ok(false)
-    }
 }
 
 // ===========================================================================

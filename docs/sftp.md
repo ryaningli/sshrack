@@ -31,7 +31,7 @@ A failed or cancelled transfer removes the partial destination (download: local 
 - Port forwarding, `~/.ssh/config` read-only import, 2FA, `print-command` + clipboard.
 - SFTP file-management (delete/mkdir/rename/chmod), resume (`reget`/`reput`), directory cache, global shared ControlMaster (connect/scp reuse), concurrent transfers, recursive-dir upload partial cleanup, upload remote-exists overwrite check.
 
-The CLI scripttable-transfer moat (`sshrack scp`) and non-interactive command execution (`sshrack <name> <cmd>`) remain first-class.
+The CLI's scriptable-transfer moat (`sshrack scp`) and one-off command execution (`sshrack <name> <cmd>`) remain first-class.
 
 ## Queue Manager (`^Q`)
 

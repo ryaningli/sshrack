@@ -37,6 +37,9 @@ unicode-width = "0.2"
 # crossterm, matching our existing ratatui backend.
 ratatui-textarea = "0.9"
 signal-hook = "0.3"
+# No-echo passphrase + yes/no prompts for the CLI's default-interactive mode
+# (binary crate only — sshrack-core stays zero-UI).
+rpassword = "7"
 
 [dev-dependencies]
 tempfile = "3"

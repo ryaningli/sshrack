@@ -44,7 +44,7 @@ use crate::cli::args::{Cli, OutputFormat, StoreAction, StoreMode};
 use crate::shared::exit_code;
 use crate::shared::format as fmt;
 
-use super::shared::{EnvPassphrase, fail, load_config, save_config, unlock_vault_key};
+use super::shared::{fail, load_config, save_config, unlock_vault_key};
 
 /// The single tunable vault runtime field exposed by `store config`: the
 /// master-key cache TTL in seconds (`0` disables caching). KDF cost params
@@ -232,8 +232,9 @@ fn switch_to_keyring(
     Ok(exit_code::SUCCESS)
 }
 
-/// Switch to vault mode. The passphrase must come from `SSHRACK_PASSPHRASE`
-/// (errors if unset); [`vault::enable`] then derives the key, writes the
+/// Switch to vault mode. The passphrase comes from `SSHRACK_PASSPHRASE` when
+/// set (script escape hatch), otherwise a double-entry prompt on a tty; with
+/// neither, errors `STORE`. [`vault::enable`] then derives the key, writes the
 /// verifier, and migrates every existing password before flipping `cfg.store`.
 fn switch_to_vault(
     cfg: &mut SshrackConfig,
@@ -253,15 +254,24 @@ fn switch_to_vault(
         ));
     }
     vault::cache::clear_default_cache();
-    // The passphrase must come from the env; refuse to prompt. An unset env
-    // surfaces as a store error.
+    // Env wins (script escape hatch); otherwise prompt with double-entry on a
+    // tty, or error when neither is available.
     let passphrase = match vault::passphrase_from_env() {
         Some(p) => p,
         None => {
-            return Err((
-                "sshrack: vault passphrase required (set SSHRACK_PASSPHRASE)".into(),
-                exit_code::STORE,
-            ));
+            let provider = crate::cli::prompt::passphrase_provider();
+            match provider.passphrase_confirm() {
+                Ok(p) => p,
+                Err(SshrackError::Interrupted) => {
+                    return Err((
+                        "sshrack: vault passphrase required (set SSHRACK_PASSPHRASE \
+                         or run in a tty)"
+                            .into(),
+                        exit_code::STORE,
+                    ));
+                }
+                Err(e) => return Err((format!("sshrack: {e}"), exit_code::STORE)),
+            }
         }
     };
     vault::enable(cfg, &passphrase, cache_ttl_secs, backend)
@@ -285,10 +295,14 @@ fn switch_to_plaintext(
         println!("already in plaintext mode");
         return Ok(exit_code::SUCCESS);
     }
-    // A destructive downgrade: require an explicit --yes.
-    if !yes {
+    // Security downgrade: --yes skips the prompt; otherwise confirm on a tty.
+    let confirmed = yes
+        || crate::cli::prompt::tty_confirm(
+            "Switching to plaintext stores all passwords unencrypted. Continue?",
+        );
+    if !confirmed {
         return Err((
-            "sshrack: switching to plaintext is a security downgrade; pass --yes to confirm".into(),
+            "sshrack: not switching to plaintext (pass --yes, or run in a tty to confirm)".into(),
             exit_code::USAGE,
         ));
     }
@@ -335,8 +349,9 @@ fn store_err(context: &'static str) -> impl Fn(SshrackError) -> (String, i32) {
 /// `sshrack store rekey`: change the master passphrase. Unlock under the
 /// current passphrase, decrypt everything to plaintext, clear the vault, then
 /// re-enable under a fresh passphrase (new salt, new verifier). Errors
-/// `VaultNotEnabled` when no vault is configured. Both the old and new
-/// passphrases come from `SSHRACK_PASSPHRASE` (env-only).
+/// `VaultNotEnabled` when no vault is configured. Each passphrase comes from
+/// `SSHRACK_PASSPHRASE` when set, otherwise a tty prompt (single-entry to
+/// unlock, double-entry for the new passphrase).
 fn rekey(cli: &Cli) -> i32 {
     let (path, mut cfg) = match load_config(cli.config.as_deref()) {
         Ok(v) => v,
@@ -354,11 +369,11 @@ fn rekey(cli: &Cli) -> i32 {
         );
     }
 
-    let provider = EnvPassphrase;
+    let provider = crate::cli::prompt::passphrase_provider();
     let env_pw = vault::passphrase_from_env();
 
     // Unlock with the current passphrase, decrypt everything to plaintext.
-    let old_key = match vault::ensure_unlocked_vault_key(&cfg, env_pw.as_ref(), &provider) {
+    let old_key = match vault::ensure_unlocked_vault_key(&cfg, env_pw.as_ref(), &*provider) {
         Ok(Some(k)) => k,
         Ok(None) => {
             // Unreachable: is_vault() is true above, so ensure_unlocked_vault_key
@@ -382,15 +397,20 @@ fn rekey(cli: &Cli) -> i32 {
     let preserved_ttl = cfg.vault_meta().map(|m| m.cache_ttl_secs);
     cfg.store = None;
 
-    // Re-enable under a fresh passphrase (new salt, new verifier). Env-only.
+    // Re-enable under a fresh passphrase (new salt, new verifier). Env wins;
+    // otherwise double-entry prompt on a tty; otherwise error.
     let new_passphrase = match vault::passphrase_from_env() {
         Some(p) => p,
-        None => {
-            return fail(
-                "sshrack: new vault passphrase required (set SSHRACK_PASSPHRASE)",
-                exit_code::STORE,
-            );
-        }
+        None => match crate::cli::prompt::passphrase_provider().passphrase_confirm() {
+            Ok(p) => p,
+            Err(SshrackError::Interrupted) => {
+                return fail(
+                    "sshrack: new vault passphrase required (set SSHRACK_PASSPHRASE or run in a tty)",
+                    exit_code::STORE,
+                );
+            }
+            Err(e) => return fail(&format!("sshrack: {e}"), exit_code::STORE),
+        },
     };
     if let Err(e) = vault::enable(&mut cfg, &new_passphrase, preserved_ttl, &backend) {
         return fail(
@@ -425,8 +445,9 @@ fn lock(cli: &Cli) -> i32 {
 }
 
 /// `sshrack store unlock`: pre-warm the cached master key so subsequent
-/// non-interactive invocations hit the cache. Idempotent. Errors `STORE` when
-/// no vault is configured. The passphrase comes from `SSHRACK_PASSPHRASE`.
+/// scripted invocations hit the cache. Idempotent. Errors `STORE` when
+/// no vault is configured. The passphrase comes from `SSHRACK_PASSPHRASE` when
+/// set, otherwise a single-entry prompt on a tty.
 fn unlock(cli: &Cli) -> i32 {
     let (_path, cfg) = match load_config(cli.config.as_deref()) {
         Ok(v) => v,
@@ -438,9 +459,9 @@ fn unlock(cli: &Cli) -> i32 {
             exit_code::STORE,
         );
     }
-    let provider = EnvPassphrase;
+    let provider = crate::cli::prompt::passphrase_provider();
     let env_pw = vault::passphrase_from_env();
-    match vault::ensure_unlocked_vault_key(&cfg, env_pw.as_ref(), &provider) {
+    match vault::ensure_unlocked_vault_key(&cfg, env_pw.as_ref(), &*provider) {
         Ok(_) => {}
         Err(SshrackError::Interrupted) => return 130,
         Err(e) => {

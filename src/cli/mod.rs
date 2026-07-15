@@ -1,14 +1,16 @@
-//! Non-interactive command surface. The CLI is fail-closed: every required
-//! field must come from a flag (missing `--host`/`--user`/`<name>` errors with
-//! `VALIDATION`/`USAGE`), the vault passphrase comes only from the
-//! `SSHRACK_PASSPHRASE` env var, destructive actions (`host rm`, `cred rm`,
-//! `store use plaintext`) require `--yes`, and a first-seen host key is only
-//! accepted with `--accept-new`. There is no `--no-input` toggle and no TTY
-//! prompting anywhere in this layer — the interactive wizard lives in `tui`.
+//! Command surface. The CLI defaults to interactive on a tty — it prompts for
+//! host-key confirmation, the vault passphrase, and destructive-action
+//! confirmation — while per-scenario escape hatches (`--accept-new`, `--yes`,
+//! `SSHRACK_PASSPHRASE`) take precedence and keep every command scriptable.
+//! Without a tty it falls back to the escape hatch or errors with a hint; it
+//! never hangs. Required *config* fields stay fail-closed (missing
+//! `--host`/`--user`/`<name>` errors with `VALIDATION`/`USAGE`). The full
+//! interactive wizard surface lives in `tui`.
 use clap::CommandFactory;
 
 pub mod args;
 pub mod cmd;
+pub(crate) mod prompt;
 pub mod table;
 
 use crate::shared::exit_code;
