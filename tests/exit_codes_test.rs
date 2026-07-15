@@ -10,6 +10,20 @@
 //! Hermeticity: every run points `--config` at a fresh temp file; these are
 //! management/list commands, so no network or `known_hosts` is touched. The
 //! `SSHRACK_PASSPHRASE` parent env is irrelevant (no vault unlock here).
+//!
+//! tty-path coverage split: the destructive confirm (`tty_confirm`) reaches a
+//! human only when BOTH stdin and stderr are a terminal. `Command::output()`
+//! pipes stdio, so `has_tty()` is false and the `--yes`-absent tests below pin
+//! the **no-tty error branch**. The tty yes/no branch (`prompt_yes_no`
+//! returning true on `y`/`yes`) is covered by the unit tests in
+//! `src/cli/prompt.rs` (`is_tty_pair`, `parse_yes_no`,
+//! `prompt_yes_no_returns_false_without_tty`) plus manual verification.
+//! Automating it here would need a pty harness the repo does not yet carry:
+//! an unsafe-free `openpty` wrapper requires a direct `nix` dev-dependency
+//! (`nix` is only transitive today, via `keyring -> mac_address`), and the
+//! `script`(1) wrapper diverges between util-linux and BSD/macOS. The no-tty
+//! pins + the `prompt.rs` unit layer are therefore the coverage vehicle by
+//! intent, not by oversight.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -87,9 +101,10 @@ fn host_add_duplicate_name_exits_duplicate() {
 // USAGE (2): missing --yes confirmations, missing operands, missing name
 // ---------------------------------------------------------------------------
 
-/// `host rm <name>` without `--yes` is rejected (USAGE) — destructive
-/// operations require an explicit confirmation flag (no interactive fallback on
-/// the CLI).
+/// `host rm <name>` without `--yes` is rejected (USAGE) when stdio is not a
+/// tty: the hint tells the user to pass `--yes` or run in a tty. On a tty,
+/// `tty_confirm` would prompt `(y/N)` instead of erroring. (`Command::output()`
+/// pipes stdio, so `has_tty()` is false here — this pins the no-tty error path.)
 #[test]
 fn host_rm_without_yes_is_rejected_as_usage() {
     let (cfg, _dir) = fresh_config();
@@ -102,8 +117,8 @@ fn host_rm_without_yes_is_rejected_as_usage() {
         "rm without --yes exits USAGE: {stderr}"
     );
     assert!(
-        stderr.contains("--yes"),
-        "rejection message tells the user to pass --yes: {stderr}"
+        stderr.contains("--yes") && stderr.contains("tty"),
+        "rejection hints at --yes and a tty: {stderr}"
     );
 }
 
@@ -158,8 +173,11 @@ fn host_edit_without_name_exits_usage() {
     );
 }
 
-/// `store use plaintext` without `--yes` is rejected (USAGE) — switching to
-/// plaintext is a security downgrade that needs explicit confirmation.
+/// `store use plaintext` without `--yes` is rejected (USAGE) when stdio is not
+/// a tty. The security downgrade needs explicit confirmation: either `--yes`,
+/// or a `tty_confirm` `(y/N)` prompt when a tty is attached. (`Command::output()`
+/// pipes stdio, so `has_tty()` is false here — this pins the no-tty error path,
+/// and the hint names both `--yes` and a tty.)
 #[test]
 fn store_use_plaintext_without_yes_is_rejected_as_usage() {
     let (cfg, _dir) = fresh_config();
@@ -170,8 +188,8 @@ fn store_use_plaintext_without_yes_is_rejected_as_usage() {
         "store use plaintext without --yes exits USAGE: {stderr}"
     );
     assert!(
-        stderr.contains("--yes"),
-        "rejection message names the required flag: {stderr}"
+        stderr.contains("--yes") && stderr.contains("tty"),
+        "rejection hints at --yes and a tty: {stderr}"
     );
 }
 
