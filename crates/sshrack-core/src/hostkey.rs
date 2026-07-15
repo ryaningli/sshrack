@@ -105,25 +105,31 @@ pub fn pick_primary(fps: &[Fingerprint]) -> Option<&Fingerprint> {
     fps.first()
 }
 
-/// What `run_host_key_flow` should do for a host, given whether its key is
-/// already trusted and whether a human can answer a prompt right now.
+/// What `run_host_key_flow` should do for a host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostKeyAction {
     /// Key already trusted — launch ssh directly.
     Launch,
-    /// New key, and a tty is available — scan + prompt.
+    /// New key, but `--accept-new` was given — scan + append without prompting
+    /// (the flag is explicit authorization; tty is irrelevant). This is the
+    /// branch that fixes `--accept-new` being ignored without a tty.
+    Accept,
+    /// New key, no flag, and a tty is available — scan + prompt.
     Prompt,
-    /// New key but no tty — cannot confirm; reject.
+    /// New key, no flag, no tty — cannot confirm; reject.
     Reject,
 }
 
-/// Decide the action from the two facts. Pure, so the tty/known checks stay
-/// out of the orchestration path and the matrix is unit-testable.
-pub fn classify(is_known: bool, has_tty: bool) -> HostKeyAction {
-    match (is_known, has_tty) {
-        (true, _) => HostKeyAction::Launch,
-        (false, true) => HostKeyAction::Prompt,
-        (false, false) => HostKeyAction::Reject,
+/// Decide the action from three facts. Pure, so the tty/known/flag matrix
+/// stays out of the orchestration path and is unit-testable. Flag (`accept_new`)
+/// wins over tty: a first-seen key is accepted with `--accept-new` whether or
+/// not a tty is present.
+pub fn classify(is_known: bool, has_tty: bool, accept_new: bool) -> HostKeyAction {
+    match (is_known, accept_new, has_tty) {
+        (true, _, _) => HostKeyAction::Launch,
+        (_, true, _) => HostKeyAction::Accept,
+        (false, false, true) => HostKeyAction::Prompt,
+        (false, false, false) => HostKeyAction::Reject,
     }
 }
 
@@ -296,8 +302,12 @@ pub fn run_host_key_flow(
     let known = is_known(host, port, &known_hosts)?;
     let has_tty = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
 
-    match classify(known, has_tty) {
+    // TODO(task-3): thread real accept_new
+    match classify(known, has_tty, false) {
         HostKeyAction::Launch => Ok(()),
+        HostKeyAction::Accept => unreachable!(
+            "invariant: classify(_, _, false) never returns Accept; task-3 threads accept_new"
+        ),
         HostKeyAction::Reject => Err(SshrackError::HostKeyNotConfirmed {
             host: host.to_string(),
         }),
@@ -408,19 +418,27 @@ garbage line with no fingerprint
     }
 
     #[test]
-    fn classify_known_launches() {
-        assert_eq!(classify(true, true), HostKeyAction::Launch);
-        assert_eq!(classify(true, false), HostKeyAction::Launch);
+    fn classify_known_always_launches_regardless_of_tty_or_flag() {
+        assert_eq!(classify(true, false, false), HostKeyAction::Launch);
+        assert_eq!(classify(true, true, false), HostKeyAction::Launch);
+        assert_eq!(classify(true, false, true), HostKeyAction::Launch);
     }
 
     #[test]
-    fn classify_unknown_with_tty_prompts() {
-        assert_eq!(classify(false, true), HostKeyAction::Prompt);
+    fn classify_accept_new_accepts_regardless_of_tty() {
+        // The bug fix: --accept-new wins even without a tty.
+        assert_eq!(classify(false, true, true), HostKeyAction::Accept);
+        assert_eq!(classify(false, false, true), HostKeyAction::Accept);
     }
 
     #[test]
-    fn classify_unknown_without_tty_rejects() {
-        assert_eq!(classify(false, false), HostKeyAction::Reject);
+    fn classify_new_key_with_tty_and_no_flag_prompts() {
+        assert_eq!(classify(false, true, false), HostKeyAction::Prompt);
+    }
+
+    #[test]
+    fn classify_new_key_without_tty_or_flag_rejects() {
+        assert_eq!(classify(false, false, false), HostKeyAction::Reject);
     }
 
     #[test]
