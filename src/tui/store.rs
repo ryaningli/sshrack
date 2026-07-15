@@ -332,4 +332,61 @@ mod tests {
         let v = StoreView::new(None);
         assert_eq!(v.active_label, "undecided");
     }
+
+    // ---- draw_in_dialog: smoke (no panic) + snapshot ----
+
+    /// Render the store picker into a full dialog (chrome + body) the way the
+    /// app does, so the snapshot captures the three-mode list + active marker.
+    fn render_picker(
+        view: &StoreView,
+        w: u16,
+        h: u16,
+    ) -> ratatui::Terminal<ratatui::backend::TestBackend> {
+        let backend = ratatui::backend::TestBackend::new(w, h);
+        let mut term = ratatui::Terminal::new(backend).expect("test backend");
+        term.draw(|f| {
+            let body = crate::tui::dialog::draw_dialog(
+                f,
+                " storage mode ",
+                view.body_rows(),
+                &[("↑↓", "select"), ("Enter", "switch"), ("Esc/^C", "cancel")],
+            );
+            view.draw_in_dialog(f, body);
+        })
+        .expect("draw");
+        term
+    }
+
+    #[test]
+    fn draw_in_dialog_renders_without_panic_80x24_and_narrow() {
+        let v = StoreView::new(Some("vault"));
+        // 80x24.
+        let _ = render_picker(&v, 80, 24);
+        // Narrow 40x8 (dialog clamps down; must not panic or overflow).
+        let _ = render_picker(&v, 40, 8);
+    }
+
+    #[test]
+    fn draw_in_dialog_cursor_on_plaintext_renders_without_panic() {
+        let mut v = StoreView::new(Some("keyring"));
+        v.move_selection(1); // -> vault
+        v.move_selection(1); // -> plaintext
+        let _ = render_picker(&v, 40, 8);
+    }
+
+    #[test]
+    fn draw_in_dialog_undecided_active_renders_without_panic() {
+        let v = StoreView::new(None);
+        let _ = render_picker(&v, 40, 8);
+    }
+
+    #[test]
+    fn draw_in_dialog_vault_active_cursor_keyring_snapshot_80x24() {
+        // Snapshot: vault is the active mode (marked `(active)`), cursor on
+        // keyring (the default, focus marker `▶`). Hermetic: TestBackend in
+        // memory, fixed labels, no timestamps.
+        let v = StoreView::new(Some("vault"));
+        let term = render_picker(&v, 80, 24);
+        insta::assert_snapshot!(term.backend());
+    }
 }

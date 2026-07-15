@@ -796,4 +796,142 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
     }
+
+    // ---- ConnectOptions::overlay: top-level flags merge with subcommand ones ----
+    //
+    // `overlay` merges two ConnectOptions layers (the flattened top-level one
+    // and the per-subcommand one) so `sshrack --port 9 ssh web1` and
+    // `sshrack ssh --port 9 web1` behave the same. For user/port/identity/
+    // credential the subcommand (self) value wins when set and falls back to
+    // the top-level (base) otherwise; ad_hoc and accept_new are OR (either
+    // level opting in is enough).
+
+    #[test]
+    fn overlay_self_set_field_wins_over_base() {
+        // Every option field set on both layers → self wins per field.
+        let base = ConnectOptions {
+            user: Some("base-user".into()),
+            port: Some(22),
+            identity: Some(PathBuf::from("/base/key")),
+            credential: Some("base-cred".into()),
+            ad_hoc: false,
+            accept_new: false,
+        };
+        let inner = ConnectOptions {
+            user: Some("inner-user".into()),
+            port: Some(2222),
+            identity: Some(PathBuf::from("/inner/key")),
+            credential: Some("inner-cred".into()),
+            ad_hoc: false,
+            accept_new: false,
+        };
+        let out = inner.overlay(&base);
+        assert_eq!(out.user.as_deref(), Some("inner-user"));
+        assert_eq!(out.port, Some(2222));
+        assert_eq!(
+            out.identity.as_deref(),
+            Some(std::path::Path::new("/inner/key"))
+        );
+        assert_eq!(out.credential.as_deref(), Some("inner-cred"));
+    }
+
+    #[test]
+    fn overlay_self_unset_field_inherits_base() {
+        // self (subcommand) omits every option → base (top-level) is inherited.
+        let base = ConnectOptions {
+            user: Some("base-user".into()),
+            port: Some(22),
+            identity: Some(PathBuf::from("/base/key")),
+            credential: Some("base-cred".into()),
+            ad_hoc: false,
+            accept_new: false,
+        };
+        let out = ConnectOptions::default().overlay(&base);
+        assert_eq!(out.user.as_deref(), Some("base-user"));
+        assert_eq!(out.port, Some(22));
+        assert_eq!(
+            out.identity.as_deref(),
+            Some(std::path::Path::new("/base/key"))
+        );
+        assert_eq!(out.credential.as_deref(), Some("base-cred"));
+    }
+
+    #[test]
+    fn overlay_subcommand_port_overrides_top_level() {
+        // The documented motivation: a subcommand `--port` overrides a
+        // top-level `--port` (self wins).
+        let base = ConnectOptions {
+            port: Some(22),
+            ..ConnectOptions::default()
+        };
+        let inner = ConnectOptions {
+            port: Some(2222),
+            ..ConnectOptions::default()
+        };
+        assert_eq!(inner.overlay(&base).port, Some(2222));
+    }
+
+    #[test]
+    fn overlay_accept_new_ors_top_level_with_subcommand() {
+        // accept_new is OR: top-level --accept-new propagates when the
+        // subcommand omits it; a subcommand flag also turns it on; neither
+        // leaves it off.
+        let top_level_only = ConnectOptions {
+            accept_new: true,
+            ..ConnectOptions::default()
+        };
+        assert!(
+            ConnectOptions::default()
+                .overlay(&top_level_only)
+                .accept_new,
+            "top-level accept_new must propagate to an omitting subcommand"
+        );
+
+        let subcommand_only = ConnectOptions {
+            accept_new: true,
+            ..ConnectOptions::default()
+        };
+        assert!(
+            subcommand_only
+                .overlay(&ConnectOptions::default())
+                .accept_new,
+            "subcommand accept_new must win through"
+        );
+
+        assert!(
+            !ConnectOptions::default()
+                .overlay(&ConnectOptions::default())
+                .accept_new,
+            "neither level opting in → false"
+        );
+    }
+
+    #[test]
+    fn overlay_ad_hoc_ors_across_levels() {
+        // ad_hoc is OR across both layers, mirroring accept_new.
+        let base_on = ConnectOptions {
+            ad_hoc: true,
+            ..ConnectOptions::default()
+        };
+        assert!(
+            ConnectOptions::default().overlay(&base_on).ad_hoc,
+            "base-only ad_hoc true → true"
+        );
+
+        let self_on = ConnectOptions {
+            ad_hoc: true,
+            ..ConnectOptions::default()
+        };
+        assert!(
+            self_on.overlay(&ConnectOptions::default()).ad_hoc,
+            "self-only ad_hoc true → true"
+        );
+
+        assert!(
+            !ConnectOptions::default()
+                .overlay(&ConnectOptions::default())
+                .ad_hoc,
+            "both false → false"
+        );
+    }
 }

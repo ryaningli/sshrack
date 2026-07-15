@@ -466,4 +466,135 @@ garbage line with no fingerprint
     fn strip_comments_empty_when_only_comments_and_blanks() {
         assert_eq!(strip_comments("# banner\n\n# another\n"), "");
     }
+
+    // ---- is_known: hermetic lookup against a temp known_hosts (no network) ----
+    //
+    // `is_known` spawns real `ssh-keygen -F` against a caller-supplied
+    // `known_hosts` path, so it is hermetic with a temp file (no network, no
+    // mutation of the user's `~/.ssh/known_hosts`). `scan_fingerprints` (runs
+    // `ssh-keyscan` against a live host) and `run_host_key_flow` (hardcodes the
+    // real `known_hosts_path()` plus a tty check) are deliberately NOT covered
+    // here: they are network/terminal-bound and would need an injected seam to
+    // test hermetically. The pure decision matrix (`classify` /
+    // `parse_fingerprints` / `pick_primary`) is already covered above.
+
+    /// Generate a throwaway ed25519 host key with `ssh-keygen` and return a
+    /// `known_hosts` line for `host` (port-22 bare form): `<host> ssh-ed25519 <b64>`.
+    /// Uses a real `ssh-keygen`-produced public key so `ssh-keygen -F` matches
+    /// the line. Hermetic: the keypair is throwaway (temp dir dropped on
+    /// return), and only the public-key text is returned — no network.
+    fn generate_ed25519_known_hosts_line(host: &str) -> String {
+        let dir = tempfile::tempdir().expect("temp dir for keygen");
+        let key_path = dir.path().join("hostkey");
+        let status = Command::new("ssh-keygen")
+            .args(["-t", "ed25519", "-N", "", "-C", "sshrack-test", "-f"])
+            .arg(&key_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("ssh-keygen spawns");
+        assert!(
+            status.success(),
+            "ssh-keygen failed to generate a throwaway key"
+        );
+        let pub_line =
+            std::fs::read_to_string(dir.path().join("hostkey.pub")).expect("read generated .pub");
+        // .pub is "<algo> <base64> <comment>"; build "<host> <algo> <base64>".
+        let mut parts = pub_line.split_whitespace();
+        let algo = parts.next().expect("pub has algo");
+        let b64 = parts.next().expect("pub has base64 key");
+        format!("{host} {algo} {b64}")
+    }
+
+    #[test]
+    fn is_known_returns_false_for_missing_known_hosts_file() {
+        // A missing file means nothing is trusted yet: the existence check
+        // short-circuits to Ok(false) before any ssh-keygen spawn.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let known_hosts = dir.path().join("known_hosts"); // does not exist
+        let known = is_known("example.com", 22, &known_hosts).expect("is_known ok");
+        assert!(!known, "a missing known_hosts file must report not-known");
+    }
+
+    #[test]
+    fn is_known_returns_false_for_absent_host_in_empty_file() {
+        // An existing but empty known_hosts: ssh-keygen -F finds nothing.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let known_hosts = dir.path().join("known_hosts");
+        std::fs::write(&known_hosts, "").expect("write empty known_hosts");
+        let known = is_known("absent.example.com", 22, &known_hosts).expect("is_known ok");
+        assert!(
+            !known,
+            "an empty known_hosts must report an absent host as not-known"
+        );
+    }
+
+    #[test]
+    fn is_known_returns_true_when_host_line_present() {
+        // Write a real ssh-keygen-generated host key line into a temp
+        // known_hosts; is_known must find it via `ssh-keygen -F`. Hermetic:
+        // ssh-keygen reads the temp file, no network.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let known_hosts = dir.path().join("known_hosts");
+        let line = generate_ed25519_known_hosts_line("example.com");
+        std::fs::write(&known_hosts, format!("{line}\n")).expect("write known_hosts line");
+        let known = is_known("example.com", 22, &known_hosts).expect("is_known ok");
+        assert!(
+            known,
+            "a host whose key is present in known_hosts must be known"
+        );
+    }
+
+    #[test]
+    fn is_known_returns_false_for_a_different_host_when_one_present() {
+        // A host absent from the file must NOT match a line written for a
+        // different host.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let known_hosts = dir.path().join("known_hosts");
+        let line = generate_ed25519_known_hosts_line("example.com");
+        std::fs::write(&known_hosts, format!("{line}\n")).expect("write known_hosts line");
+        let known = is_known("other.example.com", 22, &known_hosts).expect("is_known ok");
+        assert!(
+            !known,
+            "a host absent from known_hosts must report not-known even when another host is present"
+        );
+    }
+
+    #[test]
+    fn is_known_handles_malformed_known_hosts_gracefully() {
+        // Pin the defined behavior for a garbage known_hosts: ssh-keygen -F
+        // skips unparseable lines, finds no match, and reports not-known. The
+        // lookup must not panic and must not surface a raw ssh-keygen error.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let known_hosts = dir.path().join("known_hosts");
+        std::fs::write(&known_hosts, "this is not a valid known_hosts line\n!!!\n")
+            .expect("write garbage");
+        match is_known("example.com", 22, &known_hosts) {
+            Ok(false) => {}
+            other => panic!("malformed known_hosts should be Ok(false), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn is_known_nonstandard_port_uses_bracketed_query() {
+        // A non-22 port is stored as `[host]:port` in known_hosts; is_known must
+        // query with that bracketed form (host_query does the shaping). Write a
+        // matching `[host]:port` line and confirm it is found, and that the
+        // bare-host form is NOT found for the same file.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let known_hosts = dir.path().join("known_hosts");
+        let line = generate_ed25519_known_hosts_line("[example.com]:2222");
+        std::fs::write(&known_hosts, format!("{line}\n")).expect("write bracketed line");
+        let known = is_known("example.com", 2222, &known_hosts).expect("is_known ok");
+        assert!(
+            known,
+            "a bracketed [host]:port line must match the bracketed query"
+        );
+        // The bare-host query (port 22) must NOT match the bracketed entry.
+        let bare = is_known("example.com", 22, &known_hosts).expect("is_known ok");
+        assert!(
+            !bare,
+            "a port-22 query must not match a bracketed [host]:2222 entry"
+        );
+    }
 }

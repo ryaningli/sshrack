@@ -350,6 +350,23 @@ impl CredentialBody {
                 user: self.user.clone(),
             });
         }
+        // A non-keyring inline key with no private-key material is malformed:
+        // there is no in-body text to decrypt and no keyring slot to read, so
+        // resolve would materialize an empty file for `ssh -i` (an obscure
+        // "error in libcrypto" failure). The `InlineKey.private_key` field doc
+        // states "None only in a keyring-marker form"; enforce that invariant
+        // here so the bad body is rejected at every validate() choke point
+        // (resolve, merge_credential, add_credential, apply_credential_patch).
+        // A keyring-marker inline key (ik.keyring == true) legitimately carries
+        // no in-body text and is accepted by the check above.
+        if let Some(KeySource::Inline(ik)) = &self.key
+            && !ik.keyring
+            && ik.private_key.is_none()
+        {
+            return Err(SshrackError::InvalidCredentialBody {
+                user: self.user.clone(),
+            });
+        }
         Ok(())
     }
 
@@ -921,6 +938,31 @@ key = "/old/path"
     }
 
     #[test]
+    fn validate_rejects_non_keyring_inline_key_with_no_private_material() {
+        // A non-keyring inline key with no private-key material is malformed:
+        // there is no in-body text to decrypt and no keyring slot to read, so
+        // resolve would materialize an empty file for `ssh -i` (an obscure
+        // "error in libcrypto" failure). The `InlineKey.private_key` field doc
+        // states "None only in a keyring-marker form"; the complementary
+        // `validate_accepts_inline_key_in_keyring_marker_form` test covers the
+        // legitimate keyring-stored case.
+        let body = CredentialBody {
+            user: "u".into(),
+            password: None,
+            key: Some(KeySource::Inline(InlineKey {
+                private_key: None,
+                certificate: None,
+                keyring: false,
+            })),
+            keyring: false,
+        };
+        assert!(matches!(
+            body.validate(),
+            Err(SshrackError::InvalidCredentialBody { .. })
+        ));
+    }
+
+    #[test]
     fn validate_rejects_plaintext_inline_key_under_keyring_marker() {
         // The marker must never coexist with in-body plaintext: that is a
         // half-migrated body (text not yet moved to the keyring). Reject it as a
@@ -1242,5 +1284,55 @@ keyring = true
         let back: SshrackConfig = toml::from_str(&s).unwrap();
         assert!(back.is_vault());
         assert!(back.vault_meta().is_some());
+    }
+
+    #[test]
+    fn vault_meta_supports_kdf_only_for_argon2id() {
+        // The supported KDF is exactly "argon2id"; any other tag is rejected.
+        let mut m = VaultMeta::default_argon2id("AA==");
+        assert!(m.supports_kdf(), "argon2id must be supported");
+        m.kdf = "pbkdf2".into();
+        assert!(
+            !m.supports_kdf(),
+            "a non-argon2id KDF tag must not be supported"
+        );
+    }
+
+    #[test]
+    fn inline_key_in_keyring_tracks_inline_marker() {
+        // An inline key carrying the keyring marker (sealed form under keyring
+        // storage) reports true.
+        let marked = CredentialBody {
+            user: "u".into(),
+            password: None,
+            key: Some(KeySource::Inline(InlineKey {
+                private_key: None,
+                certificate: None,
+                keyring: true,
+            })),
+            keyring: false,
+        };
+        assert!(marked.inline_key_in_keyring());
+
+        // An inline key without the marker reports false.
+        let unmarked = CredentialBody {
+            user: "u".into(),
+            password: None,
+            key: Some(KeySource::Inline(InlineKey {
+                private_key: Some(Secret::Plain("k".into())),
+                certificate: None,
+                keyring: false,
+            })),
+            keyring: false,
+        };
+        assert!(!unmarked.inline_key_in_keyring());
+
+        // A path key reports false.
+        let path_key = CredentialBody::new("u").with_key("/k");
+        assert!(!path_key.inline_key_in_keyring());
+
+        // A body with no key at all reports false.
+        let no_key = CredentialBody::new("u");
+        assert!(!no_key.inline_key_in_keyring());
     }
 }

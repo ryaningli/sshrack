@@ -12,6 +12,42 @@ use crate::config::schema::Host;
 use crate::connect::ssh::{Overrides, connect_opts};
 use crate::credential::ResolvedAuth;
 
+/// Injectable binary paths for the SFTP spawns. Production passes
+/// [`SftpBin::default`] (`"ssh"` / `"sftp"`); integration tests pass shim paths
+/// so the worker's master / control / transfer spawns run hermetically (no
+/// sshd, no network).
+///
+/// The argv *builders* (`master_argv`, `sftp_batch_argv`, `control_check_argv`,
+/// `control_exit_argv`) are unchanged — they still emit `"ssh"` / `"sftp"` as
+/// their literal first element. The worker uses [`SftpBin`] as the
+/// `Command::new(...)` program and skips that element, so the compiled argv the
+/// OS sees is identical in production (the shim path replaces `"ssh"` only in
+/// tests).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SftpBin {
+    /// `ssh` binary for the master (`-N`) and control (`-O check|exit`) spawns.
+    pub ssh: PathBuf,
+    /// `sftp` binary for the transfer (`-b -`) spawns.
+    pub sftp: PathBuf,
+}
+
+impl Default for SftpBin {
+    fn default() -> Self {
+        Self {
+            ssh: PathBuf::from("ssh"),
+            sftp: PathBuf::from("sftp"),
+        }
+    }
+}
+
+impl SftpBin {
+    /// Construct an explicit pair of binary paths. Tests pass shim paths;
+    /// production uses [`SftpBin::default`].
+    pub fn new(ssh: PathBuf, sftp: PathBuf) -> Self {
+        Self { ssh, sftp }
+    }
+}
+
 /// Process-local counter so concurrent `control_socket_path()` calls within one
 /// sshrack process never produce the same socket name. The pid already
 /// separates processes; this separates sessions within a process.

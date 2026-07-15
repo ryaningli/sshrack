@@ -218,3 +218,42 @@ impl Status {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Pin the `Status` constructors: `error` carries `is_error=true`, the
+    //! informational and empty constructors carry `is_error=false`, and `empty`
+    //! has no message. The footer tints by `is_error`, so a constructor flipping
+    /// the flag would silently mis-color every status line.
+    use super::*;
+
+    #[test]
+    fn error_carries_is_error_true_and_the_message() {
+        let s = Status::error("boom");
+        assert!(s.is_error, "error() must set is_error");
+        assert_eq!(s.message.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn info_carries_is_error_false_and_the_message() {
+        let s = Status::info("host saved");
+        assert!(!s.is_error, "info() must not set is_error");
+        assert_eq!(s.message.as_deref(), Some("host saved"));
+    }
+
+    #[test]
+    fn empty_carries_is_error_false_and_no_message() {
+        let s = Status::empty();
+        assert!(!s.is_error, "empty() must not set is_error");
+        assert!(s.message.is_none(), "empty() must carry no message");
+    }
+
+    #[test]
+    fn default_matches_empty() {
+        // `Status` derives `Default`; the footer treats `None` message as the
+        // default hint, so `Default` must agree with `empty()`.
+        let d = Status::default();
+        assert!(!d.is_error);
+        assert!(d.message.is_none());
+    }
+}

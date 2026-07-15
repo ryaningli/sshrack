@@ -171,4 +171,62 @@ mod tests {
         let out = p.on_key(release);
         assert!(matches!(out, Outcome::Continue));
     }
+
+    // ---- draw_in_shell: smoke (no panic) + snapshot ----
+
+    #[test]
+    fn draw_in_shell_renders_without_panic_80x24_and_narrow() {
+        let p = SettingsPanel::new();
+        // 80x24.
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut term = ratatui::Terminal::new(backend).expect("test backend");
+        let res = term.draw(|f| {
+            p.draw_in_shell(f, f.area(), "vault", &Status::empty());
+        });
+        assert!(res.is_ok(), "80x24 draw returned error: {:?}", res.err());
+        // Narrow 40x8 (must not panic or overflow).
+        let backend = ratatui::backend::TestBackend::new(40, 8);
+        let mut term = ratatui::Terminal::new(backend).expect("test backend");
+        let res = term.draw(|f| {
+            p.draw_in_shell(f, f.area(), "vault", &Status::empty());
+        });
+        assert!(res.is_ok(), "40x8 draw returned error: {:?}", res.err());
+    }
+
+    #[test]
+    fn draw_in_shell_undecided_mode_renders_without_panic() {
+        let p = SettingsPanel::new();
+        let backend = ratatui::backend::TestBackend::new(40, 8);
+        let mut term = ratatui::Terminal::new(backend).expect("test backend");
+        let res = term.draw(|f| {
+            p.draw_in_shell(f, f.area(), "undecided", &Status::empty());
+        });
+        assert!(res.is_ok(), "undecided draw: {:?}", res.err());
+    }
+
+    #[test]
+    fn draw_in_shell_error_status_renders_without_panic() {
+        let p = SettingsPanel::new();
+        let backend = ratatui::backend::TestBackend::new(40, 8);
+        let mut term = ratatui::Terminal::new(backend).expect("test backend");
+        let res = term.draw(|f| {
+            p.draw_in_shell(f, f.area(), "vault", &Status::error("switch failed"));
+        });
+        assert!(res.is_ok(), "error status draw: {:?}", res.err());
+    }
+
+    #[test]
+    fn draw_in_shell_vault_mode_snapshot_80x24() {
+        // Snapshot the Settings panel with a set mode + empty status so the
+        // storage-mode row + status-row layout stay stable. Hermetic:
+        // TestBackend in memory, fixed label, no timestamps.
+        let p = SettingsPanel::new();
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut term = ratatui::Terminal::new(backend).expect("test backend");
+        term.draw(|f| {
+            p.draw_in_shell(f, f.area(), "vault", &Status::empty());
+        })
+        .expect("draw");
+        insta::assert_snapshot!(term.backend());
+    }
 }

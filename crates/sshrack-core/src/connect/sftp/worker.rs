@@ -46,7 +46,7 @@ use crate::connect::sftp::pure::{
 };
 use crate::connect::sftp::source::{LocalSftpRunner, SftpDirSource, SftpRunner};
 use crate::connect::sftp::{
-    ControlSocket, control_check_argv, control_exit_argv, get_batch, master_argv,
+    ControlSocket, SftpBin, control_check_argv, control_exit_argv, get_batch, master_argv,
     progress_snapshot, put_batch, pwd_batch, sftp_batch_argv, sftp_target, shell_quote,
 };
 use crate::connect::ssh::Overrides;
@@ -81,6 +81,7 @@ pub struct SftpWorker {
     master_child: Option<Child>,
     pw_file: Option<PathBuf>,
     target: String,
+    bin: SftpBin,
 }
 
 impl SftpWorker {
@@ -109,6 +110,7 @@ impl SftpWorker {
         self_exe: &Path,
         source: PasswordSource,
         config_path: Option<&Path>,
+        bin: SftpBin,
     ) -> Result<(Self, PathBuf), String> {
         let sock = ControlSocket::new();
         let sock_path = sock.path().to_path_buf();
@@ -132,7 +134,7 @@ impl SftpWorker {
         // side thread so an auth failure's reason is captured instead of
         // corrupting the TUI's tty.
         let master_argv = master_argv(&resolved, &host, &overrides, &sock_path);
-        let mut master_cmd = Command::new(&master_argv[0]);
+        let mut master_cmd = Command::new(&bin.ssh);
         master_cmd
             .args(&master_argv[1..])
             .stdin(Stdio::null())
@@ -180,6 +182,7 @@ impl SftpWorker {
         match wait_for_master(
             &target,
             &sock_path,
+            &bin.ssh,
             Instant::now() + HANDSHAKE_TIMEOUT,
             &mut master_child,
             &stderr_buf,
@@ -191,7 +194,7 @@ impl SftpWorker {
                 let _ = master_child.kill();
                 let _ = master_child.wait();
                 let exit_argv = control_exit_argv(&target, &sock_path);
-                let _ = Command::new(&exit_argv[0])
+                let _ = Command::new(&bin.ssh)
                     .args(&exit_argv[1..])
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
@@ -216,7 +219,7 @@ impl SftpWorker {
 
         // (5) Probe the remote home via `sftp pwd`. Falls back to `/` on any
         // failure so the UI never blocks on home detection.
-        let runner = Arc::new(LocalSftpRunner::new());
+        let runner = Arc::new(LocalSftpRunner::with_bin(bin.sftp.clone()));
         let home = {
             let batch = pwd_batch();
             match runner.run_batch(&target, &sock_path, &batch) {
@@ -234,6 +237,7 @@ impl SftpWorker {
         let worker_target = target.clone();
         let worker_sock = sock_path.clone();
         let worker_home = home.clone();
+        let worker_sftp_bin = bin.sftp.clone();
         let join = match thread::Builder::new()
             .name("sftp-worker".into())
             .spawn(move || {
@@ -244,6 +248,7 @@ impl SftpWorker {
                     worker_target,
                     worker_sock,
                     worker_home,
+                    worker_sftp_bin,
                 );
             }) {
             Ok(handle) => Some(handle),
@@ -252,7 +257,7 @@ impl SftpWorker {
                 // up everything we set up. The thread never got the inputs, so
                 // we own their lifetimes here.
                 let exit_argv = control_exit_argv(&target, &sock_path);
-                let _ = Command::new(&exit_argv[0]).args(&exit_argv[1..]).status();
+                let _ = Command::new(&bin.ssh).args(&exit_argv[1..]).status();
                 let _ = master_child.kill();
                 let _ = master_child.wait();
                 drop(sock);
@@ -273,6 +278,7 @@ impl SftpWorker {
                 master_child: Some(master_child),
                 pw_file,
                 target,
+                bin,
             },
             home,
         ))
@@ -314,7 +320,7 @@ impl Drop for SftpWorker {
             .map(|s| s.path().to_path_buf())
             .unwrap_or_default();
         let exit_argv = control_exit_argv(&self.target, &sock_path);
-        let _ = Command::new(&exit_argv[0])
+        let _ = Command::new(&self.bin.ssh)
             .args(&exit_argv[1..])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -351,6 +357,7 @@ fn worker_loop(
     target: String,
     sock: PathBuf,
     home: PathBuf,
+    sftp_bin: PathBuf,
 ) {
     let dir_source = SftpDirSource::new(target.clone(), sock.clone(), runner.clone(), Some(home));
 
@@ -366,7 +373,9 @@ fn worker_loop(
                 // back to `recv()`. Looping back would deadlock: the dropping
                 // main thread holds `cmd_tx` until `join()` returns, and
                 // `join()` waits for us to exit.
-                if run_transfer(&event_tx, &cmd_rx, &runner, &job, policy, &target, &sock) {
+                if run_transfer(
+                    &event_tx, &cmd_rx, &runner, &job, policy, &target, &sock, &sftp_bin,
+                ) {
                     break;
                 }
             }
@@ -390,6 +399,7 @@ fn worker_loop(
 /// `break`s instead of looping back to `recv()` (which would deadlock against
 /// `Drop`'s `join()`). Returns `false` on normal completion / cancel / spawn
 /// failure / channel disconnect.
+#[allow(clippy::too_many_arguments)]
 fn run_transfer(
     event_tx: &mpsc::Sender<WorkerEvent>,
     cmd_rx: &mpsc::Receiver<WorkerCmd>,
@@ -398,6 +408,7 @@ fn run_transfer(
     policy: OverwritePolicy,
     target: &str,
     sock: &Path,
+    sftp_bin: &Path,
 ) -> bool {
     // Honor Skip/SkipAll without spawning sftp: the screen already decided via
     // decide() that this conflict should be skipped; the worker trusts the
@@ -416,7 +427,7 @@ fn run_transfer(
     // captured (drained on a side thread) so we can report the first error line
     // on failure.
     let argv = sftp_batch_argv(target, sock);
-    let mut cmd = Command::new(&argv[0]);
+    let mut cmd = Command::new(sftp_bin);
     cmd.args(&argv[1..])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -652,13 +663,14 @@ fn first_meaningful_line(s: &str) -> &str {
 fn wait_for_master(
     target: &str,
     sock: &Path,
+    ssh_bin: &Path,
     deadline: Instant,
     master: &mut Child,
     stderr_buf: &Arc<Mutex<Vec<u8>>>,
 ) -> HandshakeOutcome {
     loop {
         let argv = control_check_argv(target, sock);
-        let check_ok = Command::new(&argv[0])
+        let check_ok = Command::new(ssh_bin)
             .args(&argv[1..])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

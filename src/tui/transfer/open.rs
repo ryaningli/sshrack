@@ -141,6 +141,7 @@ pub fn open_transfer(
         &self_exe,
         pw_source,
         app.config_path(),
+        sshrack_core::connect::sftp::SftpBin::default(),
     )
     .map_err(|detail| SshrackError::SftpOpenFailed { detail })?;
 

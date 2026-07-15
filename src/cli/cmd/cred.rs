@@ -595,3 +595,211 @@ fn format_detail(cred: &Credential, reveal: &RevealedPassword) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the private pure helpers that drive `cred ls`/`show`
+    //! output: `cell` rendering across every secret kind, `format_detail`
+    //! across all four secret arms, and the `require_name` guard. Pure: feeds
+    //! fixtures, asserts strings/codes.
+    use super::*;
+    use sshrack_core::config::schema::{CredentialBody, Secret};
+    use ulid::Ulid;
+
+    // ---- fixtures ----
+
+    /// A key-path credential named "team-dev" (user "deploy", path identity).
+    fn key_path_cred() -> Credential {
+        Credential {
+            id: Ulid::new(),
+            name: "team-dev".into(),
+            body: CredentialBody::new("deploy").with_key("/home/u/.ssh/team_ed25519"),
+        }
+    }
+
+    /// Build a credential with the given name + body.
+    fn cred_with(name: &str, body: CredentialBody) -> Credential {
+        Credential {
+            id: Ulid::new(),
+            name: name.into(),
+            body,
+        }
+    }
+
+    // ---- require_name ----
+
+    #[test]
+    fn require_name_some_returns_owned_name() {
+        assert_eq!(
+            require_name(Some("ops"), "credential").as_deref(),
+            Ok("ops")
+        );
+    }
+
+    #[test]
+    fn require_name_none_returns_usage_exit_code() {
+        // None prints to stderr via `fail` and returns USAGE.
+        assert_eq!(require_name(None, "credential"), Err(exit_code::USAGE));
+    }
+
+    // ---- cell ----
+
+    #[test]
+    fn cell_renders_each_field_for_key_credential() {
+        let c = key_path_cred();
+        assert_eq!(cell("name", &c), "team-dev");
+        assert_eq!(cell("user", &c), "deploy");
+        assert_eq!(cell("secret", &c), "key");
+    }
+
+    #[test]
+    fn cell_renders_password_secret_kind() {
+        let c = cred_with("ops", CredentialBody::new("ops").with_password("hunter2"));
+        assert_eq!(cell("secret", &c), "password");
+    }
+
+    #[test]
+    fn cell_renders_keyring_secret_kind() {
+        let c = cred_with(
+            "kr",
+            CredentialBody {
+                user: "u".into(),
+                password: None,
+                key: None,
+                keyring: true,
+            },
+        );
+        assert_eq!(cell("secret", &c), "keyring");
+    }
+
+    #[test]
+    fn cell_renders_default_secret_kind() {
+        let c = cred_with("def", CredentialBody::new("ec2-user"));
+        assert_eq!(cell("secret", &c), "default");
+    }
+
+    #[test]
+    fn cell_unknown_field_returns_empty_string() {
+        let c = key_path_cred();
+        assert_eq!(cell("bogus", &c), "");
+    }
+
+    // ---- format_detail: key arm ----
+
+    #[test]
+    fn format_detail_key_path_shows_key_line_and_no_password() {
+        let c = key_path_cred();
+        let out = format_detail(&c, &RevealedPassword::Masked);
+        assert!(out.contains("name:     team-dev"), "got: {out}");
+        assert!(out.contains("user:     deploy"), "got: {out}");
+        assert!(
+            out.contains("key:      /home/u/.ssh/team_ed25519"),
+            "got: {out}"
+        );
+        // The key arm takes priority and never emits a password line.
+        assert!(!out.contains("password:"), "got: {out}");
+    }
+
+    #[test]
+    fn format_detail_key_inline_shows_inline_marker_never_key_text() {
+        let c = cred_with(
+            "inline",
+            CredentialBody::new("u")
+                .with_inline_key(Secret::Plain("PRIVATE KEY TEXT".into()), None),
+        );
+        let out = format_detail(&c, &RevealedPassword::Masked);
+        assert!(out.contains("key:      <inline>"), "got: {out}");
+        // The raw key text must never appear in output.
+        assert!(!out.contains("PRIVATE KEY TEXT"), "got: {out}");
+        assert!(!out.contains("password:"), "got: {out}");
+    }
+
+    // ---- format_detail: keyring arm ----
+
+    #[test]
+    fn format_detail_keyring_marker_masked_emits_stored_in_keyring() {
+        let c = cred_with(
+            "kr",
+            CredentialBody {
+                user: "u".into(),
+                password: None,
+                key: None,
+                keyring: true,
+            },
+        );
+        let out = format_detail(&c, &RevealedPassword::Masked);
+        assert!(out.contains("password: (stored in keyring)"), "got: {out}");
+    }
+
+    #[test]
+    fn format_detail_keyring_marker_keyring_missing_emits_not_in_keyring() {
+        let c = cred_with(
+            "kr",
+            CredentialBody {
+                user: "u".into(),
+                password: None,
+                key: None,
+                keyring: true,
+            },
+        );
+        let out = format_detail(&c, &RevealedPassword::KeyringMissing);
+        assert!(out.contains("password: (not in keyring)"), "got: {out}");
+    }
+
+    // ---- format_detail: password arm ----
+
+    #[test]
+    fn format_detail_password_masked_emits_hidden_and_never_plaintext() {
+        let c = cred_with("pw", CredentialBody::new("u").with_password("hunter2"));
+        let out = format_detail(&c, &RevealedPassword::Masked);
+        assert!(out.contains("password: (hidden)"), "got: {out}");
+        assert!(!out.contains("hunter2"), "got: {out}");
+    }
+
+    #[test]
+    fn format_detail_password_revealed_emits_plaintext() {
+        let c = cred_with("pw", CredentialBody::new("u").with_password("hunter2"));
+        let out = format_detail(
+            &c,
+            &RevealedPassword::Plaintext(Zeroizing::new("hunter2".into())),
+        );
+        assert!(out.contains("password: hunter2"), "got: {out}");
+    }
+
+    #[test]
+    fn format_detail_password_with_revealed_none_emits_no_password_line() {
+        // A password body with RevealedPassword::None (no password to show)
+        // must not emit a password line at all.
+        let c = cred_with("pw", CredentialBody::new("u").with_password("ignored"));
+        let out = format_detail(&c, &RevealedPassword::None);
+        assert!(out.contains("user:     u"), "got: {out}");
+        assert!(!out.contains("password:"), "got: {out}");
+    }
+
+    // ---- format_detail: default-keys arm ----
+
+    #[test]
+    fn format_detail_default_keys_emits_default_marker() {
+        let c = cred_with("def", CredentialBody::new("ec2-user"));
+        let out = format_detail(&c, &RevealedPassword::Masked);
+        assert!(out.contains("name:     def"), "got: {out}");
+        assert!(out.contains("user:     ec2-user"), "got: {out}");
+        assert!(out.contains("auth:     default keys"), "got: {out}");
+        assert!(!out.contains("password:"), "got: {out}");
+    }
+
+    // ---- cross-arm guard ----
+
+    #[test]
+    fn format_detail_always_emits_name_id_user_header() {
+        // Regardless of secret arm, the name/id/user header is always present.
+        let c = key_path_cred();
+        let out = format_detail(&c, &RevealedPassword::Masked);
+        assert!(out.starts_with("name:     team-dev\n"), "got: {out}");
+        assert!(out.contains("id:       "), "got: {out}");
+        assert!(
+            out.contains(&c.id.to_string()),
+            "expected the ulid in the id line, got: {out}"
+        );
+    }
+}

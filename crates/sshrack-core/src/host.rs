@@ -501,9 +501,10 @@ pub fn forget_keyring_on_overwrite(cfg: &SshrackConfig, name: &str, backend: &dy
 
 /// Best-effort: if `src` is a keyring-mode host, copy every keyring slot it
 /// owns (password + inline private/cert) from the source's id to `dst`'s fresh
-/// id so the copy connects immediately. A missing/unreachable entry is reported
-/// via the returned `Err` (carrying no secret); the caller logs-and-continues.
-/// Never materializes any secret outside the backend round-trip. The per-slot
+/// id so the copy connects immediately. A missing entry is a silent no-op `Ok`
+/// (the slot is surfaced at connect time); only an unreachable backend (I/O
+/// error) propagates `Err` (carrying no secret). Never materializes any secret
+/// outside the backend round-trip. The per-slot
 /// copy lives in [`secret::copy_keyring_secret`] / [`secret::copy_inline_keyring_slots`];
 /// this wrapper only reads the source body's markers and delegates.
 pub fn copy_keyring_entry(
@@ -1796,6 +1797,252 @@ mod tests {
                 .as_deref()
                 .map(String::as_str),
             Some("PRIV")
+        );
+    }
+
+    // ---- Task 1.3 backfill: apply_patch clear_credential, patch_body validate,
+    // validate_rename, ad_hoc_auth/build_auth/merge_fields edges, from_plain
+    // mutual exclusion, copy_keyring_entry I/O propagation. ----
+
+    #[test]
+    fn apply_patch_clear_credential_reverts_to_inline_root() {
+        // clear_credential drops a Ref auth and falls back to an inline default
+        // body: user "root", key/password/keyring all None.
+        let cid = new_id();
+        let orig = Host {
+            id: new_id(),
+            name: "web1".into(),
+            host: "10.0.0.5".into(),
+            port: 22,
+            auth: Auth::reference(cid),
+        };
+        let opts = EditOptions {
+            clear_credential: true,
+            ..Default::default()
+        };
+        let out = apply_patch(&orig, &opts).unwrap();
+        let body = out
+            .auth
+            .inline_body()
+            .expect("clear_credential must yield Inline auth");
+        assert_eq!(body.user, "root");
+        assert!(
+            body.key.is_none(),
+            "key must be absent after clear_credential"
+        );
+        assert!(
+            body.password.is_none(),
+            "password must be absent after clear_credential"
+        );
+        assert!(!body.keyring, "keyring marker must be cleared");
+        // The credential reference is gone.
+        assert!(out.auth.credential_id().is_none());
+
+        // Variant: clear_credential + --user stamps the supplied user instead of
+        // the default "root".
+        let opts_user = EditOptions {
+            clear_credential: true,
+            user: Some("ops".into()),
+            ..Default::default()
+        };
+        let out_user = apply_patch(&orig, &opts_user).unwrap();
+        let body_user = out_user
+            .auth
+            .inline_body()
+            .expect("clear_credential must yield Inline auth");
+        assert_eq!(body_user.user, "ops");
+        assert!(body_user.key.is_none());
+    }
+
+    #[test]
+    fn patch_body_validate_propagates_on_password_plus_identity() {
+        use crate::config::schema::Secret;
+        // (a) An inline-password body patched with --identity ends up with both
+        // password and key set -> CredentialBody::validate rejects it.
+        let orig_pw = inline_host(
+            "web1",
+            CredentialBody {
+                user: "deploy".into(),
+                password: Some(Secret::Plain("s3cret".into())),
+                key: None,
+                keyring: false,
+            },
+        );
+        let opts = EditOptions {
+            identity: Some(PathBuf::from("/k")),
+            ..Default::default()
+        };
+        let err = apply_patch(&orig_pw, &opts).unwrap_err();
+        assert!(
+            matches!(err, SshrackError::InvalidCredentialBody { .. }),
+            "password + identity must be rejected, got {err:?}"
+        );
+
+        // (b) A keyring-marked body patched with --identity ends up with both the
+        // keyring marker and a key set -> same rejection.
+        let orig_kr = inline_host(
+            "web2",
+            CredentialBody {
+                user: "deploy".into(),
+                password: None,
+                key: None,
+                keyring: true,
+            },
+        );
+        let err_kr = apply_patch(&orig_kr, &opts).unwrap_err();
+        assert!(
+            matches!(err_kr, SshrackError::InvalidCredentialBody { .. }),
+            "keyring marker + identity must be rejected, got {err_kr:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rename_success_and_same_name_and_invalid_char() {
+        // Fresh target among two hosts -> Ok.
+        let cfg = cfg_with_names(&["web1", "web2"]);
+        assert!(validate_rename(&cfg, "web1", "fresh").is_ok());
+
+        // Same-name guard: renaming a host to its own name is allowed (the
+        // uniqueness check excludes the current name).
+        let cfg_one = cfg_with_names(&["web1"]);
+        assert!(
+            validate_rename(&cfg_one, "web1", "web1").is_ok(),
+            "rename to own name must be permitted"
+        );
+
+        // Forbidden character check wins over the uniqueness check.
+        let err = validate_rename(&cfg_one, "x", "a:b").unwrap_err();
+        assert!(matches!(
+            err,
+            SshrackError::InvalidNameChar { name, ch: ':' } if name == "a:b"
+        ));
+    }
+
+    #[test]
+    fn ad_hoc_auth_user_without_identity_yields_inline_no_key() {
+        // --ad-hoc --user with no --identity and no --credential builds an inline
+        // body whose key is None (the no-identity branch of ad_hoc_auth, which is
+        // private; exercised here through resolve_target).
+        let cfg = SshrackConfig::default();
+        let mut o = ro_none();
+        o.ad_hoc = true;
+        o.user = Some("dep");
+        o.port = Some(22);
+        let host = resolve_target(&cfg, "10.0.0.5", &o).unwrap();
+        assert_eq!(host.host, "10.0.0.5");
+        let body = host
+            .auth
+            .inline_body()
+            .expect("ad-hoc with user must yield Inline auth");
+        assert_eq!(body.user, "dep");
+        assert!(
+            body.key.is_none(),
+            "key must be None when no identity is supplied"
+        );
+    }
+
+    #[test]
+    fn build_auth_user_without_identity_yields_inline_no_key() {
+        // --user alone (no credential, no identity) builds an inline body with the
+        // supplied user and no key.
+        let opts = AddOptions {
+            user: Some("ops".into()),
+            ..Default::default()
+        };
+        let auth = build_auth(&opts);
+        let body = auth
+            .inline_body()
+            .expect("user-only options must yield Inline auth");
+        assert_eq!(body.user, "ops");
+        assert!(body.key.is_none(), "key must be None without --identity");
+    }
+
+    #[test]
+    fn merge_fields_explicit_port_and_credential() {
+        // Both --port and --credential are honored: the port overrides the
+        // default and the auth becomes a Ref pointing at the supplied id.
+        let cid = new_id();
+        let opts = AddOptions {
+            host: Some("10.0.0.5".into()),
+            port: Some(2222),
+            credential: Some(cid),
+            ..Default::default()
+        };
+        let h = merge_fields(new_id(), "web1", &opts).unwrap();
+        assert_eq!(h.host, "10.0.0.5");
+        assert_eq!(h.port, 2222);
+        assert_eq!(h.auth.credential_id(), Some(cid));
+        assert!(
+            h.auth.inline_body().is_none(),
+            "credential flag must produce a Ref, not Inline"
+        );
+    }
+
+    #[test]
+    fn from_plain_key_plus_password_is_invalid_credential_body() {
+        use crate::credential::{PasswordSource, ResolvedAuth};
+        use zeroize::Zeroizing;
+        // A path key alongside an inline password violates the
+        // mutual-exclusion invariant; from_plain rejects it.
+        let err = ResolvedAuth::from_plain(
+            "u".into(),
+            Some(PathBuf::from("/k")),
+            PasswordSource::Inline(Zeroizing::new("s3cret".into())),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, SshrackError::InvalidCredentialBody { ref user } if user == "u"),
+            "key + password must be rejected, got {err:?}"
+        );
+    }
+
+    /// Backend whose every operation fails with an I/O error. Proves the
+    /// copy_keyring_entry path propagates real backend errors (unlike the
+    /// best-effort forget path, which swallows them).
+    struct FailingBackend;
+
+    impl crate::secret::SecretBackend for FailingBackend {
+        fn set_at(&self, _key: &str, _secret: &str) -> Result<(), SshrackError> {
+            Err(SshrackError::Io(std::io::Error::other(
+                "backend unavailable",
+            )))
+        }
+        fn get(&self, _key: &str) -> Result<Option<zeroize::Zeroizing<String>>, SshrackError> {
+            Err(SshrackError::Io(std::io::Error::other(
+                "backend unavailable",
+            )))
+        }
+        fn delete_at(&self, _key: &str) -> Result<(), SshrackError> {
+            Err(SshrackError::Io(std::io::Error::other(
+                "backend unavailable",
+            )))
+        }
+        fn available(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn copy_keyring_entry_propagates_backend_io_error() {
+        // A keyring-marked source whose backend get() fails surfaces the error
+        // out of copy_keyring_entry (the copy path uses ? for real I/O errors).
+        let src = Host {
+            id: new_id(),
+            name: "web1".into(),
+            host: "h".into(),
+            port: 22,
+            auth: Auth::inline(CredentialBody {
+                user: "root".into(),
+                password: None,
+                key: None,
+                keyring: true,
+            }),
+        };
+        let dst = clone_host_as(&src, new_id(), "web2");
+        let err = copy_keyring_entry(&src, &dst, &FailingBackend).unwrap_err();
+        assert!(
+            matches!(err, SshrackError::Io(_)),
+            "backend I/O error must propagate, got {err:?}"
         );
     }
 }

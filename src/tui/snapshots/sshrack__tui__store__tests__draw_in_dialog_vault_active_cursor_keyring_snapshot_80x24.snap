@@ -1,0 +1,28 @@
+---
+source: src/tui/store.rs
+expression: term.backend()
+---
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"  ┌  storage mode  ──────────────────────────────────────────────────────────┐  "
+"  │▶ keyring OS keyring (recommended). Plaintext never touches disk; needs a │  "
+"  │  vault (active) Master-passphrase encryption (Argon2id + XChaCha20-Poly13│  "
+"  │  plaintext Stored in the clear in config.toml. Security downgrade: anyone│  "
+"  │                                                                          │  "
+"  │                                                                          │  "
+"  │                                                                          │  "
+"  │                                                                          │  "
+"  │                                                                          │  "
+"  │↑↓ select · Enter switch · Esc/^C cancel                                  │  "
+"  └──────────────────────────────────────────────────────────────────────────┘  "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "

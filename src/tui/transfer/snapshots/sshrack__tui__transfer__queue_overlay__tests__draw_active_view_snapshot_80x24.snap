@@ -1,0 +1,28 @@
+---
+source: src/tui/transfer/queue_overlay.rs
+expression: term.backend()
+---
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"  ┌ transfer queue ──────────────────────────────────────────────────────────┐  "
+"  │Active (2)   Failed (2)   Completed (1)                                   │  "
+"  │ ↑ inflight-task                                                starting… │  "
+"  │ ↑ queued-task                                                     queued │  "
+"  │                                                                          │  "
+"  │Tab view · ↑↓ select · ⏎ retry · Del remove · c cancel · p pause · Esc clo│  "
+"  └──────────────────────────────────────────────────────────────────────────┘  "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "

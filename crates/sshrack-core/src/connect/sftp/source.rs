@@ -45,24 +45,43 @@ pub trait SftpRunner: Send + Sync {
 /// `batch` to stdin, reads stdout + stderr, returns stdout on success /
 /// `Err("sftp failed: <first non-blank stderr line>")` on non-zero exit.
 ///
-/// Zero state by intent: sftp MOUNTS the already-authenticated master via
-/// `ControlPath`, so it does NOT need askpass env (the master carried auth),
-/// port, or identity flags. Built as a unit struct so the worker constructs it
-/// freely; all per-connection state lives on [`SftpDirSource`] instead.
-#[derive(Debug, Clone, Default)]
-pub struct LocalSftpRunner;
+/// Carries the `sftp` binary path so tests can inject a shim (via
+/// [`LocalSftpRunner::with_bin`]) and keep every sftp spawn hermetic — the pwd
+/// probe in `SftpWorker::open`, the listing/classify polls in `SftpDirSource`,
+/// and the progress/removal batches in `run_transfer` all flow through here in
+/// tests. Production constructs via [`LocalSftpRunner::new`] (literal
+/// `"sftp"`). The argv builder still emits `"sftp"` as its first element; this
+/// runner skips it and uses the stored path for `Command::new(...)`.
+#[derive(Debug, Clone)]
+pub struct LocalSftpRunner {
+    sftp_bin: PathBuf,
+}
+
+impl Default for LocalSftpRunner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl LocalSftpRunner {
-    /// Construct a `LocalSftpRunner` (zero state).
+    /// Construct a `LocalSftpRunner` backed by the system `sftp` binary.
     pub fn new() -> Self {
-        Self
+        Self {
+            sftp_bin: PathBuf::from("sftp"),
+        }
+    }
+
+    /// Construct a `LocalSftpRunner` backed by an explicit `sftp` binary path.
+    /// Tests pass a shim path so the sftp spawns never contact a real sshd.
+    pub fn with_bin(sftp_bin: PathBuf) -> Self {
+        Self { sftp_bin }
     }
 }
 
 impl SftpRunner for LocalSftpRunner {
     fn run_batch(&self, target: &str, sock: &Path, batch: &str) -> Result<String, String> {
         let argv = sftp_batch_argv(target, sock);
-        let mut cmd = Command::new(&argv[0]);
+        let mut cmd = Command::new(&self.sftp_bin);
         cmd.args(&argv[1..]);
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());

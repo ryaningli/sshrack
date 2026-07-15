@@ -605,3 +605,299 @@ fn keyring_mode_inline_key_materializes_temp_file_and_never_leaks_to_argv() {
         "temp cert file deleted after the artifact drops"
     );
 }
+
+// ===========================================================================
+// scp `build -> launch` shim integration (Task 5.1)
+// ===========================================================================
+// `scp::build` assembles a `ScpPlan { argv, password, remote_hosts,
+// key_artifact, .. }` whose `argv[0] == "scp"`. `connect::launch` does
+// `Command::new(&argv[0])`, so swapping `argv[0]` for the shim path runs the
+// shim (not a real scp) without PATH lookup or network. These tests drive the
+// real `scp::build` -> real `connect::launch` -> shim capture, then assert the
+// argv shape and the password/key-text-never-in-argv-or-env invariant.
+
+/// A scp plan for an inline-password host, driven through `connect::launch`
+/// with `argv[0]` swapped for the shim, must (a) carry `user@host:path` and
+/// `-P <port>` in the argv the shim observed, and (b) never let the password
+/// string appear in the captured argv or env (the Inline source stages a temp
+/// file pointed at by `SSHRACK_ASKPASS_FILE`, never the secret itself).
+#[test]
+fn scp_build_drives_launch_with_shim_argv_and_password_never_in_argv() {
+    use sshrack_core::config::schema::{Auth, CredentialBody, Host, SshrackConfig};
+    use sshrack_core::connect::scp;
+    use sshrack_core::connect::ssh::Overrides;
+    use ulid::Ulid;
+
+    let (_dir, shim_path, capture_path) = fresh_shim();
+    let self_exe = std::env::current_exe().expect("current_exe");
+
+    // Undecided store + inline password body resolves to PasswordSource::Inline,
+    // so launch stages a 0600 temp file the askpass helper reads.
+    let cfg = SshrackConfig {
+        hosts: vec![Host {
+            id: Ulid::new(),
+            name: "web1".into(),
+            host: "10.0.0.5".into(),
+            port: 2222,
+            auth: Auth::inline(CredentialBody::new("deploy").with_password("hunter2")),
+        }],
+        ..Default::default()
+    };
+    let backend = LocalFakeBackend::new();
+
+    let plan = scp::build(
+        &["local.txt".into(), "web1:/srv/app".into()],
+        &cfg,
+        &Overrides::default(),
+        None,
+        &backend,
+    )
+    .expect("scp build ok");
+
+    // (a) argv shape: scp argv[0]; -P <port>; the rewritten user@host:path
+    // operand. No key on this host -> no -i. The password lives only in
+    // plan.password, never in argv.
+    assert_eq!(plan.argv[0], "scp");
+    assert!(
+        plan.argv.iter().any(|a| a == "deploy@10.0.0.5:/srv/app"),
+        "scp argv rewrites name:path to user@host:path: {:?}",
+        plan.argv
+    );
+    let p_idx = plan
+        .argv
+        .iter()
+        .position(|a| a == "-P")
+        .expect("-P present");
+    assert_eq!(plan.argv[p_idx + 1], "2222");
+    assert!(
+        !plan.argv.iter().any(|a| a == "-i"),
+        "a password-only host must not carry -i"
+    );
+    for arg in &plan.argv {
+        assert!(!arg.contains("hunter2"), "password in scp argv: {arg}");
+    }
+
+    // (b) Drive the real launcher with argv[0] swapped for the shim path so the
+    // end-to-end launch path is exercised hermetically (no PATH, no network).
+    let mut launch_argv = plan.argv.clone();
+    launch_argv[0] = shim_path.to_string_lossy().into_owned();
+    let code = launch_retrying_etxtbsy(launch_argv, plan.password.clone(), &self_exe, None);
+    assert_eq!(code, 0, "shim exits 0");
+    let cap = read_capture(&capture_path);
+
+    // The shim observed the scp operand and -P, but never the password.
+    let received = &cap.argv[1..]; // skip argv[0] (the shim path)
+    assert!(received.iter().any(|a| a == "deploy@10.0.0.5:/srv/app"));
+    let shim_p_idx = received
+        .iter()
+        .position(|a| a == "-P")
+        .expect("shim saw -P");
+    assert_eq!(received[shim_p_idx + 1], "2222");
+    assert!(
+        !received.iter().any(|a| a == "-i"),
+        "shim must not see -i for a password-only host"
+    );
+    for arg in received {
+        assert!(!arg.contains("hunter2"), "password in shim argv: {arg}");
+    }
+    // The Inline source stages a temp file pointed at by SSHRACK_ASKPASS_FILE;
+    // the password itself never appears in any captured env value.
+    assert!(
+        cap.env.contains_key("SSHRACK_ASKPASS_FILE"),
+        "Inline source must stage the askpass file env, got {:?}",
+        cap.env
+    );
+    for (k, v) in &cap.env {
+        assert!(!v.contains("hunter2"), "password leaked into env {k}={v}");
+    }
+}
+
+/// Two remote operands: build records both endpoints in `remote_hosts` (for
+/// host-key confirmation), but the password/identity come from the FIRST remote
+/// only — the launch path never re-resolves after the network host-key check.
+/// This is a plan-level assertion (the "first host wins" contract lives in
+/// `build`, not in `launch`).
+#[test]
+fn scp_multi_remote_first_host_wins_password() {
+    use sshrack_core::config::schema::{Auth, CredentialBody, Host, SshrackConfig};
+    use sshrack_core::connect::scp;
+    use sshrack_core::connect::ssh::Overrides;
+    use ulid::Ulid;
+
+    let cfg = SshrackConfig {
+        hosts: vec![
+            Host {
+                id: Ulid::new(),
+                name: "web1".into(),
+                host: "10.0.0.5".into(),
+                port: 2222,
+                auth: Auth::inline(CredentialBody::new("deploy").with_password("pw1-first")),
+            },
+            Host {
+                id: Ulid::new(),
+                name: "web2".into(),
+                host: "10.0.0.6".into(),
+                port: 3322,
+                auth: Auth::inline(CredentialBody::new("ops").with_password("pw2-second")),
+            },
+        ],
+        ..Default::default()
+    };
+    let backend = LocalFakeBackend::new();
+
+    let plan = scp::build(
+        &[
+            "archive.tar".into(),
+            "web1:/srv/a".into(),
+            "web2:/srv/b".into(),
+        ],
+        &cfg,
+        &Overrides::default(),
+        None,
+        &backend,
+    )
+    .expect("scp build ok");
+
+    // Both remotes recorded for host-key confirmation, first-appearance order.
+    assert_eq!(plan.remote_hosts.len(), 2, "two distinct remote endpoints");
+    assert_eq!(plan.remote_hosts[0].0, "10.0.0.5");
+    assert_eq!(plan.remote_hosts[0].1, 2222);
+    assert_eq!(plan.remote_hosts[1].0, "10.0.0.6");
+    assert_eq!(plan.remote_hosts[1].1, 3322);
+
+    // The FIRST remote's password wins. -P also comes from the first remote
+    // (web1's 2222), not web2's 3322.
+    match &plan.password {
+        PasswordSource::Inline(p) => assert_eq!(
+            p.as_str(),
+            "pw1-first",
+            "first remote's password must win, got {p:?}"
+        ),
+        other => panic!("expected Inline password from first host, got {other:?}"),
+    }
+    let p_idx = plan
+        .argv
+        .iter()
+        .position(|a| a == "-P")
+        .expect("-P present");
+    assert_eq!(
+        plan.argv[p_idx + 1],
+        "2222",
+        "-P comes from the first remote (web1), not web2"
+    );
+    // Both operands rewritten to user@host:path with each host's own user.
+    assert!(plan.argv.iter().any(|a| a == "deploy@10.0.0.5:/srv/a"));
+    assert!(plan.argv.iter().any(|a| a == "ops@10.0.0.6:/srv/b"));
+}
+
+/// An inline (pasted) identity key on a scp host: build materializes a 0600
+/// temp file, argv's `-i` points at that temp path (never the key text), and
+/// the plan holds the `KeyArtifact` so the file survives launch. Driven through
+/// the real launcher with the shim, the secret-never-in-argv invariant extends
+/// end-to-end through the connect path.
+#[test]
+fn scp_identity_temp_file_is_referenced_not_inlined() {
+    use sshrack_core::config::schema::{
+        Auth, CredentialBody, Host, InlineKey, KeySource, Secret, SshrackConfig,
+    };
+    use sshrack_core::connect::scp;
+    use sshrack_core::connect::ssh::Overrides;
+    use ulid::Ulid;
+
+    const PRIVATE_TEXT: &str = "SCP-INLINE-KEY-NEVER-IN-ARGV";
+
+    let (_dir, shim_path, capture_path) = fresh_shim();
+    let self_exe = std::env::current_exe().expect("current_exe");
+
+    let cfg = SshrackConfig {
+        hosts: vec![Host {
+            id: Ulid::new(),
+            name: "ik-host".into(),
+            host: "10.0.0.5".into(),
+            port: 22,
+            auth: Auth::inline(CredentialBody {
+                user: "deploy".into(),
+                password: None,
+                key: Some(KeySource::Inline(InlineKey {
+                    private_key: Some(Secret::Plain(PRIVATE_TEXT.into())),
+                    certificate: None,
+                    keyring: false,
+                })),
+                keyring: false,
+            }),
+        }],
+        ..Default::default()
+    };
+    let backend = LocalFakeBackend::new();
+
+    let plan = scp::build(
+        &["file.bin".into(), "ik-host:/tmp/".into()],
+        &cfg,
+        &Overrides::default(),
+        None,
+        &backend,
+    )
+    .expect("scp build ok");
+
+    // build materializes the inline key to a 0600 temp file and points -i at it.
+    let i_idx = plan
+        .argv
+        .iter()
+        .position(|a| a == "-i")
+        .expect("-i present for an inline-key host");
+    let temp_path = std::path::PathBuf::from(&plan.argv[i_idx + 1]);
+    assert!(
+        temp_path.to_string_lossy().contains("sshrack-key-"),
+        "-i should point at a sshrack temp key file, got {temp_path:?}"
+    );
+    for arg in &plan.argv {
+        assert!(!arg.contains(PRIVATE_TEXT), "key text in scp argv: {arg}");
+    }
+    let artifact = plan
+        .key_artifact
+        .as_ref()
+        .expect("build must hold the KeyArtifact so the temp file survives launch");
+    let _ = artifact; // referenced to assert presence; held alive by `plan`
+    // The temp file contains the materialized key text while the plan (and its
+    // artifact) is alive.
+    assert!(
+        std::fs::read_to_string(&temp_path)
+            .map(|c| c.contains(PRIVATE_TEXT))
+            .unwrap_or(false),
+        "temp key file at {temp_path:?} must contain the private key text"
+    );
+
+    // Drive the real launcher with the shim so the end-to-end path is locked:
+    // launch must not mutate argv to inject key text either.
+    let mut launch_argv = plan.argv.clone();
+    launch_argv[0] = shim_path.to_string_lossy().into_owned();
+    let code = launch_retrying_etxtbsy(launch_argv, plan.password.clone(), &self_exe, None);
+    assert_eq!(code, 0, "shim exits 0");
+    let cap = read_capture(&capture_path);
+
+    // The shim observed -i pointed at the SAME temp file, and never the key text.
+    let received = &cap.argv[1..]; // skip argv[0] (the shim path)
+    let shim_i_idx = received
+        .iter()
+        .position(|a| a == "-i")
+        .expect("shim saw -i");
+    assert_eq!(
+        received[shim_i_idx + 1],
+        temp_path.to_string_lossy(),
+        "shim saw -i pointed at the materialized temp key file"
+    );
+    for arg in received {
+        assert!(
+            !arg.contains(PRIVATE_TEXT),
+            "key text leaked into shim argv: {arg}"
+        );
+    }
+
+    // Drop the plan (and its artifact) AFTER launch so the temp file outlives
+    // scp; the artifact's Drop removes the temp key file.
+    drop(plan);
+    assert!(
+        !temp_path.exists(),
+        "temp key file deleted after the plan (and its artifact) drops"
+    );
+}

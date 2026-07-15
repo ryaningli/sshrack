@@ -157,4 +157,49 @@ mod tests {
         enc.cipher = String::from_utf8(bytes).unwrap();
         assert!(decrypt(&enc, &key).is_err());
     }
+
+    #[test]
+    fn derive_key_rejects_unsupported_kdf() {
+        // Only "argon2id" is derivable; any other algorithm tag fails fast.
+        let mut m = fast_meta("AAAAAAAAAAAAAAAAAAAAAA==");
+        m.kdf = "pbkdf2".into();
+        assert!(matches!(
+            derive_key("hunter2", &m),
+            Err(SshrackError::VaultUnlockFailed)
+        ));
+    }
+
+    #[test]
+    fn derive_key_rejects_malformed_base64_salt() {
+        // "!!!" is outside the standard base64 alphabet, so decoding the salt
+        // fails before Argon2 runs.
+        let m = fast_meta("!!!");
+        assert!(matches!(
+            derive_key("hunter2", &m),
+            Err(SshrackError::VaultUnlockFailed)
+        ));
+    }
+
+    #[test]
+    fn derive_key_rejects_zero_memory_cost() {
+        // m:0 violates Argon2's `m_cost > 0` (and `>= 8*p_cost`) invariant, so
+        // `Params::new` rejects it before any hashing begins.
+        let mut m = fast_meta("AAAAAAAAAAAAAAAAAAAAAA==");
+        m.m = 0;
+        assert!(matches!(
+            derive_key("hunter2", &m),
+            Err(SshrackError::VaultUnlockFailed)
+        ));
+    }
+
+    #[test]
+    fn decrypt_rejects_nonce_of_wrong_length() {
+        // "AAAA" decodes to 3 bytes, not the 24-byte XChaCha20 nonce expected,
+        // so decryption fails before the cipher is constructed.
+        let enc = EncryptedSecret {
+            nonce: "AAAA".into(),
+            cipher: "Y2lwaGVy".into(),
+        };
+        assert!(decrypt(&enc, &[0u8; 32]).is_err());
+    }
 }

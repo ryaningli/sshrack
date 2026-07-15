@@ -182,8 +182,15 @@ pub(crate) fn selected_fields(
             if parsed.is_empty() {
                 allowed.to_vec()
             } else {
+                // Single pass: validate each name against `allowed`, map it to
+                // its canonical `&'static str`, and de-dup preserving the
+                // user's order. An unknown name errors and names the field; a
+                // known name never yields an empty string (the find is gated by
+                // the same `allowed` it reads from, so the `let-else` is the
+                // sole exit for unknowns).
+                let mut selected: Vec<&'static str> = Vec::with_capacity(parsed.len());
                 for name in &parsed {
-                    if !allowed.contains(name) {
+                    let Some(canonical) = allowed.iter().copied().find(|a| a == name) else {
                         return Err((
                             format!(
                                 "sshrack: unknown field '{name}' — valid fields: {}",
@@ -191,12 +198,12 @@ pub(crate) fn selected_fields(
                             ),
                             exit_code::VALIDATION,
                         ));
+                    };
+                    if !selected.contains(&canonical) {
+                        selected.push(canonical);
                     }
                 }
-                parsed
-                    .iter()
-                    .map(|s| allowed.iter().copied().find(|a| a == s).unwrap_or(""))
-                    .collect()
+                selected
             }
         }
     };
@@ -606,5 +613,142 @@ mod tests {
             !serialized.contains("CERT-BODY"),
             "plaintext cert leaked through sealing: {serialized}"
         );
+    }
+
+    // ---- selected_fields: --fields parsing, ordering, dedup, validation ----
+    //
+    // Pins the contract documented on `selected_fields`: None/whitespace falls
+    // back to `allowed`; a comma list is a user-ordered subset; repeats de-dup
+    // (the doc promises "De-dupes but preserves order"); an unknown name is a
+    // VALIDATION-exit error that names the offending field.
+
+    use sshrack_core::config::schema::Auth;
+
+    /// The canonical allowed-field table for `host ls`, reused across the
+    /// `selected_fields` assertions so they mirror the real caller.
+    const HOST_FIELDS: &[&str] = &["name", "host", "user", "port", "auth"];
+
+    #[test]
+    fn selected_fields_none_returns_all_allowed() {
+        // No --fields → the full allowed set, in allowed's order.
+        let out = selected_fields(None, HOST_FIELDS).expect("None is always Ok");
+        assert_eq!(out, HOST_FIELDS);
+    }
+
+    #[test]
+    fn selected_fields_returns_ordered_subset_in_user_order() {
+        // The subset follows the user's comma order, not `allowed`'s order.
+        let out = selected_fields(Some("host,name"), HOST_FIELDS).expect("valid names");
+        assert_eq!(out, vec!["host", "name"]);
+    }
+
+    #[test]
+    fn selected_fields_dedupes_repeated_names_preserving_order() {
+        // REGRESSION: the doc promises "De-dupes but preserves order", but the
+        // old implementation mapped `name,name` → `["name","name"]` (no dedup),
+        // which would render the column twice in `print_text_table`. A repeated
+        // name collapses to a single entry at its first-seen position.
+        let out = selected_fields(Some("name,name"), HOST_FIELDS).expect("valid names");
+        assert_eq!(out, vec!["name"]);
+
+        // Dedup keeps first-seen order across distinct repeats: `port,name,port`
+        // → `["port","name"]`.
+        let out = selected_fields(Some("port,name,port"), HOST_FIELDS).expect("valid names");
+        assert_eq!(out, vec!["port", "name"]);
+    }
+
+    #[test]
+    fn selected_fields_whitespace_only_falls_back_to_allowed() {
+        // An all-whitespace spec (`"  ,  "`) trims to no names → full allowed.
+        let out = selected_fields(Some("  ,  "), HOST_FIELDS).expect("whitespace → allowed");
+        assert_eq!(out, HOST_FIELDS);
+    }
+
+    #[test]
+    fn selected_fields_empty_string_falls_back_to_allowed() {
+        // An empty string also trims to no names → full allowed.
+        let out = selected_fields(Some(""), HOST_FIELDS).expect("empty → allowed");
+        assert_eq!(out, HOST_FIELDS);
+    }
+
+    #[test]
+    fn selected_fields_unknown_name_is_validation_error_naming_field() {
+        // A single unknown field → Err with VALIDATION exit, naming the field.
+        let (msg, code) = selected_fields(Some("nope"), HOST_FIELDS).expect_err("unknown field");
+        assert!(
+            msg.contains("unknown field 'nope'"),
+            "error must name the unknown field, got: {msg}"
+        );
+        assert_eq!(code, exit_code::VALIDATION);
+    }
+
+    #[test]
+    fn selected_fields_unknown_among_valid_errors_naming_the_unknown() {
+        // `nope,host`: the error names `nope` (the unknown one), not `host`.
+        let (msg, code) =
+            selected_fields(Some("nope,host"), HOST_FIELDS).expect_err("mixed unknown+valid");
+        assert!(
+            msg.contains("unknown field 'nope'"),
+            "error must name the unknown field, got: {msg}"
+        );
+        assert_eq!(code, exit_code::VALIDATION);
+    }
+
+    #[test]
+    fn selected_fields_never_yields_empty_column_name() {
+        // The old `unwrap_or("")` fallback was flagged as a latent bug: a
+        // validated name must always resolve to a real `&'static str` from
+        // `allowed`, never "". After the single-pass rewrite the fallback is
+        // gone (replaced by a `let-else` error); assert no "" sneaks through
+        // for a valid spec.
+        let out =
+            selected_fields(Some("name,host,user,port,auth"), HOST_FIELDS).expect("all valid");
+        assert!(
+            !out.iter().any(|f| f.is_empty()),
+            "no field should be empty, got: {out:?}"
+        );
+    }
+
+    // ---- sort_hosts: None preserves order, Name sorts alphabetically ----
+    //
+    // Frecency/Recent delegate to the core `frecency` table loaded from the
+    // machine-local data dir, so their output order is not hermetic; they are
+    // intentionally not asserted here (the arms are exercised end-to-end via
+    // the binary integration tests instead).
+
+    /// Build a minimal `Host` with the given name for sort assertions.
+    fn sort_test_host(name: &str) -> Host {
+        Host {
+            id: Ulid::new(),
+            name: name.into(),
+            host: "h".into(),
+            port: 22,
+            auth: Auth::inline(CredentialBody::new("u")),
+        }
+    }
+
+    #[test]
+    fn sort_hosts_none_preserves_input_order() {
+        // No --sort → config/input order is returned unchanged (the frecency
+        // table is never even loaded on this arm).
+        let gamma = sort_test_host("gamma");
+        let alpha = sort_test_host("alpha");
+        let beta = sort_test_host("beta");
+        let refs = vec![&gamma, &alpha, &beta];
+        let out = sort_hosts(&refs, None);
+        let names: Vec<&str> = out.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(names, vec!["gamma", "alpha", "beta"]);
+    }
+
+    #[test]
+    fn sort_hosts_name_sorts_alphabetically() {
+        // --sort name → alphabetical by name, regardless of input order.
+        let gamma = sort_test_host("gamma");
+        let alpha = sort_test_host("alpha");
+        let beta = sort_test_host("beta");
+        let refs = vec![&gamma, &alpha, &beta];
+        let out = sort_hosts(&refs, Some(SortMode::Name));
+        let names: Vec<&str> = out.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "beta", "gamma"]);
     }
 }

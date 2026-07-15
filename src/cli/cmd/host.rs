@@ -818,3 +818,370 @@ fn map_not_found_or_validation(e: &SshrackError) -> i32 {
         _ => exit_code::VALIDATION,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the private pure helpers that drive `host ls`/`show`/`rm`
+    //! output and exit codes: cell rendering, dangling-reference fallbacks,
+    //! body-line rendering across all four secret arms, and error-to-exit-code
+    //! mapping. Pure: feeds fixtures, asserts strings/codes.
+    use super::*;
+    use sshrack_core::config::schema::{Credential, SshrackConfig};
+    use sshrack_core::error::DidYouMean;
+
+    // ---- fixtures ----
+
+    /// An inline-password host (user "deploy", secret kind "password").
+    fn inline_pw_host() -> Host {
+        Host {
+            id: Ulid::new(),
+            name: "web1".into(),
+            host: "10.0.0.5".into(),
+            port: 2222,
+            auth: Auth::Inline(CredentialBody::new("deploy").with_password("hunter2")),
+        }
+    }
+
+    /// A config holding one credential named "team-dev" (key auth, user
+    /// "deploy"). Returns the config plus the credential's id for building
+    /// `Auth::reference`.
+    fn cfg_with_cred() -> (SshrackConfig, Ulid) {
+        let cred_id = Ulid::new();
+        let cfg = SshrackConfig {
+            credentials: vec![Credential {
+                id: cred_id,
+                name: "team-dev".into(),
+                body: CredentialBody::new("deploy").with_key("/home/u/.ssh/team_ed25519"),
+            }],
+            ..Default::default()
+        };
+        (cfg, cred_id)
+    }
+
+    // ---- require_name ----
+
+    #[test]
+    fn require_name_some_returns_owned_name() {
+        assert_eq!(require_name(Some("web1"), "host").as_deref(), Ok("web1"));
+    }
+
+    #[test]
+    fn require_name_none_returns_usage_exit_code() {
+        // None prints to stderr via `fail` and returns USAGE.
+        assert_eq!(require_name(None, "host"), Err(exit_code::USAGE));
+    }
+
+    // ---- cell ----
+
+    #[test]
+    fn cell_renders_each_field_for_inline_host() {
+        let h = inline_pw_host();
+        let cfg = SshrackConfig::default();
+        assert_eq!(cell("name", &h, &cfg), "web1");
+        assert_eq!(cell("host", &h, &cfg), "10.0.0.5");
+        assert_eq!(cell("user", &h, &cfg), "deploy");
+        assert_eq!(cell("port", &h, &cfg), "2222");
+        assert_eq!(cell("auth", &h, &cfg), "password");
+    }
+
+    #[test]
+    fn cell_renders_resolved_credential_user_and_auth_label() {
+        let (cfg, cred_id) = cfg_with_cred();
+        let h = Host {
+            id: Ulid::new(),
+            name: "db1".into(),
+            host: "db.internal".into(),
+            port: 22,
+            auth: Auth::reference(cred_id),
+        };
+        assert_eq!(cell("user", &h, &cfg), "deploy");
+        assert_eq!(cell("auth", &h, &cfg), "cred:team-dev");
+    }
+
+    #[test]
+    fn cell_unknown_field_returns_empty_string() {
+        let h = inline_pw_host();
+        let cfg = SshrackConfig::default();
+        assert_eq!(cell("bogus", &h, &cfg), "");
+    }
+
+    // ---- derive_user ----
+
+    #[test]
+    fn derive_user_inline_returns_body_user() {
+        let auth = Auth::Inline(CredentialBody::new("ops"));
+        assert_eq!(derive_user(&auth, &SshrackConfig::default()), "ops");
+    }
+
+    #[test]
+    fn derive_user_resolved_ref_returns_credential_user() {
+        let (cfg, cred_id) = cfg_with_cred();
+        let auth = Auth::reference(cred_id);
+        assert_eq!(derive_user(&auth, &cfg), "deploy");
+    }
+
+    #[test]
+    fn derive_user_dangling_ref_returns_question_mark() {
+        // A credential id not present in cfg must never panic — it surfaces
+        // "?" so the ls table stays renderable.
+        let cfg = SshrackConfig::default();
+        let auth = Auth::reference(Ulid::new());
+        assert_eq!(derive_user(&auth, &cfg), "?");
+    }
+
+    // ---- derive_auth_label ----
+
+    #[test]
+    fn derive_auth_label_resolved_ref_shows_cred_prefix_and_name() {
+        let (cfg, cred_id) = cfg_with_cred();
+        let auth = Auth::reference(cred_id);
+        assert_eq!(derive_auth_label(&auth, &cfg), "cred:team-dev");
+    }
+
+    #[test]
+    fn derive_auth_label_dangling_ref_shows_cred_question() {
+        let cfg = SshrackConfig::default();
+        let auth = Auth::reference(Ulid::new());
+        assert_eq!(derive_auth_label(&auth, &cfg), "cred:?");
+    }
+
+    #[test]
+    fn derive_auth_label_inline_secret_kinds() {
+        let cfg = SshrackConfig::default();
+        // password
+        let pw = Auth::Inline(CredentialBody::new("u").with_password("p"));
+        assert_eq!(derive_auth_label(&pw, &cfg), "password");
+        // key (path)
+        let key = Auth::Inline(CredentialBody::new("u").with_key("/k"));
+        assert_eq!(derive_auth_label(&key, &cfg), "key");
+        // keyring marker
+        let keyring = Auth::Inline(CredentialBody {
+            user: "u".into(),
+            password: None,
+            key: None,
+            keyring: true,
+        });
+        assert_eq!(derive_auth_label(&keyring, &cfg), "keyring");
+        // default (no secret)
+        let default = Auth::Inline(CredentialBody::new("u"));
+        assert_eq!(derive_auth_label(&default, &cfg), "default");
+    }
+
+    // ---- credential_name_for_host ----
+
+    #[test]
+    fn credential_name_for_host_resolved_ref_returns_name() {
+        let (cfg, cred_id) = cfg_with_cred();
+        let host = Host {
+            id: Ulid::new(),
+            name: "db1".into(),
+            host: "db".into(),
+            port: 22,
+            auth: Auth::reference(cred_id),
+        };
+        assert_eq!(credential_name_for_host(&cfg, &host), Some("team-dev"));
+    }
+
+    #[test]
+    fn credential_name_for_host_dangling_ref_returns_none() {
+        let cfg = SshrackConfig::default();
+        let host = Host {
+            id: Ulid::new(),
+            name: "orphan".into(),
+            host: "db".into(),
+            port: 22,
+            auth: Auth::reference(Ulid::new()),
+        };
+        assert_eq!(credential_name_for_host(&cfg, &host), None);
+    }
+
+    #[test]
+    fn credential_name_for_host_inline_returns_none() {
+        let cfg = SshrackConfig::default();
+        let host = inline_pw_host();
+        assert_eq!(credential_name_for_host(&cfg, &host), None);
+    }
+
+    // ---- format_detail ----
+
+    #[test]
+    fn format_detail_resolved_ref_shows_credential_name_and_body() {
+        let (cfg, cred_id) = cfg_with_cred();
+        let host = Host {
+            id: Ulid::new(),
+            name: "db1".into(),
+            host: "db.internal".into(),
+            port: 22,
+            auth: Auth::reference(cred_id),
+        };
+        let out = format_detail(&cfg, &host, Some("team-dev"), &RevealedPassword::Masked);
+        assert!(
+            out.contains("auth:     credential 'team-dev'"),
+            "got: {out}"
+        );
+        assert!(out.contains("user:     deploy"), "got: {out}");
+        assert!(
+            out.contains("key:      /home/u/.ssh/team_ed25519"),
+            "got: {out}"
+        );
+        assert!(
+            !out.contains("dangling reference"),
+            "resolved ref must not say dangling: {out}"
+        );
+    }
+
+    #[test]
+    fn format_detail_dangling_ref_shows_dangling_marker_and_ulid() {
+        let dangling_id = Ulid::new();
+        let cfg = SshrackConfig::default();
+        let host = Host {
+            id: Ulid::new(),
+            name: "orphan".into(),
+            host: "h".into(),
+            port: 22,
+            auth: Auth::reference(dangling_id),
+        };
+        // cred_name None → the ulid string is used in the auth line.
+        let out = format_detail(&cfg, &host, None, &RevealedPassword::Masked);
+        assert!(
+            out.contains("user:     (dangling reference)"),
+            "expected dangling marker, got: {out}"
+        );
+        assert!(
+            out.contains(&dangling_id.to_string()),
+            "expected the ulid in the auth line, got: {out}"
+        );
+    }
+
+    #[test]
+    fn format_detail_inline_shows_user_and_masked_password() {
+        let cfg = SshrackConfig::default();
+        let host = inline_pw_host();
+        let out = format_detail(&cfg, &host, None, &RevealedPassword::Masked);
+        assert!(out.contains("name:     web1"), "got: {out}");
+        assert!(out.contains("user:     deploy"), "got: {out}");
+        assert!(out.contains("password: (hidden)"), "got: {out}");
+    }
+
+    // ---- render_body_lines ----
+
+    #[test]
+    fn render_body_lines_key_only_emits_key_line_no_password() {
+        let body = CredentialBody::new("ops").with_key("/home/u/.ssh/id_ed25519");
+        let mut out = String::new();
+        render_body_lines(&body, &RevealedPassword::Masked, &mut out);
+        assert!(out.contains("user:     ops"), "got: {out}");
+        assert!(
+            out.contains("key:      /home/u/.ssh/id_ed25519"),
+            "got: {out}"
+        );
+        // No password line for a key-only body.
+        assert!(!out.contains("password:"), "got: {out}");
+    }
+
+    #[test]
+    fn render_body_lines_keyring_marker_masked_emits_stored_in_keyring() {
+        let body = CredentialBody {
+            user: "u".into(),
+            password: None,
+            key: None,
+            keyring: true,
+        };
+        let mut out = String::new();
+        render_body_lines(&body, &RevealedPassword::Masked, &mut out);
+        assert!(out.contains("password: (stored in keyring)"), "got: {out}");
+    }
+
+    #[test]
+    fn render_body_lines_keyring_marker_revealed_emits_plaintext() {
+        let body = CredentialBody {
+            user: "u".into(),
+            password: None,
+            key: None,
+            keyring: true,
+        };
+        let mut out = String::new();
+        render_body_lines(
+            &body,
+            &RevealedPassword::Plaintext(Zeroizing::new("s3cret".into())),
+            &mut out,
+        );
+        assert!(out.contains("password: s3cret"), "got: {out}");
+    }
+
+    #[test]
+    fn render_body_lines_password_masked_emits_hidden_and_never_plaintext() {
+        let body = CredentialBody::new("u").with_password("hunter2");
+        let mut out = String::new();
+        render_body_lines(&body, &RevealedPassword::Masked, &mut out);
+        assert!(out.contains("password: (hidden)"), "got: {out}");
+        // The actual password must never appear under Masked.
+        assert!(!out.contains("hunter2"), "got: {out}");
+    }
+
+    #[test]
+    fn render_body_lines_default_keys_emits_default_marker() {
+        let body = CredentialBody::new("ec2-user");
+        let mut out = String::new();
+        render_body_lines(&body, &RevealedPassword::Masked, &mut out);
+        assert!(out.contains("user:     ec2-user"), "got: {out}");
+        assert!(out.contains("auth:     default keys"), "got: {out}");
+        // No password line for a default body.
+        assert!(!out.contains("password:"), "got: {out}");
+    }
+
+    #[test]
+    fn render_body_lines_password_with_revealed_none_emits_no_password_line() {
+        // A password body with RevealedPassword::None (no password to show)
+        // must not emit a password line at all.
+        let body = CredentialBody::new("u").with_password("ignored");
+        let mut out = String::new();
+        render_body_lines(&body, &RevealedPassword::None, &mut out);
+        assert!(out.contains("user:     u"), "got: {out}");
+        assert!(!out.contains("password:"), "got: {out}");
+    }
+
+    // ---- map_not_found_or_validation ----
+
+    #[test]
+    fn map_not_found_or_validation_host_not_found_maps_to_not_found() {
+        let e = SshrackError::HostNotFound {
+            name: "ghost".into(),
+            hint: DidYouMean::none(),
+        };
+        assert_eq!(map_not_found_or_validation(&e), exit_code::NOT_FOUND);
+    }
+
+    #[test]
+    fn map_not_found_or_validation_credential_not_found_maps_to_not_found() {
+        let e = SshrackError::CredentialNotFound {
+            name: "ghost".into(),
+            hint: DidYouMean::none(),
+        };
+        assert_eq!(map_not_found_or_validation(&e), exit_code::NOT_FOUND);
+    }
+
+    #[test]
+    fn map_not_found_or_validation_other_error_maps_to_validation() {
+        let e = SshrackError::HostAlreadyExists { name: "x".into() };
+        assert_eq!(map_not_found_or_validation(&e), exit_code::VALIDATION);
+    }
+
+    // ---- cred_name_or_id ----
+
+    #[test]
+    fn cred_name_or_id_some_returns_borrowed_name() {
+        let id = Ulid::new();
+        let cow = cred_name_or_id(Some("team-dev"), &id);
+        assert_eq!(cow, "team-dev");
+        assert!(matches!(cow, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn cred_name_or_id_none_returns_owned_ulid_string() {
+        let id = Ulid::new();
+        let cow = cred_name_or_id(None, &id);
+        assert_eq!(cow, id.to_string());
+        assert!(matches!(cow, Cow::Owned(_)));
+    }
+}
