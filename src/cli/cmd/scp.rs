@@ -38,9 +38,8 @@ use sshrack_core::secret::OsKeyring;
 use sshrack_core::secret::vault;
 
 use crate::cli::args::{Cli, Command};
+use crate::cli::prompt::EnvPassphrase;
 use crate::shared::exit_code;
-
-use super::shared::EnvPassphrase;
 
 /// Dispatch for the `Scp` arm of the CLI.
 ///

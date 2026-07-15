@@ -41,10 +41,11 @@ use sshrack_core::secret::SecretBackend;
 use sshrack_core::secret::vault;
 
 use crate::cli::args::{Cli, OutputFormat, StoreAction, StoreMode};
+use crate::cli::prompt::EnvPassphrase;
 use crate::shared::exit_code;
 use crate::shared::format as fmt;
 
-use super::shared::{EnvPassphrase, fail, load_config, save_config, unlock_vault_key};
+use super::shared::{fail, load_config, save_config, unlock_vault_key};
 
 /// The single tunable vault runtime field exposed by `store config`: the
 /// master-key cache TTL in seconds (`0` disables caching). KDF cost params

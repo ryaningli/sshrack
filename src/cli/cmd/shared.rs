@@ -5,8 +5,9 @@
 //! [`Ulid`] before a pure core call, and ranking hosts by frecency for
 //! `host ls --sort frecency`.
 //!
-//! The only passphrase source in this layer is [`EnvPassphrase`] (the
-//! `SSHRACK_PASSPHRASE` env var). There are no TTY prompts anywhere here.
+//! Passphrase providers live in [`crate::cli::prompt`] (`TtyPassphrase` when a
+//! tty is present, `EnvPassphrase` for scripts/CI). This layer no longer owns a
+//! passphrase provider; it borrows one via [`prompt::passphrase_provider`].
 //!
 //! Nothing here prints, logs, or returns a password in an error message.
 
@@ -15,7 +16,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use ulid::Ulid;
-use zeroize::Zeroizing;
 
 use sshrack_core::config::path as config_path;
 use sshrack_core::config::schema::{
@@ -23,14 +23,13 @@ use sshrack_core::config::schema::{
 };
 use sshrack_core::config::store;
 use sshrack_core::credential;
-use sshrack_core::error::SshrackError;
 use sshrack_core::frecency;
 use sshrack_core::id::OwnerKind;
 use sshrack_core::secret::OsKeyring;
-use sshrack_core::secret::PassphraseProvider;
 use sshrack_core::secret::vault;
 
 use crate::cli::args::SortMode;
+use crate::cli::prompt::EnvPassphrase;
 use crate::shared::exit_code;
 
 /// Load the config at `override_path` (or the XDG default). A missing file is
@@ -139,26 +138,6 @@ pub fn seal_inline_body(
             exit_code::STORE,
         )
     })
-}
-
-/// The only passphrase source in the non-interactive CLI: the
-/// `SSHRACK_PASSPHRASE` env var. Errors if unset (mapped to
-/// [`SshrackError::Interrupted`] so the vault unlock path produces a clean
-/// "vault unlock failed" message rather than a TTY hang).
-pub struct EnvPassphrase;
-
-impl PassphraseProvider for EnvPassphrase {
-    fn passphrase(&self) -> Result<Zeroizing<String>, SshrackError> {
-        vault::passphrase_from_env().ok_or(SshrackError::Interrupted)
-    }
-
-    fn passphrase_confirm(&self) -> Result<Zeroizing<String>, SshrackError> {
-        self.passphrase()
-    }
-
-    fn confirm(&self, _text: &str) -> Result<bool, SshrackError> {
-        Ok(false)
-    }
 }
 
 // ===========================================================================
