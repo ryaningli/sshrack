@@ -59,6 +59,51 @@ pub(crate) fn tty_confirm(text: &str) -> bool {
     prompt_yes_no(&format!("{text} (y/N) "))
 }
 
+/// Pure kernel of [`prompt_host_key`]: split a multi-line host-key `message`
+/// (authenticity + fingerprint + question, as emitted by
+/// [`confirm_text`][sshrack_core::hostkey::confirm_text]) into the `body` (all
+/// lines but the last, no trailing newline) and the last line reshaped into an
+/// ssh-style inline affordance: the question's trailing `?` moves to the very
+/// end, after `(yes/no)` — `Are you sure ... connecting?` becomes
+/// `Are you sure ... connecting (yes/no)? `. ssh also offers `[fingerprint]`;
+/// sshrack already shows the fingerprint above, so the affordance is the
+/// shorter `(yes/no)`. Separated so the shaping is unit-testable without a tty.
+fn split_inline_question(message: &str) -> (String, String) {
+    let (body, question) = match message.rfind('\n') {
+        Some(i) => (&message[..i], &message[i + 1..]),
+        None => ("", message),
+    };
+    let trimmed = question.trim();
+    let stem = trimmed.strip_suffix('?').unwrap_or(trimmed);
+    (body.to_string(), format!("{stem} (yes/no)? "))
+}
+
+/// Host-key first-connect confirm. Prints the multi-line `message` line by
+/// line, with the final question line getting an inline `(yes/no)` affordance
+/// (mirroring ssh's `...connecting (yes/no/[fingerprint])? `) so the cursor
+/// sits on the prompt line — not a bare blank line with no hint of what to
+/// type. Returns `false` without a tty, on EOF (Ctrl-D), or on read error —
+/// the CLI never hangs.
+pub(crate) fn prompt_host_key(message: &str) -> bool {
+    if !has_tty() {
+        return false;
+    }
+    let (body, question) = split_inline_question(message);
+    if !body.is_empty() {
+        let _ = writeln!(std::io::stderr(), "{body}");
+    }
+    let _ = write!(std::io::stderr(), "{question}");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    let answer = match std::io::stdin().read_line(&mut line) {
+        Ok(0) => false, // EOF (Ctrl-D)
+        Ok(_) => parse_yes_no(&line),
+        Err(_) => false,
+    };
+    let _ = writeln!(std::io::stderr()); // newline after the typed answer
+    answer
+}
+
 /// Read a passphrase with no echo. Empty/failed read yields an empty string
 /// (the caller's vault-unlock will then fail the verifier cleanly).
 pub(crate) fn prompt_passphrase(prompt: &str) -> Zeroizing<String> {
@@ -160,5 +205,50 @@ mod tests {
         // decline rather than block. This is the guarantee the CLI relies on so
         // scripts never hang on a host-key prompt.
         assert!(!prompt_yes_no("irrelevant without a tty"));
+    }
+
+    #[test]
+    fn split_inline_question_moves_trailing_q_after_affordance() {
+        // The shape confirm_text emits: two body lines + a question ending in
+        // `?`. The affordance must sit inline and the `?` must move to the end
+        // so it reads like ssh's `...connecting (yes/no)? `.
+        let message = "The authenticity of host 'h' can't be established.\n\
+             ED25519 key fingerprint is: SHA256:abc.\n\
+             Are you sure you want to continue connecting?";
+        let (body, question) = split_inline_question(message);
+        assert_eq!(
+            body,
+            "The authenticity of host 'h' can't be established.\n\
+             ED25519 key fingerprint is: SHA256:abc."
+        );
+        assert_eq!(
+            question,
+            "Are you sure you want to continue connecting (yes/no)? "
+        );
+    }
+
+    #[test]
+    fn split_inline_question_single_line_still_gets_affordance() {
+        // A message with no newline: body is empty, the whole text is the
+        // question, and the affordance is still appended.
+        let (body, question) = split_inline_question("Continue connecting?");
+        assert!(body.is_empty());
+        assert_eq!(question, "Continue connecting (yes/no)? ");
+    }
+
+    #[test]
+    fn split_inline_question_keeps_stem_when_no_trailing_q() {
+        // If the question has no trailing `?` there is nothing to relocate;
+        // the affordance is appended verbatim (defensive — confirm_text
+        // currently always ends with `?`).
+        let (body, question) = split_inline_question("Continue connecting");
+        assert!(body.is_empty());
+        assert_eq!(question, "Continue connecting (yes/no)? ");
+    }
+
+    #[test]
+    fn prompt_host_key_returns_false_without_tty() {
+        // Mirror of prompt_yes_no's guarantee: no tty -> decline, never block.
+        assert!(!prompt_host_key("irrelevant without a tty"));
     }
 }

@@ -179,7 +179,7 @@ pub fn run(cli: &Cli) -> i32 {
     let host_str = resolved_host.host.as_str();
     let accept_new = opts.accept_new;
     let has_tty = crate::cli::prompt::has_tty();
-    let confirm = |fingerprint_text: &str| crate::cli::prompt::prompt_yes_no(fingerprint_text);
+    let confirm = |fingerprint_text: &str| crate::cli::prompt::prompt_host_key(fingerprint_text);
     if let Err(e) = hostkey::run_host_key_flow(host_str, port, has_tty, accept_new, confirm) {
         eprintln!("sshrack: host key: {e}");
         return exit_code::CONNECT;
