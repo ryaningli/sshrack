@@ -155,7 +155,8 @@ pub fn run(cli: &Cli) -> i32 {
         // On the Prompt path (has_tty && !accept_new) core hands us the full
         // fingerprint text; show it and ask yes/no. The Accept path (accept_new)
         // never calls this closure.
-        let confirm = |fingerprint_text: &str| crate::cli::prompt::prompt_yes_no(fingerprint_text);
+        let confirm =
+            |fingerprint_text: &str| crate::cli::prompt::prompt_host_key(fingerprint_text);
         if let Err(e) = hostkey::run_host_key_flow(host_str, *port, has_tty, accept_new, confirm) {
             eprintln!("sshrack: host key: {e}");
             return exit_code::CONNECT;
