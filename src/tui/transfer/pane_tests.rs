@@ -608,7 +608,7 @@ fn search_mode_down_moves_search_cursor_not_dir_selected() {
     let mut p = pane_with_fruits();
     // Screen would set search = Some(...); simulate by hand.
     let mut search = crate::tui::transfer::search::PaneSearch::empty();
-    search.set_results(vec![path_match("/x/a"), path_match("/x/b")]);
+    search.results = vec![path_match("/x/a"), path_match("/x/b")];
     p.search = Some(search);
     assert_eq!(p.core.selected, 0);
     assert_eq!(p.search.as_ref().expect("search active").cursor, 0);
@@ -628,7 +628,7 @@ fn search_mode_down_moves_search_cursor_not_dir_selected() {
 fn search_mode_ctrl_p_and_ctrl_n_move_search_cursor() {
     let mut p = pane_with_fruits();
     let mut search = crate::tui::transfer::search::PaneSearch::empty();
-    search.set_results(vec![path_match("/x/a"), path_match("/x/b")]);
+    search.results = vec![path_match("/x/a"), path_match("/x/b")];
     p.search = Some(search);
 
     let out = p.on_key(press_with(KeyCode::Char('n'), KeyModifiers::CONTROL));
@@ -676,7 +676,7 @@ fn search_mode_space_enter_right_emit_none() {
     // `pane.search.as_ref().and_then(|s| s.selected())`.
     let mut p = pane_with_fruits();
     let mut search = crate::tui::transfer::search::PaneSearch::empty();
-    search.set_results(vec![path_match("/x/a"), path_match("/x/b")]);
+    search.results = vec![path_match("/x/a"), path_match("/x/b")];
     p.search = Some(search);
 
     assert_eq!(p.on_key(press(KeyCode::Char(' '))), PaneOutcome::None);
@@ -692,7 +692,7 @@ fn search_mode_release_event_is_ignored() {
     // event never reaches on_search_key.
     let mut p = pane_with_fruits();
     let mut search = crate::tui::transfer::search::PaneSearch::empty();
-    search.set_results(vec![path_match("/x/a")]);
+    search.results = vec![path_match("/x/a")];
     p.search = Some(search);
     let release = KeyEvent::new_with_kind(KeyCode::Down, KeyModifiers::NONE, KeyEventKind::Release);
     assert_eq!(p.on_key(release), PaneOutcome::None);

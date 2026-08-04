@@ -220,7 +220,7 @@ mod tests {
         let mut pane = Pane::new(std::path::PathBuf::from("/srv"));
         let mut srch = PaneSearch::empty();
         srch.searching = false;
-        srch.set_results(vec![
+        srch.results = vec![
             PathMatch {
                 path: std::path::PathBuf::from("/srv/apath/bfile"),
                 is_dir: false,
@@ -236,7 +236,7 @@ mod tests {
                 is_dir: false,
                 seg_matches: vec![seg("xdir", &[0]), seg("yfile", &[0])],
             },
-        ]);
+        ];
         // Cursor on index 1, mark the directory result (index 1) so the marked
         // + cursor + dir glyphs all appear in the same snapshot row.
         srch.cursor = 1;

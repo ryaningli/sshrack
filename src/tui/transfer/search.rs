@@ -80,16 +80,6 @@ impl PaneSearch {
         }
     }
 
-    /// Replace the result list, clamping the cursor in-bounds. Does NOT toggle
-    /// `searching` — the screen clears that flag itself once a drain completes.
-    pub(crate) fn set_results(&mut self, results: Vec<PathMatch>) {
-        let len = results.len();
-        self.results = results;
-        if self.cursor >= len {
-            self.cursor = len.saturating_sub(1);
-        }
-    }
-
     /// The match under the cursor, or `None` when there are no results.
     #[must_use]
     pub(crate) fn selected(&self) -> Option<&PathMatch> {
@@ -151,7 +141,7 @@ mod tests {
     #[test]
     fn pane_search_move_cursor_wraps() {
         let mut s = super::PaneSearch::empty();
-        s.set_results(vec![
+        s.results = vec![
             PathMatch {
                 path: PathBuf::from("/x/a"),
                 is_dir: false,
@@ -162,7 +152,7 @@ mod tests {
                 is_dir: false,
                 seg_matches: vec![],
             },
-        ]);
+        ];
         assert_eq!(s.cursor, 0);
         s.move_cursor(1);
         assert_eq!(s.cursor, 1);
@@ -173,15 +163,13 @@ mod tests {
     #[test]
     fn pane_search_visible_window_bounds_cursor() {
         let mut s = super::PaneSearch::empty();
-        s.set_results(
-            (0..50)
-                .map(|i| PathMatch {
-                    path: PathBuf::from(format!("/x/{i}")),
-                    is_dir: false,
-                    seg_matches: vec![],
-                })
-                .collect(),
-        );
+        s.results = (0..50)
+            .map(|i| PathMatch {
+                path: PathBuf::from(format!("/x/{i}")),
+                is_dir: false,
+                seg_matches: vec![],
+            })
+            .collect();
         s.cursor = 40;
         let win = s.visible_window(10);
         assert!(win.start <= 40 && 40 < win.end);

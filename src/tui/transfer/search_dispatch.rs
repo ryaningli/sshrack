@@ -49,8 +49,12 @@ impl TransferScreen {
             SearchEventKind::Match(m) => {
                 srch.results.push(m);
                 rank_matches(&mut srch.results);
-                // Re-clamp the cursor into bounds after append + re-rank.
-                srch.set_results(srch.results.clone());
+                // Re-clamp the cursor into bounds after append + re-rank,
+                // in place — no full-results clone per Match event.
+                let len = srch.results.len();
+                if srch.cursor >= len {
+                    srch.cursor = len.saturating_sub(1);
+                }
             }
             SearchEventKind::Done { .. } => srch.searching = false,
             SearchEventKind::Error(msg) => {
@@ -216,6 +220,9 @@ impl TransferScreen {
         }
         self.search_rx = None;
         self.search_cancel = None;
+        // Esc inside the debounce window must not let a stale pending_search
+        // fire a background search after the user explicitly cancelled.
+        self.pending_search = None;
         let focus = self.focus;
         if let Some(pane) = self.pane_mut(focus) {
             pane.search = None;

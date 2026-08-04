@@ -14,7 +14,7 @@ use ratatui::{Terminal, backend::TestBackend};
 use sshrack_core::connect::sftp::parse::strip_control_chars;
 use sshrack_core::connect::sftp::proto::{Direction, Progress, TransferJob};
 use sshrack_core::dirsource::DirEntry;
-use sshrack_core::pathfind::{PathMatch, SearchEvent, SearchEventKind};
+use sshrack_core::pathfind::{PathMatch, SearchEvent, SearchEventKind, parse_query};
 use std::path::{Path, PathBuf};
 
 /// Build a `DirEntry` fixture: `name` carries a trailing `/` for dirs
@@ -1340,15 +1340,11 @@ fn jump_to_result_targets_parent_for_file() {
     // useful target). Clears the search + query and sets pending_list.
     let mut s = TransferScreen::new(PathBuf::from("/a"), PathBuf::from("/b"));
     s.local.search = Some(PaneSearch::empty());
-    s.local
-        .search
-        .as_mut()
-        .unwrap()
-        .set_results(vec![PathMatch {
-            path: PathBuf::from("/a/sub/f.txt"),
-            is_dir: false,
-            seg_matches: vec![],
-        }]);
+    s.local.search.as_mut().unwrap().results = vec![PathMatch {
+        path: PathBuf::from("/a/sub/f.txt"),
+        is_dir: false,
+        seg_matches: vec![],
+    }];
     let out = s.jump_to_search_result();
     assert_eq!(out, ScreenOutcome::Continue);
     assert_eq!(
@@ -1393,5 +1389,27 @@ fn search_request_filter_mode_when_single_segment() {
     assert!(
         s.pending_search.is_none(),
         "filter mode does not launch a search"
+    );
+}
+
+#[test]
+fn cancel_search_clears_pending_search() {
+    // Esc inside the ~80ms debounce window must clear pending_search too —
+    // otherwise the run loop still dispatches it after the window elapses,
+    // firing a wasted background search AFTER the user explicitly cancelled.
+    // Reproduces the leak: cancel_search cleared search_rx/search_cancel/
+    // pane.search but not pending_search.
+    let mut s = TransferScreen::new(PathBuf::from("/srv"), PathBuf::from("/r"));
+    let parsed = parse_query("a/b", Path::new("/srv"), None);
+    s.local.search = Some(PaneSearch::empty());
+    s.pending_search = Some((Side::Local, parsed));
+    s.cancel_search();
+    assert!(
+        s.pending_search.is_none(),
+        "cancel must clear pending_search so a stale search cannot fire"
+    );
+    assert!(
+        s.local.search.is_none(),
+        "cancel must drop the pane out of find mode"
     );
 }
