@@ -31,3 +31,4 @@ pub mod pane;
 pub mod queue_overlay;
 pub mod render;
 pub mod screen;
+pub(crate) mod search;
