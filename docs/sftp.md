@@ -61,3 +61,33 @@ The transfer screen is backed by a `TransferLedger` (in `tui/transfer/ledger.rs`
 - **Retry re-transfers from byte 0.** sshrack has no `reget`/`reput` (system `sftp` batch mode is append-unaware here), so retry is a fresh transfer, not a resume. The failure-hygiene cleanup already removed the partial destination, so there is no stub to collide with.
 - **Folders are indeterminate.** A recursive folder transfer (`get -R` / `put -R`) is one ledger task with no per-file progress — the gauge reads the whole dir as a single indeterminate unit. Per-file expansion (splitting a folder task into per-file children with real byte progress) is a future phase.
 
+## Path-Aware Find
+
+Each pane's filter box is path-aware. Typing one segment (`a`) is today's
+current-directory fuzzy filter (unchanged). Typing multiple segments
+(`a/b/c`) switches the pane to cross-directory find mode: each segment
+fuzzy-matches one directory level, so `a/b/c` matches
+`<cwd>/a…/b…/c…` at any depth — the depth followed is exactly the segment
+count. Per-segment pruning prevents explosion: a directory whose name fails
+to fuzzy-match segment `i` is never listed for segment `i+1`, so the search
+touches only paths on a matching prefix.
+
+- **Local vs remote.** Local find runs on a background thread
+  (`pathfind::LocalPathSearch` over `LocalDirSource`). Remote find runs
+  per-segment `sftp ls` batches over the same authenticated ControlMaster the
+  transfer worker uses (`pathfind::RemotePathSearch` over `SftpDirSource`) —
+  OpenSSH multiplexes them concurrently, so find never blocks a transfer and
+  vice versa.
+- **Bases.** `~/…` resolves against `$HOME` (remote `home` from `open_transfer`
+  for the remote pane; falls back to the pane's cwd when home is unknown),
+  `../…` pops the cwd, `/…` is filesystem-root, and a bare `a/b/c` is
+  relative to the pane's cwd.
+- **Result keys.** `Enter` jumps to the result's directory (the match itself
+  for a directory, the parent for a file), `Space` marks it for batch
+  transfer, `Ctrl-S` enqueues marked-or-selected, `Esc` cancels the in-flight
+  search and drops back to filter mode (the query text is preserved).
+- **Highlight.** Each path segment's matched characters are highlighted
+  (`theme::MATCH` + bold), joined by a dim `/`, with a trailing `/` on
+  directory results — the cursor row is accent + bold overall, mirroring the
+  directory listing's cursor.
+

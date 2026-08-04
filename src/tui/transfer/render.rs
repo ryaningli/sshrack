@@ -81,14 +81,19 @@ pub fn draw_pane(frame: &mut Frame, area: Rect, pane: &Pane, focused: bool, titl
     .areas(inner);
 
     draw_cwd_row(frame, cwd_area, pane, focused);
-    draw_filter_row(
-        frame,
-        filter_area,
-        &pane.core.query,
-        pane.matched_count(),
-        pane.core.entries.len(),
-        focused,
-    );
+
+    // Filter-row count: search-aware when a cross-directory find is active on
+    // this pane (searching / N matches / first error line), the directory
+    // `matched/total` otherwise.
+    let filter_label = match pane.search.as_ref() {
+        Some(s) if s.searching => "searching…".to_string(),
+        Some(s) => match s.results.len() {
+            0 => "no matches".to_string(),
+            n => format!("{n} matches"),
+        },
+        None => parts::count_label(pane.matched_count(), pane.core.entries.len()),
+    };
+    draw_filter_row(frame, filter_area, &pane.core.query, &filter_label, focused);
 
     if pane.loading {
         frame.render_widget(
@@ -97,6 +102,11 @@ pub fn draw_pane(frame: &mut Frame, area: Rect, pane: &Pane, focused: bool, titl
                 .alignment(Alignment::Center),
             parts::vertical_center(list_area, 1),
         );
+        return;
+    }
+
+    if pane.search.is_some() {
+        super::render_search::draw_search_list(frame, list_area, pane, focused);
         return;
     }
 
@@ -118,18 +128,13 @@ fn draw_cwd_row(frame: &mut Frame, area: Rect, pane: &Pane, focused: bool) {
 }
 
 /// Render the filter row (interior of the bordered pane): a dim `❯ ` prefix +
-/// the query on the left, the right-aligned `matched/total` [`count_label`] on
-/// the right, and — only when `focused` — the terminal cursor right after the
-/// query. Borderless (the pane `Block` already draws the surrounding border).
-fn draw_filter_row(
-    frame: &mut Frame,
-    area: Rect,
-    query: &str,
-    matched: usize,
-    total: usize,
-    focused: bool,
-) {
-    let label = parts::count_label(matched, total);
+/// the query on the left, a right-aligned `label` on the right, and — only
+/// when `focused` — the terminal cursor right after the query. Borderless (the
+/// pane `Block` already draws the surrounding border). `label` is pre-built by
+/// the caller: the directory `matched/total` ([`parts::count_label`]) in filter
+/// mode, or a search-state string (`searching…` / `N matches` / `no matches`)
+/// in find mode.
+fn draw_filter_row(frame: &mut Frame, area: Rect, query: &str, label: &str, focused: bool) {
     let label_w = label.chars().count() as u16;
     let [prompt_area, count_area] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(label_w)]).areas(area);

@@ -81,6 +81,8 @@ Bare `c`, `?`, `1`/`2`/`3` always reach the search box (never act as hotkeys). O
 
 `Ctrl-Enter` collapses to a bare `Enter` on many terminals, so it is only a hidden alias. Entry: `sshrack sftp <name>` or `Ctrl-T` on a host. Full SFTP architecture → [`docs/sftp.md`](docs/sftp.md).
 
+The pane filter box is path-aware: a single segment (`a`) is today's current-directory fuzzy filter, while multiple segments (`a/b/c`) trigger cross-directory find (each segment fuzzy-matches one directory level; per-segment pruning prevents explosion). `Enter` jumps to the result's directory, `Space` marks it, `^s` enqueues, `Esc` cancels the search. Details → [Path-Aware Find](docs/sftp.md#path-aware-find).
+
 ## Development Constraints
 
 ### Priority: Solve the Problem First

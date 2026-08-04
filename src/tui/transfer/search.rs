@@ -110,10 +110,6 @@ impl PaneSearch {
     /// Range of result indices to render for a viewport of `rows` rows, using
     /// the same focus-following window as the directory browser so scroll
     /// behavior stays identical between filter and find modes.
-    ///
-    /// `#[allow(dead_code)]`: consumed by Task 10's search-result renderer;
-    /// exercised today only by this module's own tests.
-    #[allow(dead_code)]
     #[must_use]
     pub(crate) fn visible_window(&self, rows: usize) -> Range<usize> {
         focus_window(self.results.len(), self.cursor, rows)
