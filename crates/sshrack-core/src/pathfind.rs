@@ -68,6 +68,44 @@ fn resolve_base<'a>(raw: &'a str, cwd: &Path, home: Option<&Path>) -> (PathBuf, 
     (base, rest)
 }
 
+/// One segment's fuzzy match result against a single name.
+#[derive(Debug, Clone)]
+pub struct SegmentScore {
+    pub score: u32,
+    /// Matched char indices within `name` (for highlight rendering).
+    pub indices: Vec<u32>,
+}
+
+/// Injected fuzzy matcher for one path segment. Core stays free of
+/// `nucleo-matcher`; the TUI provides the impl.
+pub trait SegmentMatcher: Send + Sync {
+    /// `Some` when `seg` fuzzy-matches `name`; an empty `seg` matches all.
+    fn match_segment(&self, name: &str, seg: &str) -> Option<SegmentScore>;
+}
+
+/// One segment's match along a matched path (name + its score/indices).
+#[derive(Debug, Clone)]
+pub struct SegMatch {
+    pub name: String,
+    pub score: u32,
+    pub indices: Vec<u32>,
+}
+
+/// A fully matched path: one `SegMatch` per query segment, in order.
+#[derive(Debug, Clone)]
+pub struct PathMatch {
+    pub path: PathBuf,
+    pub is_dir: bool,
+    pub seg_matches: Vec<SegMatch>,
+}
+
+impl PathMatch {
+    /// Sum of per-segment scores — the primary sort key.
+    pub fn total_score(&self) -> u32 {
+        self.seg_matches.iter().map(|s| s.score).sum()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,5 +186,62 @@ mod tests {
         let q = parse_query("", Path::new("/srv"), None);
         assert_eq!(q.base, PathBuf::from("/srv"));
         assert!(q.segments.is_empty());
+    }
+
+    #[test]
+    fn empty_segment_matches_anything_with_zero_score() {
+        let m = AlwaysMatcher;
+        let r = m.match_segment("anything", "");
+        assert!(r.is_some());
+        let s = r.unwrap();
+        assert_eq!(s.score, 0);
+        assert!(s.indices.is_empty());
+    }
+
+    #[test]
+    fn path_match_total_score_sums_segments() {
+        let pm = PathMatch {
+            path: PathBuf::from("/x/a/b"),
+            is_dir: false,
+            seg_matches: vec![
+                SegMatch {
+                    name: "a".into(),
+                    score: 10,
+                    indices: vec![0],
+                },
+                SegMatch {
+                    name: "b".into(),
+                    score: 5,
+                    indices: vec![0],
+                },
+            ],
+        };
+        assert_eq!(pm.total_score(), 15);
+    }
+
+    /// Trivial matcher used by the core-level unit tests (the real nucleo
+    /// impl lives in the TUI, Task 6). Matches iff `name` contains `seg`
+    /// (case-insensitive); score = matched length; indices = matched positions.
+    #[derive(Debug, Clone, Copy)]
+    struct AlwaysMatcher;
+    impl SegmentMatcher for AlwaysMatcher {
+        fn match_segment(&self, name: &str, seg: &str) -> Option<SegmentScore> {
+            if seg.is_empty() {
+                return Some(SegmentScore {
+                    score: 0,
+                    indices: vec![],
+                });
+            }
+            let nl = name.to_ascii_lowercase();
+            let sl = seg.to_ascii_lowercase();
+            let idx = nl.match_indices(&sl).next()?;
+            let indices: Vec<u32> = (0..sl.chars().count() as u32)
+                .map(|i| idx.0 as u32 + i)
+                .collect();
+            Some(SegmentScore {
+                score: sl.len() as u32,
+                indices,
+            })
+        }
     }
 }
