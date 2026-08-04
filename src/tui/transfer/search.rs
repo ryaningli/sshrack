@@ -56,12 +56,6 @@ impl SegmentMatcher for NucleoSegmentMatcher {
 /// multi-segment (find) or `None` for single-segment/empty (filter). The pane
 /// just reports `PaneOutcome::QueryChanged` when the query text changes and
 /// routes arrows to the SEARCH cursor while `search` is `Some`.
-///
-/// `#[allow(dead_code)]`: the fields and methods not yet exercised in
-/// production (`searching`, `error`, `empty`, `set_results`, `selected`,
-/// `visible_window`) are forward-used by Task 8 (screen mode dispatch) /
-/// Task 9 (drain) / Task 10 (render). Remove these allows once those land.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct PaneSearch {
     /// Ranked find results across directories (one `PathMatch` per hit).
@@ -75,10 +69,6 @@ pub(crate) struct PaneSearch {
     pub error: Option<String>,
 }
 
-/// `#[allow(dead_code)]`: see the struct-level allow above — `empty`,
-/// `set_results`, `selected`, and `visible_window` are consumed by
-/// Task 8/9/10 (screen dispatch / drain / render).
-#[allow(dead_code)]
 impl PaneSearch {
     /// Fresh search state: no results yet, cursor at 0, `searching` true (a
     /// search is about to start or is in flight).
@@ -93,6 +83,7 @@ impl PaneSearch {
 
     /// Replace the result list, clamping the cursor in-bounds. Does NOT toggle
     /// `searching` — the screen clears that flag itself once a drain completes.
+    #[allow(dead_code)] // Task 9 drain calls this via apply_search_event.
     pub(crate) fn set_results(&mut self, results: Vec<PathMatch>) {
         let len = results.len();
         self.results = results;
@@ -121,6 +112,10 @@ impl PaneSearch {
     /// Range of result indices to render for a viewport of `rows` rows, using
     /// the same focus-following window as the directory browser so scroll
     /// behavior stays identical between filter and find modes.
+    ///
+    /// `#[allow(dead_code)]`: consumed by Task 10's search-result renderer;
+    /// exercised today only by this module's own tests.
+    #[allow(dead_code)]
     #[must_use]
     pub(crate) fn visible_window(&self, rows: usize) -> Range<usize> {
         focus_window(self.results.len(), self.cursor, rows)

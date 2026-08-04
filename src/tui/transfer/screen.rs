@@ -30,7 +30,10 @@ use ratatui::{
 use sshrack_core::connect::sftp::proto::{
     Direction, OverwritePolicy, Progress, TransferJob, TransferOutcome,
 };
-use sshrack_core::dirsource::DirEntry;
+use sshrack_core::dirsource::{DirEntry, DirSource, LocalDirSource};
+use sshrack_core::pathfind::{
+    ParsedQuery, SearchEvent, SearchEventKind, parse_query, rank_matches,
+};
 
 use crate::tui::intent::Status;
 use crate::tui::theme;
@@ -38,6 +41,7 @@ use crate::tui::transfer::ledger::TransferLedger;
 use crate::tui::transfer::pane::{Pane, PaneOutcome, Side};
 use crate::tui::transfer::queue_overlay::QueueOverlay;
 use crate::tui::transfer::render;
+use crate::tui::transfer::search::PaneSearch;
 
 /// Pure intent returned by [`TransferScreen::on_key`]. The screen mutates its
 /// own focus / marks / queue / `pending_list`; this intent tells the run
@@ -73,7 +77,11 @@ pub enum ScreenOutcome {
 /// [`TransferScreen::draw`] lays out the screen and delegates pane painting to
 /// [`render::draw_pane`]. [`TransferScreen::on_key`] is the pure key router;
 /// the worker and overwrite-policy popup are driven by the live run loop.
-#[derive(Debug, Clone)]
+///
+/// Not `Clone`: the run loop owns the single live instance, and the
+/// `search_rx`/`search_cancel` pair is a single-consumer channel + flag that
+/// cannot be duplicated.
+#[derive(Debug)]
 pub struct TransferScreen {
     /// The local-filesystem pane. Owns its cwd, entries, query, cursor, marks.
     pub local: Pane,
@@ -112,6 +120,29 @@ pub struct TransferScreen {
     /// The `^Q` queue-manager modal. `None` when closed. Owned here (not as an
     /// `App::overlay`) because the transfer screen bypasses the overlay stack.
     pub queue_overlay: Option<QueueOverlay>,
+    /// Pending search launch: the focused side + parsed query that the run
+    /// loop (Task 9) reads to spawn a
+    /// [`PathSearch`](sshrack_core::pathfind::PathSearch). Set by
+    /// [`search_request`](Self::search_request) when a multi-segment query
+    /// enters find mode; the run loop clears it after launching. Pure: setting
+    /// this performs no I/O.
+    pub pending_search: Option<(Side, ParsedQuery)>,
+    /// Receiver for streamed search events, installed by the run loop (Task 9)
+    /// when it launches a search. The run loop drains it and feeds events to
+    /// [`apply_search_event`](Self::apply_search_event).
+    pub search_rx: Option<std::sync::mpsc::Receiver<SearchEvent>>,
+    /// Cancel flag for the in-flight search, installed by the run loop (Task 9)
+    /// alongside `search_rx`. [`cancel_search`](Self::cancel_search) flips it.
+    pub search_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Generation tag for the current search. Incremented by the run loop
+    /// (Task 9) on every new launch;
+    /// [`apply_search_event`](Self::apply_search_event) ignores events whose
+    /// `gen` ≠ this, so stale results from a superseded query never paint.
+    #[allow(dead_code)] // Task 9 run loop bumps it; apply_search_event reads it.
+    pub search_gen: u32,
+    /// Remote home directory (`open_transfer` fills this in Task 10); `None`
+    /// until then, so remote `~`-expansion degrades to the remote cwd.
+    pub remote_home: Option<PathBuf>,
 }
 
 impl TransferScreen {
@@ -134,6 +165,11 @@ impl TransferScreen {
             pending_list: None,
             overwrite_policy: None,
             queue_overlay: None,
+            pending_search: None,
+            search_rx: None,
+            search_cancel: None,
+            search_gen: 0,
+            remote_home: None,
         }
     }
 
@@ -227,6 +263,10 @@ impl TransferScreen {
             return out;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // Find mode: when the focused pane has an active search, `Enter` jumps
+        // to the selected result's directory and `Space` marks it (both
+        // intercepted here so they never reach the dir-list path).
+        let in_search = self.focused_pane().search.is_some();
         match key.code {
             // Tab / Shift-Tab flip focus between the two panes.
             KeyCode::Tab | KeyCode::BackTab if !ctrl => {
@@ -237,8 +277,9 @@ impl TransferScreen {
             // entries as transfer jobs. (Legacy alias — many terminals collapse
             // Ctrl-Enter to a bare Enter, so the footer advertises Ctrl-S below
             // as the reliable primary trigger. Kept for terminals that deliver
-            // it and for muscle memory.)
-            KeyCode::Enter if ctrl => self.enqueue_from_focused(),
+            // it and for muscle memory.) Routes through `enqueue_focused` so a
+            // search-result selection enqueues from the search results.
+            KeyCode::Enter if ctrl => self.enqueue_focused(),
             // Ctrl-S: the primary, footer-advertised transfer trigger. A control
             // char (0x13), so — unlike Ctrl-Enter — it survives terminal
             // decoding on every terminal. Transfers the focused pane's marked
@@ -246,10 +287,14 @@ impl TransferScreen {
             // batch. Direction follows focus (Local → Upload, Remote → Download).
             // No clash with the wizards' Ctrl-S = save: those are form overlays,
             // and this Layer-0 screen owns the key while it is open.
-            KeyCode::Char('s') if ctrl => self.enqueue_from_focused(),
-            // Esc: cancel an in-flight transfer, otherwise close the screen.
+            KeyCode::Char('s') if ctrl => self.enqueue_focused(),
+            // Esc: cancel an in-flight cross-directory find, else cancel an
+            // active transfer, else close the screen.
             KeyCode::Esc => {
-                if self.has_inflight() {
+                if in_search {
+                    self.cancel_search();
+                    ScreenOutcome::Continue
+                } else if self.has_inflight() {
                     ScreenOutcome::CancelActive
                 } else {
                     ScreenOutcome::CloseTransfer
@@ -261,6 +306,15 @@ impl TransferScreen {
             // bound to the pane search box per the no-bare-hotkey invariant.)
             KeyCode::Char('q') if ctrl => {
                 self.queue_overlay.get_or_insert(QueueOverlay::new());
+                ScreenOutcome::Continue
+            }
+            // Enter (no Ctrl) on a search result: jump to its directory.
+            KeyCode::Enter if in_search => self.jump_to_search_result(),
+            // Space on a search result: mark it (reuses Pane.core.marked). In
+            // filter mode Space falls through to the pane, which toggles the
+            // dir-list mark.
+            KeyCode::Char(' ') if in_search && !ctrl => {
+                self.search_mark_focused();
                 ScreenOutcome::Continue
             }
             // Everything else (arrows, Space, printable chars, Enter without
@@ -289,9 +343,16 @@ impl TransferScreen {
             Side::Remote => self.remote.on_key(key),
         };
         match outcome {
-            PaneOutcome::None | PaneOutcome::QueryChanged | PaneOutcome::ToggleMark(_) => {
+            // The filter query changed: re-evaluate filter-vs-find mode for the
+            // focused pane. `search_request` may flip the pane into find mode
+            // (multi-segment query) and stash `pending_search` for the run loop,
+            // or drop it back to filter mode (single-segment/empty).
+            PaneOutcome::QueryChanged => {
+                let q = self.focused_pane().core.query.clone();
+                self.search_request(focus, q);
                 ScreenOutcome::Continue
             }
+            PaneOutcome::None | PaneOutcome::ToggleMark(_) => ScreenOutcome::Continue,
             // Enter / Right on a file activated it — enqueue the focused pane's
             // marked (or selected) entries. A dir took the StepInto arm above
             // (Enter on a dir navigates, never transfers — folders transfer via
@@ -399,6 +460,220 @@ impl TransferScreen {
         match self.focus {
             Side::Local => &mut self.local,
             Side::Remote => &mut self.remote,
+        }
+    }
+
+    /// Mutable accessor by side (focus-agnostic). Returns `Some` for both
+    /// `Side::Local` and `Side::Remote` — both panes always exist; the `Option`
+    /// lets callers defensive-match rather than `expect` at every site.
+    fn pane_mut(&mut self, side: Side) -> Option<&mut Pane> {
+        match side {
+            Side::Local => Some(&mut self.local),
+            Side::Remote => Some(&mut self.remote),
+        }
+    }
+
+    /// Apply one streamed search event to the named pane's search state. The
+    /// run loop (Task 9) calls this for each event drained from
+    /// [`search_rx`](Self::search_rx). Stale events (`ev.gen ≠ search_gen`) are
+    /// dropped so results from a superseded query never reach the pane. Pure:
+    /// no I/O.
+    #[allow(dead_code)] // Task 9 run-loop drain is the production caller.
+    pub fn apply_search_event(&mut self, side: Side, ev: SearchEvent) {
+        if ev.r#gen != self.search_gen {
+            return;
+        }
+        let Some(pane) = self.pane_mut(side) else {
+            return;
+        };
+        let Some(srch) = pane.search.as_mut() else {
+            return;
+        };
+        match ev.kind {
+            SearchEventKind::Match(m) => {
+                srch.results.push(m);
+                rank_matches(&mut srch.results);
+                // Re-clamp the cursor into bounds after append + re-rank.
+                srch.set_results(srch.results.clone());
+            }
+            SearchEventKind::Done { .. } => srch.searching = false,
+            SearchEventKind::Error(msg) => {
+                srch.searching = false;
+                srch.error = Some(msg);
+            }
+        }
+    }
+
+    /// Re-evaluate filter-vs-find mode after the focused pane's query changed.
+    /// Single-segment-or-empty queries with `base == cwd` stay in filter mode
+    /// (the synchronous `core.recompute` already handles them); multi-segment
+    /// or out-of-cwd queries enter find mode (set `pane.search`, clear its
+    /// results, and stash `pending_search` for the run loop to launch). Pure:
+    /// no I/O.
+    fn search_request(&mut self, side: Side, query: String) {
+        if query.is_empty() {
+            self.pane_mut(side)
+                .expect("invariant: side is a valid pane")
+                .search = None;
+            return;
+        }
+        let (cwd, home) = match side {
+            Side::Local => (self.local.core.cwd.clone(), LocalDirSource::new().home()),
+            Side::Remote => (self.remote.core.cwd.clone(), self.remote_home.clone()),
+        };
+        let parsed = parse_query(&query, &cwd, home.as_deref());
+        let is_filter = parsed.segments.len() <= 1 && parsed.base == cwd;
+        let launch = if is_filter {
+            None
+        } else {
+            Some((side, parsed))
+        };
+        {
+            let pane = self
+                .pane_mut(side)
+                .expect("invariant: side is a valid pane");
+            if is_filter {
+                pane.search = None;
+            } else {
+                let srch = pane.search.get_or_insert_with(PaneSearch::empty);
+                srch.searching = true;
+                srch.error = None;
+                srch.results.clear();
+                srch.cursor = 0;
+            }
+        }
+        self.pending_search = launch;
+    }
+
+    /// `Enter` on a search result: jump to its directory (the match itself for
+    /// a dir, the parent for a file), clear the search + query, and set
+    /// [`pending_list`](Self::pending_list) so the run loop lists the target.
+    /// MVP: the cursor lands on the directory's remembered position (not
+    /// auto-located on the match file — a future enhancement).
+    pub fn jump_to_search_result(&mut self) -> ScreenOutcome {
+        let focus = self.focus;
+        let Some(target) = self
+            .pane_mut(focus)
+            .expect("invariant: focus is a valid pane")
+            .search
+            .as_ref()
+            .and_then(|s| s.selected().map(|m| (m.path.clone(), m.is_dir)))
+        else {
+            return ScreenOutcome::Continue;
+        };
+        let dir = if target.1 {
+            target.0.clone()
+        } else {
+            target
+                .0
+                .parent()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| target.0.clone())
+        };
+        {
+            let pane = self
+                .pane_mut(focus)
+                .expect("invariant: focus is a valid pane");
+            pane.search = None;
+            pane.core.query.clear();
+            pane.core.recompute();
+        }
+        self.pending_list = Some((focus, dir));
+        ScreenOutcome::Continue
+    }
+
+    /// `Space` on a search result: mark its path (reuses `Pane.core.marked` so
+    /// the existing mark-rendering + enqueue-from-marks path works unchanged).
+    fn search_mark_focused(&mut self) {
+        let focus = self.focus;
+        let Some(path) = self
+            .pane_mut(focus)
+            .expect("invariant: focus is a valid pane")
+            .search
+            .as_ref()
+            .and_then(|s| s.selected().map(|m| m.path.clone()))
+        else {
+            return;
+        };
+        self.focused_pane_mut().core.marked.insert(path);
+    }
+
+    /// `Ctrl-S` / `Ctrl-Enter` on search results: enqueue marked (or selected)
+    /// matches. Mirrors [`enqueue_from_focused`](Self::enqueue_from_focused)
+    /// but sources its specs from the search results instead of the dir
+    /// listing. `size_total` is `None` because [`PathMatch`] does not carry
+    /// size. Marks are single-shot (cleared after enqueue).
+    fn enqueue_from_search(&mut self) -> ScreenOutcome {
+        let focus = self.focus;
+        let direction = match focus {
+            Side::Local => Direction::Upload,
+            Side::Remote => Direction::Download,
+        };
+        let dst_cwd = match focus {
+            Side::Local => self.remote.core.cwd.clone(),
+            Side::Remote => self.local.core.cwd.clone(),
+        };
+        let mut specs: Vec<(PathBuf, bool)> = Vec::new();
+        {
+            let pane = self.focused_pane();
+            let Some(srch) = pane.search.as_ref() else {
+                return ScreenOutcome::Continue;
+            };
+            if !pane.core.marked.is_empty() {
+                for m in &srch.results {
+                    if pane.core.marked.contains(&m.path) {
+                        specs.push((m.path.clone(), m.is_dir));
+                    }
+                }
+            } else if let Some(m) = srch.selected() {
+                specs.push((m.path.clone(), m.is_dir));
+            }
+        }
+        if specs.is_empty() {
+            return ScreenOutcome::Continue;
+        }
+        self.focused_pane_mut().core.marked.clear();
+        for (path, is_dir) in specs {
+            let name = path
+                .file_name()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| path.clone());
+            let dst = dst_cwd.join(&name);
+            self.ledger.enqueue(TransferJob {
+                direction,
+                src: path,
+                dst,
+                name: name.to_string_lossy().into_owned(),
+                size_total: None,
+                recursive: is_dir,
+            });
+        }
+        ScreenOutcome::Enqueue
+    }
+
+    /// `Esc` in find mode: cancel the in-flight search (flip the cancel flag
+    /// the run loop installed) and drop back to filter mode. The query text is
+    /// left intact so the user can edit and re-trigger.
+    fn cancel_search(&mut self) {
+        if let Some(cancel) = &self.search_cancel {
+            cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.search_rx = None;
+        self.search_cancel = None;
+        let focus = self.focus;
+        if let Some(pane) = self.pane_mut(focus) {
+            pane.search = None;
+        }
+    }
+
+    /// Unified enqueue entry: search results when a search is active on the
+    /// focused pane, else the dir-listing path. Keeps `on_key` agnostic of the
+    /// current mode.
+    fn enqueue_focused(&mut self) -> ScreenOutcome {
+        if self.focused_pane().search.is_some() {
+            self.enqueue_from_search()
+        } else {
+            self.enqueue_from_focused()
         }
     }
 
