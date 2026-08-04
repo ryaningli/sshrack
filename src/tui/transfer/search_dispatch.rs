@@ -31,11 +31,10 @@ impl TransferScreen {
     }
 
     /// Apply one streamed search event to the named pane's search state. The
-    /// run loop (Task 9) calls this for each event drained from
+    /// run loop calls this for each event drained from
     /// [`search_rx`](Self::search_rx). Stale events (`ev.gen ≠ search_gen`) are
     /// dropped so results from a superseded query never reach the pane. Pure:
     /// no I/O.
-    #[allow(dead_code)] // Task 9 run-loop drain is the production caller.
     pub fn apply_search_event(&mut self, side: Side, ev: SearchEvent) {
         if ev.r#gen != self.search_gen {
             return;

@@ -20,9 +20,8 @@ use sshrack_core::pathfind::{PathMatch, SegmentMatcher, SegmentScore};
 /// `SegmentMatcher` backed by `nucleo-matcher`. One fresh `Matcher` per call
 /// (state is cheap; `Matcher::new` is a small allocation).
 ///
-/// Constructed for the first time in Task 9's run loop (`PathSearch::launch`
-/// injection); until then `dead_code` would fire under `--all-targets`.
-#[allow(dead_code)]
+/// Constructed once in `App::new` and shared via `Arc` across search launches
+/// (Task 9 run loop calls `PathSearch::launch` with a clone of it).
 pub(crate) struct NucleoSegmentMatcher;
 
 impl SegmentMatcher for NucleoSegmentMatcher {
@@ -83,7 +82,6 @@ impl PaneSearch {
 
     /// Replace the result list, clamping the cursor in-bounds. Does NOT toggle
     /// `searching` — the screen clears that flag itself once a drain completes.
-    #[allow(dead_code)] // Task 9 drain calls this via apply_search_event.
     pub(crate) fn set_results(&mut self, results: Vec<PathMatch>) {
         let len = results.len();
         self.results = results;

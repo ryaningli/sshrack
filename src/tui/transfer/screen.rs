@@ -132,10 +132,9 @@ pub struct TransferScreen {
     /// alongside `search_rx`. [`cancel_search`](Self::cancel_search) flips it.
     pub search_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Generation tag for the current search. Incremented by the run loop
-    /// (Task 9) on every new launch;
-    /// [`apply_search_event`](Self::apply_search_event) ignores events whose
-    /// `gen` ≠ this, so stale results from a superseded query never paint.
-    #[allow(dead_code)] // Task 9 run loop bumps it; apply_search_event reads it.
+    /// on every new launch; [`apply_search_event`](Self::apply_search_event)
+    /// ignores events whose `gen` ≠ this, so stale results from a superseded
+    /// query never paint.
     pub search_gen: u32,
     /// Remote home directory (`open_transfer` fills this in Task 10); `None`
     /// until then, so remote `~`-expansion degrades to the remote cwd.

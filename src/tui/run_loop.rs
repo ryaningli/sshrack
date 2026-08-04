@@ -38,8 +38,10 @@ use super::term::{TerminalHandle, Tui};
 use super::transfer::open::open_transfer;
 use super::transfer::overwrite;
 use super::transfer::pane::Side;
+use crate::tui::transfer::search::NucleoSegmentMatcher;
 use sshrack_core::connect::sftp::SftpWorker;
 use sshrack_core::connect::sftp::proto::{Direction, TransferOutcome, WorkerCmd, WorkerEvent};
+use sshrack_core::pathfind::{ParsedQuery, PathSearch, SearchEvent};
 
 /// How long [`event::poll`] blocks for a key before the loop wakes to drain
 /// SFTP worker events and re-render. crossterm's `poll` watches only the
@@ -151,6 +153,15 @@ pub fn run_loop(
         };
 
         if let Event::Key(key) = event {
+            // Stamp the last-key time before routing: the search debounce
+            // gate (should_fire_search) reads this when a pending_search is
+            // waiting, and the only surface that produces pending_search is
+            // the transfer screen. Stamping on every Press while a transfer
+            // screen is open keeps the gate honest about "the user is still
+            // typing" without coupling it to a specific arm below.
+            if app.transfer.is_some() && key.kind == crossterm::event::KeyEventKind::Press {
+                app.last_search_key = std::time::Instant::now();
+            }
             // Only react to key presses, not releases/repeats (crossterm 0.28
             // emits Release/Repeat on some platforms).
             match app.on_key(key) {
@@ -425,6 +436,21 @@ pub fn run_loop(
     }
 }
 
+/// Bundled cross-directory find launch parameters: produced inside the
+/// transfer-screen borrow and consumed after it ends (the searchers live on
+/// `App` disjoint from `app.transfer`, so the launch call cannot stay inside
+/// the `if let Some(screen) = app.transfer.as_mut()` block). Naming the tuple
+/// keeps clippy's `type_complexity` lint satisfied and documents what crosses
+/// the borrow boundary.
+type SearchLaunch = (
+    Side,
+    ParsedQuery,
+    u32,
+    std::sync::Arc<NucleoSegmentMatcher>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    std::sync::mpsc::Sender<SearchEvent>,
+);
+
 /// Drain pending SFTP worker events into the transfer screen + handle the
 /// screen's navigation/transfer intents. Called once per loop iteration AFTER
 /// key handling when a transfer session is open. Pure-I/O: reads
@@ -518,6 +544,111 @@ fn drain_transfer_events(app: &mut App, handle: &TerminalHandle) {
                 if let Some(worker) = app.transfer_worker.as_ref() {
                     worker.send(WorkerCmd::List(path));
                 }
+            }
+        }
+    }
+
+    // 2. Drain in-flight search events into the screen, then dispatch any
+    //    pending search launch. Two steps:
+    //      (a) Snapshot every buffered SearchEvent out of `search_rx`, then
+    //          apply them to the active-search pane. The snapshot releases the
+    //          `search_rx` borrow BEFORE we mutate the screen (the receiver is
+    //          re-seated unless the search was cancelled mid-loop, in which
+    //          case `search_cancel` is None and we let the rx drop).
+    //      (b) If the screen stashed a `pending_search`, debounce + launch it
+    //          via the injected `PathSearch` (local now; remote no-op until
+    //          Task 10's `open_transfer` populates `app.remote_search`).
+    if let Some(screen) = app.transfer.as_mut() {
+        let rx = screen.search_rx.take();
+        if let Some(rx) = rx {
+            // Snapshot all buffered events this tick. Only one pane has a
+            // search active at a time, so the side is read once up front.
+            let side = if screen.local.search.is_some() {
+                Side::Local
+            } else {
+                Side::Remote
+            };
+            let mut events: Vec<_> = rx.try_recv().into_iter().collect();
+            // Keep receiving while there are buffered events; the loop bounds
+            // the work per tick so a runaway worker cannot starve key handling.
+            while let Ok(ev) = rx.try_recv() {
+                events.push(ev);
+            }
+            // Re-seat the receiver unless the search was cancelled mid-loop
+            // (cancel_search clears search_rx to None AND drops search_cancel).
+            // The generation check inside apply_search_event drops stragglers
+            // from a superseded query, so re-seating is always safe.
+            let still_listening = app
+                .transfer
+                .as_ref()
+                .is_some_and(|s| s.search_cancel.is_some());
+            if still_listening && let Some(screen) = app.transfer.as_mut() {
+                screen.search_rx = Some(rx);
+            }
+            // Apply the snapshot now that the rx borrow is released.
+            if let Some(screen) = app.transfer.as_mut() {
+                for ev in events {
+                    screen.apply_search_event(side, ev);
+                }
+            }
+        }
+    }
+
+    // (b) Dispatch pending_search with ~80 ms debounce + cancel-on-retarget.
+    // Compute everything the launch needs INSIDE the screen borrow, then exit
+    // the borrow before calling launch — the searcher (app.local_search /
+    // app.remote_search) is borrowed separately from app.transfer, and holding
+    // both at once would not compile.
+    let launch: Option<SearchLaunch> = {
+        if let Some(screen) = app.transfer.as_mut() {
+            if let Some((side, parsed)) = screen.pending_search.take() {
+                let elapsed = std::time::Instant::now()
+                    .duration_since(app.last_search_key)
+                    .as_millis() as u64;
+                if !should_fire_search(elapsed) {
+                    // Too soon after the last keystroke — put it back and
+                    // retry next tick. The user is still typing; launching now
+                    // would thrash the search worker on every char.
+                    screen.pending_search = Some((side, parsed));
+                    None
+                } else {
+                    // Generation bump first so stragglers from the previous
+                    // in-flight search are dropped by apply_search_event's gen
+                    // check even if their cancel flag has not been observed.
+                    screen.search_gen = screen.search_gen.wrapping_add(1);
+                    // Cancel any previous in-flight search before installing
+                    // the new rx/cancel pair. The worker thread observes the
+                    // flag and exits its walk.
+                    if let Some(c) = screen.search_cancel.as_ref() {
+                        c.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    screen.search_rx = Some(rx);
+                    screen.search_cancel = Some(cancel.clone());
+                    let r#gen = screen.search_gen;
+                    let matcher = app.search_matcher.clone();
+                    Some((side, parsed, r#gen, matcher, cancel, tx))
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    if let Some((side, parsed, r#gen, matcher, cancel, tx)) = launch {
+        match side {
+            Side::Local => {
+                app.local_search.launch(&parsed, matcher, r#gen, cancel, tx);
+            }
+            Side::Remote => {
+                if let Some(rs) = app.remote_search.as_ref() {
+                    rs.launch(&parsed, matcher, r#gen, cancel, tx);
+                }
+                // remote_search None until Task 10 wires open_transfer —
+                // remote find is a no-op then, while local find already works
+                // end-to-end.
             }
         }
     }
@@ -646,6 +777,13 @@ fn decide_post_done_refresh(
         TransferOutcome::Ok | TransferOutcome::Cancelled if queue_empty => last_direction,
         _ => None,
     }
+}
+
+/// Debounce gate for cross-directory find: fire only after ≥80 ms since the
+/// last keystroke. The run loop checks this before launching a `PathSearch`;
+/// if too soon, it puts `pending_search` back and retries next tick. Pure.
+fn should_fire_search(elapsed_ms: u64) -> bool {
+    elapsed_ms >= 80
 }
 
 /// Pop the next queued job (if any) and send it to the worker, resolving an
@@ -777,6 +915,161 @@ mod tests {
         // negligible CPU (the loop just re-polls). Bump deliberately only if a
         // re-measurement justifies it.
         assert_eq!(EVENT_POLL, Duration::from_millis(50));
+    }
+
+    // ---- should_fire_search ----
+
+    #[test]
+    fn should_fire_search_debounce_boundary() {
+        // 80 ms is the documented debounce window: anything below holds the
+        // search back (put pending_search back + retry next tick), 80 ms or
+        // above fires. Pins the exact boundary so a refactor of the gate stays
+        // honest about the user-visible lag.
+        assert!(!should_fire_search(50), "<80 ms must not fire");
+        assert!(should_fire_search(80), "80 ms must fire (≥)");
+        assert!(should_fire_search(200), "200 ms must fire");
+    }
+
+    // ===============================================================
+    // Search-event drain wiring: drain_transfer_events must snapshot
+    // buffered SearchEvents out of `search_rx`, apply each to the active
+    // pane's PaneSearch, drop stale events (gen mismatch), and re-seat the
+    // receiver for the next tick. The borrow shape (snapshot then apply) is
+    // load-bearing — pinning it here guards against a refactor that drops the
+    // snapshot and silently breaks the search-result feed.
+    // ===============================================================
+
+    #[test]
+    fn drain_applies_buffered_search_events_to_active_pane_search() {
+        use sshrack_core::pathfind::{PathMatch, SearchEvent, SearchEventKind};
+        use std::path::PathBuf;
+        use std::sync::mpsc;
+
+        let mut app = app_with_host("web");
+        let mut screen = TransferScreen::new(PathBuf::from("/local"), PathBuf::from("/remote"));
+        // Active search on the LOCAL pane with gen 1. The remote pane has no
+        // search so the drain's "active side" pick lands on Local.
+        screen.local.search = Some(crate::tui::transfer::search::PaneSearch::empty());
+        screen.search_gen = 1;
+        // Install a receiver buffered with one Match + one Done, and a live
+        // cancel flag so the drain re-seats the rx.
+        let (tx, rx) = mpsc::channel();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        tx.send(SearchEvent {
+            r#gen: 1,
+            kind: SearchEventKind::Match(PathMatch {
+                path: PathBuf::from("/local/sub/a.txt"),
+                is_dir: false,
+                seg_matches: vec![],
+            }),
+        })
+        .expect("send match");
+        tx.send(SearchEvent {
+            r#gen: 1,
+            kind: SearchEventKind::Done { truncated: false },
+        })
+        .expect("send done");
+        screen.search_rx = Some(rx);
+        screen.search_cancel = Some(cancel);
+        app.transfer = Some(screen);
+
+        let rc = Rc::new(RefCell::new(stdout_tui()));
+        let handle: TerminalHandle = Rc::downgrade(&rc);
+        drain_transfer_events(&mut app, &handle);
+
+        let screen = app.transfer.as_ref().expect("transfer screen present");
+        let srch = screen
+            .local
+            .search
+            .as_ref()
+            .expect("search still active on local pane");
+        assert_eq!(srch.results.len(), 1, "exactly one Match applied");
+        assert!(!srch.searching, "Done event must clear the searching flag");
+        assert!(
+            screen.search_rx.is_some(),
+            "rx must be re-seated for the next tick (cancel still live)"
+        );
+    }
+
+    #[test]
+    fn drain_drops_stale_search_events_with_mismatched_gen() {
+        use sshrack_core::pathfind::{PathMatch, SearchEvent, SearchEventKind};
+        use std::path::PathBuf;
+        use std::sync::mpsc;
+
+        let mut app = app_with_host("web");
+        let mut screen = TransferScreen::new(PathBuf::from("/local"), PathBuf::from("/remote"));
+        screen.local.search = Some(crate::tui::transfer::search::PaneSearch::empty());
+        // Current gen is 2 — an event tagged gen 1 is from a superseded query.
+        screen.search_gen = 2;
+        let (tx, rx) = mpsc::channel();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        tx.send(SearchEvent {
+            r#gen: 1,
+            kind: SearchEventKind::Match(PathMatch {
+                path: PathBuf::from("/local/stale"),
+                is_dir: false,
+                seg_matches: vec![],
+            }),
+        })
+        .expect("send stale match");
+        tx.send(SearchEvent {
+            r#gen: 2,
+            kind: SearchEventKind::Match(PathMatch {
+                path: PathBuf::from("/local/fresh"),
+                is_dir: false,
+                seg_matches: vec![],
+            }),
+        })
+        .expect("send fresh match");
+        screen.search_rx = Some(rx);
+        screen.search_cancel = Some(cancel);
+        app.transfer = Some(screen);
+
+        let rc = Rc::new(RefCell::new(stdout_tui()));
+        let handle: TerminalHandle = Rc::downgrade(&rc);
+        drain_transfer_events(&mut app, &handle);
+
+        let screen = app.transfer.as_ref().expect("transfer screen present");
+        let srch = screen.local.search.as_ref().expect("search still active");
+        assert_eq!(srch.results.len(), 1, "stale gen-1 event must be dropped");
+        assert_eq!(
+            srch.results[0].path,
+            PathBuf::from("/local/fresh"),
+            "only the gen-2 event lands"
+        );
+    }
+
+    #[test]
+    fn drain_does_not_reseat_rx_when_search_was_cancelled() {
+        // cancel_search clears search_rx AND search_cancel together. If a
+        // future drain runs after that (before the next launch re-installs a
+        // pair), the drain must NOT re-seat an rx whose cancel flag was
+        // dropped — otherwise the cancelled search's stray events would be
+        // re-applied forever. Pin the "still_listening" gate.
+        use std::sync::mpsc;
+
+        let mut app = app_with_host("web");
+        let mut screen = TransferScreen::new(PathBuf::from("/local"), PathBuf::from("/remote"));
+        let (_tx, rx) = mpsc::channel::<sshrack_core::pathfind::SearchEvent>();
+        screen.search_rx = Some(rx);
+        // No search_cancel — simulates the post-cancel_search state. The drain
+        // takes the rx, finds no buffered events, and must NOT re-seat it.
+        screen.search_cancel = None;
+        app.transfer = Some(screen);
+
+        let rc = Rc::new(RefCell::new(stdout_tui()));
+        let handle: TerminalHandle = Rc::downgrade(&rc);
+        drain_transfer_events(&mut app, &handle);
+
+        assert!(
+            app.transfer
+                .as_ref()
+                .expect("screen present")
+                .search_rx
+                .is_none(),
+            "rx must NOT be re-seated when search_cancel is None (post-cancel state)"
+        );
     }
 
     // ---- decide_post_done_refresh ----

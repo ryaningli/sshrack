@@ -142,6 +142,24 @@ pub struct App {
     /// `Done` handler when the queue is non-empty. The loop reads (and clears)
     /// this and calls `TransferScreen::next_job` → `WorkerCmd::Transfer`.
     pending_advance: bool,
+    /// Shared nucleo-backed segment matcher for cross-directory find. Cloned
+    /// per search launch (the `Arc` is cheap; nucleo's `Matcher` state is
+    /// per-call inside [`NucleoSegmentMatcher`]). Lives on `App` so every
+    /// search launch shares the same instance instead of rebuilding one.
+    pub(crate) search_matcher: std::sync::Arc<crate::tui::transfer::search::NucleoSegmentMatcher>,
+    /// Local-filesystem [`PathSearch`]. Default-constructed; the run loop calls
+    /// its `launch` when `pending_search` resolves to `Side::Local`. Local find
+    /// works end-to-end as of Task 9.
+    pub(crate) local_search: sshrack_core::pathfind::LocalPathSearch,
+    /// Remote SFTP [`PathSearch`]. `None` until Task 10's `open_transfer`
+    /// populates it from the live worker's connection details. While `None`,
+    /// remote find is a silent no-op (the run loop skips the launch) — local
+    /// find still works.
+    pub(crate) remote_search: Option<sshrack_core::connect::sftp::RemotePathSearch>,
+    /// Timestamp of the last keypress routed into the transfer screen, used by
+    /// the run loop's ~80 ms search debounce ([`should_fire_search`]). Stamped
+    /// once per transfer key event; only read while a `pending_search` waits.
+    pub(crate) last_search_key: std::time::Instant,
 }
 
 /// A synthetic `Enter` Press event, used by [`App::primary_action`] to drive
@@ -189,6 +207,10 @@ impl App {
             pending_transfer_host: None,
             pending_cancel: false,
             pending_advance: false,
+            search_matcher: std::sync::Arc::new(crate::tui::transfer::search::NucleoSegmentMatcher),
+            local_search: sshrack_core::pathfind::LocalPathSearch,
+            remote_search: None,
+            last_search_key: std::time::Instant::now(),
         }
     }
 
