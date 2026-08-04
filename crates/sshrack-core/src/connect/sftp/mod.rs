@@ -42,6 +42,9 @@ pub use source::{LocalSftpRunner, SftpDirSource, SftpRunner};
 pub mod pure;
 pub use pure::parse_remote_home;
 
+pub mod search;
+pub use search::RemotePathSearch;
+
 pub mod worker;
 pub use worker::{HANDSHAKE_TIMEOUT, SftpWorker};
 
