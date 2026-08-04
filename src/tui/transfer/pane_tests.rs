@@ -13,6 +13,7 @@
 use super::*;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use sshrack_core::dirsource::DirEntry;
+use sshrack_core::pathfind::PathMatch;
 use std::path::PathBuf;
 
 /// Build a `DirEntry` test fixture: `name` is decorated with a trailing
@@ -65,6 +66,10 @@ fn new_starts_empty_with_no_query_no_marks() {
     assert!(p.core.marked.is_empty());
     assert!(!p.loading);
     assert!(p.selected_entry().is_none());
+    assert!(
+        p.search.is_none(),
+        "no active cross-dir search on a fresh pane"
+    );
 }
 
 // ---- set_entries: resets cursor + re-ranks (empty query → all entries) ----
@@ -573,5 +578,127 @@ fn remembered_cursor_missing_falls_back_to_zero() {
     assert_eq!(
         p.selected_entry().map(|e| e.name.clone()).as_deref(),
         Some("B9/")
+    );
+}
+
+// ---- cross-directory find mode (`pane.search = Some`) ----
+//
+// When `pane.search` is `Some`, `on_key` delegates to `on_search_key`: arrows
+// (and Ctrl-P/N) move the SEARCH result cursor (NOT `core.selected`); query
+// edits go to `core.query` via `apply_nav_key` and surface `QueryChanged`;
+// `Space`/`Enter`/`Right` return `None` so the screen acts on the selected
+// result. The screen (not the pane) owns mode switching.
+
+/// A `KeyEvent::Press` with explicit modifiers (for Ctrl-P / Ctrl-N).
+fn press_with(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+    KeyEvent::new_with_kind(code, mods, KeyEventKind::Press)
+}
+
+/// Build a `PathMatch` fixture for a single-segment find result.
+fn path_match(path: &str) -> PathMatch {
+    PathMatch {
+        path: PathBuf::from(path),
+        is_dir: false,
+        seg_matches: vec![],
+    }
+}
+
+#[test]
+fn search_mode_down_moves_search_cursor_not_dir_selected() {
+    let mut p = pane_with_fruits();
+    // Screen would set search = Some(...); simulate by hand.
+    let mut search = crate::tui::transfer::search::PaneSearch::empty();
+    search.set_results(vec![path_match("/x/a"), path_match("/x/b")]);
+    p.search = Some(search);
+    assert_eq!(p.core.selected, 0);
+    assert_eq!(p.search.as_ref().expect("search active").cursor, 0);
+
+    // Down moves the SEARCH cursor; core.selected (dir list) is untouched.
+    assert_eq!(p.on_key(press(KeyCode::Down)), PaneOutcome::None);
+    assert_eq!(p.search.as_ref().expect("search active").cursor, 1);
+    assert_eq!(p.core.selected, 0, "dir-list cursor frozen in find mode");
+
+    // Up wraps the search cursor back over the top; dir cursor still frozen.
+    assert_eq!(p.on_key(press(KeyCode::Up)), PaneOutcome::None);
+    assert_eq!(p.search.as_ref().expect("search active").cursor, 0);
+    assert_eq!(p.core.selected, 0);
+}
+
+#[test]
+fn search_mode_ctrl_p_and_ctrl_n_move_search_cursor() {
+    let mut p = pane_with_fruits();
+    let mut search = crate::tui::transfer::search::PaneSearch::empty();
+    search.set_results(vec![path_match("/x/a"), path_match("/x/b")]);
+    p.search = Some(search);
+
+    let out = p.on_key(press_with(KeyCode::Char('n'), KeyModifiers::CONTROL));
+    assert_eq!(out, PaneOutcome::None);
+    assert_eq!(p.search.as_ref().expect("search active").cursor, 1);
+
+    let out = p.on_key(press_with(KeyCode::Char('p'), KeyModifiers::CONTROL));
+    assert_eq!(out, PaneOutcome::None);
+    assert_eq!(p.search.as_ref().expect("search active").cursor, 0);
+}
+
+#[test]
+fn search_mode_char_emits_query_changed_and_appends_to_core_query() {
+    // The query stays unified in core.query (no second field on PaneSearch).
+    // A printable char delegates to apply_nav_key, which appends to core.query
+    // and returns QueryChanged so the screen re-runs parse_query.
+    let mut p = pane_with_fruits();
+    let search = crate::tui::transfer::search::PaneSearch::empty();
+    p.search = Some(search);
+    assert!(p.core.query.is_empty());
+
+    let out = p.on_key(press(KeyCode::Char('a')));
+    assert_eq!(out, PaneOutcome::QueryChanged);
+    assert_eq!(p.core.query, "a", "find mode edits the same core.query");
+}
+
+#[test]
+fn search_mode_backspace_pops_core_query() {
+    let mut p = pane_with_fruits();
+    // Seed a two-char query, then enter find mode.
+    let _ = p.on_key(press(KeyCode::Char('a')));
+    let _ = p.on_key(press(KeyCode::Char('b')));
+    assert_eq!(p.core.query, "ab");
+    p.search = Some(crate::tui::transfer::search::PaneSearch::empty());
+
+    let out = p.on_key(press(KeyCode::Backspace));
+    assert_eq!(out, PaneOutcome::QueryChanged);
+    assert_eq!(p.core.query, "a");
+}
+
+#[test]
+fn search_mode_space_enter_right_emit_none() {
+    // Space marks the selected result; Enter/Right jump — the screen handles
+    // all three. The pane returns None so the screen reads
+    // `pane.search.as_ref().and_then(|s| s.selected())`.
+    let mut p = pane_with_fruits();
+    let mut search = crate::tui::transfer::search::PaneSearch::empty();
+    search.set_results(vec![path_match("/x/a"), path_match("/x/b")]);
+    p.search = Some(search);
+
+    assert_eq!(p.on_key(press(KeyCode::Char(' '))), PaneOutcome::None);
+    assert_eq!(p.on_key(press(KeyCode::Enter)), PaneOutcome::None);
+    assert_eq!(p.on_key(press(KeyCode::Right)), PaneOutcome::None);
+    // Cursor did not move for any of these (only Up/Down/Ctrl-P/N move it).
+    assert_eq!(p.search.as_ref().expect("search active").cursor, 0);
+}
+
+#[test]
+fn search_mode_release_event_is_ignored() {
+    // The Press-kind guard runs before the search-mode branch, so a non-Press
+    // event never reaches on_search_key.
+    let mut p = pane_with_fruits();
+    let mut search = crate::tui::transfer::search::PaneSearch::empty();
+    search.set_results(vec![path_match("/x/a")]);
+    p.search = Some(search);
+    let release = KeyEvent::new_with_kind(KeyCode::Down, KeyModifiers::NONE, KeyEventKind::Release);
+    assert_eq!(p.on_key(release), PaneOutcome::None);
+    assert_eq!(
+        p.search.as_ref().expect("search active").cursor,
+        0,
+        "release did not move the search cursor"
     );
 }

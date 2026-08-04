@@ -18,6 +18,7 @@ use sshrack_core::dirsource::DirEntry;
 use sshrack_core::pathutil::{FilterIntent, expand_tilde, parse_filter_intent};
 
 use crate::tui::browser_core::{BrowserCore, NavDecision};
+use crate::tui::transfer::search::PaneSearch;
 
 /// Which side of the transfer screen a [`Pane`] drives. Pure label — the pane
 /// does not branch on it; the screen renders each side differently and routes
@@ -67,6 +68,12 @@ pub struct Pane {
     /// Pending-list indicator the screen toggles around `set_entries`.
     /// Render-only; the pane never mutates it.
     pub loading: bool,
+    /// Active cross-directory find state. `None` in filter mode (≤1 query
+    /// segment); `Some` in find mode (>1 segment). The screen sets/clears
+    /// this from `parse_query(core.query)`; the pane only reads it to route
+    /// keys (arrows move the SEARCH cursor, not the dir-list cursor) and to
+    /// report `QueryChanged` when the query text changes.
+    pub(crate) search: Option<PaneSearch>,
 }
 
 impl Pane {
@@ -77,6 +84,7 @@ impl Pane {
         Self {
             core: BrowserCore::new(cwd),
             loading: false,
+            search: None,
         }
     }
 
@@ -114,6 +122,14 @@ impl Pane {
         if key.kind != KeyEventKind::Press {
             return PaneOutcome::None;
         }
+        // Find mode: when a cross-directory search is active on this pane,
+        // route keys to the search-result handler instead of the dir-list one.
+        // Arrows move the SEARCH cursor; query edits still go to core.query.
+        // Tab/Esc/Ctrl-S/Ctrl-Q/Ctrl-C never reach here — the screen
+        // intercepts them before delegating.
+        if self.search.is_some() {
+            return self.on_search_key(key);
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         // Space → toggle mark (Pane-specific). Must precede apply_nav_key,
         // which treats Space as a query char.
@@ -135,6 +151,65 @@ impl Pane {
             KeyCode::Right => self.activate_or_step(),
             KeyCode::Enter => self.on_enter(),
             _ => PaneOutcome::None,
+        }
+    }
+
+    /// Key handling while a cross-directory search is active on this pane.
+    /// Arrows (and Ctrl-P/N) move the SEARCH result cursor; query-edit keys
+    /// delegate to [`BrowserCore::apply_nav_key`] (which edits `core.query`)
+    /// and surface [`PaneOutcome::QueryChanged`] when the text changed;
+    /// `Space`/`Enter`/`Right` return [`PaneOutcome::None`] so the screen
+    /// acts on the selected result. `Tab`/`Esc`/`Ctrl-S`/`Ctrl-Q`/`Ctrl-C`
+    /// never reach here — the screen intercepts them first.
+    ///
+    /// The query stays unified in `core.query`: this method does NOT carry a
+    /// second query field on `PaneSearch`. Both filter mode (≤1 segment) and
+    /// find mode (>1 segment) edit the same `core.query`.
+    fn on_search_key(&mut self, key: KeyEvent) -> PaneOutcome {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            // Bare arrows always move the search cursor; Ctrl-P/N are the same
+            // motion. Kept as separate arms (not `Up | Char('p') if ctrl`)
+            // because a guard on a `|`-pattern applies to BOTH alternatives —
+            // collapsing them would require Ctrl for a bare Up.
+            KeyCode::Up => {
+                self.move_search_cursor(-1);
+                PaneOutcome::None
+            }
+            KeyCode::Down => {
+                self.move_search_cursor(1);
+                PaneOutcome::None
+            }
+            KeyCode::Char('p') if ctrl => {
+                self.move_search_cursor(-1);
+                PaneOutcome::None
+            }
+            KeyCode::Char('n') if ctrl => {
+                self.move_search_cursor(1);
+                PaneOutcome::None
+            }
+            // Space marks the selected result; Enter/Right jump — the screen
+            // handles both. Returning None lets the screen read
+            // `pane.search.as_ref().and_then(|s| s.selected())`.
+            KeyCode::Char(' ') | KeyCode::Enter | KeyCode::Right => PaneOutcome::None,
+            // Query edit (printable, Backspace, Left-for-parent): delegate to
+            // core, which edits core.query and returns QueryChanged when the
+            // text changed. The screen re-runs parse_query on QueryChanged
+            // and may flip this pane back to filter mode (search = None).
+            _ => match self.core.apply_nav_key(key) {
+                Some(NavDecision::QueryChanged) => PaneOutcome::QueryChanged,
+                Some(_) => PaneOutcome::None,
+                None => PaneOutcome::None,
+            },
+        }
+    }
+
+    /// Move the find-result cursor by `delta` (wraps). No-op if the search
+    /// state is gone (defensive — the `on_key` guard keeps it `Some` for the
+    /// duration of a search-key call).
+    fn move_search_cursor(&mut self, delta: i32) {
+        if let Some(srch) = self.search.as_mut() {
+            srch.move_cursor(delta);
         }
     }
 
