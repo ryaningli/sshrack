@@ -127,7 +127,7 @@ pub struct DescendCandidate {
 /// Match segment `seg_idx` of `query` against `entries`. Pure: no I/O. The
 /// caller passes ancestor segments' matches (`ancestor.len() == seg_idx`) so a
 /// final-segment leaf carries every segment's highlight.
-pub fn filter_level<M: SegmentMatcher>(
+pub fn filter_level<M: SegmentMatcher + ?Sized>(
     entries: &[DirEntry],
     seg_idx: usize,
     query: &ParsedQuery,
@@ -183,6 +183,162 @@ pub fn rank_matches(matches: &mut [PathMatch]) {
             })
             .then_with(|| a.path.cmp(&b.path))
     });
+}
+
+// ---------------------------------------------------------------------------
+// Streaming traversal (Task 4): PathSearch trait, SearchEvent, the shared
+// walk_levels driver, and LocalPathSearch. Task 5's RemotePathSearch reuses
+// walk_levels, so it is pub(crate).
+// ---------------------------------------------------------------------------
+
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
+
+use crate::dirsource::{DirSource, LocalDirSource};
+
+/// Cap on descent even when segments are many — a pathology backstop only.
+const MAX_DEPTH: usize = 8;
+
+/// One event emitted by a streaming path search.
+#[derive(Debug, Clone)]
+pub enum SearchEventKind {
+    /// A fully matched path (one [`SegMatch`] per query segment).
+    Match(PathMatch),
+    /// The search terminated. `truncated` is set when it stopped early due to
+    /// [`MAX_DEPTH`] (segments still remained).
+    Done { truncated: bool },
+    /// A recoverable error from one directory listing (the search continues).
+    Error(String),
+}
+
+/// A tagged event from a [`PathSearch`]: the `gen` lets the run loop ignore
+/// results from a stale query that has since been superseded.
+#[derive(Debug, Clone)]
+pub struct SearchEvent {
+    /// Generation tag: the run loop ignores events whose `gen` is stale.
+    // `gen` is a reserved keyword in edition 2024 — raw identifier preserves
+    // the field name (downstream code uses `.r#gen`).
+    pub r#gen: u32,
+    pub kind: SearchEventKind,
+}
+
+/// Streaming path search. [`PathSearch::launch`] returns quickly; matches
+/// arrive on `sink` until a `Done` or `Error` terminator is observed (or the
+/// receiver is dropped). Cancel by flipping `cancel`.
+pub trait PathSearch: Send + Sync {
+    /// Spawn the search; return immediately. Events flow on `sink`.
+    fn launch(
+        &self,
+        query: &ParsedQuery,
+        matcher: Arc<dyn SegmentMatcher>,
+        r#gen: u32,
+        cancel: Arc<AtomicBool>,
+        sink: mpsc::Sender<SearchEvent>,
+    );
+}
+
+/// Drive `query`'s per-segment walk using `list` to read each directory.
+/// Shared by [`LocalPathSearch`] and the remote search (Task 5). Pure-ish:
+/// touches the filesystem only through `list`.
+///
+/// Frontier = `[(base, vec![])]`; for each segment index, every frontier dir
+/// is listed (skipping already-visited paths as a symlink-loop guard),
+/// [`filter_level`] produces leaves (emitted as [`SearchEventKind::Match`])
+/// and the next frontier's descend candidates. Stops when: segments exhaust
+/// (Done, not truncated), the frontier empties, `seg_idx >= MAX_DEPTH` (Done,
+/// truncated), or `cancel` is flipped. A listing error for one directory
+/// emits [`SearchEventKind::Error`] and the search continues.
+pub(crate) fn walk_levels<L>(
+    list: L,
+    query: &ParsedQuery,
+    matcher: &dyn SegmentMatcher,
+    r#gen: u32,
+    cancel: &AtomicBool,
+    sink: &mpsc::Sender<SearchEvent>,
+) where
+    L: Fn(&Path) -> Result<Vec<DirEntry>, String>,
+{
+    let emit = |kind: SearchEventKind, sink: &mpsc::Sender<SearchEvent>| {
+        let _ = sink.send(SearchEvent { r#gen, kind });
+    };
+    if query.segments.is_empty() {
+        emit(SearchEventKind::Done { truncated: false }, sink);
+        return;
+    }
+    let mut frontier: Vec<DescendCandidate> = vec![DescendCandidate {
+        path: query.base.clone(),
+        ancestor: vec![],
+    }];
+    let mut visited: HashSet<PathBuf> = HashSet::new();
+    for seg_idx in 0..query.segments.len() {
+        if cancel.load(Ordering::SeqCst) {
+            return;
+        }
+        if seg_idx >= MAX_DEPTH {
+            emit(SearchEventKind::Done { truncated: true }, sink);
+            return;
+        }
+        let mut next: Vec<DescendCandidate> = Vec::new();
+        for cand in frontier {
+            if cancel.load(Ordering::SeqCst) {
+                return;
+            }
+            if !visited.insert(cand.path.clone()) {
+                continue; // symlink-loop guard
+            }
+            let entries = match list(&cand.path) {
+                Ok(e) => e,
+                Err(msg) => {
+                    emit(
+                        SearchEventKind::Error(format!("{}: {msg}", cand.path.display())),
+                        sink,
+                    );
+                    continue;
+                }
+            };
+            let split = filter_level(&entries, seg_idx, query, matcher, cand.ancestor.clone());
+            for leaf in split.leaves {
+                if sink
+                    .send(SearchEvent {
+                        r#gen,
+                        kind: SearchEventKind::Match(leaf),
+                    })
+                    .is_err()
+                {
+                    return; // receiver dropped → cancelled
+                }
+            }
+            next.extend(split.descend);
+        }
+        frontier = next;
+        if frontier.is_empty() {
+            break;
+        }
+    }
+    emit(SearchEventKind::Done { truncated: false }, sink);
+}
+
+/// Local-filesystem [`PathSearch`]. The background thread owns its own
+/// [`LocalDirSource`] (zero state) and reads via `std::fs`.
+#[derive(Debug, Default, Copy, Clone)]
+pub struct LocalPathSearch;
+
+impl PathSearch for LocalPathSearch {
+    fn launch(
+        &self,
+        query: &ParsedQuery,
+        matcher: Arc<dyn SegmentMatcher>,
+        r#gen: u32,
+        cancel: Arc<AtomicBool>,
+        sink: mpsc::Sender<SearchEvent>,
+    ) {
+        let query = query.clone();
+        std::thread::spawn(move || {
+            let src = LocalDirSource::new();
+            walk_levels(|p| src.list(p), &query, &*matcher, r#gen, &cancel, &sink);
+        });
+    }
 }
 
 #[cfg(test)]
@@ -456,6 +612,77 @@ mod tests {
         assert_eq!(ms[0].path, PathBuf::from("/x/a/b"));
         assert_eq!(ms[1].path, PathBuf::from("/x/m"));
         assert_eq!(ms[2].path, PathBuf::from("/x/zz"));
+    }
+
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+
+    #[test]
+    fn walk_levels_streams_three_segment_match() {
+        // Fake tree:
+        //   /srv/apath/bdir/cfile.txt   (target of "a/b/c")
+        //   /srv/apath/bdir/zzz.txt
+        //   /srv/xdir/...
+        let mut tree: HashMap<PathBuf, Vec<DirEntry>> = HashMap::new();
+        tree.insert(
+            PathBuf::from("/srv"),
+            vec![entry("apath", "/srv", true), entry("xdir", "/srv", true)],
+        );
+        tree.insert(
+            PathBuf::from("/srv/apath"),
+            vec![entry("bdir", "/srv/apath", true)],
+        );
+        tree.insert(
+            PathBuf::from("/srv/apath/bdir"),
+            vec![
+                entry("cfile.txt", "/srv/apath/bdir", false),
+                entry("zzz.txt", "/srv/apath/bdir", false),
+            ],
+        );
+        let list = |p: &Path| tree.get(p).cloned().ok_or_else(|| "no dir".to_string());
+
+        let q = query_at("/srv", &["a", "b", "c"]);
+        let (tx, rx) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        walk_levels(list, &q, &AlwaysMatcher, 1, &cancel, &tx);
+        drop(tx);
+
+        let mut leaves = vec![];
+        let mut done = false;
+        for ev in rx.iter() {
+            match ev.kind {
+                SearchEventKind::Match(m) => leaves.push(m),
+                SearchEventKind::Done { .. } => done = true,
+                SearchEventKind::Error(e) => panic!("unexpected error: {e}"),
+            }
+        }
+        assert!(done);
+        assert_eq!(leaves.len(), 1, "cfile.txt matches 'c'; zzz.txt does not");
+        assert!(leaves[0].path.ends_with("cfile.txt"));
+        assert_eq!(leaves[0].seg_matches.len(), 3);
+    }
+
+    #[test]
+    fn walk_levels_respects_cancel() {
+        // A list closure that flips cancel after the first call → walk stops,
+        // emits no Done, no further matches.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel2 = cancel.clone();
+        let list = move |_p: &Path| {
+            cancel2.store(true, Ordering::SeqCst);
+            Ok(vec![entry("apath", "/srv", true)])
+        };
+        let q = query_at("/srv", &["a", "b"]);
+        let (tx, rx) = mpsc::channel();
+        walk_levels(list, &q, &AlwaysMatcher, 1, &cancel, &tx);
+        drop(tx);
+        let evs: Vec<_> = rx.iter().collect();
+        assert!(
+            evs.iter()
+                .all(|e| !matches!(e.kind, SearchEventKind::Done { .. }))
+        );
     }
 
     /// Trivial matcher used by the core-level unit tests (the real nucleo
