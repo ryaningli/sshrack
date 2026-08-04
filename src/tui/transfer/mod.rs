@@ -32,3 +32,4 @@ pub mod queue_overlay;
 pub mod render;
 pub mod screen;
 pub(crate) mod search;
+pub(crate) mod search_dispatch;

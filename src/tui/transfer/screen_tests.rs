@@ -9,6 +9,7 @@
 //! 800-line guideline (mirrors the inline-test convention everywhere else in
 //! the TUI; the split is purely mechanical).
 use super::*;
+use crate::tui::transfer::search::PaneSearch;
 use ratatui::{Terminal, backend::TestBackend};
 use sshrack_core::connect::sftp::parse::strip_control_chars;
 use sshrack_core::connect::sftp::proto::{Direction, Progress, TransferJob};
