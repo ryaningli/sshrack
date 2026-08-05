@@ -117,70 +117,6 @@ impl PathMatch {
     }
 }
 
-/// Result of matching one segment against one directory's entries.
-#[derive(Debug, Default)]
-pub struct LevelSplit {
-    /// Final-segment matches — complete [`PathMatch`]es ready to display/enqueue.
-    pub leaves: Vec<PathMatch>,
-    /// Directories matching this segment that should be listed for the next.
-    pub descend: Vec<DescendCandidate>,
-}
-
-/// A directory to descend into, carrying ancestor segments' matches so a leaf
-/// built deeper can reconstruct its full `seg_matches`.
-#[derive(Debug, Clone)]
-pub struct DescendCandidate {
-    pub path: PathBuf,
-    pub ancestor: Vec<SegMatch>,
-}
-
-/// Match segment `seg_idx` of `query` against `entries`. Pure: no I/O. The
-/// caller passes ancestor segments' matches (`ancestor.len() == seg_idx`) so a
-/// final-segment leaf carries every segment's highlight.
-pub fn filter_level<M: SegmentMatcher + ?Sized>(
-    entries: &[DirEntry],
-    seg_idx: usize,
-    query: &ParsedQuery,
-    matcher: &M,
-    ancestor: Vec<SegMatch>,
-) -> LevelSplit {
-    let mut out = LevelSplit::default();
-    let Some(seg) = query.segments.get(seg_idx) else {
-        return out; // no segment at this depth → nothing matches
-    };
-    let is_last = seg_idx + 1 == query.segments.len();
-    for e in entries {
-        // Match against the raw file name (DirEntry.name is decorated).
-        let Some(raw) = e.path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        let Some(score) = matcher.match_segment(raw, seg) else {
-            continue; // pruned — this entry's subtree can't match
-        };
-        let this_match = SegMatch {
-            name: raw.to_string(),
-            score: score.score,
-            indices: score.indices,
-        };
-        let mut full = ancestor.clone();
-        full.push(this_match);
-        if is_last {
-            out.leaves.push(PathMatch {
-                path: e.path.clone(),
-                is_dir: e.is_dir,
-                seg_matches: full,
-            });
-        } else if e.is_dir {
-            out.descend.push(DescendCandidate {
-                path: e.path.clone(),
-                ancestor: full,
-            });
-        }
-        // file at a non-final segment → dropped (can't satisfy deeper segments)
-    }
-    out
-}
-
 /// Sort matches: total score desc → fewer path components → lexical. Stable.
 pub fn rank_matches(matches: &mut [PathMatch]) {
     matches.sort_by(|a, b| {
@@ -207,17 +143,13 @@ use std::sync::{Arc, mpsc};
 
 use crate::dirsource::{DirSource, LocalDirSource};
 
-/// Cap on descent even when segments are many — a pathology backstop only.
-const MAX_DEPTH: usize = 8;
-
 /// One event emitted by a streaming path search.
 #[derive(Debug, Clone)]
 pub enum SearchEventKind {
     /// A fully matched path (one [`SegMatch`] per query segment).
     Match(PathMatch),
-    /// The search terminated. `truncated` is set when it stopped early due to
-    /// [`MAX_DEPTH`] (segments still remained).
-    Done { truncated: bool },
+    /// The search terminated normally.
+    Done,
     /// A recoverable error from one directory listing (the search continues).
     Error(String),
 }
@@ -248,17 +180,24 @@ pub trait PathSearch: Send + Sync {
     );
 }
 
-/// Drive `query`'s per-segment walk using `list` to read each directory.
-/// Shared by [`LocalPathSearch`] and the remote search (Task 5). Pure-ish:
-/// touches the filesystem only through `list`.
+/// Drive `query` using `list` to read each directory. Shared by
+/// [`LocalPathSearch`] and the remote search. Pure-ish: touches the filesystem
+/// only through `list`.
 ///
-/// Frontier = `[(base, vec![])]`; for each segment index, every frontier dir
-/// is listed (skipping already-visited paths as a symlink-loop guard),
-/// [`filter_level`] produces leaves (emitted as [`SearchEventKind::Match`])
-/// and the next frontier's descend candidates. Stops when: segments exhaust
-/// (Done, not truncated), the frontier empties, `seg_idx >= MAX_DEPTH` (Done,
-/// truncated), or `cancel` is flipped. A listing error for one directory
-/// emits [`SearchEventKind::Error`] and the search continues.
+/// Two phases. **Phase 1 — exact descent:** the query's non-final segments (or,
+/// when [`ParsedQuery::trailing_slash`] is set, *all* segments) must name
+/// directories *exactly*; the frontier starts at `query.base` and at each level
+/// keeps only entries whose name equals that segment, descending into them. A
+/// symlink-loop guard (`visited`) prevents cycles. **Phase 2 — leaf collect:**
+/// at every surviving directory, `list` it and either keep every entry (trailing
+/// slash / empty query → "list this directory") or keep only entries that
+/// fuzzy-match the final segment via `matcher`. Each emitted [`PathMatch`]'s
+/// `seg_matches` is the exact-drill ancestor chain (each with empty `indices`)
+/// followed by the leaf's match, so the renderer highlights exactly the leaf.
+///
+/// Stops early when `cancel` is flipped or the receiver is dropped. A listing
+/// error for one directory emits [`SearchEventKind::Error`] and the search
+/// continues with the rest.
 pub(crate) fn walk_levels<L>(
     list: L,
     query: &ParsedQuery,
@@ -272,61 +211,128 @@ pub(crate) fn walk_levels<L>(
     let emit = |kind: SearchEventKind, sink: &mpsc::Sender<SearchEvent>| {
         let _ = sink.send(SearchEvent { r#gen, kind });
     };
-    if query.segments.is_empty() {
-        emit(SearchEventKind::Done { truncated: false }, sink);
-        return;
-    }
-    let mut frontier: Vec<DescendCandidate> = vec![DescendCandidate {
-        path: query.base.clone(),
-        ancestor: vec![],
-    }];
+
+    // Split the query into exact-drill segments and an optional fuzzy leaf.
+    // trailing_slash ⇒ every segment drills exactly; the leaf is "list all".
+    // otherwise ⇒ all but the last segment drill exactly; the last is the leaf.
+    // An empty segment list (e.g. "/", "~/") drills nothing and lists the base.
+    let (drill_count, leaf): (usize, Option<&str>) = if query.trailing_slash {
+        (query.segments.len(), None)
+    } else {
+        match query.segments.split_last() {
+            None => (0, None),
+            Some((last, drill)) => (drill.len(), Some(last.as_str())),
+        }
+    };
+
+    // Phase 1 — linear exact descent.
+    let mut frontier: Vec<(PathBuf, Vec<SegMatch>)> = vec![(query.base.clone(), Vec::new())];
     let mut visited: HashSet<PathBuf> = HashSet::new();
-    for seg_idx in 0..query.segments.len() {
+    for seg_idx in 0..drill_count {
         if cancel.load(Ordering::SeqCst) {
             return;
         }
-        if seg_idx >= MAX_DEPTH {
-            emit(SearchEventKind::Done { truncated: true }, sink);
-            return;
-        }
-        let mut next: Vec<DescendCandidate> = Vec::new();
-        for cand in frontier {
+        let seg = &query.segments[seg_idx];
+        let mut next: Vec<(PathBuf, Vec<SegMatch>)> = Vec::new();
+        for (dir, ancestor) in frontier {
             if cancel.load(Ordering::SeqCst) {
                 return;
             }
-            if !visited.insert(cand.path.clone()) {
+            if !visited.insert(dir.clone()) {
                 continue; // symlink-loop guard
             }
-            let entries = match list(&cand.path) {
+            let entries = match list(&dir) {
                 Ok(e) => e,
                 Err(msg) => {
                     emit(
-                        SearchEventKind::Error(format!("{}: {msg}", cand.path.display())),
+                        SearchEventKind::Error(format!("{}: {msg}", dir.display())),
                         sink,
                     );
                     continue;
                 }
             };
-            let split = filter_level(&entries, seg_idx, query, matcher, cand.ancestor.clone());
-            for leaf in split.leaves {
-                if sink
-                    .send(SearchEvent {
-                        r#gen,
-                        kind: SearchEventKind::Match(leaf),
-                    })
-                    .is_err()
-                {
-                    return; // receiver dropped → cancelled
+            for e in &entries {
+                // Drill segments must name a directory; a file never continues.
+                if !e.is_dir {
+                    continue;
+                }
+                let Some(raw) = e.path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if raw == seg {
+                    let mut anc = ancestor.clone();
+                    // Exact match highlights nothing — the whole name is base-styled.
+                    anc.push(SegMatch {
+                        name: raw.to_string(),
+                        score: 0,
+                        indices: Vec::new(),
+                    });
+                    next.push((e.path.clone(), anc));
                 }
             }
-            next.extend(split.descend);
         }
         frontier = next;
         if frontier.is_empty() {
             break;
         }
     }
-    emit(SearchEventKind::Done { truncated: false }, sink);
+
+    if cancel.load(Ordering::SeqCst) {
+        return;
+    }
+
+    // Phase 2 — leaf collection at each surviving directory.
+    if frontier.is_empty() {
+        emit(SearchEventKind::Done, sink);
+        return;
+    }
+    for (dir, ancestor) in &frontier {
+        if cancel.load(Ordering::SeqCst) {
+            return;
+        }
+        let entries = match list(dir) {
+            Ok(e) => e,
+            Err(msg) => {
+                emit(
+                    SearchEventKind::Error(format!("{}: {msg}", dir.display())),
+                    sink,
+                );
+                continue;
+            }
+        };
+        for e in &entries {
+            let Some(raw) = e.path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let (indices, score) = match leaf {
+                None => (Vec::new(), 0),
+                Some(pat) => match matcher.match_segment(raw, pat) {
+                    Some(s) => (s.indices, s.score),
+                    None => continue,
+                },
+            };
+            let mut full = ancestor.clone();
+            full.push(SegMatch {
+                name: raw.to_string(),
+                score,
+                indices,
+            });
+            if sink
+                .send(SearchEvent {
+                    r#gen,
+                    kind: SearchEventKind::Match(PathMatch {
+                        path: e.path.clone(),
+                        is_dir: e.is_dir,
+                        seg_matches: full,
+                    }),
+                })
+                .is_err()
+            {
+                return; // receiver dropped → cancelled
+            }
+        }
+    }
+    emit(SearchEventKind::Done, sink);
 }
 
 /// Local-filesystem [`PathSearch`]. The background thread owns its own
@@ -504,97 +510,6 @@ mod tests {
     }
 
     #[test]
-    fn single_segment_keeps_all_matches_as_leaves() {
-        // query "a" (1 segment): every matching entry is a leaf (files AND dirs).
-        // This is the degenerate case == today's current-directory filter.
-        let entries = vec![
-            entry("apath", "/srv", true),
-            entry("afile", "/srv", false),
-            entry("zzz", "/srv", false),
-        ];
-        let q = query_at("/srv", &["a"]);
-        let split = filter_level(&entries, 0, &q, &AlwaysMatcher, vec![]);
-        assert_eq!(split.leaves.len(), 2, "apath + afile match 'a'");
-        assert!(
-            split.descend.is_empty(),
-            "no deeper segments → nothing to descend"
-        );
-    }
-
-    #[test]
-    fn multi_segment_level0_prunes_files_and_descends_dirs() {
-        // query "a/b": level 0 — a matching FILE is pruned (it can't satisfy seg 1);
-        // a matching DIR becomes a descend candidate; a non-matching dir is dropped.
-        let entries = vec![
-            entry("apath", "/srv", true),
-            entry("xdir", "/srv", true),
-            entry("afile", "/srv", false),
-        ];
-        let q = query_at("/srv", &["a", "b"]);
-        let split = filter_level(&entries, 0, &q, &AlwaysMatcher, vec![]);
-        assert!(
-            split.leaves.is_empty(),
-            "files at a non-final segment are pruned"
-        );
-        assert_eq!(
-            split.descend.len(),
-            1,
-            "only apath/ matches seg 'a' and is a dir"
-        );
-        assert_eq!(split.descend[0].path, PathBuf::from("/srv/apath"));
-        assert_eq!(
-            split.descend[0].ancestor.len(),
-            1,
-            "ancestor carries seg 0's match"
-        );
-    }
-
-    #[test]
-    fn final_segment_makes_both_files_and_dirs_leaves() {
-        // query "a/b" at level 1 (seg_idx 1 == last): a matching file AND dir are leaves.
-        let entries = vec![
-            entry("bfile", "/srv/apath", false),
-            entry("bdir", "/srv/apath", true),
-            entry("zzz", "/srv/apath", false),
-        ];
-        let q = query_at("/srv", &["a", "b"]);
-        let ancestor = vec![SegMatch {
-            name: "apath".into(),
-            score: 1,
-            indices: vec![0],
-        }];
-        let split = filter_level(&entries, 1, &q, &AlwaysMatcher, ancestor);
-        assert_eq!(
-            split.leaves.len(),
-            2,
-            "bfile + bdir match seg 'b' at the final segment"
-        );
-        assert!(split.descend.is_empty(), "final segment → no descent");
-        assert_eq!(
-            split.leaves[0].seg_matches.len(),
-            2,
-            "leaf carries ancestor + this seg"
-        );
-    }
-
-    #[test]
-    fn ancestor_threads_through_descend() {
-        // A leaf built at depth 2 carries seg matches for all segments.
-        let entries = vec![entry("cfile", "/a/b", false)];
-        let q = query_at("/a", &["b", "c"]);
-        let ancestor = vec![SegMatch {
-            name: "b".into(),
-            score: 1,
-            indices: vec![0],
-        }];
-        let split = filter_level(&entries, 1, &q, &AlwaysMatcher, ancestor);
-        let leaf = &split.leaves[0];
-        assert_eq!(leaf.seg_matches.len(), 2);
-        assert_eq!(leaf.seg_matches[0].name, "b");
-        assert_eq!(leaf.seg_matches[1].name, "cfile");
-    }
-
-    #[test]
     fn rank_by_score_then_components_then_lexical() {
         let mut ms = vec![
             PathMatch {
@@ -645,29 +560,31 @@ mod tests {
     use std::sync::mpsc;
 
     #[test]
-    fn walk_levels_streams_three_segment_match() {
-        // Fake tree:
-        //   /srv/apath/bdir/cfile.txt   (target of "a/b/c")
-        //   /srv/apath/bdir/zzz.txt
-        //   /srv/xdir/...
+    fn walk_levels_exact_drill_then_fuzzy_leaf() {
+        // Exact dir names "a" and "b"; "apath" must NOT descend (exact, not fuzzy).
+        //   /srv/a/b/cfile.txt   (leaf "c" fuzzy-matches)
+        //   /srv/a/b/zzz.txt     (does not match "c")
+        //   /srv/apath/b/...     (pruned: "a" != "apath")
         let mut tree: HashMap<PathBuf, Vec<DirEntry>> = HashMap::new();
         tree.insert(
             PathBuf::from("/srv"),
-            vec![entry("apath", "/srv", true), entry("xdir", "/srv", true)],
+            vec![entry("a", "/srv", true), entry("apath", "/srv", true)],
         );
+        tree.insert(PathBuf::from("/srv/a"), vec![entry("b", "/srv/a", true)]);
         tree.insert(
             PathBuf::from("/srv/apath"),
-            vec![entry("bdir", "/srv/apath", true)],
+            vec![entry("b", "/srv/apath", true)],
         );
         tree.insert(
-            PathBuf::from("/srv/apath/bdir"),
+            PathBuf::from("/srv/a/b"),
             vec![
-                entry("cfile.txt", "/srv/apath/bdir", false),
-                entry("zzz.txt", "/srv/apath/bdir", false),
+                entry("cfile.txt", "/srv/a/b", false),
+                entry("zzz.txt", "/srv/a/b", false),
             ],
         );
         let list = |p: &Path| tree.get(p).cloned().ok_or_else(|| "no dir".to_string());
 
+        // drill "a","b" exact; leaf "c" fuzzy.
         let q = query_at("/srv", &["a", "b", "c"]);
         let (tx, rx) = mpsc::channel();
         let cancel = AtomicBool::new(false);
@@ -679,14 +596,106 @@ mod tests {
         for ev in rx.iter() {
             match ev.kind {
                 SearchEventKind::Match(m) => leaves.push(m),
-                SearchEventKind::Done { .. } => done = true,
+                SearchEventKind::Done => done = true,
                 SearchEventKind::Error(e) => panic!("unexpected error: {e}"),
             }
         }
         assert!(done);
-        assert_eq!(leaves.len(), 1, "cfile.txt matches 'c'; zzz.txt does not");
+        assert_eq!(
+            leaves.len(),
+            1,
+            "only cfile.txt matches leaf 'c' under exact a/b"
+        );
         assert!(leaves[0].path.ends_with("cfile.txt"));
-        assert_eq!(leaves[0].seg_matches.len(), 3);
+        assert_eq!(leaves[0].seg_matches.len(), 3, "drill a,b + leaf cfile");
+        // Exact drill segments carry no highlight indices; only the leaf does.
+        assert!(leaves[0].seg_matches[0].indices.is_empty());
+        assert!(leaves[0].seg_matches[1].indices.is_empty());
+        assert!(
+            !leaves[0].seg_matches[2].indices.is_empty(),
+            "leaf 'c' highlighted"
+        );
+    }
+
+    #[test]
+    fn walk_levels_trailing_slash_lists_directory() {
+        // query "a/b/" (trailing slash) → exact drill a,b then list /srv/a/b fully.
+        let mut tree: HashMap<PathBuf, Vec<DirEntry>> = HashMap::new();
+        tree.insert(PathBuf::from("/srv"), vec![entry("a", "/srv", true)]);
+        tree.insert(PathBuf::from("/srv/a"), vec![entry("b", "/srv/a", true)]);
+        tree.insert(
+            PathBuf::from("/srv/a/b"),
+            vec![
+                entry("one.txt", "/srv/a/b", false),
+                entry("two", "/srv/a/b", true),
+            ],
+        );
+        let list = |p: &Path| tree.get(p).cloned().ok_or_else(|| "no dir".to_string());
+
+        let q = ParsedQuery {
+            base: PathBuf::from("/srv"),
+            segments: vec!["a".into(), "b".into()],
+            trailing_slash: true,
+        };
+        let (tx, rx) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        walk_levels(list, &q, &AlwaysMatcher, 1, &cancel, &tx);
+        drop(tx);
+
+        let leaves: Vec<_> = rx
+            .iter()
+            .filter_map(|ev| match ev.kind {
+                SearchEventKind::Match(m) => Some(m),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(leaves.len(), 2, "trailing slash lists every entry");
+        // A listed leaf's own seg_match has empty indices (no fuzzy highlight).
+        assert!(
+            leaves
+                .iter()
+                .all(|m| m.seg_matches.last().is_some_and(|s| s.indices.is_empty()))
+        );
+    }
+
+    #[test]
+    fn walk_levels_exact_drill_prunes_non_matching_dir() {
+        // query "a/b": "a" exact descends only /srv/a; /srv/zzz is pruned even though
+        // it also contains a "bfile" that would fuzzy-match "b".
+        let mut tree: HashMap<PathBuf, Vec<DirEntry>> = HashMap::new();
+        tree.insert(
+            PathBuf::from("/srv"),
+            vec![entry("a", "/srv", true), entry("zzz", "/srv", true)],
+        );
+        tree.insert(
+            PathBuf::from("/srv/a"),
+            vec![entry("bfile", "/srv/a", false)],
+        );
+        tree.insert(
+            PathBuf::from("/srv/zzz"),
+            vec![entry("bfile", "/srv/zzz", false)],
+        );
+        let list = |p: &Path| tree.get(p).cloned().ok_or_else(|| "no dir".to_string());
+
+        let q = query_at("/srv", &["a", "b"]);
+        let (tx, rx) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        walk_levels(list, &q, &AlwaysMatcher, 1, &cancel, &tx);
+        drop(tx);
+
+        let paths: Vec<_> = rx
+            .iter()
+            .filter_map(|ev| match ev.kind {
+                SearchEventKind::Match(m) => Some(m.path),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(paths.len(), 1, "only the exact 'a' descent contributes");
+        assert!(
+            paths[0].starts_with("/srv/a/"),
+            "pruned sibling /srv/zzz did not contribute: {:?}",
+            paths[0]
+        );
     }
 
     #[test]
@@ -697,17 +706,14 @@ mod tests {
         let cancel2 = cancel.clone();
         let list = move |_p: &Path| {
             cancel2.store(true, Ordering::SeqCst);
-            Ok(vec![entry("apath", "/srv", true)])
+            Ok(vec![entry("a", "/srv", true)])
         };
         let q = query_at("/srv", &["a", "b"]);
         let (tx, rx) = mpsc::channel();
         walk_levels(list, &q, &AlwaysMatcher, 1, &cancel, &tx);
         drop(tx);
         let evs: Vec<_> = rx.iter().collect();
-        assert!(
-            evs.iter()
-                .all(|e| !matches!(e.kind, SearchEventKind::Done { .. }))
-        );
+        assert!(evs.iter().all(|e| !matches!(e.kind, SearchEventKind::Done)));
     }
 
     /// Trivial matcher used by the core-level unit tests (the real nucleo

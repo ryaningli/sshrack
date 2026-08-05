@@ -56,7 +56,7 @@ impl TransferScreen {
                     srch.cursor = len.saturating_sub(1);
                 }
             }
-            SearchEventKind::Done { .. } => srch.searching = false,
+            SearchEventKind::Done => srch.searching = false,
             SearchEventKind::Error(msg) => {
                 srch.searching = false;
                 srch.error = Some(msg);
