@@ -1552,6 +1552,37 @@ fn apply_search_event_second_drilled_is_ambiguous_and_clears() {
 }
 
 #[test]
+fn apply_search_event_error_clears_current_dir() {
+    // An Error event (a directory listing failed mid-search) must clear the
+    // synthetic "." row. Otherwise a stale dot — from this query's earlier
+    // Drilled, or carried over from a prior query via stale-while-revalidate —
+    // would persist and mask the error: the renderer's empty-state gate only
+    // surfaces the error when `current_dir.is_none()`.
+    let mut s = TransferScreen::new(PathBuf::from("/a"), PathBuf::from("/b"));
+    s.local.search = Some(PaneSearch::empty());
+    s.search_gen = 1;
+    s.apply_search_event(
+        Side::Local,
+        SearchEvent {
+            r#gen: 1,
+            kind: SearchEventKind::Drilled(PathBuf::from("/a/sub")),
+        },
+    );
+    assert!(s.local.search.as_ref().unwrap().current_dir.is_some());
+    s.apply_search_event(
+        Side::Local,
+        SearchEvent {
+            r#gen: 1,
+            kind: SearchEventKind::Error("boom".into()),
+        },
+    );
+    let srch = s.local.search.as_ref().unwrap();
+    assert!(srch.current_dir.is_none(), "Error must clear the dot");
+    assert!(srch.results.is_empty(), "Error clears results");
+    assert_eq!(srch.error.as_deref(), Some("boom"));
+}
+
+#[test]
 fn completion_returns_none_when_cursor_on_dot() {
     // Tab on the synthetic "." row must not complete (it would malform the
     // query, e.g. "/a/sub/" + "sub" + "/" → "/a/sub/sub/"). It returns None so

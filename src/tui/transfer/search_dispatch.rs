@@ -87,9 +87,13 @@ impl TransferScreen {
                 srch.searching = false;
                 srch.error = Some(msg);
                 // Surface the error (the renderer only shows it when results
-                // are empty), so drop any stale hits.
+                // are empty AND there is no dot), so drop any stale hits and
+                // the synthetic "." row — otherwise a stale dot (from this
+                // query's earlier Drilled, or carried over from a prior query
+                // via stale-while-revalidate) would mask the error message.
                 srch.results.clear();
                 srch.cursor = 0;
+                srch.current_dir = None;
                 srch.results_gen = Some(ev.r#gen);
             }
             SearchEventKind::Drilled(dir) => {
