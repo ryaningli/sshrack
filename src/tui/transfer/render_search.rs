@@ -208,12 +208,13 @@ fn draw_search_row(
 /// Otherwise units are kept from the RIGHT until the next would overflow
 /// `avail - 1` (1 cell reserved for a leading `…`), and a dim `…` span is
 /// prepended. If even the last unit alone overflows the budget, that lone unit
-/// is flattened to a string and right-truncated via [`truncate_cells`] (its
-/// highlight degrades to the unit's first-span style — a rare case where a
-/// single segment name is wider than the whole row). `avail == 0` or no units
-/// → empty. Pure.
+/// is flattened to a string and left-truncated via [`truncate_cells_head`] so
+/// the tail (a filename's extension, or a dir's trailing `/`) survives —
+/// consistent with this helper's tail-preserving strategy. Its highlight
+/// degrades to the unit's first-span style (a rare case where a single segment
+/// name is wider than the whole row). `avail == 0` or no units → empty. Pure.
 fn fit_units_tail(units: Vec<Vec<Span<'static>>>, avail: usize) -> Vec<Span<'static>> {
-    use crate::tui::fit::{cells, truncate_cells};
+    use crate::tui::fit::{cells, truncate_cells_head};
 
     let n = units.len();
     if avail == 0 || n == 0 {
@@ -243,11 +244,12 @@ fn fit_units_tail(units: Vec<Vec<Span<'static>>>, avail: usize) -> Vec<Span<'sta
 
     let mut out: Vec<Span<'static>> = Vec::new();
     if kept_from_right == 0 {
-        // The last unit alone overflows: flatten + right-truncate it.
+        // The last unit alone overflows: flatten + left-truncate it (keep the
+        // tail — a filename extension or a dir's trailing `/`).
         let last = units.last().expect("invariant: n > 0 checked above");
         let flat: String = last.iter().map(|s| s.content.as_ref()).collect();
         let style = last.first().map(|s| s.style).unwrap_or_default();
-        out.push(Span::styled(truncate_cells(&flat, avail), style));
+        out.push(Span::styled(truncate_cells_head(&flat, avail), style));
         return out;
     }
 
@@ -665,11 +667,13 @@ mod tests {
 
     #[test]
     fn fit_units_tail_degenerates_to_truncate_when_last_unit_alone_overflows() {
-        // Single unit wider than avail: flatten + right-truncate with "…".
-        // "verylongname/" = 13 cells, avail 5 → truncate_cells("verylongname/", 5) = "very…".
-        let units = vec![unit("verylongname/")];
-        let out = fit_units_tail(units, 5);
-        assert_eq!(join_spans_owned(&out), "very…");
+        // Single unit wider than avail: flatten + left-truncate with "…", keeping
+        // the tail (a filename's extension) — consistent with this helper's
+        // tail-preserving strategy.
+        // "abcdefghi.txt" = 13 cells, avail 8 → truncate_cells_head(_, 8) = "…ghi.txt".
+        let units = vec![unit("abcdefghi.txt")];
+        let out = fit_units_tail(units, 8);
+        assert_eq!(join_spans_owned(&out), "…ghi.txt");
     }
 
     #[test]
