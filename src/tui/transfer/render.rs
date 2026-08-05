@@ -167,10 +167,21 @@ fn draw_filter_row(frame: &mut Frame, area: Rect, query: &str, label: &str, focu
     } else {
         Style::new().dim()
     };
+    // Reserve the 2-cell "❯ " prefix; tail-truncate a query that overflows so
+    // the visible tail (what the user is typing — the cursor is always at the
+    // end) survives behind a "…". `prompt_area.width` already excludes the
+    // right-hand count label (the Layout split it off).
+    let budget = (prompt_area.width as usize).saturating_sub(2);
+    let shown = if crate::tui::fit::cells(query) > budget {
+        crate::tui::fit::truncate_cells_head(query, budget)
+    } else {
+        query.to_string()
+    };
+    let shown_cells = crate::tui::fit::cells(&shown);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("❯ ", Style::new().dim()),
-            Span::styled(query.to_string(), query_style),
+            Span::styled(shown, query_style),
         ])),
         prompt_area,
     );
@@ -181,12 +192,12 @@ fn draw_filter_row(frame: &mut Frame, area: Rect, query: &str, label: &str, focu
         count_area,
     );
 
-    // Place the terminal cursor right after the 2-cell `❯ ` prefix, only on the
-    // focused pane (the non-focused pane must not fight the focused pane's
-    // cursor). Clamp to the row's last cell.
+    // Place the terminal cursor right after the VISIBLE query tail (its cell
+    // width, so CJK aligns), only on the focused pane. Clamp to the prompt
+    // row's last cell.
     if focused {
-        let cursor_x = area.x + 2 + query.chars().count() as u16;
-        let max_x = area.x + area.width.saturating_sub(1);
+        let cursor_x = prompt_area.x + 2 + shown_cells as u16;
+        let max_x = prompt_area.x + prompt_area.width.saturating_sub(1);
         frame.set_cursor_position((cursor_x.min(max_x), area.y));
     }
 }
@@ -1850,6 +1861,42 @@ mod tests {
         term.draw(|f| draw_pane(f, f.area(), &pane, true, "local", 0))
             .unwrap();
         insta::assert_snapshot!(term.backend());
+    }
+
+    // ---- draw_filter_row: tail-truncation of a long query ----
+
+    #[test]
+    fn draw_filter_row_short_query_is_shown_unchanged() {
+        // A query well within a 30-cell prompt row renders verbatim, no ellipsis.
+        use ratatui::{Terminal, backend::TestBackend};
+        let backend = TestBackend::new(30, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            draw_filter_row(f, f.area(), "web1", "0/3", true);
+        })
+        .unwrap();
+        let txt = row_text(&term);
+        assert!(txt.contains("❯ web1"), "short query shown: {txt:?}");
+        assert!(!txt.contains('…'), "no ellipsis for a short query: {txt:?}");
+    }
+
+    #[test]
+    fn draw_filter_row_long_query_is_tail_truncated_with_ellipsis() {
+        // Query wider than the row: the tail (what the user is typing) survives,
+        // the head is dropped behind "…". The 2-cell "❯ " prefix is reserved, so
+        // with width 12 the query budget is 10 → truncate_cells_head keeps 9 tail
+        // chars + "…".
+        use ratatui::{Terminal, backend::TestBackend};
+        let backend = TestBackend::new(12, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        let query = "/home/ryan/proj";
+        term.draw(|f| draw_filter_row(f, f.area(), query, "", true))
+            .unwrap();
+        let txt = row_text(&term);
+        assert!(txt.contains('…'), "long query must show ellipsis: {txt:?}");
+        // The tail "proj" must be visible; the head "/home" must not.
+        assert!(txt.contains("proj"), "tail survives: {txt:?}");
+        assert!(!txt.contains("/home"), "head dropped: {txt:?}");
     }
 }
 
