@@ -569,13 +569,14 @@ fn drain_transfer_events(app: &mut App, handle: &TerminalHandle) {
     if let Some(screen) = app.transfer.as_mut() {
         let rx = screen.search_rx.take();
         if let Some(rx) = rx {
-            // Snapshot all buffered events this tick. Only one pane has a
-            // search active at a time, so the side is read once up front.
-            let side = if screen.local.search.is_some() {
-                Side::Local
-            } else {
-                Side::Remote
-            };
+            // Snapshot all buffered events this tick. The in-flight search's
+            // pane is recorded explicitly at launch (`begin_search` sets
+            // `search_side`); it CANNOT be inferred from
+            // `local.search.is_some()` — a finished find keeps `search` as
+            // `Some` (stale-while-revalidate), so after a Shift-Tab both panes
+            // can carry `search = Some` at once and the heuristic would route
+            // the in-flight worker's events into the wrong pane.
+            let side = screen.search_side;
             let mut events: Vec<_> = rx.try_recv().into_iter().collect();
             // Keep receiving while there are buffered events; the loop bounds
             // the work per tick so a runaway worker cannot starve key handling.
@@ -593,8 +594,13 @@ fn drain_transfer_events(app: &mut App, handle: &TerminalHandle) {
             if still_listening && let Some(screen) = app.transfer.as_mut() {
                 screen.search_rx = Some(rx);
             }
-            // Apply the snapshot now that the rx borrow is released.
-            if let Some(screen) = app.transfer.as_mut() {
+            // Apply the snapshot now that the rx borrow is released. `side` is
+            // `None` only when a receiver lingers without a recorded in-flight
+            // side (`cancel_search` clears both together, so this is unreachable
+            // in normal flow) — in that case drop the events without routing.
+            if let Some(side) = side
+                && let Some(screen) = app.transfer.as_mut()
+            {
                 for ev in events {
                     screen.apply_search_event(side, ev);
                 }
@@ -630,6 +636,13 @@ fn drain_transfer_events(app: &mut App, handle: &TerminalHandle) {
                     if let Some(c) = screen.search_cancel.as_ref() {
                         c.store(true, std::sync::atomic::Ordering::SeqCst);
                     }
+                    // Record the new in-flight side, and stop a displaced
+                    // OTHER-pane search's spinner — its worker was just
+                    // cancelled and will never emit Done, so without this its
+                    // pane would spin forever. Done before installing the fresh
+                    // rx/cancel pair so `search_side` is consistent with the
+                    // receiver the next drain reads.
+                    screen.begin_search(side);
                     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                     let (tx, rx) = std::sync::mpsc::channel();
                     screen.search_rx = Some(rx);
@@ -959,6 +972,7 @@ mod tests {
         // search so the drain's "active side" pick lands on Local.
         screen.local.search = Some(crate::tui::transfer::search::PaneSearch::empty());
         screen.search_gen = 1;
+        screen.search_side = Some(Side::Local);
         // Install a receiver buffered with one Match + one Done, and a live
         // cancel flag so the drain re-seats the rx.
         let (tx, rx) = mpsc::channel();
@@ -1010,6 +1024,7 @@ mod tests {
         screen.local.search = Some(crate::tui::transfer::search::PaneSearch::empty());
         // Current gen is 2 — an event tagged gen 1 is from a superseded query.
         screen.search_gen = 2;
+        screen.search_side = Some(Side::Local);
         let (tx, rx) = mpsc::channel();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         tx.send(SearchEvent {
@@ -1078,6 +1093,80 @@ mod tests {
                 .is_none(),
             "rx must NOT be re-seated when search_cancel is None (post-cancel state)"
         );
+    }
+
+    #[test]
+    fn drain_routes_events_to_in_flight_side_not_local_heuristic() {
+        // Repro: a find left on the LOCAL pane (its `search` stays `Some` —
+        // stale-while-revalidate keeps the results visible after Done) when
+        // the user Shift-Tabs to REMOTE and starts a new find. Both panes
+        // now carry `search = Some`, so the old heuristic
+        // `local.search.is_some()` routes the REMOTE worker's events into the
+        // LOCAL pane — remote candidates appear on the left, and the right
+        // pane spins forever (its Done lands on the wrong pane). The drain
+        // must route by the recorded in-flight side (`search_side`).
+        use sshrack_core::pathfind::{PathMatch, SearchEvent, SearchEventKind};
+        use std::sync::mpsc;
+
+        let mut app = app_with_host("web");
+        let mut screen = TransferScreen::new(PathBuf::from("/local"), PathBuf::from("/remote"));
+        // Both panes carry search state: local is the stale leftover, remote
+        // is the new in-flight find.
+        screen.local.search = Some(crate::tui::transfer::search::PaneSearch::empty());
+        screen.remote.search = Some(crate::tui::transfer::search::PaneSearch::empty());
+        // The in-flight search (whose events sit in search_rx) is REMOTE.
+        screen.search_side = Some(Side::Remote);
+        screen.search_gen = 2;
+        let (tx, rx) = mpsc::channel();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        tx.send(SearchEvent {
+            r#gen: 2,
+            kind: SearchEventKind::Match(PathMatch {
+                path: PathBuf::from("/remote/opt/sub"),
+                is_dir: true,
+                seg_matches: vec![],
+            }),
+        })
+        .expect("send remote match");
+        tx.send(SearchEvent {
+            r#gen: 2,
+            kind: SearchEventKind::Done,
+        })
+        .expect("send done");
+        screen.search_rx = Some(rx);
+        screen.search_cancel = Some(cancel);
+        app.transfer = Some(screen);
+
+        let rc = Rc::new(RefCell::new(stdout_tui()));
+        let handle: TerminalHandle = Rc::downgrade(&rc);
+        drain_transfer_events(&mut app, &handle);
+
+        let screen = app.transfer.as_ref().expect("transfer screen present");
+        let local = screen
+            .local
+            .search
+            .as_ref()
+            .expect("local search state preserved");
+        let remote = screen
+            .remote
+            .search
+            .as_ref()
+            .expect("remote search state preserved");
+        assert!(
+            local.results.is_empty(),
+            "remote worker's events must NOT contaminate the local pane"
+        );
+        assert_eq!(
+            remote.results.len(),
+            1,
+            "the in-flight (remote) pane receives its own events"
+        );
+        assert_eq!(
+            remote.results[0].path,
+            PathBuf::from("/remote/opt/sub"),
+            "remote pane gets the remote match"
+        );
+        assert!(!remote.searching, "Done cleared the remote pane's spinner");
     }
 
     // ---- decide_post_done_refresh ----

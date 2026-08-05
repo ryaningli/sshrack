@@ -1437,6 +1437,81 @@ fn cancel_search_clears_pending_search() {
     );
 }
 
+// ---- begin_search: in-flight side tracking + displaced-pane spinner ----
+
+#[test]
+fn begin_search_displaces_prior_side_and_stops_its_spinner() {
+    // A find running on LOCAL (search_side = Local, local spinner active) is
+    // displaced when a new find starts on REMOTE. The local worker is
+    // cancelled and will never emit Done, so begin_search must clear the
+    // local pane's `searching` flag itself — otherwise the left pane spins
+    // forever. Stale local results stay visible (stale-while-revalidate).
+    let mut s = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
+    s.search_side = Some(Side::Local);
+    s.local.search = Some(PaneSearch::empty()); // searching == true
+    s.begin_search(Side::Remote);
+    assert_eq!(
+        s.search_side,
+        Some(Side::Remote),
+        "in-flight side is now remote"
+    );
+    let local_after = s
+        .local
+        .search
+        .as_ref()
+        .expect("local search kept for stale results");
+    assert!(
+        !local_after.searching,
+        "displaced pane must stop spinning (its worker was cancelled)"
+    );
+}
+
+#[test]
+fn begin_search_same_side_keeps_spinner_running() {
+    // Retyping in the SAME pane relaunches the search (new gen, new worker)
+    // but the pane is not displaced — its spinner must keep running.
+    let mut s = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
+    s.search_side = Some(Side::Local);
+    s.local.search = Some(PaneSearch::empty()); // searching == true
+    s.begin_search(Side::Local);
+    assert_eq!(s.search_side, Some(Side::Local));
+    assert!(
+        s.local.search.as_ref().expect("local search").searching,
+        "same-side relaunch keeps the spinner running"
+    );
+}
+
+#[test]
+fn begin_search_first_search_sets_side() {
+    let mut s = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
+    assert!(s.search_side.is_none(), "no in-flight search initially");
+    s.begin_search(Side::Local);
+    assert_eq!(s.search_side, Some(Side::Local));
+}
+
+#[test]
+fn cancel_search_clears_in_flight_side_pane_not_focus() {
+    // Esc cancels the IN-FLIGHT search's pane (the one whose worker stops),
+    // not merely the focused pane. When focus has flipped to the other pane
+    // (Shift-Tab) these differ; clearing the wrong one would leave the
+    // cancelled search's pane stuck in find mode while the worker is dead.
+    let mut s = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
+    s.focus = Side::Remote; // user flipped to remote
+    s.search_side = Some(Side::Local); // but the in-flight find is still local
+    s.local.search = Some(PaneSearch::empty());
+    s.remote.search = Some(PaneSearch::empty());
+    s.cancel_search();
+    assert!(
+        s.local.search.is_none(),
+        "in-flight (local) pane exits find mode"
+    );
+    assert!(s.search_side.is_none(), "no in-flight search after cancel");
+    assert!(
+        s.remote.search.is_some(),
+        "non-in-flight remote pane untouched by cancel"
+    );
+}
+
 // ---- on_key: Tab completion (input state) ----
 
 #[test]

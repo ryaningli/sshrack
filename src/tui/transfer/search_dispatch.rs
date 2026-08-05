@@ -322,6 +322,25 @@ impl TransferScreen {
         ScreenOutcome::Enqueue
     }
 
+    /// Record that `side` now owns the in-flight search. Called by the run
+    /// loop once it has bumped `search_gen` and cancelled the previous
+    /// worker, just before installing the fresh `search_rx` / `search_cancel`
+    /// pair. When a DIFFERENT pane's search is being displaced, that pane's
+    /// `searching` flag is cleared here: the displaced worker was just
+    /// cancelled and will never emit `Done`, so without this its pane would
+    /// spin forever. The displaced pane's stale `results` stay visible
+    /// (stale-while-revalidate). Pure: no I/O.
+    pub(crate) fn begin_search(&mut self, side: Side) {
+        if let Some(prev) = self.search_side
+            && prev != side
+            && let Some(pane) = self.pane_mut(prev)
+            && let Some(srch) = pane.search.as_mut()
+        {
+            srch.searching = false;
+        }
+        self.search_side = Some(side);
+    }
+
     /// `Esc` in find mode: cancel the in-flight search (flip the cancel flag
     /// the run loop installed) and drop back to filter mode. The query text is
     /// left intact so the user can edit and re-trigger.
@@ -334,10 +353,17 @@ impl TransferScreen {
         // Esc inside the debounce window must not let a stale pending_search
         // fire a background search after the user explicitly cancelled.
         self.pending_search = None;
-        let focus = self.focus;
-        if let Some(pane) = self.pane_mut(focus) {
+        // Clear the IN-FLIGHT search's pane (the one whose worker we just
+        // stopped), not merely the focused pane — after a Shift-Tab these can
+        // differ, and clearing the wrong one would leave the cancelled
+        // search's pane stuck in find mode with a dead worker. Fall back to
+        // focus when nothing is in flight (defensive; an Esc that takes this
+        // path implies a search was active).
+        let target = self.search_side.unwrap_or(self.focus);
+        if let Some(pane) = self.pane_mut(target) {
             pane.search = None;
         }
+        self.search_side = None;
     }
 
     /// Unified enqueue entry: search results when a search is active on the
