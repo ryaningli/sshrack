@@ -966,7 +966,7 @@ mod tests {
         .expect("send match");
         tx.send(SearchEvent {
             r#gen: 1,
-            kind: SearchEventKind::Done { truncated: false },
+            kind: SearchEventKind::Done,
         })
         .expect("send done");
         screen.search_rx = Some(rx);

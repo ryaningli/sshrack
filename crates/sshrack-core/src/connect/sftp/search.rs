@@ -119,11 +119,11 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(
             PathBuf::from("/srv"),
-            String::from("drwxr-xr-x 2 u g 4 Jan 1 00:00 /srv/apath\n"),
+            String::from("drwxr-xr-x 2 u g 4 Jan 1 00:00 /srv/a\n"),
         );
         map.insert(
-            PathBuf::from("/srv/apath"),
-            String::from("-rw-r--r-- 1 u g 4 Jan 1 00:00 /srv/apath/bfile\n"),
+            PathBuf::from("/srv/a"),
+            String::from("-rw-r--r-- 1 u g 4 Jan 1 00:00 /srv/a/bfile\n"),
         );
         let search = RemotePathSearch::new(
             "u@h".into(),
@@ -134,6 +134,7 @@ mod tests {
         let q = ParsedQuery {
             base: PathBuf::from("/srv"),
             segments: vec!["a".into(), "b".into()],
+            trailing_slash: false,
         };
         let (tx, rx) = mpsc::channel();
         search.launch(
@@ -152,11 +153,11 @@ mod tests {
         for ev in rx.iter() {
             match ev.kind {
                 SearchEventKind::Match(_) => leaves += 1,
-                SearchEventKind::Done { .. } => done = true,
+                SearchEventKind::Done => done = true,
                 SearchEventKind::Error(e) => panic!("unexpected error: {e}"),
             }
         }
         assert!(done);
-        assert_eq!(leaves, 1, "only /srv/apath/bfile matches a/b");
+        assert_eq!(leaves, 1, "only /srv/a/bfile matches drill 'a' + leaf 'b'");
     }
 }

@@ -122,7 +122,7 @@ fn sftp_lines() -> Vec<Line<'static>> {
         binding("Right", "open the selected directory"),
         binding(
             "type a/b/c",
-            "find across dirs (Enter jump · Space mark · ^S transfer · Esc cancel)",
+            "drill exact dirs · fuzzy last seg · a/ lists dir (Enter · Space · ^S · Esc)",
         ),
         binding("Space", "mark entry (batch, single-shot)"),
         binding("Ctrl-S", "transfer marked/selected (dirs recurse)"),
@@ -267,7 +267,7 @@ mod tests {
         assert!(s.contains("transfer marked/selected (dirs recurse)"));
         assert!(s.contains("queue manager"));
         assert!(
-            s.contains("find across dirs"),
+            s.contains("drill exact dirs"),
             "sftp help must document path-aware find: {s}"
         );
     }

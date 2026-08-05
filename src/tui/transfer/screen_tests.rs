@@ -1393,6 +1393,23 @@ fn search_request_filter_mode_when_single_segment() {
 }
 
 #[test]
+fn search_request_find_mode_when_trailing_slash() {
+    // A single-segment query with a trailing slash ("a/") enters find mode:
+    // exact-drill into "a" then list it. It must NOT stay in filter mode (which
+    // would only fuzzy-filter the current directory and never descend).
+    let mut s = TransferScreen::new(PathBuf::from("/srv"), PathBuf::from("/r"));
+    s.search_request(Side::Local, "a/".into());
+    assert!(
+        s.local.search.is_some(),
+        "trailing slash → find mode (not filter)"
+    );
+    assert!(
+        s.pending_search.is_some(),
+        "pending_search set for the run loop"
+    );
+}
+
+#[test]
 fn cancel_search_clears_pending_search() {
     // Esc inside the ~80ms debounce window must clear pending_search too —
     // otherwise the run loop still dispatches it after the window elapses,

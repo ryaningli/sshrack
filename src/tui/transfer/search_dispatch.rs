@@ -56,7 +56,7 @@ impl TransferScreen {
                     srch.cursor = len.saturating_sub(1);
                 }
             }
-            SearchEventKind::Done { .. } => srch.searching = false,
+            SearchEventKind::Done => srch.searching = false,
             SearchEventKind::Error(msg) => {
                 srch.searching = false;
                 srch.error = Some(msg);
@@ -65,11 +65,11 @@ impl TransferScreen {
     }
 
     /// Re-evaluate filter-vs-find mode after the focused pane's query changed.
-    /// Single-segment-or-empty queries with `base == cwd` stay in filter mode
-    /// (the synchronous `core.recompute` already handles them); multi-segment
-    /// or out-of-cwd queries enter find mode (set `pane.search`, clear its
-    /// results, and stash `pending_search` for the run loop to launch). Pure:
-    /// no I/O.
+    /// A plain single name (no slash) with `base == cwd` stays in filter mode
+    /// (the synchronous `core.recompute` already handles it); a trailing slash,
+    /// any multi-segment, or an out-of-cwd query enters find mode (set
+    /// `pane.search`, clear its results, and stash `pending_search` for the run
+    /// loop to launch). Pure: no I/O.
     pub(crate) fn search_request(&mut self, side: Side, query: String) {
         if query.is_empty() {
             self.pane_mut(side)
@@ -82,7 +82,9 @@ impl TransferScreen {
             Side::Remote => (self.remote.core.cwd.clone(), self.remote_home.clone()),
         };
         let parsed = parse_query(&query, &cwd, home.as_deref());
-        let is_filter = parsed.segments.len() <= 1 && parsed.base == cwd;
+        // Filter mode = a plain single name in the current directory (no slash at all).
+        // A trailing slash ("a/") or any multi-segment / out-of-cwd query is find mode.
+        let is_filter = !parsed.trailing_slash && parsed.segments.len() == 1 && parsed.base == cwd;
         let launch = if is_filter {
             None
         } else {
