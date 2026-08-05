@@ -1627,6 +1627,107 @@ fn jump_to_result_jumps_into_directory() {
 }
 
 #[test]
+fn enter_after_drill_navigates_into_drilled_dir_not_first_child() {
+    // THE Tab+Enter habit collision, end-to-end at the screen layer: a
+    // trailing-slash find lists a directory's children with the synthetic "."
+    // at index 0 (cursor lands on it). Enter must navigate into the DRILLED
+    // directory (the dot), NOT dive into the first child — which here is itself
+    // a directory (the trap). Simulates the post-Tab search event stream a real
+    // run loop would drain (Drilled + Matches + Done), then exercises Enter via
+    // jump_to_search_result (the on_key Enter-on-dir path).
+    let mut s = TransferScreen::new(PathBuf::from("/a"), PathBuf::from("/b"));
+    s.focus = Side::Local;
+    s.local.search = Some(PaneSearch::empty());
+    s.search_gen = 1;
+    // Drilled first, then two children — one a directory (the pre-fix trap).
+    s.apply_search_event(
+        Side::Local,
+        SearchEvent {
+            r#gen: 1,
+            kind: SearchEventKind::Drilled(PathBuf::from("/a/sub")),
+        },
+    );
+    s.apply_search_event(
+        Side::Local,
+        SearchEvent {
+            r#gen: 1,
+            kind: SearchEventKind::Match(PathMatch {
+                path: PathBuf::from("/a/sub/child_dir"),
+                is_dir: true,
+                seg_matches: vec![],
+            }),
+        },
+    );
+    s.apply_search_event(
+        Side::Local,
+        SearchEvent {
+            r#gen: 1,
+            kind: SearchEventKind::Match(PathMatch {
+                path: PathBuf::from("/a/sub/file.txt"),
+                is_dir: false,
+                seg_matches: vec![],
+            }),
+        },
+    );
+    s.apply_search_event(
+        Side::Local,
+        SearchEvent {
+            r#gen: 1,
+            kind: SearchEventKind::Done,
+        },
+    );
+
+    let srch = s.local.search.as_ref().unwrap();
+    assert!(srch.on_dot(), "cursor on the dot after the drill");
+    // Enter on a directory result routes to jump_to_search_result (screen.rs
+    // Enter-if-in_search arm). The dot's selected() is_dir is true, so it jumps.
+    assert!(srch.selected().unwrap().is_dir);
+    let out = s.jump_to_search_result();
+    assert_eq!(out, ScreenOutcome::Continue);
+    assert_eq!(
+        s.pending_list,
+        Some((Side::Local, PathBuf::from("/a/sub"))),
+        "Enter on '.' navigates into the drilled dir, not its first child"
+    );
+    assert!(s.local.search.is_none(), "search cleared after the jump");
+}
+
+#[test]
+fn enter_on_dot_navigates_into_empty_drilled_dir() {
+    // A drilled directory that exists but is empty: Drilled fires, zero Matches,
+    // Done. The "." row is the only entry; Enter navigates into it. Pre-feature
+    // this was impossible (no match to select → Enter was a no-op).
+    let mut s = TransferScreen::new(PathBuf::from("/a"), PathBuf::from("/b"));
+    s.focus = Side::Local;
+    s.local.search = Some(PaneSearch::empty());
+    s.search_gen = 1;
+    s.apply_search_event(
+        Side::Local,
+        SearchEvent {
+            r#gen: 1,
+            kind: SearchEventKind::Drilled(PathBuf::from("/a/empty")),
+        },
+    );
+    s.apply_search_event(
+        Side::Local,
+        SearchEvent {
+            r#gen: 1,
+            kind: SearchEventKind::Done,
+        },
+    );
+    let srch = s.local.search.as_ref().unwrap();
+    assert!(srch.results.is_empty(), "empty dir → no child matches");
+    assert!(srch.on_dot(), "the dot is the only row");
+    let out = s.jump_to_search_result();
+    assert_eq!(out, ScreenOutcome::Continue);
+    assert_eq!(
+        s.pending_list,
+        Some((Side::Local, PathBuf::from("/a/empty"))),
+        "Enter on '.' navigates into the empty drilled dir"
+    );
+}
+
+#[test]
 fn find_enter_on_file_enqueues_instead_of_jumping() {
     // find mode: Enter on a FILE result enqueues it — parity with filter mode,
     // where Enter on a file transfers. Previously Enter jumped to the file's
