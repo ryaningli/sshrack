@@ -372,9 +372,39 @@ pub(crate) fn walk_levels<L>(
 }
 
 /// Local-filesystem [`PathSearch`]. The background thread owns its own
-/// [`LocalDirSource`] (zero state) and reads via `std::fs`.
-#[derive(Debug, Default, Copy, Clone)]
-pub struct LocalPathSearch;
+/// [`LocalDirSource`] (zero state) and reads via `std::fs`. A per-instance
+/// [`DirListCache`] amortizes repeated listings across find queries.
+#[derive(Clone)]
+pub struct LocalPathSearch {
+    cache: Arc<std::sync::Mutex<DirListCache>>,
+}
+
+// Manual `Debug`: [`DirListCache`] holds a closure (the clock) which is not
+// `Debug`, so we cannot derive it. Keep the public `Debug` impl the unit struct
+// previously had without requiring `DirListCache: Debug`.
+impl std::fmt::Debug for LocalPathSearch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalPathSearch").finish_non_exhaustive()
+    }
+}
+
+impl Default for LocalPathSearch {
+    fn default() -> Self {
+        Self {
+            cache: Arc::new(std::sync::Mutex::new(
+                DirListCache::default_with_real_clock(),
+            )),
+        }
+    }
+}
+
+impl LocalPathSearch {
+    /// Construct with an injected cache (tests / sharing).
+    #[must_use]
+    pub fn new(cache: Arc<std::sync::Mutex<DirListCache>>) -> Self {
+        Self { cache }
+    }
+}
 
 impl PathSearch for LocalPathSearch {
     fn launch(
@@ -386,9 +416,16 @@ impl PathSearch for LocalPathSearch {
         sink: mpsc::Sender<SearchEvent>,
     ) {
         let query = query.clone();
+        let cache = self.cache.clone();
         std::thread::spawn(move || {
             let src = LocalDirSource::new();
-            walk_levels(|p| src.list(p), &query, &*matcher, r#gen, &cancel, &sink);
+            let list = |p: &Path| -> Result<Vec<DirEntry>, String> {
+                cache
+                    .lock()
+                    .expect("invariant: dir-list cache mutex not poisoned")
+                    .get_or_fetch(p, |x| src.list(x))
+            };
+            walk_levels(list, &query, &*matcher, r#gen, &cancel, &sink);
         });
     }
 }
@@ -790,6 +827,43 @@ mod tests {
         drop(tx);
         let evs: Vec<_> = rx.iter().collect();
         assert!(evs.iter().all(|e| !matches!(e.kind, SearchEventKind::Done)));
+    }
+
+    #[test]
+    fn local_path_search_launch_returns_matches_with_cache_wired() {
+        // Characterization test: with the DirListCache wired into launch, a real
+        // local search over a tempdir still streams the correct leaf matches.
+        use std::sync::Arc;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("a").join("b")).unwrap();
+        std::fs::write(root.join("a").join("b").join("cfile.txt"), b"x").unwrap();
+
+        let q = query_at(&root.to_string_lossy(), &["a", "b", "c"]);
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let search = LocalPathSearch::default();
+        search.launch(
+            &q,
+            Arc::new(AlwaysMatcher),
+            1,
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        );
+        // `launch` moves tx into the spawned thread; rx.iter() blocks until done.
+        let mut leaves = Vec::new();
+        let mut done = false;
+        for ev in rx.iter() {
+            match ev.kind {
+                SearchEventKind::Match(m) => leaves.push(m),
+                SearchEventKind::Done => done = true,
+                SearchEventKind::Error(e) => panic!("unexpected error: {e}"),
+            }
+        }
+        assert!(done);
+        assert_eq!(leaves.len(), 1, "only cfile.txt matches leaf 'c'");
+        assert!(leaves[0].path.ends_with("cfile.txt"));
+        let _ = cancel; // not flipped — the search runs to completion
     }
 
     /// Trivial matcher used by the core-level unit tests (the real nucleo
