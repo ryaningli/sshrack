@@ -16,13 +16,19 @@ use crate::pathutil::expand_tilde;
 pub struct ParsedQuery {
     /// Absolute directory the search descends from.
     pub base: PathBuf,
-    /// Ordered fuzzy segments (`a/b/c` → `["a","b","c"]`).
+    /// Ordered path segments (`a/b/c` → `["a","b","c"]`). Empty segments are
+    /// dropped, so `aaa` and `aaa/` differ only in [`Self::trailing_slash`].
     pub segments: Vec<String>,
+    /// `true` iff the trimmed query ended with `/`. A trailing slash makes the
+    /// final (empty) segment a "list this directory" leaf instead of a fuzzy
+    /// filter — see `walk_levels`.
+    pub trailing_slash: bool,
 }
 
 /// Parse `raw` into a [`ParsedQuery`] against `cwd` and optional `home`.
 pub fn parse_query(raw: &str, cwd: &Path, home: Option<&Path>) -> ParsedQuery {
     let raw = raw.trim();
+    let trailing_slash = raw.ends_with('/');
     let (base, rest) = resolve_base(raw, cwd, home);
     let segments: Vec<String> = rest
         .split('/')
@@ -30,7 +36,11 @@ pub fn parse_query(raw: &str, cwd: &Path, home: Option<&Path>) -> ParsedQuery {
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect();
-    ParsedQuery { base, segments }
+    ParsedQuery {
+        base,
+        segments,
+        trailing_slash,
+    }
 }
 
 /// Split `raw` into `(base, rest_str)` by leading prefix. Pure.
@@ -415,6 +425,20 @@ mod tests {
     fn empty_segment_are_dropped() {
         let q = parse_query("a//b/", Path::new("/srv"), None);
         assert_eq!(q.segments, vec!["a", "b"]);
+        assert!(q.trailing_slash, "a//b/ ends with / → trailing_slash true");
+    }
+
+    #[test]
+    fn trailing_slash_detected() {
+        // trailing_slash is true iff the trimmed query ends with '/'.
+        assert!(!parse_query("a", Path::new("/srv"), None).trailing_slash);
+        assert!(parse_query("a/", Path::new("/srv"), None).trailing_slash);
+        assert!(parse_query("a/b/", Path::new("/srv"), None).trailing_slash);
+        assert!(parse_query("/", Path::new("/srv"), None).trailing_slash);
+        assert!(parse_query("~/", Path::new("/srv"), Some(Path::new("/h"))).trailing_slash);
+        assert!(!parse_query("a/b", Path::new("/srv"), None).trailing_slash);
+        // Trailing whitespace is trimmed first, so "a/ " still counts.
+        assert!(parse_query("a/ ", Path::new("/srv"), None).trailing_slash);
     }
 
     #[test]
@@ -475,6 +499,7 @@ mod tests {
         ParsedQuery {
             base: PathBuf::from(base),
             segments: segs.iter().map(|s| s.to_string()).collect(),
+            trailing_slash: false,
         }
     }
 

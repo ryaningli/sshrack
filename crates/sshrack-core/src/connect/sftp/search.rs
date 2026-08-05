@@ -134,6 +134,7 @@ mod tests {
         let q = ParsedQuery {
             base: PathBuf::from("/srv"),
             segments: vec!["a".into(), "b".into()],
+            trailing_slash: false,
         };
         let (tx, rx) = mpsc::channel();
         search.launch(
