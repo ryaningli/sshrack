@@ -44,6 +44,26 @@ const NAME_MIN: usize = 6;
 /// `██░░ N%` label is unreadable) nor wider than this (else it dominates).
 const GAUGE_MIN: u16 = 10;
 const GAUGE_MAX: u16 = 30;
+/// Braille spinner frames for the find-mode "searching" state. 10 frames,
+/// advanced once per run-loop tick (~50 ms, `EVENT_POLL`) → ~500 ms/turn. A
+/// classic ratatui-style spinner; braille is widely supported by terminals.
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Build the find-mode filter-row label: a single braille spinner frame while
+/// the search is in flight, otherwise the result count as a bare number (`0`
+/// for no hits, `N` for `N` hits). Symmetric to [`parts::count_label`] (which
+/// serves the filter-mode `matched/total` label).
+///
+/// The error state is deliberately NOT surfaced here: a listing error clears
+/// the results (see `apply_search_event`), so `len == 0` → `"0"`, and the
+/// result-list empty state ([`draw_search_list`]) shows the error's first
+/// line. The filter row just reports the count.
+fn find_count_label(len: usize, searching: bool, spinner_frame: usize) -> String {
+    if searching {
+        return SPINNER[spinner_frame % SPINNER.len()].to_string();
+    }
+    len.to_string()
+}
 
 /// Paint one pane into `area` as a titled bordered block: focus = accent
 /// border + bold title, non-focus = dim border + dim title (mirrors sshelf and
@@ -55,7 +75,14 @@ const GAUGE_MAX: u16 = 30;
 /// [`parts::draw_search_box`] so the pane has exactly one border (no box-in-box)
 /// and the list loses no vertical room (the border costs 2 rows, the filter
 /// shrinks 3→1, net zero).
-pub fn draw_pane(frame: &mut Frame, area: Rect, pane: &Pane, focused: bool, title: &str) {
+pub fn draw_pane(
+    frame: &mut Frame,
+    area: Rect,
+    pane: &Pane,
+    focused: bool,
+    title: &str,
+    spinner_frame: usize,
+) {
     let border_style = if focused {
         theme::accent()
     } else {
@@ -82,15 +109,11 @@ pub fn draw_pane(frame: &mut Frame, area: Rect, pane: &Pane, focused: bool, titl
 
     draw_cwd_row(frame, cwd_area, pane, focused);
 
-    // Filter-row count: search-aware when a cross-directory find is active on
-    // this pane (searching / N matches / first error line), the directory
-    // `matched/total` otherwise.
+    // Filter-row count: a spinner frame while the cross-directory find on this
+    // pane is in flight, the bare result count once it lands, else the
+    // directory `matched/total` (filter mode). Built by `find_count_label`.
     let filter_label = match pane.search.as_ref() {
-        Some(s) if s.searching => "searching…".to_string(),
-        Some(s) => match s.results.len() {
-            0 => "no matches".to_string(),
-            n => format!("{n} matches"),
-        },
+        Some(s) => find_count_label(s.results.len(), s.searching, spinner_frame),
         None => parts::count_label(pane.matched_count(), pane.core.entries.len()),
     };
     draw_filter_row(frame, filter_area, &pane.core.query, &filter_label, focused);
@@ -1741,6 +1764,31 @@ mod tests {
         );
     }
 
+    // ---- find_count_label: find-mode filter-row label (spinner / count) ----
+
+    #[test]
+    fn find_count_label_searching_returns_spinner_frame() {
+        // SPINNER[0] = "⠋".
+        assert_eq!(find_count_label(0, true, 0), "⠋");
+    }
+
+    #[test]
+    fn find_count_label_searching_wraps_frame_modulo_spinner_len() {
+        assert_eq!(find_count_label(0, true, 10), "⠋"); // 10 % 10 = 0
+        assert_eq!(find_count_label(0, true, 23), "⠸"); // 23 % 10 = 3
+    }
+
+    #[test]
+    fn find_count_label_idle_zero_results_is_bare_zero() {
+        assert_eq!(find_count_label(0, false, 0), "0");
+    }
+
+    #[test]
+    fn find_count_label_idle_n_results_is_bare_number() {
+        assert_eq!(find_count_label(1, false, 0), "1");
+        assert_eq!(find_count_label(137, false, 5), "137");
+    }
+
     // ---- draw_pane: titled bordered block, no panic on a short terminal ----
 
     #[test]
@@ -1753,7 +1801,7 @@ mod tests {
         ]);
         let backend = TestBackend::new(40, 12);
         let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| draw_pane(f, f.area(), &pane, true, "local"))
+        term.draw(|f| draw_pane(f, f.area(), &pane, true, "local", 0))
             .expect("focused titled pane must render without panic");
         let pos = term.backend().cursor_position();
         assert!(
@@ -1771,7 +1819,7 @@ mod tests {
         pane.set_entries(vec![entry("alpha.txt", false, Some(1024))]);
         let backend = TestBackend::new(40, 12);
         let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| draw_pane(f, f.area(), &pane, false, "u@h"))
+        term.draw(|f| draw_pane(f, f.area(), &pane, false, "u@h", 0))
             .expect("unfocused titled pane must render without panic");
     }
 
@@ -1799,7 +1847,7 @@ mod tests {
         }]);
         let backend = TestBackend::new(40, 10);
         let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| draw_pane(f, f.area(), &pane, true, "local"))
+        term.draw(|f| draw_pane(f, f.area(), &pane, true, "local", 0))
             .unwrap();
         insta::assert_snapshot!(term.backend());
     }

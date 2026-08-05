@@ -139,6 +139,12 @@ pub struct TransferScreen {
     /// Remote home directory (`open_transfer` fills this in Task 10); `None`
     /// until then, so remote `~`-expansion degrades to the remote cwd.
     pub remote_home: Option<PathBuf>,
+    /// Global spinner phase for the find-mode "searching" filter-row label.
+    /// Advanced once per run-loop tick ([`advance_spinner`](Self::advance_spinner))
+    /// while any pane's search is in flight; read by `draw` → `draw_pane` →
+    /// `find_count_label` to pick the current braille frame. Read-only in
+    /// render, never mutated there.
+    pub spinner: usize,
 }
 
 impl TransferScreen {
@@ -166,6 +172,20 @@ impl TransferScreen {
             search_cancel: None,
             search_gen: 0,
             remote_home: None,
+            spinner: 0,
+        }
+    }
+
+    /// Advance the global spinner phase by one tick if (and only if) a find
+    /// search is in flight on either pane. Called by the run loop every tick
+    /// before draw so the find-mode filter-row label animates. A no-op when no
+    /// search is active (the phase does not advance, so an idle screen holds a
+    /// stable frame). Pure: mutates only `self.spinner`.
+    pub(crate) fn advance_spinner(&mut self) {
+        let any_searching = self.local.search.as_ref().is_some_and(|s| s.searching)
+            || self.remote.search.as_ref().is_some_and(|s| s.searching);
+        if any_searching {
+            self.spinner = self.spinner.wrapping_add(1);
         }
     }
 
@@ -559,6 +579,7 @@ impl TransferScreen {
             &self.local,
             self.focus == Side::Local,
             "local",
+            self.spinner,
         );
         render::draw_pane(
             frame,
@@ -566,6 +587,7 @@ impl TransferScreen {
             &self.remote,
             self.focus == Side::Remote,
             &self.remote_title,
+            self.spinner,
         );
 
         self.draw_progress_panel(frame, panel_area);
