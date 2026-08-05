@@ -1778,3 +1778,40 @@ fn tab_while_searching_with_no_candidate_does_not_flip_focus() {
     );
     assert_eq!(s.local.core.query, "/ho", "query untouched");
 }
+
+#[test]
+fn tab_while_searching_does_not_complete_from_stale_results() {
+    // Gap in stale-while-revalidate: while a search is in flight the previous
+    // query's results stay visible (no flash), but the candidate under the
+    // cursor belongs to the OLD query. Tab must NOT complete off it — e.g.
+    // query `/home/ryan/` listing `some_dir`, then typing `w` and Tab must
+    // stay `/home/ryan/w`, not jump to `/home/ryan/some_dir`. Swallow Tab
+    // until the new search yields fresh results.
+    let mut s = TransferScreen::new(PathBuf::from("/srv"), PathBuf::from("/r"));
+    let mut srch = PaneSearch::empty();
+    srch.searching = true; // new search in flight
+    srch.yielded = false;
+    srch.results = vec![PathMatch {
+        // stale result from the PREVIOUS query (`/home/ryan/` list-all)
+        path: PathBuf::from("/home/ryan/some_dir"),
+        is_dir: true,
+        seg_matches: vec![SegMatch {
+            name: "some_dir".into(),
+            score: 0,
+            indices: vec![],
+        }],
+    }];
+    s.local.search = Some(srch);
+    s.local.core.query = "/home/ryan/w".into();
+    assert_eq!(s.focus, Side::Local);
+    let _ = s.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(
+        s.local.core.query, "/home/ryan/w",
+        "Tab mid-search must not complete from stale results"
+    );
+    assert_eq!(
+        s.focus,
+        Side::Local,
+        "Tab mid-search must not flip focus either"
+    );
+}

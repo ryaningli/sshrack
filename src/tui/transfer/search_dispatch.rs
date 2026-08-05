@@ -161,9 +161,9 @@ impl TransferScreen {
     }
 
     /// Compute the query string that completes the focused pane's current
-    /// candidate, or `None` when completion does not apply (empty query, or no
-    /// candidate under the cursor). The single source of the candidate → query
-    /// mapping for both pane modes.
+    /// candidate, or `None` when completion does not apply (empty query, a find
+    /// search still in flight, or no candidate under the cursor). The single
+    /// source of the candidate → query mapping for both pane modes.
     ///
     /// Only the FINAL segment is completed. The prefix the user already typed —
     /// up to and including the last `/` — is preserved verbatim, so the base
@@ -184,6 +184,14 @@ impl TransferScreen {
         // verbatim; complete only the final segment from the candidate.
         let prefix = query.rfind('/').map(|i| &query[..=i]).unwrap_or("");
         let (last_seg, is_dir) = if let Some(srch) = pane.search.as_ref() {
+            // A search is in flight: the visible results are the PREVIOUS
+            // query's, kept only to avoid a flash (stale-while-revalidate), so
+            // the candidate under the cursor does not belong to the current
+            // query. Do not complete off it — return None so Tab is swallowed
+            // until the new search yields fresh results.
+            if srch.searching {
+                return None;
+            }
             let pm = srch.selected()?;
             let name = pm.path.file_name()?.to_string_lossy().into_owned();
             (name, pm.is_dir)
