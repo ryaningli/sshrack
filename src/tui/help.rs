@@ -116,7 +116,11 @@ fn launcher_lines(tab: Tab) -> Vec<Line<'static>> {
 fn sftp_lines() -> Vec<Line<'static>> {
     vec![
         section("SFTP transfer"),
-        binding("Tab", "switch pane (focus = direction)"),
+        binding(
+            "Tab",
+            "complete highlighted (dir → next level) · else switch pane",
+        ),
+        binding("Shift-Tab", "switch pane (focus = direction)"),
         binding("Up / Down", "move selection"),
         binding("Left", "up to the parent directory"),
         binding("Right", "open the selected directory"),
@@ -264,6 +268,14 @@ mod tests {
     fn sftp_help_documents_the_transfer_bindings() {
         let s = joined(&HelpContext::Sftp);
         assert!(s.contains("switch pane (focus = direction)"));
+        assert!(
+            s.contains("complete highlighted"),
+            "help documents Tab completion: {s:?}"
+        );
+        assert!(
+            s.contains("Shift-Tab"),
+            "help documents Shift-Tab pane switch: {s:?}"
+        );
         assert!(s.contains("transfer marked/selected (dirs recurse)"));
         assert!(s.contains("queue manager"));
         assert!(

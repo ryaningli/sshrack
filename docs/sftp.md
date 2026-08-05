@@ -77,8 +77,12 @@ directory (unchanged). Anything with a `/` is a **drill find**:
 Bases: `~/` = home, `/` = root, `../` = parent (one or more), bare/`./` = current
 directory. Depth follows the number of segments you type.
 
-Keys while a find is active: `Enter` jump to the result's directory · `Space`
-mark · `^S` transfer · `Esc` cancel. Local find is a background `read_dir` walk;
-remote find runs one `sftp ls` per level over the shared ControlMaster (never
-blocks transfers).
+Keys while a find is active: `Tab` complete the highlighted result (a directory
+completes to `name/` and lists the next level — the same drill + list-all as
+typing the `/` yourself) · `Enter` jump to the result's directory · `Space`
+mark · `^S` transfer · `Esc` cancel. `Tab` completes from the filter list too
+(a single name); with an empty query or no candidate under the cursor, `Tab`
+switches panes and `Shift-Tab` always switches panes. Local find is a
+background `read_dir` walk; remote find runs one `sftp ls` per level over the
+shared ControlMaster (never blocks transfers).
 
