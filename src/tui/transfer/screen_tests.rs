@@ -522,6 +522,45 @@ fn ctrl_s_on_dir_enqueues_recursive_job() {
 }
 
 #[test]
+fn ctrl_s_in_find_mode_enqueues_cursor_result_only_ignoring_marks() {
+    // Find mode has no marking: Ctrl-S enqueues the cursor result only. Stale
+    // `marked` entries (e.g. carried over from listing mode) are NOT consulted
+    // — find results are cross-directory, so a marked set would be meaningless
+    // and could silently suppress the enqueue (stale-mark pollution). The
+    // cursor file is enqueued with dst = opposite cwd / file name.
+    let mut s = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
+    let mut srch = PaneSearch::empty();
+    srch.results = vec![
+        PathMatch {
+            path: PathBuf::from("/l/sub/a.txt"),
+            is_dir: false,
+            seg_matches: vec![],
+        },
+        PathMatch {
+            path: PathBuf::from("/l/sub/dir"),
+            is_dir: true,
+            seg_matches: vec![],
+        },
+    ];
+    s.local.search = Some(srch);
+    // Cursor on index 0 (the file). Stale mark unrelated to the find results.
+    s.local.core.marked.insert(PathBuf::from("/l/legacy.txt"));
+
+    let out = s.on_key(press(KeyCode::Char('s'), KeyModifiers::CONTROL));
+    assert_eq!(out, ScreenOutcome::Enqueue);
+    assert_eq!(s.ledger.tasks.len(), 1, "only the cursor result enqueued");
+    let job = &s.ledger.tasks[0].job;
+    assert_eq!(job.direction, Direction::Upload);
+    assert_eq!(job.src, PathBuf::from("/l/sub/a.txt"));
+    assert_eq!(
+        job.dst,
+        PathBuf::from("/r/a.txt"),
+        "dst = opposite cwd / file name"
+    );
+    assert!(!job.recursive, "file → recursive=false");
+}
+
+#[test]
 fn ctrl_s_focus_remote_enqueues_download_job() {
     let local_cwd = PathBuf::from("/l");
     let remote_cwd = PathBuf::from("/r");
@@ -1362,6 +1401,35 @@ fn jump_to_result_targets_parent_for_file() {
     assert!(
         s.local.core.query.is_empty(),
         "query cleared after jump so the pane returns to filter mode in the new dir"
+    );
+}
+
+#[test]
+fn find_mode_space_appends_to_query_instead_of_marking() {
+    // Find mode disables Space-marking. `Pane.core.marked` is a current-dir
+    // concept (toggle + single-shot per enqueue); allowing cross-dir find
+    // results into it caused: (a) no toggle (insert-only), (b) stale marks
+    // polluting listing-mode enqueue after Esc, (c) same-name dst collisions
+    // across directories. Space now reaches the query box like any printable
+    // char — filenames may contain spaces.
+    let mut s = TransferScreen::new(PathBuf::from("/a"), PathBuf::from("/b"));
+    s.local.search = Some(PaneSearch::empty());
+    s.local.search.as_mut().unwrap().results = vec![PathMatch {
+        path: PathBuf::from("/a/sub"),
+        is_dir: true,
+        seg_matches: vec![],
+    }];
+    s.local.core.query = "/a/s".to_string();
+
+    let out = s.on_key(press(KeyCode::Char(' '), KeyModifiers::NONE));
+    assert_eq!(out, ScreenOutcome::Continue);
+    assert!(
+        s.local.core.marked.is_empty(),
+        "find mode must not mark on Space"
+    );
+    assert_eq!(
+        s.local.core.query, "/a/s ",
+        "Space appends to the query like a printable char"
     );
 }
 

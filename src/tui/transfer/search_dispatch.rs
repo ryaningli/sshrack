@@ -253,29 +253,22 @@ impl TransferScreen {
         ScreenOutcome::Continue
     }
 
-    /// `Space` on a search result: mark its path (reuses `Pane.core.marked` so
-    /// the existing mark-rendering + enqueue-from-marks path works unchanged).
-    pub(crate) fn search_mark_focused(&mut self) {
-        let focus = self.focus;
-        let Some(path) = self
-            .pane_mut(focus)
-            .expect("invariant: focus is a valid pane")
-            .search
-            .as_ref()
-            .and_then(|s| s.selected().map(|m| m.path.clone()))
-        else {
-            return;
-        };
-        self.focused_pane_mut().core.marked.insert(path);
-    }
-
-    /// `Ctrl-S` / `Ctrl-Enter` on search results: enqueue marked (or selected)
-    /// matches. Mirrors [`enqueue_from_focused`](Self::enqueue_from_focused)
-    /// but sources its specs from the search results instead of the dir
-    /// listing. `size_total` is `None` because `PathMatch` does not carry
-    /// size. Marks are single-shot (cleared after enqueue).
+    /// `Ctrl-S` / `Ctrl-Enter` on search results: enqueue the selected match.
+    /// Find mode has no marking (the cross-dir `marked` set is a current-dir
+    /// concept), so this transfers the cursor result only — a file, or a dir
+    /// (recursive). `size_total` is `None` because `PathMatch` does not carry
+    /// size. Mirrors [`enqueue_from_focused`](Self::enqueue_from_focused) but
+    /// sources its single spec from the search results.
     fn enqueue_from_search(&mut self) -> ScreenOutcome {
         let focus = self.focus;
+        let Some((path, is_dir)) = self
+            .focused_pane()
+            .search
+            .as_ref()
+            .and_then(|s| s.selected().map(|m| (m.path.clone(), m.is_dir)))
+        else {
+            return ScreenOutcome::Continue;
+        };
         let direction = match focus {
             Side::Local => Direction::Upload,
             Side::Remote => Direction::Download,
@@ -284,41 +277,19 @@ impl TransferScreen {
             Side::Local => self.remote.core.cwd.clone(),
             Side::Remote => self.local.core.cwd.clone(),
         };
-        let mut specs: Vec<(PathBuf, bool)> = Vec::new();
-        {
-            let pane = self.focused_pane();
-            let Some(srch) = pane.search.as_ref() else {
-                return ScreenOutcome::Continue;
-            };
-            if !pane.core.marked.is_empty() {
-                for m in &srch.results {
-                    if pane.core.marked.contains(&m.path) {
-                        specs.push((m.path.clone(), m.is_dir));
-                    }
-                }
-            } else if let Some(m) = srch.selected() {
-                specs.push((m.path.clone(), m.is_dir));
-            }
-        }
-        if specs.is_empty() {
-            return ScreenOutcome::Continue;
-        }
-        self.focused_pane_mut().core.marked.clear();
-        for (path, is_dir) in specs {
-            let name = path
-                .file_name()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| path.clone());
-            let dst = dst_cwd.join(&name);
-            self.ledger.enqueue(TransferJob {
-                direction,
-                src: path,
-                dst,
-                name: name.to_string_lossy().into_owned(),
-                size_total: None,
-                recursive: is_dir,
-            });
-        }
+        let name = path
+            .file_name()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| path.clone());
+        let dst = dst_cwd.join(&name);
+        self.ledger.enqueue(TransferJob {
+            direction,
+            src: path,
+            dst,
+            name: name.to_string_lossy().into_owned(),
+            size_total: None,
+            recursive: is_dir,
+        });
         ScreenOutcome::Enqueue
     }
 

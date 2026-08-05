@@ -670,18 +670,26 @@ fn search_mode_backspace_pops_core_query() {
 }
 
 #[test]
-fn search_mode_space_enter_right_emit_none() {
-    // Space marks the selected result; Enter/Right jump — the screen handles
-    // all three. The pane returns None so the screen reads
-    // `pane.search.as_ref().and_then(|s| s.selected())`.
+fn search_mode_enter_right_emit_none_space_appends_to_query() {
+    // Enter/Right jump to the selected result — the screen handles both, so
+    // the pane returns None and reads `pane.search.selected()`. Space is NOT
+    // handled here: it falls through to `apply_nav_key` and appends to the
+    // query like any printable char (find mode has no marking).
     let mut p = pane_with_fruits();
     let mut search = crate::tui::transfer::search::PaneSearch::empty();
     search.results = vec![path_match("/x/a"), path_match("/x/b")];
     p.search = Some(search);
 
-    assert_eq!(p.on_key(press(KeyCode::Char(' '))), PaneOutcome::None);
     assert_eq!(p.on_key(press(KeyCode::Enter)), PaneOutcome::None);
     assert_eq!(p.on_key(press(KeyCode::Right)), PaneOutcome::None);
+
+    // Space reaches the query box: QueryChanged + a trailing space.
+    assert_eq!(
+        p.on_key(press(KeyCode::Char(' '))),
+        PaneOutcome::QueryChanged
+    );
+    assert_eq!(p.core.query, " ");
+
     // Cursor did not move for any of these (only Up/Down/Ctrl-P/N move it).
     assert_eq!(p.search.as_ref().expect("search active").cursor, 0);
 }

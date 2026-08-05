@@ -2,9 +2,10 @@
 //! — no I/O. [`draw_search_list`] paints the flat ranked [`PathMatch`] list a
 //! focused/unfocused pane overlays on top of its directory listing while a
 //! find query is active (`pane.search.is_some()`). It mirrors [`draw_pane_row`]
-//! / [`draw_pane_list`] in [`super::render`]: same 4-cell leading prefix (mark
-//! glyph + focus marker) so columns align with the directory listing, same
-//! accent+bold cursor-row highlight, same dim-the-non-focused-pane language.
+//! / [`draw_pane_list`] in [`super::render`]: same 4-cell leading prefix (a
+//! 2-cell spacer where the listing puts its mark glyph, + focus marker) so
+//! columns align with the directory listing, same accent+bold cursor-row
+//! highlight, same dim-the-non-focused-pane language.
 //! The only difference is the cell body — a joined path with per-segment fuzzy
 //! highlight (one highlight run per `SegMatch.indices`) instead of a single
 //! name column + size/mtime meta.
@@ -32,8 +33,8 @@ use crate::tui::transfer::pane::Pane;
 ///   flight, `no matches` when the search terminated with zero hits, or the
 ///   error string's first line when a listing error terminated the search.
 /// - Otherwise: window via [`PaneSearch::visible_window`], and for each visible
-///   [`PathMatch`] a row that mirrors [`draw_pane_row`]'s prefix (2-cell mark
-///   glyph + 2-cell focus marker) so columns line up with the directory
+///   [`PathMatch`] a row that mirrors [`draw_pane_row`]'s prefix width (2-cell
+///   spacer + 2-cell focus marker) so columns line up with the directory
 ///   listing. The body is the joined path: each `SegMatch.name` rendered with
 ///   its own per-segment highlight (matched chars in `theme::MATCH` + bold,
 ///   unmatched chars in the row's base style), names joined by a dim `/`, with
@@ -87,7 +88,6 @@ pub(crate) fn draw_search_list(frame: &mut Frame, area: Rect, pane: &Pane, focus
         };
         lines.push(draw_search_row(
             pm,
-            pane,
             i == srch.cursor,
             focused,
             hi,
@@ -98,11 +98,12 @@ pub(crate) fn draw_search_list(frame: &mut Frame, area: Rect, pane: &Pane, focus
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-/// Build one search-result row: 2-cell mark glyph + 2-cell focus marker +
+/// Build one search-result row: 2-cell spacer + 2-cell focus marker +
 /// base-syntax prefix + joined path with per-segment highlight + trailing dim
 /// `/` for directories. Pure: returns a `Line` the caller renders. Mirrors
-/// [`draw_pane_row`]'s prefix and cursor/mark styling so the two list surfaces
-/// (directory listing and find results) align column-for-column.
+/// [`draw_pane_row`]'s prefix and cursor styling so the two list surfaces
+/// (directory listing and find results) align column-for-column. Find mode has
+/// no marking, so there is no mark glyph here (unlike `draw_pane_row`).
 ///
 /// `prefix` is the query's base syntax (`/`, `~/`, `../`, or `""` for a
 /// relative query) — the path component `seg_matches` does not carry, prepended
@@ -112,7 +113,6 @@ pub(crate) fn draw_search_list(frame: &mut Frame, area: Rect, pane: &Pane, focus
 /// [`draw_pane_row`]: super::render::draw_pane_row
 fn draw_search_row(
     pm: &PathMatch,
-    pane: &Pane,
     is_cursor: bool,
     focused: bool,
     hi: Style,
@@ -129,22 +129,12 @@ fn draw_search_row(
         Style::new().dim()
     };
 
-    let mut spans: Vec<Span> = Vec::with_capacity(8);
+    let mut spans: Vec<Span> = Vec::with_capacity(6);
 
-    // Leading mark glyph: `● ` accented when marked + focused, dimly accented
-    // when marked + non-focused, two spaces when unmarked. Same 2-cell prefix
-    // as draw_pane_row so columns line up with the directory listing.
-    let is_marked = pane.core.marked.contains(&pm.path);
-    if is_marked {
-        let mark_style = if focused {
-            theme::accent().add_modifier(Modifier::BOLD)
-        } else {
-            Style::new().fg(theme::ACCENT).dim()
-        };
-        spans.push(Span::styled("● ", mark_style));
-    } else {
-        spans.push(Span::raw("  "));
-    }
+    // Leading 2-space prefix — the mark-glyph column from draw_pane_row, kept
+    // so columns line up with the directory listing. Find mode has no marking,
+    // so this is always blank (the `●` glyph never appears on a search row).
+    spans.push(Span::raw("  "));
 
     spans.push(theme::focus_marker(focused && is_cursor));
 
@@ -257,18 +247,15 @@ mod tests {
                 seg_matches: vec![seg("xdir", &[0]), seg("yfile", &[0])],
             },
         ];
-        // Cursor on index 1, mark the directory result (index 1) so the marked
-        // + cursor + dir glyphs all appear in the same snapshot row.
+        // Cursor on index 1 (the directory result) so the cursor + dir
+        // glyphs appear in the same snapshot row.
         srch.cursor = 1;
-        pane.core
-            .marked
-            .insert(std::path::PathBuf::from("/srv/apath/bdir"));
         pane.search = Some(srch);
         pane
     }
 
     #[test]
-    fn draw_search_list_renders_results_cursor_mark_and_dir_suffix_snapshot() {
+    fn draw_search_list_renders_results_cursor_and_dir_suffix_snapshot() {
         let pane = build_pane();
         let backend = TestBackend::new(40, 6);
         let mut term = Terminal::new(backend).unwrap();
@@ -297,7 +284,7 @@ mod tests {
         };
         let hi = Style::new().fg(theme::MATCH).add_modifier(Modifier::BOLD);
         let sep = Style::new().dim();
-        let line = draw_search_row(&pm, &pane, true, true, hi, sep, "/");
+        let line = draw_search_row(&pm, true, true, hi, sep, "/");
         let joined = join_spans(&line);
         assert!(
             joined.contains("/home/ryan/"),
@@ -316,7 +303,7 @@ mod tests {
         };
         let hi = Style::new().fg(theme::MATCH).add_modifier(Modifier::BOLD);
         let sep = Style::new().dim();
-        let line = draw_search_row(&pm, &pane, false, true, hi, sep, "~/");
+        let line = draw_search_row(&pm, false, true, hi, sep, "~/");
         let joined = join_spans(&line);
         assert!(
             joined.contains("~/proj/"),
@@ -337,7 +324,7 @@ mod tests {
         };
         let hi = Style::new().fg(theme::MATCH).add_modifier(Modifier::BOLD);
         let sep = Style::new().dim();
-        let line = draw_search_row(&pm, &pane, false, true, hi, sep, "");
+        let line = draw_search_row(&pm, false, true, hi, sep, "");
         let joined = join_spans(&line);
         assert!(
             joined.contains("a/bdir/") && !joined.contains("/a/bdir/"),
