@@ -118,6 +118,12 @@ fn draw_paints_title_panes_progress_and_footer() {
     assert!(view.contains("sshrack"), "brand missing: {view}");
     assert!(view.contains("sftp"), "sftp label missing: {view}");
 
+    // Footer advertises Tab completion (not the old "switch" wording).
+    assert!(
+        view.contains("complete"),
+        "footer Tab hint says complete: {view}"
+    );
+
     // Both pane cwds are rendered.
     assert!(
         view.contains("local") || view.contains("/home/local"),

@@ -602,7 +602,7 @@ impl TransferScreen {
     /// footer degrades gracefully instead of being silently clipped.
     fn draw_footer(&self, frame: &mut Frame, area: Rect) {
         let hints: &[(&str, &str)] = &[
-            ("Tab", "switch"),
+            ("Tab", "complete"),
             ("↑↓", "move"),
             ("←", "up"),
             ("→", "open"),
