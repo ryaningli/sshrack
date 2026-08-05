@@ -81,8 +81,10 @@ Keys while a find is active: `Tab` complete the highlighted result (a directory
 completes to `name/` and lists the next level — the same drill + list-all as
 typing the `/` yourself) · `Enter` jump to the result's directory · `Space`
 mark · `^S` transfer · `Esc` cancel. `Tab` completes from the filter list too
-(a single name); with an empty query or no candidate under the cursor, `Tab`
-switches panes and `Shift-Tab` always switches panes. Local find is a
-background `read_dir` walk; remote find runs one `sftp ls` per level over the
+(a single name). `Tab` switches panes only in filter mode (an empty query or no
+candidate under the cursor); in find mode `Tab` never switches — it completes,
+or is a no-op while the search is in flight, finishes with zero results, or has
+no candidate under the cursor. `Shift-Tab` always switches panes. Local find is
+a background `read_dir` walk; remote find runs one `sftp ls` per level over the
 shared ControlMaster (never blocks transfers).
 

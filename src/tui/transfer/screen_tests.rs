@@ -1815,3 +1815,26 @@ fn tab_while_searching_does_not_complete_from_stale_results() {
         "Tab mid-search must not flip focus either"
     );
 }
+
+#[test]
+fn tab_find_mode_zero_results_does_not_flip_focus() {
+    // Find mode owns Tab for completion only. Even when the search has
+    // FINISHED with zero results (searching=false, results=[]) — so no
+    // candidate is under the cursor — Tab must NOT flip focus. Only filter
+    // mode (incl. an empty query) flips; Shift-Tab always flips.
+    let mut s = TransferScreen::new(PathBuf::from("/srv"), PathBuf::from("/r"));
+    let mut srch = PaneSearch::empty();
+    srch.searching = false; // search finished
+    srch.yielded = true;
+    srch.results = vec![]; // zero matches
+    s.local.search = Some(srch);
+    s.local.core.query = "/srv/zzz".into();
+    assert_eq!(s.focus, Side::Local);
+    let _ = s.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(
+        s.focus,
+        Side::Local,
+        "find mode with zero results: Tab must not flip focus"
+    );
+    assert_eq!(s.local.core.query, "/srv/zzz", "query untouched");
+}

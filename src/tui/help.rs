@@ -118,7 +118,7 @@ fn sftp_lines() -> Vec<Line<'static>> {
         section("SFTP transfer"),
         binding(
             "Tab",
-            "complete highlighted (dir → next level) · else switch pane",
+            "complete highlighted (dir → next level) · else switch pane (filter mode)",
         ),
         binding("Shift-Tab", "switch pane (focus = direction)"),
         binding("Up / Down", "move selection"),
