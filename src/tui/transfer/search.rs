@@ -77,6 +77,13 @@ pub(crate) struct PaneSearch {
     pub results_gen: Option<u32>,
     /// Last search error, if any (e.g. unreadable directory). Render-only.
     pub error: Option<String>,
+    /// The synthetic "." (current-directory) row, set when a trailing-slash
+    /// find drilled successfully into a directory (a `Drilled` event arrived).
+    /// `Some` ⇒ the rendered list has "." pinned at index 0: `selected()`
+    /// returns this `PathMatch` for cursor 0, so Enter/enqueue treat "." as a
+    /// normal directory (Enter navigates into the drilled dir). `None` ⇒ no
+    /// "." row (leaf search, drill failure, or before the first event).
+    pub current_dir: Option<PathMatch>,
 }
 
 impl PaneSearch {
@@ -90,32 +97,54 @@ impl PaneSearch {
             searching: true,
             results_gen: None,
             error: None,
+            current_dir: None,
         }
     }
 
-    /// The match under the cursor, or `None` when there are no results.
+    /// Number of rendered rows: the results plus the synthetic "." row when
+    /// present. The cursor, `visible_window`, and render loop all key off this.
     #[must_use]
-    pub(crate) fn selected(&self) -> Option<&PathMatch> {
-        self.results.get(self.cursor)
+    pub(crate) fn display_len(&self) -> usize {
+        self.results.len() + usize::from(self.current_dir.is_some())
     }
 
-    /// Move the result cursor by `delta`, wrapping around the result list.
-    /// An empty result list pins the cursor at 0.
+    /// True when the cursor sits on the synthetic "." row (cursor 0 with a
+    /// current-dir entry present). Used to suppress Tab completion on ".".
+    #[must_use]
+    pub(crate) fn on_dot(&self) -> bool {
+        self.cursor == 0 && self.current_dir.is_some()
+    }
+
+    /// The match under the cursor, or `None` when the list is empty. Cursor 0
+    /// returns the synthetic "." `PathMatch` when `current_dir` is set; the
+    /// dot shifts result indices by one.
+    #[must_use]
+    pub(crate) fn selected(&self) -> Option<&PathMatch> {
+        let has_dot = self.current_dir.is_some();
+        if has_dot && self.cursor == 0 {
+            return self.current_dir.as_ref();
+        }
+        let idx = self.cursor.saturating_sub(usize::from(has_dot));
+        self.results.get(idx)
+    }
+
+    /// Move the cursor by `delta`, wrapping around the full display list
+    /// (results + the "." row when present). An empty list pins the cursor at 0.
     pub(crate) fn move_cursor(&mut self, delta: i32) {
-        if self.results.is_empty() {
+        let n = self.display_len();
+        if n == 0 {
             self.cursor = 0;
             return;
         }
-        let n = self.results.len() as i32;
-        self.cursor = ((self.cursor as i32 + delta).rem_euclid(n)) as usize;
+        self.cursor = ((self.cursor as i32 + delta).rem_euclid(n as i32)) as usize;
     }
 
-    /// Range of result indices to render for a viewport of `rows` rows, using
+    /// Range of display indices to render for a viewport of `rows` rows, using
     /// the same focus-following window as the directory browser so scroll
     /// behavior stays identical between filter and find modes.
     #[must_use]
     pub(crate) fn visible_window(&self, rows: usize) -> Range<usize> {
-        focus_window(self.results.len(), self.cursor, rows)
+        focus_window(self.display_len(), self.cursor, rows)
     }
 }
 
@@ -186,5 +215,110 @@ mod tests {
         s.cursor = 40;
         let win = s.visible_window(10);
         assert!(win.start <= 40 && 40 < win.end);
+    }
+
+    fn dot_match(path: &str) -> PathMatch {
+        PathMatch {
+            path: PathBuf::from(path),
+            is_dir: true,
+            seg_matches: vec![],
+        }
+    }
+
+    #[test]
+    fn display_len_counts_the_dot_row() {
+        let mut s = super::PaneSearch::empty();
+        assert_eq!(s.display_len(), 0, "no results, no dot");
+        s.current_dir = Some(dot_match("/srv/a"));
+        assert_eq!(s.display_len(), 1, "dot only, no results");
+        s.results = vec![
+            PathMatch {
+                path: PathBuf::from("/srv/a/x"),
+                is_dir: false,
+                seg_matches: vec![],
+            },
+            PathMatch {
+                path: PathBuf::from("/srv/a/y"),
+                is_dir: false,
+                seg_matches: vec![],
+            },
+        ];
+        assert_eq!(s.display_len(), 3, "dot + 2 results");
+    }
+
+    #[test]
+    fn selected_returns_dot_at_cursor_zero_then_results() {
+        let mut s = super::PaneSearch::empty();
+        s.current_dir = Some(dot_match("/srv/a"));
+        s.results = vec![PathMatch {
+            path: PathBuf::from("/srv/a/x"),
+            is_dir: false,
+            seg_matches: vec![],
+        }];
+        // cursor 0 → the dot row (the drilled dir).
+        assert_eq!(s.selected().unwrap().path, PathBuf::from("/srv/a"));
+        assert!(s.selected().unwrap().is_dir);
+        // cursor 1 → results[0].
+        s.cursor = 1;
+        assert_eq!(s.selected().unwrap().path, PathBuf::from("/srv/a/x"));
+        assert!(!s.selected().unwrap().is_dir);
+    }
+
+    #[test]
+    fn selected_without_dot_behaves_unchanged() {
+        let mut s = super::PaneSearch::empty();
+        s.results = vec![PathMatch {
+            path: PathBuf::from("/x/a"),
+            is_dir: false,
+            seg_matches: vec![],
+        }];
+        // No dot: cursor 0 maps straight to results[0] (pre-existing behavior).
+        assert_eq!(s.selected().unwrap().path, PathBuf::from("/x/a"));
+    }
+
+    #[test]
+    fn move_cursor_wraps_over_dot_plus_results() {
+        let mut s = super::PaneSearch::empty();
+        s.current_dir = Some(dot_match("/srv/a"));
+        s.results = vec![
+            PathMatch {
+                path: PathBuf::from("/srv/a/x"),
+                is_dir: false,
+                seg_matches: vec![],
+            },
+            PathMatch {
+                path: PathBuf::from("/srv/a/y"),
+                is_dir: false,
+                seg_matches: vec![],
+            },
+        ];
+        // display_len = 3 (dot + x + y). cursor 0 → 1 → 2 → wrap → 0.
+        assert_eq!(s.cursor, 0);
+        s.move_cursor(1);
+        assert_eq!(s.cursor, 1);
+        s.move_cursor(1);
+        assert_eq!(s.cursor, 2);
+        s.move_cursor(1); // wrap
+        assert_eq!(s.cursor, 0, "wraps past the last result back to the dot");
+    }
+
+    #[test]
+    fn move_cursor_empty_with_dot_stays_on_dot() {
+        let mut s = super::PaneSearch::empty();
+        s.current_dir = Some(dot_match("/srv/a")); // empty existing dir
+        s.move_cursor(1);
+        assert_eq!(s.cursor, 0, "display_len=1 → cursor pinned to the dot");
+        s.move_cursor(-1);
+        assert_eq!(s.cursor, 0);
+    }
+
+    #[test]
+    fn on_dot_only_when_cursor_zero_and_dot_present() {
+        let mut s = super::PaneSearch::empty();
+        assert!(!s.on_dot());
+        s.current_dir = Some(dot_match("/srv/a"));
+        assert!(s.on_dot(), "cursor 0 + dot → on_dot");
+        s.cursor = 1;
+        assert!(!s.on_dot(), "moved off the dot");
     }
 }

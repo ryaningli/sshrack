@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 use sshrack_core::connect::sftp::proto::{Direction, TransferJob};
 use sshrack_core::dirsource::{DirSource, LocalDirSource};
-use sshrack_core::pathfind::{SearchEvent, SearchEventKind, parse_query, rank_matches};
+use sshrack_core::pathfind::{PathMatch, SearchEvent, SearchEventKind, parse_query, rank_matches};
 
 use crate::tui::transfer::pane::{Pane, Side};
 use crate::tui::transfer::screen::{ScreenOutcome, TransferScreen};
@@ -58,6 +58,7 @@ impl TransferScreen {
                 if first_of_gen {
                     srch.results.clear();
                     srch.cursor = 0;
+                    srch.current_dir = None;
                 }
                 srch.results.push(m);
                 rank_matches(&mut srch.results);
@@ -77,6 +78,7 @@ impl TransferScreen {
                 if first_of_gen {
                     srch.results.clear();
                     srch.cursor = 0;
+                    srch.current_dir = None;
                 }
                 srch.searching = false;
                 srch.results_gen = Some(ev.r#gen);
@@ -85,9 +87,33 @@ impl TransferScreen {
                 srch.searching = false;
                 srch.error = Some(msg);
                 // Surface the error (the renderer only shows it when results
-                // are empty), so drop any stale hits.
+                // are empty AND there is no dot), so drop any stale hits and
+                // the synthetic "." row — otherwise a stale dot (from this
+                // query's earlier Drilled, or carried over from a prior query
+                // via stale-while-revalidate) would mask the error message.
                 srch.results.clear();
                 srch.cursor = 0;
+                srch.current_dir = None;
+                srch.results_gen = Some(ev.r#gen);
+            }
+            SearchEventKind::Drilled(dir) => {
+                if first_of_gen {
+                    srch.results.clear();
+                    srch.cursor = 0;
+                    srch.current_dir = None;
+                }
+                // First drilled dir registers as the "." row. A second (a
+                // multi-frontier resolution) makes the target ambiguous → drop
+                // the row so "." never points at one of several dirs.
+                if srch.current_dir.is_none() {
+                    srch.current_dir = Some(PathMatch {
+                        path: dir,
+                        is_dir: true,
+                        seg_matches: Vec::new(),
+                    });
+                } else {
+                    srch.current_dir = None;
+                }
                 srch.results_gen = Some(ev.r#gen);
             }
         }
@@ -199,6 +225,12 @@ impl TransferScreen {
             // query. Do not complete off it — return None so Tab is swallowed
             // until the new search yields fresh results.
             if srch.searching {
+                return None;
+            }
+            // The synthetic "." row is not a completion candidate — completing
+            // it would malform the query ("/a/sub/" + "sub" + "/"). Tab on "."
+            // is a swallowed no-op instead.
+            if srch.on_dot() {
                 return None;
             }
             let pm = srch.selected()?;

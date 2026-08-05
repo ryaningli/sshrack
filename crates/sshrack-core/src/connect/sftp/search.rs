@@ -169,6 +169,7 @@ mod tests {
                 SearchEventKind::Match(_) => leaves += 1,
                 SearchEventKind::Done => done = true,
                 SearchEventKind::Error(e) => panic!("unexpected error: {e}"),
+                SearchEventKind::Drilled(_) => {}
             }
         }
         assert!(done);
@@ -241,6 +242,7 @@ mod tests {
                     SearchEventKind::Match(_) => {}
                     SearchEventKind::Done => done = true,
                     SearchEventKind::Error(e) => panic!("unexpected error: {e}"),
+                    SearchEventKind::Drilled(_) => {}
                 }
             }
             assert!(done);
