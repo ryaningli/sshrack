@@ -297,6 +297,20 @@ impl SftpWorker {
     pub fn try_event(&self) -> Option<WorkerEvent> {
         self.event_rx.try_recv().ok()
     }
+
+    /// The `user@host` sftp target string the master authenticated as. Callers
+    /// (e.g. `open_transfer` building a `RemotePathSearch`) pass this to
+    /// [`crate::connect::sftp::source::SftpDirSource::new`] / the search.
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+
+    /// The master `ControlPath` the worker mounts its sftp batches on, or
+    /// `None` if the socket has been torn down. Borrowed from `self.sock` so
+    /// the caller cannot outlive the worker.
+    pub fn sock_path(&self) -> Option<&Path> {
+        self.sock.as_ref().map(|c| c.path())
+    }
 }
 
 impl Drop for SftpWorker {

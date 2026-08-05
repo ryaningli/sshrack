@@ -27,7 +27,7 @@
 use std::path::Path;
 
 use sshrack_core::config::schema::{Host, SshrackConfig};
-use sshrack_core::connect::sftp::SftpWorker;
+use sshrack_core::connect::sftp::{RemotePathSearch, SftpWorker, source::LocalSftpRunner};
 use sshrack_core::connect::ssh::Overrides;
 use sshrack_core::connect::{self, KeyArtifact};
 use sshrack_core::credential;
@@ -153,9 +153,27 @@ pub fn open_transfer(
     // inside worker::open, so the screen still renders). Send an initial
     // `List(home)` so the remote pane populates as soon as the worker drains
     // its command queue.
+    //
+    // While `worker` is in scope, also build the remote path-aware find
+    // searcher from the live master's connection details — it spawns its own
+    // `sftp -b -` batches on the shared ControlMaster, so cross-dir find works
+    // on the remote pane the same way `LocalPathSearch` works on the local
+    // one. The searcher is stored on `App::remote_search`; while it is `None`,
+    // remote find is a silent no-op.
+    let remote_search = RemotePathSearch::new(
+        worker.target().to_string(),
+        worker
+            .sock_path()
+            .expect("invariant: master socket alive immediately after SftpWorker::open")
+            .to_path_buf(),
+        Some(home.clone()),
+        std::sync::Arc::new(LocalSftpRunner::new()),
+    );
+
     let local_cwd = std::env::current_dir()?;
     let mut screen = TransferScreen::new(local_cwd.clone(), home.clone());
     screen.remote_title = remote_title;
+    screen.remote_home = Some(home.clone());
     worker.send(sshrack_core::connect::sftp::proto::WorkerCmd::List(home));
 
     // Seed the local pane now (the local fs is fast and synchronous) so it is
@@ -175,6 +193,7 @@ pub fn open_transfer(
     app.transfer = Some(screen);
     app.transfer_worker = Some(worker);
     app.transfer_key_artifact = key_artifact;
+    app.remote_search = Some(remote_search);
     Ok(())
 }
 

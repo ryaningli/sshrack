@@ -9,10 +9,12 @@
 //! 800-line guideline (mirrors the inline-test convention everywhere else in
 //! the TUI; the split is purely mechanical).
 use super::*;
+use crate::tui::transfer::search::PaneSearch;
 use ratatui::{Terminal, backend::TestBackend};
 use sshrack_core::connect::sftp::parse::strip_control_chars;
 use sshrack_core::connect::sftp::proto::{Direction, Progress, TransferJob};
 use sshrack_core::dirsource::DirEntry;
+use sshrack_core::pathfind::{PathMatch, SearchEvent, SearchEventKind, parse_query};
 use std::path::{Path, PathBuf};
 
 /// Build a `DirEntry` fixture: `name` carries a trailing `/` for dirs
@@ -1287,4 +1289,127 @@ fn draw_footer_narrow_drops_trailing_hints_with_ellipsis() {
     );
     assert!(view.contains("Tab"), "first hint kept: {view:?}");
     assert!(!view.contains("help"), "trailing hint dropped: {view:?}");
+}
+
+// ---- cross-directory find: TransferScreen search dispatch (Task 8) ----
+//
+// `PaneSearch` state + `core.query` are owned by the pane, but the SCREEN owns
+// the mode switch (filter ↔ find), streamed-result handling, and the
+// Enter/Space/Ctrl-S/Esc result actions. These pin each arm of that state
+// machine without spawning a real search (Task 9 wires the run-loop drain).
+
+#[test]
+fn apply_search_event_match_appends_and_ignores_stale_gen() {
+    // A Match event whose `gen` matches `search_gen` is appended + re-ranked;
+    // a stale-`gen` event (≠ `search_gen`) is dropped.
+    let mut s = TransferScreen::new(PathBuf::from("/a"), PathBuf::from("/b"));
+    s.local.search = Some(PaneSearch::empty());
+    s.search_gen = 1;
+    let m = PathMatch {
+        path: PathBuf::from("/a/x1"),
+        is_dir: false,
+        seg_matches: vec![],
+    };
+    s.apply_search_event(
+        Side::Local,
+        SearchEvent {
+            r#gen: 1,
+            kind: SearchEventKind::Match(m.clone()),
+        },
+    );
+    assert_eq!(s.local.search.as_ref().unwrap().results.len(), 1);
+    // Stale gen (0 ≠ 1) ignored — result count stays at 1.
+    s.apply_search_event(
+        Side::Local,
+        SearchEvent {
+            r#gen: 0,
+            kind: SearchEventKind::Match(m),
+        },
+    );
+    assert_eq!(
+        s.local.search.as_ref().unwrap().results.len(),
+        1,
+        "stale-gen event must be ignored"
+    );
+}
+
+#[test]
+fn jump_to_result_targets_parent_for_file() {
+    // Enter on a file search result jumps to the file's PARENT directory
+    // (navigating to the file itself is impossible; its containing dir is the
+    // useful target). Clears the search + query and sets pending_list.
+    let mut s = TransferScreen::new(PathBuf::from("/a"), PathBuf::from("/b"));
+    s.local.search = Some(PaneSearch::empty());
+    s.local.search.as_mut().unwrap().results = vec![PathMatch {
+        path: PathBuf::from("/a/sub/f.txt"),
+        is_dir: false,
+        seg_matches: vec![],
+    }];
+    let out = s.jump_to_search_result();
+    assert_eq!(out, ScreenOutcome::Continue);
+    assert_eq!(
+        s.pending_list,
+        Some((Side::Local, PathBuf::from("/a/sub"))),
+        "jump targets the file's parent dir"
+    );
+    assert!(s.local.search.is_none(), "search cleared after jump");
+    assert!(
+        s.local.core.query.is_empty(),
+        "query cleared after jump so the pane returns to filter mode in the new dir"
+    );
+}
+
+#[test]
+fn search_request_find_mode_when_multi_segment() {
+    // A multi-segment relative query ("a/b") against the focused pane's cwd
+    // enters find mode: pane.search is Some, pending_search is set for the
+    // run loop.
+    let mut s = TransferScreen::new(PathBuf::from("/srv"), PathBuf::from("/r"));
+    s.search_request(Side::Local, "a/b".into());
+    assert!(s.local.search.is_some(), "multi-segment → find mode");
+    assert!(
+        s.pending_search.is_some(),
+        "pending_search set for the run loop"
+    );
+}
+
+#[test]
+fn search_request_filter_mode_when_single_segment() {
+    // A single-segment query ("a") with base == cwd stays in filter mode: the
+    // existing synchronous core.recompute handles it. A prior find state is
+    // cleared, and pending_search is NOT set.
+    let mut s = TransferScreen::new(PathBuf::from("/srv"), PathBuf::from("/r"));
+    // Simulate a prior find, then a single-segment query must clear it.
+    s.local.search = Some(PaneSearch::empty());
+    s.search_request(Side::Local, "a".into());
+    assert!(
+        s.local.search.is_none(),
+        "single-segment → filter mode (search cleared)"
+    );
+    assert!(
+        s.pending_search.is_none(),
+        "filter mode does not launch a search"
+    );
+}
+
+#[test]
+fn cancel_search_clears_pending_search() {
+    // Esc inside the ~80ms debounce window must clear pending_search too —
+    // otherwise the run loop still dispatches it after the window elapses,
+    // firing a wasted background search AFTER the user explicitly cancelled.
+    // Reproduces the leak: cancel_search cleared search_rx/search_cancel/
+    // pane.search but not pending_search.
+    let mut s = TransferScreen::new(PathBuf::from("/srv"), PathBuf::from("/r"));
+    let parsed = parse_query("a/b", Path::new("/srv"), None);
+    s.local.search = Some(PaneSearch::empty());
+    s.pending_search = Some((Side::Local, parsed));
+    s.cancel_search();
+    assert!(
+        s.pending_search.is_none(),
+        "cancel must clear pending_search so a stale search cannot fire"
+    );
+    assert!(
+        s.local.search.is_none(),
+        "cancel must drop the pane out of find mode"
+    );
 }

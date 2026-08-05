@@ -30,4 +30,7 @@ pub mod overwrite;
 pub mod pane;
 pub mod queue_overlay;
 pub mod render;
+pub(crate) mod render_search;
 pub mod screen;
+pub(crate) mod search;
+pub(crate) mod search_dispatch;

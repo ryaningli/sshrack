@@ -1,0 +1,10 @@
+---
+source: src/tui/transfer/render_search.rs
+expression: term.backend()
+---
+"    apath/bfile                         "
+"● ▶ apath/bdir/                         "
+"    xdir/yfile                          "
+"                                        "
+"                                        "
+"                                        "

@@ -120,6 +120,10 @@ fn sftp_lines() -> Vec<Line<'static>> {
         binding("Up / Down", "move selection"),
         binding("Left", "up to the parent directory"),
         binding("Right", "open the selected directory"),
+        binding(
+            "type a/b/c",
+            "find across dirs (Enter jump · Space mark · ^S transfer · Esc cancel)",
+        ),
         binding("Space", "mark entry (batch, single-shot)"),
         binding("Ctrl-S", "transfer marked/selected (dirs recurse)"),
         binding("Enter", "file: enqueue · directory: enter"),
@@ -262,6 +266,10 @@ mod tests {
         assert!(s.contains("switch pane (focus = direction)"));
         assert!(s.contains("transfer marked/selected (dirs recurse)"));
         assert!(s.contains("queue manager"));
+        assert!(
+            s.contains("find across dirs"),
+            "sftp help must document path-aware find: {s}"
+        );
     }
 
     #[test]
