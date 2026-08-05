@@ -263,8 +263,9 @@ impl TransferScreen {
     /// completes or is swallowed (in flight, zero results, or no candidate) so
     /// a search session never bounces panes; `Shift-Tab` always flips focus,
     /// `Ctrl-Enter` enqueues the focused pane's marked (or selected)
-    /// entries, `Esc` cancels an active transfer or else closes the screen,
-    /// `Ctrl-C` always closes, and everything else delegates to the focused
+    /// entries, `Esc` peels layers inside-out (cancel an in-flight find, else
+    /// clear a non-empty filter query, else cancel an active transfer, else
+    /// close), `Ctrl-C` always closes, and everything else delegates to the focused
     /// [`Pane::on_key`]. Performs no I/O; the returned [`ScreenOutcome`] tells
     /// the run loop what side effect to run.
     ///
@@ -346,11 +347,16 @@ impl TransferScreen {
             // No clash with the wizards' Ctrl-S = save: those are form overlays,
             // and this Layer-0 screen owns the key while it is open.
             KeyCode::Char('s') if ctrl => self.enqueue_focused(),
-            // Esc: cancel an in-flight cross-directory find, else cancel an
-            // active transfer, else close the screen.
+            // Esc peels layers inside-out: cancel an in-flight cross-dir find,
+            // else clear a non-empty filter query (mirrors find mode — the
+            // instinct to clear the search box must not close the session),
+            // else cancel an active transfer, else close the screen.
             KeyCode::Esc => {
                 if in_search {
                     self.cancel_search();
+                    ScreenOutcome::Continue
+                } else if !self.focused_pane().core.query.is_empty() {
+                    self.clear_query(self.focus);
                     ScreenOutcome::Continue
                 } else if self.has_inflight() {
                     ScreenOutcome::CancelActive

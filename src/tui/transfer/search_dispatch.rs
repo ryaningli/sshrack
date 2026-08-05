@@ -313,8 +313,13 @@ impl TransferScreen {
     }
 
     /// `Esc` in find mode: cancel the in-flight search (flip the cancel flag
-    /// the run loop installed) and drop back to filter mode. The query text is
-    /// left intact so the user can edit and re-trigger.
+    /// the run loop installed), drop the pane out of find mode, AND clear the
+    /// query so the listing returns to the full current directory. filter and
+    /// find share `core.query`, and find typing recomputes `core.ranked`
+    /// against the cross-dir query (which matches no current-dir name) —
+    /// leaving the query intact would render a stale empty list on drop-back.
+    /// Esc abandons the search entirely; to retry with edits, type in find
+    /// mode (Backspace re-triggers) rather than relying on Esc to keep text.
     pub(crate) fn cancel_search(&mut self) {
         if let Some(cancel) = &self.search_cancel {
             cancel.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -334,7 +339,27 @@ impl TransferScreen {
         if let Some(pane) = self.pane_mut(target) {
             pane.search = None;
         }
+        // Clear the find query and recompute so the pane returns to the full
+        // current-dir listing (shared with filter-mode Esc via
+        // [`clear_query`]). filter/find share core.query, and find typing left
+        // core.ranked computed against the cross-dir query (matches no
+        // current-dir name); without this, dropping back to filter mode would
+        // show that stale empty list until the user Backspaced the query away.
+        self.clear_query(target);
         self.search_side = None;
+    }
+
+    /// Clear the query on `side`'s pane and recompute so the listing returns
+    /// to the full current directory (cursor clamped into range). Shared by
+    /// find-mode `Esc` ([`cancel_search`]) and filter-mode `Esc`
+    /// ([`TransferScreen::on_key`]) so neither leaves a stale filtered list
+    /// behind — both abandon the typed query entirely.
+    pub(crate) fn clear_query(&mut self, side: Side) {
+        if let Some(pane) = self.pane_mut(side) {
+            pane.core.query.clear();
+            pane.core.recompute();
+            pane.core.clamp_selected();
+        }
     }
 
     /// Unified enqueue entry: search results when a search is active on the
