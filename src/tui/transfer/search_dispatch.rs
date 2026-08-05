@@ -131,43 +131,40 @@ impl TransferScreen {
     /// Compute the query string that completes the focused pane's current
     /// candidate, or `None` when completion does not apply (empty query, or no
     /// candidate under the cursor). The single source of the candidate → query
-    /// mapping for both pane modes:
+    /// mapping for both pane modes.
     ///
-    /// - **Filter mode** (no active search): the cursor `DirEntry`'s name with
-    ///   its trailing `/` stripped; a directory gets a trailing `/` appended so
-    ///   the completion enters find mode and lists that directory's contents
-    ///   (the exact-drill trailing-slash trigger).
-    /// - **Find mode** (active search): the selected `PathMatch`'s
-    ///   `seg_matches` names joined by `/`; a directory likewise gets a
-    ///   trailing `/` to drill + list the next level. A file is completed to
-    ///   its full name with no slash.
+    /// Only the FINAL segment is completed. The prefix the user already typed —
+    /// up to and including the last `/` — is preserved verbatim, so the base
+    /// syntax survives: `/ho` → `/home/`, `~/do` → `~/documents/`, `../sib` →
+    /// `../sibling/`, and a relative drill `aaa/bb` → `aaa/bbb/`. Completing
+    /// off `seg_matches` instead would drop the base, since `seg_matches` holds
+    /// only the path relative to the query base. The completed segment is the
+    /// candidate's last path component, with a trailing `/` appended for a
+    /// directory so the completion re-enters find mode and lists that
+    /// directory's contents (the exact-drill trailing-slash trigger).
     fn completion_for_focused(&self) -> Option<String> {
         let pane = self.focused_pane();
-        if pane.core.query.is_empty() {
+        let query: &str = &pane.core.query;
+        if query.is_empty() {
             return None;
         }
-        if let Some(srch) = pane.search.as_ref() {
+        // Preserve the typed prefix (base syntax + any drilled segments)
+        // verbatim; complete only the final segment from the candidate.
+        let prefix = query.rfind('/').map(|i| &query[..=i]).unwrap_or("");
+        let (last_seg, is_dir) = if let Some(srch) = pane.search.as_ref() {
             let pm = srch.selected()?;
-            let joined = pm
-                .seg_matches
-                .iter()
-                .map(|s| s.name.as_str())
-                .collect::<Vec<_>>()
-                .join("/");
-            Some(if pm.is_dir {
-                format!("{joined}/")
-            } else {
-                joined
-            })
+            let name = pm.path.file_name()?.to_string_lossy().into_owned();
+            (name, pm.is_dir)
         } else {
             let e = pane.selected_entry()?;
-            let name = e.name.trim_end_matches('/');
-            Some(if e.is_dir {
-                format!("{name}/")
-            } else {
-                name.to_string()
-            })
-        }
+            let name = e.name.trim_end_matches('/').to_string();
+            (name, e.is_dir)
+        };
+        Some(if is_dir {
+            format!("{prefix}{last_seg}/")
+        } else {
+            format!("{prefix}{last_seg}")
+        })
     }
 
     /// `Enter` on a search result: jump to its directory (the match itself for
