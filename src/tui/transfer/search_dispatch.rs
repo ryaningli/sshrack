@@ -82,7 +82,9 @@ impl TransferScreen {
             Side::Remote => (self.remote.core.cwd.clone(), self.remote_home.clone()),
         };
         let parsed = parse_query(&query, &cwd, home.as_deref());
-        let is_filter = parsed.segments.len() <= 1 && parsed.base == cwd;
+        // Filter mode = a plain single name in the current directory (no slash at all).
+        // A trailing slash ("a/") or any multi-segment / out-of-cwd query is find mode.
+        let is_filter = !parsed.trailing_slash && parsed.segments.len() == 1 && parsed.base == cwd;
         let launch = if is_filter {
             None
         } else {
