@@ -14,7 +14,7 @@ use ratatui::{Terminal, backend::TestBackend};
 use sshrack_core::connect::sftp::parse::strip_control_chars;
 use sshrack_core::connect::sftp::proto::{Direction, Progress, TransferJob};
 use sshrack_core::dirsource::DirEntry;
-use sshrack_core::pathfind::{PathMatch, SearchEvent, SearchEventKind, parse_query};
+use sshrack_core::pathfind::{PathMatch, SearchEvent, SearchEventKind, SegMatch, parse_query};
 use std::path::{Path, PathBuf};
 
 /// Build a `DirEntry` fixture: `name` carries a trailing `/` for dirs
@@ -1429,4 +1429,138 @@ fn cancel_search_clears_pending_search() {
         s.local.search.is_none(),
         "cancel must drop the pane out of find mode"
     );
+}
+
+// ---- on_key: Tab completion (input state) ----
+
+#[test]
+fn tab_empty_query_flips_focus_not_complete() {
+    // Decision: an empty query keeps Tab = switch pane (the candidate under
+    // the cursor is ignored until the user starts typing).
+    let cwd = PathBuf::from("/l");
+    let mut s = TransferScreen::new(cwd.clone(), PathBuf::from("/r"));
+    s.local.set_entries(vec![entry("bbb", &cwd, true)]);
+    assert_eq!(s.focus, Side::Local, "default focus Local");
+    let out = s.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(out, ScreenOutcome::Continue);
+    assert_eq!(s.focus, Side::Remote, "empty query → Tab flips");
+    assert!(s.local.core.query.is_empty(), "query untouched");
+}
+
+#[test]
+fn tab_filter_mode_completes_dir_with_trailing_slash_and_enters_find() {
+    let cwd = PathBuf::from("/l");
+    let mut s = TransferScreen::new(cwd.clone(), PathBuf::from("/r"));
+    s.local.set_entries(vec![entry("bbb", &cwd, true)]);
+    s.local.core.query = "bb".into();
+    s.local.core.recompute();
+    let _ = s.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(s.local.core.query, "bbb/", "dir completed with trailing /");
+    assert!(
+        s.local.search.is_some(),
+        "trailing slash entered find mode (lists bbb/)"
+    );
+}
+
+#[test]
+fn tab_filter_mode_completes_file_without_slash_stays_filter() {
+    let cwd = PathBuf::from("/l");
+    let mut s = TransferScreen::new(cwd.clone(), PathBuf::from("/r"));
+    s.local.set_entries(vec![entry("bbc.txt", &cwd, false)]);
+    s.local.core.query = "bb".into();
+    s.local.core.recompute();
+    let _ = s.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(s.local.core.query, "bbc.txt", "file completed, no slash");
+    assert!(s.local.search.is_none(), "no slash → stayed in filter mode");
+}
+
+#[test]
+fn tab_find_mode_completes_dir_by_joining_segments() {
+    let mut s = TransferScreen::new(PathBuf::from("/srv"), PathBuf::from("/r"));
+    let mut srch = PaneSearch::empty();
+    srch.searching = false;
+    srch.results = vec![PathMatch {
+        path: PathBuf::from("/srv/aaa/bbb"),
+        is_dir: true,
+        seg_matches: vec![
+            SegMatch {
+                name: "aaa".into(),
+                score: 0,
+                indices: vec![],
+            },
+            SegMatch {
+                name: "bbb".into(),
+                score: 0,
+                indices: vec![],
+            },
+        ],
+    }];
+    s.local.search = Some(srch);
+    s.local.core.query = "aaa/bb".into();
+    let _ = s.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(
+        s.local.core.query, "aaa/bbb/",
+        "find dir → segments joined + /"
+    );
+}
+
+#[test]
+fn tab_find_mode_completes_file_without_slash() {
+    let mut s = TransferScreen::new(PathBuf::from("/srv"), PathBuf::from("/r"));
+    let mut srch = PaneSearch::empty();
+    srch.searching = false;
+    srch.results = vec![PathMatch {
+        path: PathBuf::from("/srv/aaa/bbc.txt"),
+        is_dir: false,
+        seg_matches: vec![
+            SegMatch {
+                name: "aaa".into(),
+                score: 0,
+                indices: vec![],
+            },
+            SegMatch {
+                name: "bbc.txt".into(),
+                score: 0,
+                indices: vec![],
+            },
+        ],
+    }];
+    s.local.search = Some(srch);
+    s.local.core.query = "aaa/bb".into();
+    let _ = s.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(
+        s.local.core.query, "aaa/bbc.txt",
+        "find file → segments joined, no /"
+    );
+}
+
+#[test]
+fn backtab_flips_focus_even_with_search_candidate() {
+    // Shift-Tab is the dedicated pane-switch escape: it never completes,
+    // even when a find candidate is under the cursor.
+    let mut s = TransferScreen::new(PathBuf::from("/srv"), PathBuf::from("/r"));
+    let mut srch = PaneSearch::empty();
+    srch.searching = false;
+    srch.results = vec![PathMatch {
+        path: PathBuf::from("/srv/aaa/bbb"),
+        is_dir: true,
+        seg_matches: vec![
+            SegMatch {
+                name: "aaa".into(),
+                score: 0,
+                indices: vec![],
+            },
+            SegMatch {
+                name: "bbb".into(),
+                score: 0,
+                indices: vec![],
+            },
+        ],
+    }];
+    s.local.search = Some(srch);
+    s.local.core.query = "aaa/bb".into();
+    assert_eq!(s.focus, Side::Local);
+    let _ = s.on_key(press(KeyCode::BackTab, KeyModifiers::SHIFT));
+    assert_eq!(s.focus, Side::Remote, "Shift-Tab flips, does not complete");
+    assert_eq!(s.local.core.query, "aaa/bb", "query untouched by Shift-Tab");
 }

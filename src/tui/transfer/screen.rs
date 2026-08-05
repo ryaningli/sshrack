@@ -223,12 +223,15 @@ impl TransferScreen {
     }
 
     /// Pure key router. Mirrors the app's three-layer discipline
-    /// (Press-only): `Tab`/`Shift-Tab` flip focus, `Ctrl-Enter` enqueues the
-    /// focused pane's marked (or selected) entries, `Esc` cancels an active
-    /// transfer or else closes the screen, `Ctrl-C` always closes, and
-    /// everything else delegates to the focused [`Pane::on_key`]. Performs no
-    /// I/O; the returned [`ScreenOutcome`] tells the run loop what side
-    /// effect to run.
+    /// (Press-only): `Tab` completes the focused pane's query from its
+    /// highlighted candidate (directory → `name/` enters the next level;
+    /// file → full name) and falls back to flipping focus when the query is
+    /// empty or no candidate is under the cursor, `Shift-Tab` always flips
+    /// focus, `Ctrl-Enter` enqueues the focused pane's marked (or selected)
+    /// entries, `Esc` cancels an active transfer or else closes the screen,
+    /// `Ctrl-C` always closes, and everything else delegates to the focused
+    /// [`Pane::on_key`]. Performs no I/O; the returned [`ScreenOutcome`] tells
+    /// the run loop what side effect to run.
     ///
     /// For navigation intents (`StepInto` / `StepUp` / `RequestList`) this
     /// sets [`pending_list`](Self::pending_list) and returns `Continue` —
@@ -264,10 +267,24 @@ impl TransferScreen {
         // intercepted here so they never reach the dir-list path).
         let in_search = self.focused_pane().search.is_some();
         match key.code {
-            // Tab / Shift-Tab flip focus between the two panes.
-            KeyCode::Tab | KeyCode::BackTab if !ctrl => {
+            // Shift-Tab always flips focus — the dedicated pane-switch escape
+            // that is never swallowed by completion.
+            KeyCode::BackTab if !ctrl => {
                 self.flip_focus();
                 ScreenOutcome::Continue
+            }
+            // Tab completes the focused pane's query from its highlighted
+            // candidate when one exists (directory → name/ enters the next
+            // level; file → full name); otherwise it flips focus, so Tab still
+            // switches panes when the query box is empty or nothing is under
+            // the cursor.
+            KeyCode::Tab if !ctrl => {
+                if self.complete_focused() {
+                    ScreenOutcome::Continue
+                } else {
+                    self.flip_focus();
+                    ScreenOutcome::Continue
+                }
             }
             // Ctrl-Enter enqueues the focused pane's marked (or selected)
             // entries as transfer jobs. (Legacy alias — many terminals collapse

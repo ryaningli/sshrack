@@ -107,6 +107,69 @@ impl TransferScreen {
         self.pending_search = launch;
     }
 
+    /// `Tab`: complete the focused pane's query from its highlighted
+    /// candidate. Returns `true` when a completion was applied (the query was
+    /// updated and the find re-launched); `false` when there was nothing to
+    /// complete — an empty query or no candidate under the cursor — so the
+    /// caller falls back to flipping focus. Pure: no I/O (it mutates only
+    /// pane state and stashes `pending_search`, exactly what typing a key does
+    /// via `search_request`).
+    pub(crate) fn complete_focused(&mut self) -> bool {
+        let focus = self.focus;
+        let Some(completion) = self.completion_for_focused() else {
+            return false;
+        };
+        {
+            let pane = self.focused_pane_mut();
+            pane.core.query = completion.clone();
+            pane.core.recompute();
+        }
+        self.search_request(focus, completion);
+        true
+    }
+
+    /// Compute the query string that completes the focused pane's current
+    /// candidate, or `None` when completion does not apply (empty query, or no
+    /// candidate under the cursor). The single source of the candidate → query
+    /// mapping for both pane modes:
+    ///
+    /// - **Filter mode** (no active search): the cursor `DirEntry`'s name with
+    ///   its trailing `/` stripped; a directory gets a trailing `/` appended so
+    ///   the completion enters find mode and lists that directory's contents
+    ///   (the exact-drill trailing-slash trigger).
+    /// - **Find mode** (active search): the selected `PathMatch`'s
+    ///   `seg_matches` names joined by `/`; a directory likewise gets a
+    ///   trailing `/` to drill + list the next level. A file is completed to
+    ///   its full name with no slash.
+    fn completion_for_focused(&self) -> Option<String> {
+        let pane = self.focused_pane();
+        if pane.core.query.is_empty() {
+            return None;
+        }
+        if let Some(srch) = pane.search.as_ref() {
+            let pm = srch.selected()?;
+            let joined = pm
+                .seg_matches
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>()
+                .join("/");
+            Some(if pm.is_dir {
+                format!("{joined}/")
+            } else {
+                joined
+            })
+        } else {
+            let e = pane.selected_entry()?;
+            let name = e.name.trim_end_matches('/');
+            Some(if e.is_dir {
+                format!("{name}/")
+            } else {
+                name.to_string()
+            })
+        }
+    }
+
     /// `Enter` on a search result: jump to its directory (the match itself for
     /// a dir, the parent for a file), clear the search + query, and set
     /// [`pending_list`](Self::pending_list) so the run loop lists the target.
