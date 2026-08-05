@@ -90,6 +90,12 @@ impl TransferScreen {
                 srch.cursor = 0;
                 srch.results_gen = Some(ev.r#gen);
             }
+            SearchEventKind::Drilled(_) => {
+                // `Drilled` carries the directory a trailing-slash find entered;
+                // a later task wires it to `srch.current_dir` (the synthetic "."
+                // row). Accepted here only so the match stays exhaustive now
+                // that core emits the event.
+            }
         }
     }
 
