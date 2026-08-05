@@ -93,10 +93,17 @@ pub fn draw_pane(
     } else {
         Style::new().dim()
     };
+    // Border title: head-truncate to the border area (pane width minus the two
+    // corners) so a long remote host name clips with "…" instead of overflowing
+    // the top border. ratatui 0.30 has no title-truncation API, so truncate
+    // before handing the string to Block::title.
+    let title_str = format!(" {title} ");
+    let title_budget = (area.width as usize).saturating_sub(2);
+    let title_shown = truncate_cells(&title_str, title_budget);
     let block = Block::new()
         .borders(Borders::ALL)
         .border_style(border_style)
-        .title(Span::styled(format!(" {title} "), title_style));
+        .title(Span::styled(title_shown, title_style));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1821,6 +1828,30 @@ mod tests {
             pos.x,
             pos.y,
         );
+    }
+
+    #[test]
+    fn draw_pane_long_title_is_truncated_with_ellipsis() {
+        // A title wider than a narrow pane's border area is right-truncated with
+        // "…" (head preserved — the host name is the meaningful part). The border
+        // area is pane width minus the two corners, so width 14 → budget 12 →
+        // "…" + 11 leading chars of " a-very-long-host ".
+        use ratatui::{Terminal, backend::TestBackend};
+        let pane = Pane::new(std::path::PathBuf::from("/srv"));
+        let backend = TestBackend::new(14, 6);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw_pane(f, f.area(), &pane, true, "a-very-long-host", 0))
+            .unwrap();
+        // The title renders on the pane's top border row (y == 0), which is
+        // exactly what `row_text` reads.
+        let txt = row_text(&term);
+        assert!(
+            txt.contains('…'),
+            "long title truncated with ellipsis: {txt:?}"
+        );
+        // The head "a-very" survives; the clipped tail "host" does not.
+        assert!(txt.contains("a-very"), "title head kept: {txt:?}");
+        assert!(!txt.contains("host"), "title tail dropped: {txt:?}");
     }
 
     #[test]
