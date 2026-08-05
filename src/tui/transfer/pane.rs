@@ -157,10 +157,12 @@ impl Pane {
     /// Key handling while a cross-directory search is active on this pane.
     /// Arrows (and Ctrl-P/N) move the SEARCH result cursor; query-edit keys
     /// delegate to [`BrowserCore::apply_nav_key`] (which edits `core.query`)
-    /// and surface [`PaneOutcome::QueryChanged`] when the text changed;
-    /// `Space`/`Enter`/`Right` return [`PaneOutcome::None`] so the screen
-    /// acts on the selected result. `Tab`/`Esc`/`Ctrl-S`/`Ctrl-Q`/`Ctrl-C`
-    /// never reach here — the screen intercepts them first.
+    /// and surface [`PaneOutcome::QueryChanged`] when the text changed.
+    /// `Enter`/`Right` return [`PaneOutcome::None`] so the screen acts on the
+    /// selected result. `Space` is NOT special-cased: it falls through to
+    /// `apply_nav_key` and appends to the query like any printable char (find
+    /// mode has no marking). `Tab`/`Esc`/`Ctrl-S`/`Ctrl-Q`/`Ctrl-C` never reach
+    /// here — the screen intercepts them first.
     ///
     /// The query stays unified in `core.query`: this method does NOT carry a
     /// second query field on `PaneSearch`. Both filter mode (≤1 segment) and
@@ -188,10 +190,12 @@ impl Pane {
                 self.move_search_cursor(1);
                 PaneOutcome::None
             }
-            // Space marks the selected result; Enter/Right jump — the screen
-            // handles both. Returning None lets the screen read
-            // `pane.search.as_ref().and_then(|s| s.selected())`.
-            KeyCode::Char(' ') | KeyCode::Enter | KeyCode::Right => PaneOutcome::None,
+            // Enter/Right jump to the selected result — the screen handles
+            // both. Returning None lets it read
+            // `pane.search.as_ref().and_then(|s| s.selected())`. Space is
+            // deliberately absent: it falls through to `apply_nav_key` and
+            // appends to the query (find mode has no marking).
+            KeyCode::Enter | KeyCode::Right => PaneOutcome::None,
             // Query edit (printable, Backspace, Left-for-parent): delegate to
             // core, which edits core.query and returns QueryChanged when the
             // text changed. The screen re-runs parse_query on QueryChanged

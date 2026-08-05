@@ -368,15 +368,14 @@ impl TransferScreen {
             }
             // Enter (no Ctrl) on a search result: jump to its directory.
             KeyCode::Enter if in_search => self.jump_to_search_result(),
-            // Space on a search result: mark it (reuses Pane.core.marked). In
-            // filter mode Space falls through to the pane, which toggles the
-            // dir-list mark.
-            KeyCode::Char(' ') if in_search && !ctrl => {
-                self.search_mark_focused();
-                ScreenOutcome::Continue
-            }
-            // Everything else (arrows, Space, printable chars, Enter without
-            // Ctrl, Backspace) delegates to the focused pane.
+            // Everything else delegates to the focused pane: arrows (move the
+            // search/listing cursor), Backspace/Left (edit query or step up),
+            // and printable chars — INCLUDING Space, which find mode treats as
+            // a query char. Find has no marking: the cross-dir `marked` set is
+            // a current-dir concept (toggle + single-shot), and letting find
+            // results into it caused stale-mark pollution and same-name dst
+            // collisions. In filter mode Space still reaches the pane's own
+            // mark-toggle.
             _ => self.route_to_focused(key),
         }
     }

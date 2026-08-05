@@ -72,7 +72,7 @@ Bare `c`, `?`, `1`/`2`/`3` always reach the search box (never act as hotkeys). O
 | Key | Action |
 |---|---|
 | `Tab` | switch pane (focus = direction: local→upload, remote→download) |
-| `Space` | mark entry (current-dir scope, single-shot per enqueue) |
+| `Space` | listing: mark entry (current-dir scope, single-shot per enqueue) · find: append to the query (find has no marking) |
 | `^s` | enqueue marked/selected (dirs recurse via `get -R`/`put -R`) — the advertised trigger |
 | `^Q` | open the queue-manager overlay (retry / remove / cancel / pause) |
 | `Enter` | on a file: enqueue · on a directory: enter (never transfers) |
