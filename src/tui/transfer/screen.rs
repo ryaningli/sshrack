@@ -136,6 +136,17 @@ pub struct TransferScreen {
     /// ignores events whose `gen` ≠ this, so stale results from a superseded
     /// query never paint.
     pub search_gen: u32,
+    /// The pane whose search currently owns the `search_rx` / `search_cancel`
+    /// / `search_gen` triple — i.e. the side of the single in-flight
+    /// cross-directory find. `None` when no search is in flight. The run-loop
+    /// drain reads this to route streamed `SearchEvent`s to the correct pane;
+    /// it CANNOT infer the side from `pane.search.is_some()`, because
+    /// stale-while-revalidate keeps a finished find's `search` as `Some`, so
+    /// after a Shift-Tab both panes can carry `search = Some` at once (a stale
+    /// leftover on one side, the new in-flight find on the other). Set by
+    /// [`begin_search`](Self::begin_search) at launch, cleared by
+    /// [`cancel_search`](Self::cancel_search).
+    pub search_side: Option<Side>,
     /// Remote home directory (`open_transfer` fills this in Task 10); `None`
     /// until then, so remote `~`-expansion degrades to the remote cwd.
     pub remote_home: Option<PathBuf>,
@@ -171,6 +182,7 @@ impl TransferScreen {
             search_rx: None,
             search_cancel: None,
             search_gen: 0,
+            search_side: None,
             remote_home: None,
             spinner: 0,
         }
