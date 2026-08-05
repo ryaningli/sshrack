@@ -9,6 +9,10 @@ use std::path::{Path, PathBuf};
 use crate::dirsource::DirEntry;
 use crate::pathutil::expand_tilde;
 
+mod cache;
+
+pub use cache::{DEFAULT_CAPACITY, DEFAULT_TTL, DirListCache, real_clock};
+
 /// A parsed find query: an absolute search `base` plus ordered `segments`.
 /// Intermediate segments match directory names exactly (one level each); the
 /// final segment fuzzy-matches within the resolved directory, or — when
