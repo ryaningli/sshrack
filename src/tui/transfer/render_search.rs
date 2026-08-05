@@ -48,7 +48,7 @@ pub(crate) fn draw_search_list(frame: &mut Frame, area: Rect, pane: &Pane, focus
         return;
     };
 
-    if srch.results.is_empty() {
+    if srch.results.is_empty() && srch.current_dir.is_none() {
         let msg = if srch.searching {
             "searching…"
         } else if let Some(err) = &srch.error {
@@ -69,6 +69,7 @@ pub(crate) fn draw_search_list(frame: &mut Frame, area: Rect, pane: &Pane, focus
 
     let rows = area.height as usize;
     let win = srch.visible_window(rows);
+    let has_dot = srch.current_dir.is_some();
 
     // Highlight style applied to every matched char regardless of row state —
     // same `base.add_modifier(BOLD).fg(MATCH)` panel::highlighted_spans uses,
@@ -83,7 +84,12 @@ pub(crate) fn draw_search_list(frame: &mut Frame, area: Rect, pane: &Pane, focus
 
     let mut lines: Vec<Line> = Vec::with_capacity(win.end.saturating_sub(win.start));
     for i in win {
-        let Some(pm) = srch.results.get(i) else {
+        if has_dot && i == 0 {
+            lines.push(draw_dot_row(i == srch.cursor, focused));
+            continue;
+        }
+        let idx = i - usize::from(has_dot);
+        let Some(pm) = srch.results.get(idx) else {
             continue;
         };
         lines.push(draw_search_row(
@@ -96,6 +102,29 @@ pub(crate) fn draw_search_list(frame: &mut Frame, area: Rect, pane: &Pane, focus
         ));
     }
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Build the synthetic "." (current-directory) row that tops a trailing-slash
+/// find listing. Same leading 4-cell prefix (2-cell spacer + focus marker) as
+/// [`draw_search_row`] so columns line up with the directory listing and the
+/// other find rows; the body is a literal "." in the row's base style (cursor
+/// row = accent + bold when focused). Pure: returns a `Line` the caller renders.
+///
+/// [`draw_search_row`]: draw_search_row
+fn draw_dot_row(is_cursor: bool, focused: bool) -> Line<'static> {
+    let base = if focused && is_cursor {
+        theme::accent().add_modifier(Modifier::BOLD)
+    } else if focused {
+        Style::new()
+    } else {
+        Style::new().dim()
+    };
+    let spans: Vec<Span> = vec![
+        Span::raw("  "),
+        theme::focus_marker(focused && is_cursor),
+        Span::styled(".", base),
+    ];
+    Line::from(spans)
 }
 
 /// Build one search-result row: 2-cell spacer + 2-cell focus marker +
@@ -258,6 +287,64 @@ mod tests {
     fn draw_search_list_renders_results_cursor_and_dir_suffix_snapshot() {
         let pane = build_pane();
         let backend = TestBackend::new(40, 6);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw_search_list(f, f.area(), &pane, true))
+            .unwrap();
+        insta::assert_snapshot!(term.backend());
+    }
+
+    fn dot_pane(cursor: usize) -> Pane {
+        let mut pane = Pane::new(std::path::PathBuf::from("/srv"));
+        let mut srch = PaneSearch::empty();
+        srch.searching = false;
+        srch.current_dir = Some(PathMatch {
+            path: std::path::PathBuf::from("/srv/apath"),
+            is_dir: true,
+            seg_matches: vec![],
+        });
+        srch.results = vec![
+            PathMatch {
+                path: std::path::PathBuf::from("/srv/apath/bfile"),
+                is_dir: false,
+                seg_matches: vec![seg("apath", &[]), seg("bfile", &[0])],
+            },
+            PathMatch {
+                path: std::path::PathBuf::from("/srv/apath/bdir"),
+                is_dir: true,
+                seg_matches: vec![seg("apath", &[]), seg("bdir", &[0])],
+            },
+        ];
+        srch.cursor = cursor;
+        pane.search = Some(srch);
+        pane
+    }
+
+    #[test]
+    fn draw_search_list_renders_dot_row_at_top_snapshot() {
+        // Cursor on "." (index 0): the top row is the synthetic current-dir
+        // entry, then the drilled dir's children below it.
+        let pane = dot_pane(0);
+        let backend = TestBackend::new(40, 6);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw_search_list(f, f.area(), &pane, true))
+            .unwrap();
+        insta::assert_snapshot!(term.backend());
+    }
+
+    #[test]
+    fn draw_search_list_empty_dir_shows_dot_not_no_matches_snapshot() {
+        // A drilled directory that exists but is empty: the "." row renders
+        // (NOT the "no matches" empty state), so the user can Enter into it.
+        let mut pane = Pane::new(std::path::PathBuf::from("/srv"));
+        let mut srch = PaneSearch::empty();
+        srch.searching = false;
+        srch.current_dir = Some(PathMatch {
+            path: std::path::PathBuf::from("/srv/empty"),
+            is_dir: true,
+            seg_matches: vec![],
+        });
+        pane.search = Some(srch);
+        let backend = TestBackend::new(40, 3);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw_search_list(f, f.area(), &pane, true))
             .unwrap();
