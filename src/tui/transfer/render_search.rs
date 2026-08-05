@@ -155,10 +155,10 @@ fn draw_search_row(
 /// Render one segment's name as styled spans, splitting it into matched and
 /// unmatched runs by precomputed `indices` (char positions into `name`).
 /// Mirrors [`panel::highlighted_spans`] but reads the matcher's verdict
-/// verbatim instead of re-running nucleo — the per-segment matcher already
-/// produced these indices when the search descended the path, so the renderer
-/// treats them as opaque. Empty `indices` (e.g. an empty query segment, which
-/// matches every name with score 0) yields a single base-styled span.
+/// verbatim instead of re-running nucleo — the leaf matcher produced these
+/// indices, so the renderer treats them as opaque. Empty `indices` (an
+/// exact-drill ancestor segment, or a trailing-slash "list all" leaf) yields a
+/// single base-styled span.
 ///
 /// [`panel::highlighted_spans`]: crate::tui::panel::highlighted_spans
 fn seg_spans(name: &str, indices: &[u32], base: Style, hi: Style) -> Vec<Span<'static>> {

@@ -45,14 +45,15 @@ impl SegmentMatcher for NucleoSegmentMatcher {
 }
 
 /// Per-pane search result state, overlaid on a [`crate::tui::browser_core::BrowserCore`]
-/// while a cross-directory find query (more than one segment) is active. The
-/// query itself lives in the core's unified `query` field — this struct holds
-/// only the result side: the ranked matches, the cursor over them, and the
-/// pending/error flags the renderer reads.
+/// while a cross-directory find query is active. The query itself lives in the
+/// core's unified `query` field — this struct holds only the result side: the
+/// ranked matches, the cursor over them, and the pending/error flags the
+/// renderer reads.
 ///
 /// Mode switching is the screen's job, not the pane's: the screen reads
 /// `core.query`, runs `parse_query`, and sets `pane.search = Some(...)` for
-/// multi-segment (find) or `None` for single-segment/empty (filter). The pane
+/// find mode (a trailing slash, any multi-segment query, or any out-of-cwd
+/// base) or `None` for filter mode (a plain single name in the cwd). The pane
 /// just reports `PaneOutcome::QueryChanged` when the query text changes and
 /// routes arrows to the SEARCH cursor while `search` is `Some`.
 #[derive(Debug, Clone)]

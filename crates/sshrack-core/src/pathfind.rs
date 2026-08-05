@@ -1,7 +1,7 @@
-//! Path-aware cross-directory find: pure query parsing, segment matching via
-//! an injected [`SegmentMatcher`] trait, per-level pruning, ranking, and the
-//! streaming [`PathSearch`] traversal (added by later tasks). The TUI injects
-//! the nucleo-backed matcher so this core module stays free of UI crates (the
+//! Path-aware cross-directory find: pure query parsing, exact-drill descent
+//! with leaf-only fuzzy matching (via an injected [`SegmentMatcher`] trait),
+//! ranking, and the streaming [`PathSearch`] traversal. The TUI injects the
+//! nucleo-backed matcher so this core module stays free of UI crates (the
 //! zero-UI invariant).
 
 use std::path::{Path, PathBuf};
@@ -10,8 +10,9 @@ use crate::dirsource::DirEntry;
 use crate::pathutil::expand_tilde;
 
 /// A parsed find query: an absolute search `base` plus ordered `segments`.
-/// Each segment fuzzy-matches one directory level under `base`; depth at match
-/// time equals `segments.len()`.
+/// Intermediate segments match directory names exactly (one level each); the
+/// final segment fuzzy-matches within the resolved directory, or — when
+/// [`Self::trailing_slash`] is set — lists that directory's contents.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedQuery {
     /// Absolute directory the search descends from.
