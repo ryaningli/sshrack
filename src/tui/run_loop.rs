@@ -119,6 +119,14 @@ pub fn run_loop(
             }
         }
 
+        // Advance the find-mode spinner phase once per tick (only while a
+        // search is in flight) so the filter-row label animates at ~50 ms/frame.
+        // Borrowed and released in this block, before the draw block re-borrows
+        // `app` below.
+        if let Some(screen) = app.transfer.as_mut() {
+            screen.advance_spinner();
+        }
+
         // Borrow ONLY for the draw, then release before any key read or side
         // effect. A popup re-borrows via the weak handle and must not collide.
         {

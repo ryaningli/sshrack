@@ -1917,3 +1917,42 @@ fn tab_find_mode_zero_results_does_not_flip_focus() {
     );
     assert_eq!(s.local.core.query, "/srv/zzz", "query untouched");
 }
+
+// ---- advance_spinner: tick the find-mode spinner phase ----
+
+#[test]
+fn advance_spinner_increments_while_local_pane_searching() {
+    let mut s = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
+    assert_eq!(s.spinner, 0, "fresh screen starts at frame 0");
+    s.local.search = Some(PaneSearch::empty()); // PaneSearch::empty() has searching = true
+    s.advance_spinner();
+    assert_eq!(s.spinner, 1);
+    s.advance_spinner();
+    assert_eq!(s.spinner, 2);
+}
+
+#[test]
+fn advance_spinner_increments_while_remote_pane_searching() {
+    let mut s = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
+    s.remote.search = Some(PaneSearch::empty());
+    s.advance_spinner();
+    assert_eq!(s.spinner, 1);
+}
+
+#[test]
+fn advance_spinner_noop_when_no_search_in_flight() {
+    let mut s = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
+    // No search on either pane.
+    s.advance_spinner();
+    assert_eq!(s.spinner, 0);
+    // A FINISHED search (searching = false) must not advance either — only an
+    // in-flight search animates the spinner.
+    let mut done = PaneSearch::empty();
+    done.searching = false;
+    s.local.search = Some(done);
+    s.advance_spinner();
+    assert_eq!(
+        s.spinner, 0,
+        "a finished search must not animate the spinner"
+    );
+}
