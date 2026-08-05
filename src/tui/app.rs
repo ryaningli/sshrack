@@ -208,7 +208,7 @@ impl App {
             pending_cancel: false,
             pending_advance: false,
             search_matcher: std::sync::Arc::new(crate::tui::transfer::search::NucleoSegmentMatcher),
-            local_search: sshrack_core::pathfind::LocalPathSearch,
+            local_search: sshrack_core::pathfind::LocalPathSearch::default(),
             remote_search: None,
             last_search_key: std::time::Instant::now(),
         }

@@ -168,6 +168,9 @@ pub fn open_transfer(
             .to_path_buf(),
         Some(home.clone()),
         std::sync::Arc::new(LocalSftpRunner::new()),
+        std::sync::Arc::new(std::sync::Mutex::new(
+            sshrack_core::pathfind::DirListCache::default_with_real_clock(),
+        )),
     );
 
     let local_cwd = std::env::current_dir()?;
