@@ -372,8 +372,23 @@ impl TransferScreen {
                 self.queue_overlay.get_or_insert(QueueOverlay::new());
                 ScreenOutcome::Continue
             }
-            // Enter (no Ctrl) on a search result: jump to its directory.
-            KeyCode::Enter if in_search => self.jump_to_search_result(),
+            // Enter (no Ctrl) on a search result: a FILE enqueues (parity with
+            // filter mode, where Enter on a file transfers) and a DIRECTORY
+            // jumps into itself (parity with filter mode, where Enter on a dir
+            // enters). Ctrl-Enter / Ctrl-S above already enqueue either kind.
+            KeyCode::Enter if in_search => {
+                let is_dir = self
+                    .focused_pane()
+                    .search
+                    .as_ref()
+                    .and_then(|s| s.selected())
+                    .is_some_and(|m| m.is_dir);
+                if is_dir {
+                    self.jump_to_search_result()
+                } else {
+                    self.enqueue_focused()
+                }
+            }
             // Everything else delegates to the focused pane: arrows (move the
             // search/listing cursor), Backspace/Left (edit query or step up),
             // and printable chars — INCLUDING Space, which find mode treats as

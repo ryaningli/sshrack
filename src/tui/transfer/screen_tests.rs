@@ -1454,10 +1454,11 @@ fn apply_search_event_match_appends_and_ignores_stale_gen() {
 }
 
 #[test]
-fn jump_to_result_targets_parent_for_file() {
-    // Enter on a file search result jumps to the file's PARENT directory
-    // (navigating to the file itself is impossible; its containing dir is the
-    // useful target). Clears the search + query and sets pending_list.
+fn jump_to_result_noops_on_file() {
+    // jump_to_search_result only jumps on a DIRECTORY result. A file result is
+    // enqueued by the caller (on_key routes file results to enqueue_focused),
+    // so reaching here with a file is a no-op — it must NOT jump to the file's
+    // parent (that lost the user's selected file and left them to re-find it).
     let mut s = TransferScreen::new(PathBuf::from("/a"), PathBuf::from("/b"));
     s.local.search = Some(PaneSearch::empty());
     s.local.search.as_mut().unwrap().results = vec![PathMatch {
@@ -1466,17 +1467,102 @@ fn jump_to_result_targets_parent_for_file() {
         seg_matches: vec![],
     }];
     let out = s.jump_to_search_result();
+    assert_eq!(
+        out,
+        ScreenOutcome::Continue,
+        "file result → no-op (enqueue owns files)"
+    );
+    assert!(s.pending_list.is_none(), "file does not jump");
+    assert!(
+        s.local.search.is_some(),
+        "file leaves the search state untouched"
+    );
+}
+
+#[test]
+fn jump_to_result_jumps_into_directory() {
+    // Enter on a DIRECTORY result jumps into the directory itself: clears
+    // search + query and sets pending_list so the run loop lists the target.
+    let mut s = TransferScreen::new(PathBuf::from("/a"), PathBuf::from("/b"));
+    s.local.search = Some(PaneSearch::empty());
+    s.local.search.as_mut().unwrap().results = vec![PathMatch {
+        path: PathBuf::from("/a/sub"),
+        is_dir: true,
+        seg_matches: vec![],
+    }];
+    let out = s.jump_to_search_result();
     assert_eq!(out, ScreenOutcome::Continue);
     assert_eq!(
         s.pending_list,
         Some((Side::Local, PathBuf::from("/a/sub"))),
-        "jump targets the file's parent dir"
+        "jump targets the directory itself"
     );
     assert!(s.local.search.is_none(), "search cleared after jump");
     assert!(
         s.local.core.query.is_empty(),
         "query cleared after jump so the pane returns to filter mode in the new dir"
     );
+}
+
+#[test]
+fn find_enter_on_file_enqueues_instead_of_jumping() {
+    // find mode: Enter on a FILE result enqueues it — parity with filter mode,
+    // where Enter on a file transfers. Previously Enter jumped to the file's
+    // parent dir (and left the cursor off the file), forcing a re-find.
+    // Direction follows focus (Local → Upload); dst is the opposite pane's cwd
+    // + the file name. enqueue_from_search does not touch search/query, so the
+    // find state survives (the user can keep searching + enqueuing).
+    let local_cwd = PathBuf::from("/a");
+    let remote_cwd = PathBuf::from("/b");
+    let mut s = TransferScreen::new(local_cwd.clone(), remote_cwd.clone());
+    s.local.search = Some(PaneSearch::empty());
+    s.local.search.as_mut().unwrap().results = vec![PathMatch {
+        path: PathBuf::from("/a/sub/f.txt"),
+        is_dir: false,
+        seg_matches: vec![],
+    }];
+    let out = s.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(out, ScreenOutcome::Enqueue, "file result → Enqueue");
+    assert_eq!(s.ledger.tasks.len(), 1, "exactly one job queued");
+    let job = &s.ledger.tasks[0].job;
+    assert_eq!(job.direction, Direction::Upload, "focus=Local → Upload");
+    assert_eq!(job.src, PathBuf::from("/a/sub/f.txt"));
+    assert_eq!(
+        job.dst,
+        remote_cwd.join("f.txt"),
+        "dst = remote cwd + file name"
+    );
+    assert_eq!(job.name, "f.txt");
+    assert!(!job.recursive, "file → recursive=false");
+    assert_eq!(job.size_total, None, "PathMatch carries no size");
+    assert!(
+        s.local.search.is_some(),
+        "find state retained after enqueue"
+    );
+    assert!(s.pending_list.is_none(), "no navigation on file enqueue");
+}
+
+#[test]
+fn find_enter_on_dir_jumps_into_directory() {
+    // find mode: Enter on a DIRECTORY result jumps into it — parity with
+    // filter mode, where Enter on a dir enters. Regression pin: the file
+    // enqueue change above must not alter directory behavior.
+    let mut s = TransferScreen::new(PathBuf::from("/a"), PathBuf::from("/b"));
+    s.local.search = Some(PaneSearch::empty());
+    s.local.search.as_mut().unwrap().results = vec![PathMatch {
+        path: PathBuf::from("/a/sub"),
+        is_dir: true,
+        seg_matches: vec![],
+    }];
+    let out = s.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(out, ScreenOutcome::Continue, "dir result → jump (Continue)");
+    assert_eq!(
+        s.pending_list,
+        Some((Side::Local, PathBuf::from("/a/sub"))),
+        "jump targets the directory itself"
+    );
+    assert!(s.local.search.is_none(), "search cleared after jump");
+    assert!(s.local.core.query.is_empty(), "query cleared after jump");
 }
 
 #[test]
