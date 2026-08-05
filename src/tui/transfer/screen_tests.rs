@@ -1570,3 +1570,24 @@ fn backtab_flips_focus_even_with_search_candidate() {
     assert_eq!(s.focus, Side::Remote, "Shift-Tab flips, does not complete");
     assert_eq!(s.local.core.query, "aaa/bb", "query untouched by Shift-Tab");
 }
+
+#[test]
+fn tab_no_candidate_under_cursor_flips_focus() {
+    // A non-empty query that matches nothing leaves no candidate under the
+    // cursor: Tab falls back to switching panes (completion_for_focused
+    // returns None via selected_entry() on an empty ranked list — distinct
+    // from the empty-query early return).
+    let cwd = PathBuf::from("/l");
+    let mut s = TransferScreen::new(cwd.clone(), PathBuf::from("/r"));
+    s.local.set_entries(vec![entry("alpha.txt", &cwd, false)]);
+    s.local.core.query = "zz".into();
+    s.local.core.recompute();
+    assert_eq!(s.focus, Side::Local);
+    let _ = s.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(
+        s.focus,
+        Side::Remote,
+        "no candidate under cursor → Tab flips, no completion"
+    );
+    assert_eq!(s.local.core.query, "zz", "query untouched");
+}
