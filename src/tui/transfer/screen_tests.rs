@@ -1454,6 +1454,128 @@ fn apply_search_event_match_appends_and_ignores_stale_gen() {
 }
 
 #[test]
+fn apply_search_event_drilled_sets_current_dir_before_matches() {
+    // A Drilled event sets the synthetic "." row; subsequent Matches append
+    // behind it; cursor lands on "." (index 0).
+    let mut s = TransferScreen::new(PathBuf::from("/a"), PathBuf::from("/b"));
+    s.local.search = Some(PaneSearch::empty());
+    s.search_gen = 1;
+    s.apply_search_event(
+        Side::Local,
+        SearchEvent {
+            r#gen: 1,
+            kind: SearchEventKind::Drilled(PathBuf::from("/a/sub")),
+        },
+    );
+    s.apply_search_event(
+        Side::Local,
+        SearchEvent {
+            r#gen: 1,
+            kind: SearchEventKind::Match(PathMatch {
+                path: PathBuf::from("/a/sub/c.txt"),
+                is_dir: false,
+                seg_matches: vec![],
+            }),
+        },
+    );
+    let srch = s.local.search.as_ref().unwrap();
+    assert_eq!(
+        srch.current_dir.as_ref().unwrap().path,
+        PathBuf::from("/a/sub"),
+        "Drilled sets current_dir to the drilled dir"
+    );
+    assert!(srch.current_dir.as_ref().unwrap().is_dir);
+    assert_eq!(srch.results.len(), 1, "Match appended behind the dot");
+    assert_eq!(srch.cursor, 0, "cursor on the dot");
+}
+
+#[test]
+fn apply_search_event_new_gen_clears_current_dir() {
+    // A new generation's first event clears the previous "." row (stale dir).
+    let mut s = TransferScreen::new(PathBuf::from("/a"), PathBuf::from("/b"));
+    s.local.search = Some(PaneSearch::empty());
+    s.search_gen = 1;
+    s.apply_search_event(
+        Side::Local,
+        SearchEvent {
+            r#gen: 1,
+            kind: SearchEventKind::Drilled(PathBuf::from("/a/sub")),
+        },
+    );
+    assert!(s.local.search.as_ref().unwrap().current_dir.is_some());
+    // A new generation (2) whose first event is a leaf Match → no Drilled →
+    // current_dir must be cleared.
+    s.search_gen = 2;
+    s.apply_search_event(
+        Side::Local,
+        SearchEvent {
+            r#gen: 2,
+            kind: SearchEventKind::Match(PathMatch {
+                path: PathBuf::from("/a/leaf.txt"),
+                is_dir: false,
+                seg_matches: vec![],
+            }),
+        },
+    );
+    assert!(
+        s.local.search.as_ref().unwrap().current_dir.is_none(),
+        "first event of a new gen clears the stale dot"
+    );
+}
+
+#[test]
+fn apply_search_event_second_drilled_is_ambiguous_and_clears() {
+    // Two Drilled events in one generation (multi-frontier resolution) → the
+    // drilled target is ambiguous → suppress the "." row.
+    let mut s = TransferScreen::new(PathBuf::from("/a"), PathBuf::from("/b"));
+    s.local.search = Some(PaneSearch::empty());
+    s.search_gen = 1;
+    s.apply_search_event(
+        Side::Local,
+        SearchEvent {
+            r#gen: 1,
+            kind: SearchEventKind::Drilled(PathBuf::from("/a/x")),
+        },
+    );
+    assert!(s.local.search.as_ref().unwrap().current_dir.is_some());
+    s.apply_search_event(
+        Side::Local,
+        SearchEvent {
+            r#gen: 1,
+            kind: SearchEventKind::Drilled(PathBuf::from("/a/y")),
+        },
+    );
+    assert!(
+        s.local.search.as_ref().unwrap().current_dir.is_none(),
+        "a second Drilled makes the target ambiguous → no dot"
+    );
+}
+
+#[test]
+fn completion_returns_none_when_cursor_on_dot() {
+    // Tab on the synthetic "." row must not complete (it would malform the
+    // query, e.g. "/a/sub/" + "sub" + "/" → "/a/sub/sub/"). It returns None so
+    // Tab is swallowed in find mode (no focus flip either).
+    let mut s = TransferScreen::new(PathBuf::from("/a"), PathBuf::from("/b"));
+    s.focus = Side::Local;
+    s.local.core.query = "/a/sub/".into();
+    let mut srch = PaneSearch::empty();
+    srch.searching = false;
+    srch.current_dir = Some(PathMatch {
+        path: PathBuf::from("/a/sub"),
+        is_dir: true,
+        seg_matches: vec![],
+    });
+    srch.cursor = 0; // on the dot
+    s.local.search = Some(srch);
+    assert!(
+        !s.complete_focused(),
+        "Tab on '.' completes nothing (returns false)"
+    );
+    assert_eq!(s.local.core.query, "/a/sub/", "query left untouched");
+}
+
+#[test]
 fn jump_to_result_noops_on_file() {
     // jump_to_search_result only jumps on a DIRECTORY result. A file result is
     // enqueued by the caller (on_key routes file results to enqueue_focused),

@@ -110,12 +110,6 @@ impl PaneSearch {
 
     /// True when the cursor sits on the synthetic "." row (cursor 0 with a
     /// current-dir entry present). Used to suppress Tab completion on ".".
-    //
-    // `allow(dead_code)`: no production caller yet — wired in a later task
-    // (Tab-completion suppression on the "." row). Tests exercise it today, so
-    // `#[expect(dead_code)]` would be unfulfilled under `--all-targets`; remove
-    // this attribute when the first production caller lands.
-    #[allow(dead_code)]
     #[must_use]
     pub(crate) fn on_dot(&self) -> bool {
         self.cursor == 0 && self.current_dir.is_some()
