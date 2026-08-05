@@ -713,6 +713,81 @@ fn esc_without_active_transfer_returns_close_transfer() {
 }
 
 #[test]
+fn filter_esc_clears_non_empty_query_instead_of_closing() {
+    // In filter mode (no active find), Esc with a non-empty query clears the
+    // query and returns to the full current-dir listing — mirroring find
+    // mode's Esc. Only an empty query lets Esc proceed to cancel a transfer
+    // or close the SFTP session. Otherwise the instinct to "clear the search
+    // box" would kick the user out of SFTP.
+    let cwd = PathBuf::from("/srv");
+    let mut s = TransferScreen::new(cwd.clone(), PathBuf::from("/r"));
+    s.local.set_entries(vec![
+        entry("alpha.txt", &cwd, false),
+        entry("beta.txt", &cwd, false),
+    ]);
+    s.local.core.query = "alpha".into();
+    s.local.core.recompute();
+    assert_eq!(
+        s.local.matched_count(),
+        1,
+        "precondition: filter narrows to alpha"
+    );
+
+    let out = s.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
+
+    assert_eq!(out, ScreenOutcome::Continue, "Esc clears query, not close");
+    assert!(s.local.core.query.is_empty(), "query cleared");
+    assert_eq!(s.local.matched_count(), 2, "full listing restored");
+}
+
+#[test]
+fn filter_esc_clears_query_before_cancelling_inflight_transfer() {
+    // Esc peels layers inside-out: a non-empty query is cleared BEFORE an
+    // in-flight transfer is cancelled — matching find mode's precedence
+    // (in_search is checked before has_inflight). The user cancels the
+    // transfer with a second Esc once the query is empty.
+    let cwd = PathBuf::from("/srv");
+    let mut s = TransferScreen::new(cwd.clone(), PathBuf::from("/r"));
+    s.local.set_entries(vec![entry("alpha.txt", &cwd, false)]);
+    s.local.core.query = "alpha".into();
+    s.local.core.recompute();
+    // Seed an in-flight transfer.
+    s.ledger.enqueue(TransferJob {
+        direction: Direction::Upload,
+        src: PathBuf::from("/srv/alpha.txt"),
+        dst: PathBuf::from("/r/alpha.txt"),
+        name: "alpha.txt".into(),
+        size_total: Some(10),
+        recursive: false,
+    });
+    s.ledger.next_to_dispatch();
+    s.ledger.set_inflight_progress(Progress {
+        name: "alpha.txt".into(),
+        direction: Direction::Upload,
+        bytes_done: 0,
+        bytes_total: Some(10),
+        rate_bps: None,
+        eta_secs: None,
+    });
+
+    let out = s.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
+
+    assert_eq!(
+        out,
+        ScreenOutcome::Continue,
+        "Esc clears the query first, not CancelActive"
+    );
+    assert!(
+        s.local.core.query.is_empty(),
+        "query cleared before transfer cancel"
+    );
+    assert!(
+        s.has_inflight(),
+        "transfer still in flight after query-clear Esc"
+    );
+}
+
+#[test]
 fn ctrl_c_always_returns_close_transfer() {
     let mut screen = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
     let out = screen.on_key(press(KeyCode::Char('c'), KeyModifiers::CONTROL));
@@ -1577,6 +1652,48 @@ fn cancel_search_clears_in_flight_side_pane_not_focus() {
     assert!(
         s.remote.search.is_some(),
         "non-in-flight remote pane untouched by cancel"
+    );
+}
+
+#[test]
+fn cancel_search_clears_query_and_restores_full_listing() {
+    // Esc in find mode must clear the query AND restore the full current-dir
+    // listing. filter/find share core.query, and find typing recomputes
+    // core.ranked against the cross-dir query (e.g. "a/b" matches no
+    // current-dir name). cancel_search used to leave the query intact, so
+    // dropping back to filter mode rendered that stale empty ranked list —
+    // the user saw the old query text but an empty pane until they Backspaced
+    // it all away. Esc = abandon the search entirely.
+    let local_cwd = PathBuf::from("/srv");
+    let mut s = TransferScreen::new(local_cwd.clone(), PathBuf::from("/r"));
+    s.local.set_entries(vec![
+        entry("alpha.txt", &local_cwd, false),
+        entry("beta.txt", &local_cwd, false),
+        entry("docs", &local_cwd, true),
+    ]);
+    // Simulate the user having typed a cross-dir find query: ranked collapses
+    // (a/b matches no current-dir name) while search is active.
+    s.local.core.query = "a/b".into();
+    s.local.core.recompute();
+    assert_eq!(
+        s.local.matched_count(),
+        0,
+        "precondition: cross-dir query matches no current-dir name"
+    );
+    s.local.search = Some(PaneSearch::empty());
+
+    s.cancel_search();
+
+    assert!(s.local.core.query.is_empty(), "Esc clears the query");
+    assert!(s.local.search.is_none(), "Esc exits find mode");
+    assert_eq!(
+        s.local.matched_count(),
+        3,
+        "ranked restored to full current-dir listing"
+    );
+    assert!(
+        s.local.core.selected < s.local.matched_count(),
+        "cursor clamped into the restored ranked range"
     );
 }
 
