@@ -184,6 +184,13 @@ use crate::dirsource::{DirSource, LocalDirSource};
 pub enum SearchEventKind {
     /// A fully matched path (one [`SegMatch`] per query segment).
     Match(PathMatch),
+    /// The resolved drilled directory in a trailing-slash (list-all) search,
+    /// emitted once per surviving frontier directory after it lists
+    /// successfully, before its child [`Match`]es. The TUI renders a synthetic
+    /// "." current-dir row from it so `Enter` on "." navigates into the drilled
+    /// directory. Suppressed for leaf searches (no trailing slash) — "." would
+    /// only noise up a fuzzy filter of the final segment.
+    Drilled(PathBuf),
     /// The search terminated normally.
     Done,
     /// A recoverable error from one directory listing (the search continues).
@@ -336,6 +343,14 @@ pub(crate) fn walk_levels<L>(
                 continue;
             }
         };
+        if leaf.is_none() {
+            // Trailing-slash drill (leaf = None): surface the resolved
+            // directory so the TUI can render a synthetic "." current-dir row.
+            // Lets Enter on "." confirm the drilled dir instead of Tab+Enter
+            // diving into the first child. Suppressed for leaf searches so "."
+            // stays out of the way while fuzzy-matching the final segment.
+            emit(SearchEventKind::Drilled(dir.clone()), sink);
+        }
         for e in &entries {
             let Some(raw) = e.path.file_name().and_then(|n| n.to_str()) else {
                 continue;
@@ -711,6 +726,7 @@ mod tests {
                 SearchEventKind::Match(m) => leaves.push(m),
                 SearchEventKind::Done => done = true,
                 SearchEventKind::Error(e) => panic!("unexpected error: {e}"),
+                SearchEventKind::Drilled(_) => {}
             }
         }
         assert!(done);
@@ -768,6 +784,111 @@ mod tests {
             leaves
                 .iter()
                 .all(|m| m.seg_matches.last().is_some_and(|s| s.indices.is_empty()))
+        );
+    }
+
+    #[test]
+    fn walk_levels_trailing_slash_emits_drilled_before_children() {
+        // query "a/b/" → exact drill a,b; Phase 2 lists /srv/a/b in list-all
+        // mode. A Drilled(/srv/a/b) event must precede the child Match events.
+        let mut tree: HashMap<PathBuf, Vec<DirEntry>> = HashMap::new();
+        tree.insert(PathBuf::from("/srv"), vec![entry("a", "/srv", true)]);
+        tree.insert(PathBuf::from("/srv/a"), vec![entry("b", "/srv/a", true)]);
+        tree.insert(
+            PathBuf::from("/srv/a/b"),
+            vec![entry("one.txt", "/srv/a/b", false)],
+        );
+        let list = |p: &Path| tree.get(p).cloned().ok_or_else(|| "no dir".to_string());
+
+        let q = ParsedQuery {
+            base: PathBuf::from("/srv"),
+            segments: vec!["a".into(), "b".into()],
+            trailing_slash: true,
+        };
+        let (tx, rx) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        walk_levels(list, &q, &AlwaysMatcher, 1, &cancel, &tx);
+        drop(tx);
+
+        let kinds: Vec<_> = rx.iter().map(|ev| ev.kind).collect();
+        assert!(
+            matches!(kinds.first(), Some(SearchEventKind::Drilled(p)) if p == Path::new("/srv/a/b")),
+            "first event must be Drilled(/srv/a/b): {kinds:?}"
+        );
+        let drilled_idx = kinds
+            .iter()
+            .position(|k| matches!(k, SearchEventKind::Drilled(_)));
+        let match_idx = kinds
+            .iter()
+            .position(|k| matches!(k, SearchEventKind::Match(_)));
+        assert!(
+            drilled_idx.is_some() && match_idx.is_some() && drilled_idx < match_idx,
+            "Drilled must precede the first Match: {kinds:?}"
+        );
+        assert!(
+            matches!(kinds.last(), Some(SearchEventKind::Done)),
+            "last event must be Done: {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn walk_levels_leaf_search_emits_no_drilled() {
+        // query "a/b" (no trailing slash) → leaf search; no Drilled event.
+        let mut tree: HashMap<PathBuf, Vec<DirEntry>> = HashMap::new();
+        tree.insert(PathBuf::from("/srv"), vec![entry("a", "/srv", true)]);
+        tree.insert(
+            PathBuf::from("/srv/a"),
+            vec![entry("bfile", "/srv/a", false)],
+        );
+        let list = |p: &Path| tree.get(p).cloned().ok_or_else(|| "no dir".to_string());
+
+        let q = query_at("/srv", &["a", "b"]);
+        let (tx, rx) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        walk_levels(list, &q, &AlwaysMatcher, 1, &cancel, &tx);
+        drop(tx);
+
+        let kinds: Vec<_> = rx.iter().map(|ev| ev.kind).collect();
+        assert!(
+            !kinds
+                .iter()
+                .any(|k| matches!(k, SearchEventKind::Drilled(_))),
+            "leaf search must not emit Drilled: {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn walk_levels_drill_failure_emits_no_drilled() {
+        // query "a/missing/" → Phase 1 cannot resolve "missing" → empty frontier
+        // → no Phase 2 listing → no Drilled. Only Done.
+        let mut tree: HashMap<PathBuf, Vec<DirEntry>> = HashMap::new();
+        tree.insert(PathBuf::from("/srv"), vec![entry("a", "/srv", true)]);
+        tree.insert(
+            PathBuf::from("/srv/a"),
+            vec![entry("real", "/srv/a", true)], // no "missing" child
+        );
+        let list = |p: &Path| tree.get(p).cloned().ok_or_else(|| "no dir".to_string());
+
+        let q = ParsedQuery {
+            base: PathBuf::from("/srv"),
+            segments: vec!["a".into(), "missing".into()],
+            trailing_slash: true,
+        };
+        let (tx, rx) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        walk_levels(list, &q, &AlwaysMatcher, 1, &cancel, &tx);
+        drop(tx);
+
+        let kinds: Vec<_> = rx.iter().map(|ev| ev.kind).collect();
+        assert!(
+            !kinds
+                .iter()
+                .any(|k| matches!(k, SearchEventKind::Drilled(_))),
+            "a failed drill must not emit Drilled: {kinds:?}"
+        );
+        assert!(
+            matches!(kinds.last(), Some(SearchEventKind::Done)),
+            "last event must be Done: {kinds:?}"
         );
     }
 
@@ -858,6 +979,7 @@ mod tests {
                 SearchEventKind::Match(m) => leaves.push(m),
                 SearchEventKind::Done => done = true,
                 SearchEventKind::Error(e) => panic!("unexpected error: {e}"),
+                SearchEventKind::Drilled(_) => {}
             }
         }
         assert!(done);
