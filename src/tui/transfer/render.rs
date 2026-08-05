@@ -179,12 +179,12 @@ fn draw_filter_row(frame: &mut Frame, area: Rect, query: &str, label: &str, focu
     // end) survives behind a "…". `prompt_area.width` already excludes the
     // right-hand count label (the Layout split it off).
     let budget = (prompt_area.width as usize).saturating_sub(2);
-    let shown = if crate::tui::fit::cells(query) > budget {
-        crate::tui::fit::truncate_cells_head(query, budget)
+    let shown = if cells(query) > budget {
+        truncate_cells_head(query, budget)
     } else {
         query.to_string()
     };
-    let shown_cells = crate::tui::fit::cells(&shown);
+    let shown_cells = cells(&shown);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("❯ ", Style::new().dim()),
