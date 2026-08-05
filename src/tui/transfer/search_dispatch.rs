@@ -47,6 +47,14 @@ impl TransferScreen {
         };
         match ev.kind {
             SearchEventKind::Match(m) => {
+                if !srch.yielded {
+                    // First event of this generation: drop the stale
+                    // previous-query results so the new hits replace — not
+                    // concatenate with — them.
+                    srch.results.clear();
+                    srch.cursor = 0;
+                    srch.yielded = true;
+                }
                 srch.results.push(m);
                 rank_matches(&mut srch.results);
                 // Re-clamp the cursor into bounds after append + re-rank,
@@ -56,10 +64,25 @@ impl TransferScreen {
                     srch.cursor = len.saturating_sub(1);
                 }
             }
-            SearchEventKind::Done => srch.searching = false,
+            SearchEventKind::Done => {
+                // A search that yielded no Match must clear the stale results
+                // so the renderer shows "no matches" instead of the previous
+                // query's hits.
+                if !srch.yielded {
+                    srch.results.clear();
+                    srch.cursor = 0;
+                    srch.yielded = true;
+                }
+                srch.searching = false;
+            }
             SearchEventKind::Error(msg) => {
                 srch.searching = false;
                 srch.error = Some(msg);
+                // Surface the error (the renderer only shows it when results
+                // are empty), so drop any stale hits.
+                srch.results.clear();
+                srch.cursor = 0;
+                srch.yielded = true;
             }
         }
     }
@@ -68,8 +91,13 @@ impl TransferScreen {
     /// A plain single name (no slash) with `base == cwd` stays in filter mode
     /// (the synchronous `core.recompute` already handles it); a trailing slash,
     /// any multi-segment, or an out-of-cwd query enters find mode (set
-    /// `pane.search`, clear its results, and stash `pending_search` for the run
-    /// loop to launch). Pure: no I/O.
+    /// `pane.search`, mark it `searching` with `yielded` reset, and stash
+    /// `pending_search` for the run loop to launch). Pure: no I/O.
+    ///
+    /// Stale-while-revalidate: the previous query's `results` are deliberately
+    /// kept here (not cleared) so the list does not flash to "search…" on every
+    /// keystroke. [`apply_search_event`](Self::apply_search_event) clears them
+    /// on the first event of the new generation (the `yielded` gate).
     pub(crate) fn search_request(&mut self, side: Side, query: String) {
         if query.is_empty() {
             self.pane_mut(side)
@@ -100,8 +128,12 @@ impl TransferScreen {
                 let srch = pane.search.get_or_insert_with(PaneSearch::empty);
                 srch.searching = true;
                 srch.error = None;
-                srch.results.clear();
-                srch.cursor = 0;
+                srch.yielded = false;
+                // NOTE: results are intentionally kept (not cleared). The
+                // previous query's hits stay visible until the new search's
+                // first event lands — stale-while-revalidate, so the list
+                // does not flash empty on every keystroke. apply_search_event
+                // clears them via the `yielded` gate.
             }
         }
         self.pending_search = launch;

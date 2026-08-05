@@ -65,18 +65,27 @@ pub(crate) struct PaneSearch {
     /// True while a search is in flight (debounce window or worker drain
     /// pending). Render-only signal; the pane never mutates it.
     pub searching: bool,
+    /// Whether the current search generation has produced any event yet.
+    /// `false` from search launch until the first `Match`/`Done`/`Error` of
+    /// this generation. During that window the renderer keeps showing the
+    /// *previous* query's results (stale-while-revalidate) so the list does
+    /// not flash to "searching…" on every keystroke; the first event of the
+    /// new generation clears the stale results before applying.
+    pub yielded: bool,
     /// Last search error, if any (e.g. unreadable directory). Render-only.
     pub error: Option<String>,
 }
 
 impl PaneSearch {
     /// Fresh search state: no results yet, cursor at 0, `searching` true (a
-    /// search is about to start or is in flight).
+    /// search is about to start or is in flight), `yielded` false (this
+    /// generation has produced no events yet).
     pub(crate) fn empty() -> Self {
         Self {
             results: vec![],
             cursor: 0,
             searching: true,
+            yielded: false,
             error: None,
         }
     }

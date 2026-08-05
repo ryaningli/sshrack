@@ -1591,3 +1591,102 @@ fn tab_no_candidate_under_cursor_flips_focus() {
     );
     assert_eq!(s.local.core.query, "zz", "query untouched");
 }
+
+// ---- find flicker: stale-while-revalidate ----
+//
+// Re-typing in find mode used to clear `results` immediately, so the list
+// flashed to "searching…" on every keystroke until the new search yielded.
+// Stale-while-revalidate keeps the previous query's results visible until the
+// new generation's first event lands (`PaneSearch.yielded` gates the clear).
+
+#[test]
+fn search_request_find_mode_keeps_stale_results_until_first_event() {
+    // A new find query must NOT clear the previous query's results: they stay
+    // visible (searching=true, yielded=false) so the renderer does not flash
+    // empty. The first event of the new generation clears them.
+    let mut s = TransferScreen::new(PathBuf::from("/srv"), PathBuf::from("/r"));
+    let mut prior = PaneSearch::empty();
+    prior.searching = false;
+    prior.yielded = true;
+    prior.results = vec![PathMatch {
+        path: PathBuf::from("/srv/old"),
+        is_dir: false,
+        seg_matches: vec![],
+    }];
+    s.local.search = Some(prior);
+    // A multi-segment query re-enters find mode.
+    s.search_request(Side::Local, "a/b".into());
+    let srch = s.local.search.as_ref().expect("still find mode");
+    assert!(srch.searching, "new search marked in-flight");
+    assert!(
+        !srch.yielded,
+        "yielded reset: new generation has produced no events yet"
+    );
+    assert_eq!(
+        srch.results.len(),
+        1,
+        "stale previous-query results retained until first event (no flash)"
+    );
+}
+
+#[test]
+fn apply_search_event_first_match_clears_stale_results() {
+    // The first Match of the new generation drops the stale results before
+    // pushing, so the list swaps cleanly old→new instead of concatenating.
+    let mut s = TransferScreen::new(PathBuf::from("/srv"), PathBuf::from("/r"));
+    let mut srch = PaneSearch::empty();
+    srch.searching = true;
+    srch.yielded = false;
+    srch.results = vec![PathMatch {
+        path: PathBuf::from("/srv/old"),
+        is_dir: false,
+        seg_matches: vec![],
+    }];
+    s.local.search = Some(srch);
+    s.search_gen = 1;
+    s.apply_search_event(
+        Side::Local,
+        SearchEvent {
+            r#gen: 1,
+            kind: SearchEventKind::Match(PathMatch {
+                path: PathBuf::from("/srv/new"),
+                is_dir: false,
+                seg_matches: vec![],
+            }),
+        },
+    );
+    let srch = s.local.search.as_ref().unwrap();
+    assert!(srch.yielded, "yielded set after first event");
+    assert_eq!(srch.results.len(), 1, "stale result replaced, not appended");
+    assert_eq!(srch.results[0].path, PathBuf::from("/srv/new"));
+}
+
+#[test]
+fn apply_search_event_done_zero_results_clears_stale() {
+    // A search that finishes with zero matches must clear the stale results
+    // so the renderer shows "no matches" instead of the previous query's hits.
+    let mut s = TransferScreen::new(PathBuf::from("/srv"), PathBuf::from("/r"));
+    let mut srch = PaneSearch::empty();
+    srch.searching = true;
+    srch.yielded = false;
+    srch.results = vec![PathMatch {
+        path: PathBuf::from("/srv/old"),
+        is_dir: false,
+        seg_matches: vec![],
+    }];
+    s.local.search = Some(srch);
+    s.search_gen = 1;
+    s.apply_search_event(
+        Side::Local,
+        SearchEvent {
+            r#gen: 1,
+            kind: SearchEventKind::Done,
+        },
+    );
+    let srch = s.local.search.as_ref().unwrap();
+    assert!(!srch.searching, "Done clears searching");
+    assert!(
+        srch.results.is_empty(),
+        "zero-result Done clears stale results (no lingering previous hits)"
+    );
+}
