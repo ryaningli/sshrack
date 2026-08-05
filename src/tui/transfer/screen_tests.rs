@@ -1591,3 +1591,70 @@ fn tab_no_candidate_under_cursor_flips_focus() {
     );
     assert_eq!(s.local.core.query, "zz", "query untouched");
 }
+
+#[test]
+fn tab_find_mode_completes_absolute_path_preserves_root_prefix() {
+    // Regression: `/ho` → `/home/` must keep the leading `/`. Completing off
+    // seg_matches alone dropped it (seg_matches is relative to the query base,
+    // so it never carries the `/`/`~/`/`../` the user typed).
+    let mut s = TransferScreen::new(PathBuf::from("/srv"), PathBuf::from("/r"));
+    let mut srch = PaneSearch::empty();
+    srch.searching = false;
+    srch.results = vec![PathMatch {
+        path: PathBuf::from("/home"),
+        is_dir: true,
+        seg_matches: vec![SegMatch {
+            name: "home".into(),
+            score: 0,
+            indices: vec![],
+        }],
+    }];
+    s.local.search = Some(srch);
+    s.local.core.query = "/ho".into();
+    let _ = s.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(s.local.core.query, "/home/", "absolute base / preserved");
+}
+
+#[test]
+fn tab_find_mode_completes_parent_path_preserves_dotdot_prefix() {
+    let cwd = PathBuf::from("/srv/app");
+    let mut s = TransferScreen::new(cwd, PathBuf::from("/r"));
+    let mut srch = PaneSearch::empty();
+    srch.searching = false;
+    srch.results = vec![PathMatch {
+        path: PathBuf::from("/srv/sibling"),
+        is_dir: true,
+        seg_matches: vec![SegMatch {
+            name: "sibling".into(),
+            score: 0,
+            indices: vec![],
+        }],
+    }];
+    s.local.search = Some(srch);
+    s.local.core.query = "../sib".into();
+    let _ = s.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(
+        s.local.core.query, "../sibling/",
+        "../ parent base preserved"
+    );
+}
+
+#[test]
+fn tab_find_mode_completes_home_path_preserves_tilde_prefix() {
+    let mut s = TransferScreen::new(PathBuf::from("/srv"), PathBuf::from("/r"));
+    let mut srch = PaneSearch::empty();
+    srch.searching = false;
+    srch.results = vec![PathMatch {
+        path: PathBuf::from("/home/user/documents"),
+        is_dir: true,
+        seg_matches: vec![SegMatch {
+            name: "documents".into(),
+            score: 0,
+            indices: vec![],
+        }],
+    }];
+    s.local.search = Some(srch);
+    s.local.core.query = "~/do".into();
+    let _ = s.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(s.local.core.query, "~/documents/", "~/ home base preserved");
+}
