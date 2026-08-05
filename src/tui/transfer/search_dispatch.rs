@@ -216,11 +216,14 @@ impl TransferScreen {
         })
     }
 
-    /// `Enter` on a search result: jump to its directory (the match itself for
-    /// a dir, the parent for a file), clear the search + query, and set
-    /// [`pending_list`](Self::pending_list) so the run loop lists the target.
-    /// MVP: the cursor lands on the directory's remembered position (not
-    /// auto-located on the match file — a future enhancement).
+    /// `Enter` on a DIRECTORY search result: jump into it, clear the search +
+    /// query, and set [`pending_list`](Self::pending_list) so the run loop
+    /// lists the target. The cursor lands on the target's remembered position.
+    /// A FILE result is a no-op here — `on_key` routes file results to
+    /// [`enqueue_focused`](Self::enqueue_focused) (Enter on a file transfers,
+    /// parity with filter mode), so a file only reaches here via a direct call,
+    /// where the safe contract is "do nothing" rather than jump to its parent
+    /// (which would discard the user's selected file and force a re-find).
     pub fn jump_to_search_result(&mut self) -> ScreenOutcome {
         let focus = self.focus;
         let Some(target) = self
@@ -232,15 +235,13 @@ impl TransferScreen {
         else {
             return ScreenOutcome::Continue;
         };
-        let dir = if target.1 {
-            target.0.clone()
-        } else {
-            target
-                .0
-                .parent()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| target.0.clone())
-        };
+        // Only a directory result jumps (into itself). A file result is owned
+        // by enqueue; if one reaches here anyway, no-op — never jump to its
+        // parent.
+        if !target.1 {
+            return ScreenOutcome::Continue;
+        }
+        let dir = target.0;
         {
             let pane = self
                 .pane_mut(focus)
