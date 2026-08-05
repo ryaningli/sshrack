@@ -63,31 +63,22 @@ The transfer screen is backed by a `TransferLedger` (in `tui/transfer/ledger.rs`
 
 ## Path-Aware Find
 
-Each pane's filter box is path-aware. Typing one segment (`a`) is today's
-current-directory fuzzy filter (unchanged). Typing multiple segments
-(`a/b/c`) switches the pane to cross-directory find mode: each segment
-fuzzy-matches one directory level, so `a/b/c` matches
-`<cwd>/a…/b…/c…` at any depth — the depth followed is exactly the segment
-count. Per-segment pruning prevents explosion: a directory whose name fails
-to fuzzy-match segment `i` is never listed for segment `i+1`, so the search
-touches only paths on a matching prefix.
+The pane filter box is path-aware. A plain name (`a`) fuzzy-filters the current
+directory (unchanged). Anything with a `/` is a **drill find**:
 
-- **Local vs remote.** Local find runs on a background thread
-  (`pathfind::LocalPathSearch` over `LocalDirSource`). Remote find runs
-  per-segment `sftp ls` batches over the same authenticated ControlMaster the
-  transfer worker uses (`pathfind::RemotePathSearch` over `SftpDirSource`) —
-  OpenSSH multiplexes them concurrently, so find never blocks a transfer and
-  vice versa.
-- **Bases.** `~/…` resolves against `$HOME` (remote `home` from `open_transfer`
-  for the remote pane; falls back to the pane's cwd when home is unknown),
-  `../…` pops the cwd, `/…` is filesystem-root, and a bare `a/b/c` is
-  relative to the pane's cwd.
-- **Result keys.** `Enter` jumps to the result's directory (the match itself
-  for a directory, the parent for a file), `Space` marks it for batch
-  transfer, `Ctrl-S` enqueues marked-or-selected, `Esc` cancels the in-flight
-  search and drops back to filter mode (the query text is preserved).
-- **Highlight.** Each path segment's matched characters are highlighted
-  (`theme::MATCH` + bold), joined by a dim `/`, with a trailing `/` on
-  directory results — the cursor row is accent + bold overall, mirroring the
-  directory listing's cursor.
+- **Intermediate segments match directory names exactly** — `aaa` only descends
+  into a directory literally named `aaa`, never `apath`. This kills the old
+  cross-level fuzzy explosion (where `/a/b` predicted `/aaa/bbb/ccc`).
+- **The final segment fuzzy-matches within the resolved directory** — type
+  `aaa/bb` to fuzzy-find `bb*` inside `aaa/`.
+- **A trailing `/` lists the resolved directory** — `aaa/` shows every entry of
+  `aaa/` so the next level is visible as you type. `aaa/bb/` lists `aaa/bb/`.
+
+Bases: `~/` = home, `/` = root, `../` = parent (one or more), bare/`./` = current
+directory. Depth follows the number of segments you type.
+
+Keys while a find is active: `Enter` jump to the result's directory · `Space`
+mark · `^S` transfer · `Esc` cancel. Local find is a background `read_dir` walk;
+remote find runs one `sftp ls` per level over the shared ControlMaster (never
+blocks transfers).
 

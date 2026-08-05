@@ -65,11 +65,11 @@ impl TransferScreen {
     }
 
     /// Re-evaluate filter-vs-find mode after the focused pane's query changed.
-    /// Single-segment-or-empty queries with `base == cwd` stay in filter mode
-    /// (the synchronous `core.recompute` already handles them); multi-segment
-    /// or out-of-cwd queries enter find mode (set `pane.search`, clear its
-    /// results, and stash `pending_search` for the run loop to launch). Pure:
-    /// no I/O.
+    /// A plain single name (no slash) with `base == cwd` stays in filter mode
+    /// (the synchronous `core.recompute` already handles it); a trailing slash,
+    /// any multi-segment, or an out-of-cwd query enters find mode (set
+    /// `pane.search`, clear its results, and stash `pending_search` for the run
+    /// loop to launch). Pure: no I/O.
     pub(crate) fn search_request(&mut self, side: Side, query: String) {
         if query.is_empty() {
             self.pane_mut(side)
