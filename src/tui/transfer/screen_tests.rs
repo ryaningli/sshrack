@@ -1690,3 +1690,24 @@ fn apply_search_event_done_zero_results_clears_stale() {
         "zero-result Done clears stale results (no lingering previous hits)"
     );
 }
+
+#[test]
+fn tab_while_searching_with_no_candidate_does_not_flip_focus() {
+    // Race reported in the wild: type "/ho" and press Tab before the search
+    // yields. The pane is in find mode, searching=true, no results yet, so
+    // completion has no candidate. Tab must NOT fall through to flipping the
+    // pane — the user's intent is completion, not switching. Swallow it until
+    // the search produces a candidate; Shift-Tab remains the dedicated switch.
+    let mut s = TransferScreen::new(PathBuf::from("/srv"), PathBuf::from("/r"));
+    // PaneSearch::empty(): searching=true, results=[], yielded=false.
+    s.local.search = Some(PaneSearch::empty());
+    s.local.core.query = "/ho".into();
+    assert_eq!(s.focus, Side::Local);
+    let _ = s.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(
+        s.focus,
+        Side::Local,
+        "Tab mid-search with no candidate must not steal focus"
+    );
+    assert_eq!(s.local.core.query, "/ho", "query untouched");
+}
