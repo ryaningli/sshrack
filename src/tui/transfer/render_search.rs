@@ -20,7 +20,7 @@ use ratatui::{
     widgets::Paragraph,
 };
 
-use sshrack_core::pathfind::PathMatch;
+use sshrack_core::pathfind::{PathMatch, base_display_prefix};
 
 use crate::tui::parts;
 use crate::tui::theme;
@@ -74,6 +74,11 @@ pub(crate) fn draw_search_list(frame: &mut Frame, area: Rect, pane: &Pane, focus
     // so a find result highlights the same way a directory filter does.
     let hi = Style::new().fg(theme::MATCH).add_modifier(Modifier::BOLD);
     let sep = Style::new().dim();
+    // The base-syntax prefix the user typed (`/`, `~/`, `../` chain) — the path
+    // component NOT carried by `seg_matches` (they hold only the path relative
+    // to the base). Prepended to every row so an absolute query renders
+    // `/home/ryan/` instead of `home/ryan/`. Empty for a relative query.
+    let prefix = base_display_prefix(&pane.core.query);
 
     let mut lines: Vec<Line> = Vec::with_capacity(win.end.saturating_sub(win.start));
     for i in win {
@@ -87,16 +92,22 @@ pub(crate) fn draw_search_list(frame: &mut Frame, area: Rect, pane: &Pane, focus
             focused,
             hi,
             sep,
+            &prefix,
         ));
     }
     frame.render_widget(Paragraph::new(lines), area);
 }
 
 /// Build one search-result row: 2-cell mark glyph + 2-cell focus marker +
-/// joined path with per-segment highlight + trailing dim `/` for directories.
-/// Pure: returns a `Line` the caller renders. Mirrors [`draw_pane_row`]'s
-/// prefix and cursor/mark styling so the two list surfaces (directory listing
-/// and find results) align column-for-column.
+/// base-syntax prefix + joined path with per-segment highlight + trailing dim
+/// `/` for directories. Pure: returns a `Line` the caller renders. Mirrors
+/// [`draw_pane_row`]'s prefix and cursor/mark styling so the two list surfaces
+/// (directory listing and find results) align column-for-column.
+///
+/// `prefix` is the query's base syntax (`/`, `~/`, `../`, or `""` for a
+/// relative query) — the path component `seg_matches` does not carry, prepended
+/// so an absolute query shows `/home/ryan/` not `home/ryan/`. Rendered in the
+/// dim separator style (it is structural, like the inter-segment slashes).
 ///
 /// [`draw_pane_row`]: super::render::draw_pane_row
 fn draw_search_row(
@@ -106,6 +117,7 @@ fn draw_search_row(
     focused: bool,
     hi: Style,
     sep: Style,
+    prefix: &str,
 ) -> Line<'static> {
     // Base style mirrors draw_pane_row: focused cursor = accent + bold, focused
     // non-cursor = plain, non-focused pane = dim overall.
@@ -135,6 +147,14 @@ fn draw_search_row(
     }
 
     spans.push(theme::focus_marker(focused && is_cursor));
+
+    // Base-syntax prefix (e.g. `/`, `~/`, `../`) — the path component the
+    // seg_matches below do not carry. Prepended so an absolute query renders
+    // `/home/ryan/` instead of `home/ryan/`. Empty (omitted) for a relative
+    // query. Dim like the inter-segment separators: it is structural.
+    if !prefix.is_empty() {
+        spans.push(Span::styled(prefix.to_string(), sep));
+    }
 
     // Path body: join each SegMatch.name with a dim `/`, highlight the matched
     // chars within each name (per its own `indices`), and append a trailing
@@ -255,6 +275,74 @@ mod tests {
         term.draw(|f| draw_search_list(f, f.area(), &pane, true))
             .unwrap();
         insta::assert_snapshot!(term.backend());
+    }
+
+    // ---- base prefix (Bug 1): absolute/tilde/parent queries must show their
+    // leading base syntax, which seg_matches does not carry. ----
+
+    fn join_spans(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn draw_search_row_prepends_root_slash_for_absolute_query() {
+        // Query "/home/ryan" → base "/", seg_matches [home, ryan]. Without the
+        // prefix the row read "home/ryan/"; it must read "/home/ryan/".
+        let mut pane = Pane::new(std::path::PathBuf::from("/srv"));
+        pane.core.query = "/home/ryan".into();
+        let pm = PathMatch {
+            path: std::path::PathBuf::from("/home/ryan"),
+            is_dir: true,
+            seg_matches: vec![seg("home", &[]), seg("ryan", &[0, 1])],
+        };
+        let hi = Style::new().fg(theme::MATCH).add_modifier(Modifier::BOLD);
+        let sep = Style::new().dim();
+        let line = draw_search_row(&pm, &pane, true, true, hi, sep, "/");
+        let joined = join_spans(&line);
+        assert!(
+            joined.contains("/home/ryan/"),
+            "absolute query must render with leading slash: {joined:?}"
+        );
+    }
+
+    #[test]
+    fn draw_search_row_prepends_tilde_for_home_query() {
+        let mut pane = Pane::new(std::path::PathBuf::from("/srv"));
+        pane.core.query = "~/proj".into();
+        let pm = PathMatch {
+            path: std::path::PathBuf::from("/home/u/proj"),
+            is_dir: true,
+            seg_matches: vec![seg("proj", &[0])],
+        };
+        let hi = Style::new().fg(theme::MATCH).add_modifier(Modifier::BOLD);
+        let sep = Style::new().dim();
+        let line = draw_search_row(&pm, &pane, false, true, hi, sep, "~/");
+        let joined = join_spans(&line);
+        assert!(
+            joined.contains("~/proj/"),
+            "tilde query must render with ~/: {joined:?}"
+        );
+    }
+
+    #[test]
+    fn draw_search_row_no_prefix_for_relative_query() {
+        // A relative query renders segments as-typed — no leading slash. The
+        // cwd base is intentionally not shown.
+        let mut pane = Pane::new(std::path::PathBuf::from("/srv"));
+        pane.core.query = "a/bdir".into();
+        let pm = PathMatch {
+            path: std::path::PathBuf::from("/srv/a/bdir"),
+            is_dir: true,
+            seg_matches: vec![seg("a", &[]), seg("bdir", &[0])],
+        };
+        let hi = Style::new().fg(theme::MATCH).add_modifier(Modifier::BOLD);
+        let sep = Style::new().dim();
+        let line = draw_search_row(&pm, &pane, false, true, hi, sep, "");
+        let joined = join_spans(&line);
+        assert!(
+            joined.contains("a/bdir/") && !joined.contains("/a/bdir/"),
+            "relative query renders segments without a leading slash: {joined:?}"
+        );
     }
 
     // ---- seg_spans: pure per-segment highlight ----

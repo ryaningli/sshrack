@@ -45,15 +45,19 @@ impl TransferScreen {
         let Some(srch) = pane.search.as_mut() else {
             return;
         };
+        // First event of a generation different from the one that produced the
+        // current results: drop the stale results before applying. Gated on
+        // the EVENT's generation (== search_gen), not a boolean — so a stale
+        // event from the previous generation that drains after search_request
+        // (but before the new search launches and bumps search_gen) cannot
+        // flip the gate and let the new generation's first hit append to
+        // (instead of replace) the old results.
+        let first_of_gen = srch.results_gen != Some(ev.r#gen);
         match ev.kind {
             SearchEventKind::Match(m) => {
-                if !srch.yielded {
-                    // First event of this generation: drop the stale
-                    // previous-query results so the new hits replace — not
-                    // concatenate with — them.
+                if first_of_gen {
                     srch.results.clear();
                     srch.cursor = 0;
-                    srch.yielded = true;
                 }
                 srch.results.push(m);
                 rank_matches(&mut srch.results);
@@ -63,17 +67,19 @@ impl TransferScreen {
                 if srch.cursor >= len {
                     srch.cursor = len.saturating_sub(1);
                 }
+                srch.results_gen = Some(ev.r#gen);
             }
             SearchEventKind::Done => {
-                // A search that yielded no Match must clear the stale results
-                // so the renderer shows "no matches" instead of the previous
-                // query's hits.
-                if !srch.yielded {
+                // A search that produced no Match reaches Done as the first
+                // event of its generation: clear the stale results so the
+                // renderer shows "no matches" instead of the previous query's
+                // hits.
+                if first_of_gen {
                     srch.results.clear();
                     srch.cursor = 0;
-                    srch.yielded = true;
                 }
                 srch.searching = false;
+                srch.results_gen = Some(ev.r#gen);
             }
             SearchEventKind::Error(msg) => {
                 srch.searching = false;
@@ -82,7 +88,7 @@ impl TransferScreen {
                 // are empty), so drop any stale hits.
                 srch.results.clear();
                 srch.cursor = 0;
-                srch.yielded = true;
+                srch.results_gen = Some(ev.r#gen);
             }
         }
     }
@@ -91,13 +97,16 @@ impl TransferScreen {
     /// A plain single name (no slash) with `base == cwd` stays in filter mode
     /// (the synchronous `core.recompute` already handles it); a trailing slash,
     /// any multi-segment, or an out-of-cwd query enters find mode (set
-    /// `pane.search`, mark it `searching` with `yielded` reset, and stash
-    /// `pending_search` for the run loop to launch). Pure: no I/O.
+    /// `pane.search`, mark it `searching`, and stash `pending_search` for the
+    /// run loop to launch). Pure: no I/O.
     ///
-    /// Stale-while-revalidate: the previous query's `results` are deliberately
-    /// kept here (not cleared) so the list does not flash to "search…" on every
-    /// keystroke. [`apply_search_event`](Self::apply_search_event) clears them
-    /// on the first event of the new generation (the `yielded` gate).
+    /// Stale-while-revalidate: the previous query's `results` AND `results_gen`
+    /// are deliberately kept here (not cleared) so the list does not flash to
+    /// "search…" on every keystroke. [`apply_search_event`](Self::apply_search_event)
+    /// clears the results on the first event whose generation differs from
+    /// `results_gen` — gated on the event's generation, not a reset boolean, so
+    /// a stale previous-generation event draining in the debounce window
+    /// cannot flip the gate ahead of the new generation's first hit.
     pub(crate) fn search_request(&mut self, side: Side, query: String) {
         if query.is_empty() {
             self.pane_mut(side)
@@ -128,12 +137,12 @@ impl TransferScreen {
                 let srch = pane.search.get_or_insert_with(PaneSearch::empty);
                 srch.searching = true;
                 srch.error = None;
-                srch.yielded = false;
-                // NOTE: results are intentionally kept (not cleared). The
-                // previous query's hits stay visible until the new search's
-                // first event lands — stale-while-revalidate, so the list
-                // does not flash empty on every keystroke. apply_search_event
-                // clears them via the `yielded` gate.
+                // NOTE: results AND results_gen are intentionally kept (not
+                // cleared). The previous query's hits stay visible until the
+                // new search's first event lands — stale-while-revalidate, so
+                // the list does not flash empty on every keystroke.
+                // apply_search_event clears them when an event of a NEW
+                // generation (results_gen != Some(ev.gen)) arrives.
             }
         }
         self.pending_search = launch;

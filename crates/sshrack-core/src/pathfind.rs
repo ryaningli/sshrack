@@ -44,6 +44,37 @@ pub fn parse_query(raw: &str, cwd: &Path, home: Option<&Path>) -> ParsedQuery {
     }
 }
 
+/// The base-syntax prefix the user typed to address the search base — the
+/// leading `/`, `~/`, or `../` chain — for faithful display of match paths.
+/// The renderer prepends this to the matched segments (which carry only the
+/// path *relative to the base*), so an absolute query shows `/home/ryan/`
+/// instead of `home/ryan/`. Returns `""` for a bare or `./` relative query
+/// (the segments already render relative, matching the typed form). Pure.
+pub fn base_display_prefix(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.starts_with('/') {
+        return "/".to_string();
+    }
+    if raw.starts_with('~') {
+        return "~/".to_string();
+    }
+    if raw.starts_with("./") {
+        return String::new();
+    }
+    // One or more leading `../` — reconstruct the chain verbatim. A bare `..`
+    // (no trailing slash) also addresses the parent, so it yields `../`.
+    let mut prefix = String::new();
+    let mut rest = raw;
+    while let Some(r) = rest.strip_prefix("../") {
+        prefix.push_str("../");
+        rest = r;
+    }
+    if rest == ".." {
+        prefix.push_str("../");
+    }
+    prefix
+}
+
 /// Split `raw` into `(base, rest_str)` by leading prefix. Pure.
 fn resolve_base<'a>(raw: &'a str, cwd: &Path, home: Option<&Path>) -> (PathBuf, &'a str) {
     if let Some(rest) = raw.strip_prefix('~') {
@@ -453,6 +484,46 @@ mod tests {
         let q = parse_query("", Path::new("/srv"), None);
         assert_eq!(q.base, PathBuf::from("/srv"));
         assert!(q.segments.is_empty());
+    }
+
+    #[test]
+    fn base_display_prefix_absolute_is_root_slash() {
+        // An absolute query's base syntax is the leading `/` — the part of the
+        // path NOT carried by seg_matches, which the renderer must re-prepend.
+        assert_eq!(base_display_prefix("/home/ryan"), "/");
+        assert_eq!(base_display_prefix("/"), "/");
+        assert_eq!(base_display_prefix("/a/b/c"), "/");
+    }
+
+    #[test]
+    fn base_display_prefix_tilde_is_home() {
+        assert_eq!(base_display_prefix("~/proj"), "~/");
+        assert_eq!(base_display_prefix("~"), "~/");
+        assert_eq!(base_display_prefix("~/a/b"), "~/");
+    }
+
+    #[test]
+    fn base_display_prefix_relative_is_empty() {
+        // Bare and `./` relative queries render their segments as-typed (no
+        // leading prefix) — the cwd base is intentionally NOT shown.
+        assert_eq!(base_display_prefix("a/b"), "");
+        assert_eq!(base_display_prefix("a"), "");
+        assert_eq!(base_display_prefix("./a"), "");
+        assert_eq!(base_display_prefix("./a/b"), "");
+    }
+
+    #[test]
+    fn base_display_prefix_parent_chain_reconstructed() {
+        assert_eq!(base_display_prefix("../a"), "../");
+        assert_eq!(base_display_prefix("../../a"), "../../");
+        assert_eq!(base_display_prefix(".."), "../");
+        assert_eq!(base_display_prefix("../"), "../");
+    }
+
+    #[test]
+    fn base_display_prefix_trims_whitespace() {
+        assert_eq!(base_display_prefix("  /home/ryan  "), "/");
+        assert_eq!(base_display_prefix(" ~/x"), "~/");
     }
 
     #[test]
