@@ -225,12 +225,12 @@ impl TransferScreen {
     /// Pure key router. Mirrors the app's three-layer discipline
     /// (Press-only): `Tab` completes the focused pane's query from its
     /// highlighted candidate (directory → `name/` enters the next level;
-    /// file → full name) and falls back to flipping focus when the query is
-    /// empty or no candidate is under the cursor — but is swallowed (no focus
-    /// flip) while a find search is in flight with no candidate yet, so a fast
-    /// Tab does not steal focus from a completion the user is waiting on;
-    /// `Shift-Tab` always flips focus, `Ctrl-Enter` enqueues the focused pane's
-    /// marked (or selected)
+    /// file → full name). In filter mode it falls back to flipping focus when
+    /// the query is empty or no candidate is under the cursor; in find mode
+    /// (an active cross-directory search) `Tab` never flips focus — it
+    /// completes or is swallowed (in flight, zero results, or no candidate) so
+    /// a search session never bounces panes; `Shift-Tab` always flips focus,
+    /// `Ctrl-Enter` enqueues the focused pane's marked (or selected)
     /// entries, `Esc` cancels an active transfer or else closes the screen,
     /// `Ctrl-C` always closes, and everything else delegates to the focused
     /// [`Pane::on_key`]. Performs no I/O; the returned [`ScreenOutcome`] tells
@@ -278,28 +278,23 @@ impl TransferScreen {
             }
             // Tab completes the focused pane's query from its highlighted
             // candidate when one exists (directory → name/ enters the next
-            // level; file → full name). Otherwise it flips focus — so Tab still
-            // switches panes when the query box is empty or nothing is under
-            // the cursor — UNLESS a find search is still in flight with no
-            // candidate yet, in which case Tab is swallowed so a fast keypress
-            // does not steal focus from the completion the user is waiting on
-            // (Shift-Tab is the dedicated, always-switches escape).
+            // level; file → full name). In filter mode (no active search,
+            // incl. an empty query) it otherwise flips focus. In find mode
+            // (an active cross-directory search) Tab NEVER flips focus —
+            // whether the search is in flight, finished with zero results,
+            // or has a candidate — so a search-session Tab never bounces the
+            // user to the other pane (Shift-Tab is the dedicated,
+            // always-switches escape).
             KeyCode::Tab if !ctrl => {
-                // Flip focus only when Tab neither completed (a candidate was
-                // under the cursor) nor is swallowed by an in-flight find
-                // search with no candidate yet. complete_focused applies the
-                // completion as a side effect, so its result alone gates the
-                // flip; the searching guard keeps a fast Tab from stealing
-                // focus while the user waits on results (Shift-Tab always
-                // switches).
+                // Flip focus only in filter mode when Tab did not just
+                // complete a candidate. In find mode Tab is completion-only:
+                // it completes, or is swallowed (never flips). complete_focused
+                // applies the completion as a side effect, so its result gates
+                // the flip; the in_find guard keeps any find-mode Tab from
+                // switching panes.
                 let completed = self.complete_focused();
-                let swallowed = !completed
-                    && self
-                        .focused_pane()
-                        .search
-                        .as_ref()
-                        .is_some_and(|s| s.searching);
-                if !completed && !swallowed {
+                let in_find = self.focused_pane().search.is_some();
+                if !completed && !in_find {
                     self.flip_focus();
                 }
                 ScreenOutcome::Continue
