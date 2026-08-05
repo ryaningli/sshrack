@@ -1662,19 +1662,20 @@ fn tab_find_mode_completes_home_path_preserves_tilde_prefix() {
 // ---- find flicker: stale-while-revalidate ----
 //
 // Re-typing in find mode used to clear `results` immediately, so the list
-// flashed to "searching…" on every keystroke until the new search yielded.
-// Stale-while-revalidate keeps the previous query's results visible until the
-// new generation's first event lands (`PaneSearch.yielded` gates the clear).
+// flashed to "searching…" on every keystroke until the new search produced
+// results. Stale-while-revalidate keeps the previous query's results visible
+// until an event of a NEW generation lands (`PaneSearch.results_gen` gates
+// the clear).
 
 #[test]
 fn search_request_find_mode_keeps_stale_results_until_first_event() {
-    // A new find query must NOT clear the previous query's results: they stay
-    // visible (searching=true, yielded=false) so the renderer does not flash
-    // empty. The first event of the new generation clears them.
+    // A new find query must NOT clear the previous query's results or reset
+    // `results_gen`: they stay visible (searching=true) so the renderer does
+    // not flash empty. The first event of a NEW generation clears them.
     let mut s = TransferScreen::new(PathBuf::from("/srv"), PathBuf::from("/r"));
     let mut prior = PaneSearch::empty();
     prior.searching = false;
-    prior.yielded = true;
+    prior.results_gen = Some(0);
     prior.results = vec![PathMatch {
         path: PathBuf::from("/srv/old"),
         is_dir: false,
@@ -1685,9 +1686,10 @@ fn search_request_find_mode_keeps_stale_results_until_first_event() {
     s.search_request(Side::Local, "a/b".into());
     let srch = s.local.search.as_ref().expect("still find mode");
     assert!(srch.searching, "new search marked in-flight");
-    assert!(
-        !srch.yielded,
-        "yielded reset: new generation has produced no events yet"
+    assert_eq!(
+        srch.results_gen,
+        Some(0),
+        "results_gen kept: new generation has produced no events yet"
     );
     assert_eq!(
         srch.results.len(),
@@ -1698,12 +1700,13 @@ fn search_request_find_mode_keeps_stale_results_until_first_event() {
 
 #[test]
 fn apply_search_event_first_match_clears_stale_results() {
-    // The first Match of the new generation drops the stale results before
-    // pushing, so the list swaps cleanly old→new instead of concatenating.
+    // The first Match of a NEW generation (results_gen != Some(ev.gen)) drops
+    // the stale results before pushing, so the list swaps cleanly old→new
+    // instead of concatenating.
     let mut s = TransferScreen::new(PathBuf::from("/srv"), PathBuf::from("/r"));
     let mut srch = PaneSearch::empty();
     srch.searching = true;
-    srch.yielded = false;
+    srch.results_gen = Some(0); // results belong to a previous generation
     srch.results = vec![PathMatch {
         path: PathBuf::from("/srv/old"),
         is_dir: false,
@@ -1723,7 +1726,7 @@ fn apply_search_event_first_match_clears_stale_results() {
         },
     );
     let srch = s.local.search.as_ref().unwrap();
-    assert!(srch.yielded, "yielded set after first event");
+    assert_eq!(srch.results_gen, Some(1), "results_gen advanced to new gen");
     assert_eq!(srch.results.len(), 1, "stale result replaced, not appended");
     assert_eq!(srch.results[0].path, PathBuf::from("/srv/new"));
 }
@@ -1735,7 +1738,7 @@ fn apply_search_event_done_zero_results_clears_stale() {
     let mut s = TransferScreen::new(PathBuf::from("/srv"), PathBuf::from("/r"));
     let mut srch = PaneSearch::empty();
     srch.searching = true;
-    srch.yielded = false;
+    srch.results_gen = Some(0);
     srch.results = vec![PathMatch {
         path: PathBuf::from("/srv/old"),
         is_dir: false,
@@ -1752,10 +1755,88 @@ fn apply_search_event_done_zero_results_clears_stale() {
     );
     let srch = s.local.search.as_ref().unwrap();
     assert!(!srch.searching, "Done clears searching");
+    assert_eq!(srch.results_gen, Some(1));
     assert!(
         srch.results.is_empty(),
         "zero-result Done clears stale results (no lingering previous hits)"
     );
+}
+
+#[test]
+fn apply_search_event_new_gen_clears_after_stale_drain_race() {
+    // Bug 2 regression: the fast-backspace duplicate. Sequence —
+    //   gen 0 produced a result (results_gen = Some(0));
+    //   user retypes → search_request keeps the stale results (no flash);
+    //   a LATE gen-0 event drains in the debounce window (search_gen still 0,
+    //     new search not launched yet) — same generation, so it APPENDS;
+    //   the new search launches → search_gen bumps to 1;
+    //   gen 1's first Match arrives — must CLEAR the gen-0 results and land
+    //     alone, NOT concatenate. The clear is gated on the event's generation
+    //     differing from results_gen, so the late gen-0 drain (which left
+    //     results_gen == Some(0)) cannot suppress it.
+    let mut s = TransferScreen::new(PathBuf::from("/srv"), PathBuf::from("/r"));
+    s.search_gen = 0;
+    let mut srch = PaneSearch::empty();
+    srch.results_gen = Some(0);
+    srch.results = vec![PathMatch {
+        path: PathBuf::from("/home/ryan"),
+        is_dir: true,
+        seg_matches: vec![SegMatch {
+            name: "ryan".into(),
+            score: 3,
+            indices: vec![0, 1, 2],
+        }],
+    }];
+    s.local.search = Some(srch);
+    // User retypes; stale results + results_gen kept (stale-while-revalidate).
+    s.search_request(Side::Local, "/home/ry".into());
+    // A late gen-0 event drains before the new search launches (search_gen=0).
+    s.apply_search_event(
+        Side::Local,
+        SearchEvent {
+            r#gen: 0,
+            kind: SearchEventKind::Match(PathMatch {
+                path: PathBuf::from("/home/ryan-old"),
+                is_dir: true,
+                seg_matches: vec![SegMatch {
+                    name: "ryan-old".into(),
+                    score: 3,
+                    indices: vec![0, 1, 2],
+                }],
+            }),
+        },
+    );
+    assert_eq!(
+        s.local.search.as_ref().unwrap().results.len(),
+        2,
+        "same-gen stale event appends (stale-while-revalidate)"
+    );
+    assert_eq!(s.local.search.as_ref().unwrap().results_gen, Some(0));
+    // New search launches → generation advances.
+    s.search_gen = 1;
+    s.apply_search_event(
+        Side::Local,
+        SearchEvent {
+            r#gen: 1,
+            kind: SearchEventKind::Match(PathMatch {
+                path: PathBuf::from("/home/ryan"),
+                is_dir: true,
+                seg_matches: vec![SegMatch {
+                    name: "ryan".into(),
+                    score: 2,
+                    indices: vec![0, 1],
+                }],
+            }),
+        },
+    );
+    let srch = s.local.search.as_ref().unwrap();
+    assert_eq!(
+        srch.results.len(),
+        1,
+        "new generation clears stale gen-0 results — no duplicate path"
+    );
+    assert_eq!(srch.results[0].path, PathBuf::from("/home/ryan"));
+    assert_eq!(srch.results_gen, Some(1));
 }
 
 #[test]
@@ -1766,7 +1847,7 @@ fn tab_while_searching_with_no_candidate_does_not_flip_focus() {
     // pane — the user's intent is completion, not switching. Swallow it until
     // the search produces a candidate; Shift-Tab remains the dedicated switch.
     let mut s = TransferScreen::new(PathBuf::from("/srv"), PathBuf::from("/r"));
-    // PaneSearch::empty(): searching=true, results=[], yielded=false.
+    // PaneSearch::empty(): searching=true, results=[], results_gen=None.
     s.local.search = Some(PaneSearch::empty());
     s.local.core.query = "/ho".into();
     assert_eq!(s.focus, Side::Local);
@@ -1790,7 +1871,6 @@ fn tab_while_searching_does_not_complete_from_stale_results() {
     let mut s = TransferScreen::new(PathBuf::from("/srv"), PathBuf::from("/r"));
     let mut srch = PaneSearch::empty();
     srch.searching = true; // new search in flight
-    srch.yielded = false;
     srch.results = vec![PathMatch {
         // stale result from the PREVIOUS query (`/home/ryan/` list-all)
         path: PathBuf::from("/home/ryan/some_dir"),
@@ -1825,7 +1905,6 @@ fn tab_find_mode_zero_results_does_not_flip_focus() {
     let mut s = TransferScreen::new(PathBuf::from("/srv"), PathBuf::from("/r"));
     let mut srch = PaneSearch::empty();
     srch.searching = false; // search finished
-    srch.yielded = true;
     srch.results = vec![]; // zero matches
     s.local.search = Some(srch);
     s.local.core.query = "/srv/zzz".into();
