@@ -20,14 +20,8 @@ use crate::tui::transfer::screen::ScreenOutcome;
 /// drop the overlay without quitting. A confirm key returns
 /// [`ScreenOutcome::CloseTransfer`] directly.
 ///
-/// Reachability: the owning `TransferScreen` (Task 2 of the quit-confirm
-/// plan) opens this overlay. Until that wiring lands, no `main` call site
-/// reaches `draw` (or the `direction`/`name` fields it reads), so
-/// `cargo clippy --all-targets` (which lints the non-test binary target
-/// separately from the test target) flags it dead. The scoped
-/// `#[allow(dead_code)]` annotations below are removed once Task 2 wires
-/// the screen to construct + pump + draw this overlay.
-#[allow(dead_code)]
+/// Reachability: the owning `TransferScreen` opens this overlay from its
+/// `request_close` guard when a transfer is in flight.
 #[derive(Debug)]
 pub(crate) struct CloseConfirm {
     direction: Direction,
@@ -35,7 +29,6 @@ pub(crate) struct CloseConfirm {
     closed: bool,
 }
 
-#[allow(dead_code)] // screen wiring lands in Task 2; see the struct note.
 impl CloseConfirm {
     /// Snapshot the in-flight task's display info.
     pub(crate) fn new(direction: Direction, name: String) -> Self {
@@ -95,7 +88,6 @@ impl CloseConfirm {
 }
 
 /// Direction → (glyph, word) for the in-flight summary line.
-#[allow(dead_code)] // only called from `draw`, whose screen wiring lands in Task 2.
 fn direction_display(d: Direction) -> (&'static str, &'static str) {
     match d {
         Direction::Upload => ("↑", "upload"),

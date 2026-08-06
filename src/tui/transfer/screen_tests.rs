@@ -35,6 +35,28 @@ fn entry(name: &str, parent: &Path, is_dir: bool) -> DirEntry {
     }
 }
 
+/// Seed one in-flight upload task named `name` (mirrors the seeding in
+/// `filter_esc_clears_query_before_cancelling_inflight_transfer`).
+fn seed_inflight_upload(s: &mut TransferScreen, name: &str) {
+    s.ledger.enqueue(TransferJob {
+        direction: Direction::Upload,
+        src: PathBuf::from("/srv").join(name),
+        dst: PathBuf::from("/r").join(name),
+        name: name.into(),
+        size_total: Some(100),
+        recursive: false,
+    });
+    s.ledger.next_to_dispatch();
+    s.ledger.set_inflight_progress(Progress {
+        name: name.into(),
+        direction: Direction::Upload,
+        bytes_done: 0,
+        bytes_total: Some(100),
+        rate_bps: None,
+        eta_secs: None,
+    });
+}
+
 /// Build a screen with a few entries on each side, a marked local file, an
 /// active upload, and one queued download — the rendering smoke case.
 fn canned_screen() -> TransferScreen {
@@ -784,37 +806,6 @@ fn filter_esc_clears_query_before_cancelling_inflight_transfer() {
     assert!(
         s.has_inflight(),
         "transfer still in flight after query-clear Esc"
-    );
-}
-
-#[test]
-fn ctrl_c_always_returns_close_transfer() {
-    let mut screen = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
-    let out = screen.on_key(press(KeyCode::Char('c'), KeyModifiers::CONTROL));
-    assert_eq!(out, ScreenOutcome::CloseTransfer);
-    // Even with an active transfer, Ctrl-C closes (the user wants out).
-    screen.ledger.enqueue(TransferJob {
-        direction: Direction::Upload,
-        src: PathBuf::from("/l/x"),
-        dst: PathBuf::from("/r/x"),
-        name: "x".into(),
-        size_total: Some(10),
-        recursive: false,
-    });
-    screen.ledger.next_to_dispatch();
-    screen.ledger.set_inflight_progress(Progress {
-        name: "x".into(),
-        direction: Direction::Upload,
-        bytes_done: 0,
-        bytes_total: Some(10),
-        rate_bps: None,
-        eta_secs: None,
-    });
-    let out = screen.on_key(press(KeyCode::Char('c'), KeyModifiers::CONTROL));
-    assert_eq!(
-        out,
-        ScreenOutcome::CloseTransfer,
-        "Ctrl-C closes even with an active transfer"
     );
 }
 
@@ -2572,4 +2563,103 @@ fn advance_spinner_noop_when_no_search_in_flight() {
         s.spinner, 0,
         "a finished search must not animate the spinner"
     );
+}
+
+// ---- quit-confirm overlay: Ctrl-C / Esc route through request_close ----
+//
+// Every quit path (Esc's final layer + Ctrl-C) routes through a single
+// `request_close()` guard that opens the `CloseConfirm` overlay when a
+// transfer is in flight, so the exit never silently discards the active task.
+
+#[test]
+fn ctrl_c_with_inflight_opens_quit_confirm_instead_of_quitting() {
+    // Every quit path routes through request_close: Ctrl-C while a transfer
+    // is in flight must NOT close — it opens the confirmation overlay and
+    // stays. The in-flight task is untouched (still InFlight).
+    let cwd = PathBuf::from("/srv");
+    let mut s = TransferScreen::new(cwd.clone(), PathBuf::from("/r"));
+    seed_inflight_upload(&mut s, "big.tar");
+
+    let out = s.on_key(press(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+    assert_eq!(
+        out,
+        ScreenOutcome::Continue,
+        "Ctrl-C does not quit while in flight"
+    );
+    assert!(s.close_confirm.is_some(), "quit-confirm overlay opened");
+    assert!(
+        s.has_inflight(),
+        "in-flight task not cancelled by opening the overlay"
+    );
+}
+
+#[test]
+fn esc_with_inflight_still_cancels_active_and_does_not_open_confirm() {
+    // Esc's in-flight branch is CancelActive (a cancel, NOT a quit), so the
+    // quit guard must not intercept it. Pinning this prevents a regression
+    // where Esc accidentally opens the quit dialog instead of cancelling.
+    let cwd = PathBuf::from("/srv");
+    let mut s = TransferScreen::new(cwd.clone(), PathBuf::from("/r"));
+    seed_inflight_upload(&mut s, "big.tar");
+
+    let out = s.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
+
+    assert_eq!(
+        out,
+        ScreenOutcome::CancelActive,
+        "Esc still cancels the transfer"
+    );
+    assert!(
+        s.close_confirm.is_none(),
+        "Esc cancel must not open the quit overlay"
+    );
+}
+
+#[test]
+fn quit_confirm_enter_quits() {
+    let cwd = PathBuf::from("/srv");
+    let mut s = TransferScreen::new(cwd.clone(), PathBuf::from("/r"));
+    seed_inflight_upload(&mut s, "big.tar");
+    s.on_key(press(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(s.close_confirm.is_some());
+
+    let out = s.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(out, ScreenOutcome::CloseTransfer, "Enter confirms the quit");
+}
+
+#[test]
+fn quit_confirm_cancel_keeps_transfer_and_closes_overlay() {
+    let cwd = PathBuf::from("/srv");
+    let mut s = TransferScreen::new(cwd.clone(), PathBuf::from("/r"));
+    seed_inflight_upload(&mut s, "big.tar");
+    s.on_key(press(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(s.close_confirm.is_some());
+
+    let out = s.on_key(press(KeyCode::Char('n'), KeyModifiers::NONE));
+
+    assert_eq!(out, ScreenOutcome::Continue, "cancel stays in SFTP");
+    assert!(s.close_confirm.is_none(), "overlay closed after cancel");
+    assert!(
+        s.has_inflight(),
+        "in-flight task still running after cancel"
+    );
+}
+
+#[test]
+fn ctrl_c_idle_closes_immediately_without_overlay() {
+    let mut s = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
+    assert!(!s.has_inflight());
+    let out = s.on_key(press(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert_eq!(out, ScreenOutcome::CloseTransfer);
+    assert!(s.close_confirm.is_none());
+}
+
+#[test]
+fn esc_idle_quit_path_does_not_open_overlay() {
+    let mut s = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
+    assert!(!s.has_inflight());
+    let out = s.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
+    assert_eq!(out, ScreenOutcome::CloseTransfer);
+    assert!(s.close_confirm.is_none());
 }

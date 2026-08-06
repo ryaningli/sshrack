@@ -35,6 +35,7 @@ use sshrack_core::pathfind::{ParsedQuery, SearchEvent};
 
 use crate::tui::intent::Status;
 use crate::tui::theme;
+use crate::tui::transfer::close_confirm::CloseConfirm;
 use crate::tui::transfer::ledger::TransferLedger;
 use crate::tui::transfer::pane::{Pane, PaneOutcome, Side};
 use crate::tui::transfer::queue_overlay::QueueOverlay;
@@ -117,6 +118,12 @@ pub struct TransferScreen {
     /// The `^Q` queue-manager modal. `None` when closed. Owned here (not as an
     /// `App::overlay`) because the transfer screen bypasses the overlay stack.
     pub queue_overlay: Option<QueueOverlay>,
+    /// The quit-SFTP confirmation modal. `None` unless the user tried to quit
+    /// (`Esc` final layer / `Ctrl-C`) while a transfer was in flight — see
+    /// [`TransferScreen::request_close`]. Owned here (not on the `App` overlay
+    /// stack) because the transfer screen bypasses that stack and owns its own
+    /// popups, like [`queue_overlay`](Self::queue_overlay).
+    pub close_confirm: Option<CloseConfirm>,
     /// Pending search launch: the focused side + parsed query that the run
     /// loop (Task 9) reads to spawn a
     /// [`PathSearch`](sshrack_core::pathfind::PathSearch). Set by
@@ -178,6 +185,7 @@ impl TransferScreen {
             pending_list: None,
             overwrite_policy: None,
             queue_overlay: None,
+            close_confirm: None,
             pending_search: None,
             search_rx: None,
             search_cancel: None,
@@ -264,6 +272,29 @@ impl TransferScreen {
         }
     }
 
+    /// Unified quit guard. Every code path that would close the SFTP screen
+    /// routes through here — both `Esc`'s final layer and `Ctrl-C` — so the
+    /// trigger key is irrelevant: any quit while a transfer is in flight is
+    /// intercepted.
+    ///
+    /// If a transfer is in flight (and the overlay is not already open), open
+    /// [`CloseConfirm`] snapshotted to that task and return [`Continue`](ScreenOutcome::Continue)
+    /// (stay in SFTP; the user confirms via the overlay). Otherwise return
+    /// [`CloseTransfer`](ScreenOutcome::CloseTransfer) at once. If the in-flight
+    /// id/job cannot be resolved (should not happen — `has_inflight` implies a
+    /// resolvable `inflight_id`), fall through to closing so a broken ledger
+    /// never traps the user in the screen.
+    fn request_close(&mut self) -> ScreenOutcome {
+        if self.close_confirm.is_none()
+            && let Some(id) = self.ledger.inflight_id()
+            && let Some(job) = self.ledger.job_for(id)
+        {
+            self.close_confirm = Some(CloseConfirm::new(job.direction, job.name.clone()));
+            return ScreenOutcome::Continue;
+        }
+        ScreenOutcome::CloseTransfer
+    }
+
     /// Pure key router. Mirrors the app's three-layer discipline
     /// (Press-only): `Tab` completes the focused pane's query from its
     /// highlighted candidate (directory → `name/` enters the next level;
@@ -275,9 +306,10 @@ impl TransferScreen {
     /// `Ctrl-Enter` enqueues the focused pane's marked (or selected)
     /// entries, `Esc` peels layers inside-out (cancel an in-flight find, else
     /// clear a non-empty filter query, else cancel an active transfer, else
-    /// close), `Ctrl-C` always closes, and everything else delegates to the focused
-    /// [`Pane::on_key`]. Performs no I/O; the returned [`ScreenOutcome`] tells
-    /// the run loop what side effect to run.
+    /// close), `Ctrl-C` quits via [`request_close`](Self::request_close)
+    /// (confirms first if a transfer is in flight), and everything else
+    /// delegates to the focused [`Pane::on_key`]. Performs no I/O; the
+    /// returned [`ScreenOutcome`] tells the run loop what side effect to run.
     ///
     /// For navigation intents (`StepInto` / `StepUp` / `RequestList`) this
     /// sets [`pending_list`](Self::pending_list) and returns `Continue` —
@@ -304,6 +336,21 @@ impl TransferScreen {
             let out = ov.on_key(key, &mut self.ledger);
             if !ov.closed {
                 self.queue_overlay = Some(ov);
+            }
+            return out;
+        }
+        // The quit-confirm overlay is modal: when open it owns every key.
+        // Confirmed (CloseTransfer) or cancelled (closed) the overlay is not
+        // reseated; a neutral key keeps it open. Same shape as the
+        // queue-overlay gate above.
+        if self.close_confirm.is_some() {
+            let mut ov = match self.close_confirm.take() {
+                Some(ov) => ov,
+                None => return ScreenOutcome::Continue,
+            };
+            let out = ov.on_key(key);
+            if !ov.closed() && !matches!(out, ScreenOutcome::CloseTransfer) {
+                self.close_confirm = Some(ov);
             }
             return out;
         }
@@ -371,11 +418,12 @@ impl TransferScreen {
                 } else if self.has_inflight() {
                     ScreenOutcome::CancelActive
                 } else {
-                    ScreenOutcome::CloseTransfer
+                    self.request_close()
                 }
             }
-            // Ctrl-C always closes (matches the rest of the app).
-            KeyCode::Char('c') if ctrl => ScreenOutcome::CloseTransfer,
+            // Ctrl-C quits via request_close (opens the confirm overlay if a
+            // transfer is in flight, else closes immediately).
+            KeyCode::Char('c') if ctrl => self.request_close(),
             // Ctrl-Q toggles the queue-manager overlay. (Bare `q`/`Q` stay
             // bound to the pane search box per the no-bare-hotkey invariant.)
             KeyCode::Char('q') if ctrl => {
@@ -638,6 +686,11 @@ impl TransferScreen {
         // The queue-manager overlay paints last so it sits above every band.
         if let Some(ov) = &self.queue_overlay {
             ov.draw(frame, &self.ledger);
+        }
+        // The quit-confirm overlay paints last so it sits above every band,
+        // including the queue overlay.
+        if let Some(ov) = &self.close_confirm {
+            ov.draw(frame);
         }
     }
 
