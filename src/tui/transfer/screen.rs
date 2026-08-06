@@ -305,9 +305,9 @@ impl TransferScreen {
     /// a search session never bounces panes; `Shift-Tab` always flips focus,
     /// `Ctrl-Enter` enqueues the focused pane's marked (or selected)
     /// entries, `Esc` peels layers inside-out (cancel an in-flight find, else
-    /// clear a non-empty filter query, else cancel an active transfer, else
-    /// close), `Ctrl-C` quits via [`request_close`](Self::request_close)
-    /// (confirms first if a transfer is in flight), and everything else
+    /// clear a non-empty filter query, else quit), `Ctrl-C` quits outright —
+    /// both quit paths route through [`request_close`](Self::request_close)
+    /// and confirm first if a transfer is in flight — and everything else
     /// delegates to the focused [`Pane::on_key`]. Performs no I/O; the
     /// returned [`ScreenOutcome`] tells the run loop what side effect to run.
     ///
@@ -407,7 +407,9 @@ impl TransferScreen {
             // Esc peels layers inside-out: cancel an in-flight cross-dir find,
             // else clear a non-empty filter query (mirrors find mode — the
             // instinct to clear the search box must not close the session),
-            // else cancel an active transfer, else close the screen.
+            // else quit via request_close (confirms first if a transfer is in
+            // flight). Cancelling an in-flight transfer is owned by ^Q's queue
+            // manager, not Esc — so Esc never silently discards an active task.
             KeyCode::Esc => {
                 if in_search {
                     self.cancel_search();
@@ -415,8 +417,6 @@ impl TransferScreen {
                 } else if !self.focused_pane().core.query.is_empty() {
                     self.clear_query(self.focus);
                     ScreenOutcome::Continue
-                } else if self.has_inflight() {
-                    ScreenOutcome::CancelActive
                 } else {
                     self.request_close()
                 }

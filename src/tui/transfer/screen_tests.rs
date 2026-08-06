@@ -694,35 +694,6 @@ fn plain_s_types_into_filter_and_does_not_enqueue() {
 // ---- on_key: Esc / Ctrl-C ----
 
 #[test]
-fn esc_with_active_transfer_returns_cancel_active() {
-    let mut screen = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
-    // Seed an in-flight transfer: enqueue + dispatch + progress snapshot.
-    screen.ledger.enqueue(TransferJob {
-        direction: Direction::Upload,
-        src: PathBuf::from("/l/x"),
-        dst: PathBuf::from("/r/x"),
-        name: "x".into(),
-        size_total: Some(10),
-        recursive: false,
-    });
-    screen.ledger.next_to_dispatch();
-    screen.ledger.set_inflight_progress(Progress {
-        name: "x".into(),
-        direction: Direction::Upload,
-        bytes_done: 0,
-        bytes_total: Some(10),
-        rate_bps: None,
-        eta_secs: None,
-    });
-    let out = screen.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
-    assert_eq!(
-        out,
-        ScreenOutcome::CancelActive,
-        "Esc with active → CancelActive"
-    );
-}
-
-#[test]
 fn esc_without_active_transfer_returns_close_transfer() {
     let mut screen = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
     assert!(!screen.has_inflight());
@@ -738,9 +709,9 @@ fn esc_without_active_transfer_returns_close_transfer() {
 fn filter_esc_clears_non_empty_query_instead_of_closing() {
     // In filter mode (no active find), Esc with a non-empty query clears the
     // query and returns to the full current-dir listing — mirroring find
-    // mode's Esc. Only an empty query lets Esc proceed to cancel a transfer
-    // or close the SFTP session. Otherwise the instinct to "clear the search
-    // box" would kick the user out of SFTP.
+    // mode's Esc. Only an empty query lets Esc proceed to quit the SFTP
+    // session. Otherwise the instinct to "clear the search box" would kick
+    // the user out of SFTP.
     let cwd = PathBuf::from("/srv");
     let mut s = TransferScreen::new(cwd.clone(), PathBuf::from("/r"));
     s.local.set_entries(vec![
@@ -763,11 +734,12 @@ fn filter_esc_clears_non_empty_query_instead_of_closing() {
 }
 
 #[test]
-fn filter_esc_clears_query_before_cancelling_inflight_transfer() {
-    // Esc peels layers inside-out: a non-empty query is cleared BEFORE an
-    // in-flight transfer is cancelled — matching find mode's precedence
-    // (in_search is checked before has_inflight). The user cancels the
-    // transfer with a second Esc once the query is empty.
+fn filter_esc_clears_query_before_opening_quit_confirm() {
+    // Esc peels layers inside-out: a non-empty query is cleared BEFORE Esc
+    // reaches the quit path — matching find mode's precedence (in_search is
+    // checked before request_close). A second Esc (query now empty) opens the
+    // quit-confirm overlay; cancelling the transfer itself is done in ^Q's
+    // queue manager, not with Esc.
     let cwd = PathBuf::from("/srv");
     let mut s = TransferScreen::new(cwd.clone(), PathBuf::from("/r"));
     s.local.set_entries(vec![entry("alpha.txt", &cwd, false)]);
@@ -2595,10 +2567,12 @@ fn ctrl_c_with_inflight_opens_quit_confirm_instead_of_quitting() {
 }
 
 #[test]
-fn esc_with_inflight_still_cancels_active_and_does_not_open_confirm() {
-    // Esc's in-flight branch is CancelActive (a cancel, NOT a quit), so the
-    // quit guard must not intercept it. Pinning this prevents a regression
-    // where Esc accidentally opens the quit dialog instead of cancelling.
+fn esc_with_inflight_opens_quit_confirm_instead_of_cancelling() {
+    // Esc no longer cancels an in-flight transfer — that is owned by ^Q's
+    // queue manager. Like Ctrl-C, Esc routes through request_close: with a
+    // transfer in flight it opens the quit-confirm overlay and stays, leaving
+    // the task untouched. Cancelling is a deliberate act in the queue manager,
+    // not an Esc side effect.
     let cwd = PathBuf::from("/srv");
     let mut s = TransferScreen::new(cwd.clone(), PathBuf::from("/r"));
     seed_inflight_upload(&mut s, "big.tar");
@@ -2607,12 +2581,13 @@ fn esc_with_inflight_still_cancels_active_and_does_not_open_confirm() {
 
     assert_eq!(
         out,
-        ScreenOutcome::CancelActive,
-        "Esc still cancels the transfer"
+        ScreenOutcome::Continue,
+        "Esc does not cancel while in flight"
     );
+    assert!(s.close_confirm.is_some(), "quit-confirm overlay opened");
     assert!(
-        s.close_confirm.is_none(),
-        "Esc cancel must not open the quit overlay"
+        s.has_inflight(),
+        "in-flight task not cancelled by opening the overlay"
     );
 }
 

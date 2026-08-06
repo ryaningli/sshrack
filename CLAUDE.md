@@ -76,7 +76,7 @@ Bare `c`, `?`, `1`/`2`/`3` always reach the search box (never act as hotkeys). O
 | `^s` | enqueue marked/selected (dirs recurse via `get -R`/`put -R`) — the advertised trigger |
 | `^Q` | open the queue-manager overlay (retry / remove / cancel / pause) |
 | `Enter` | on a file: enqueue · on a directory: enter (never transfers) |
-| `Esc` | cancel in-flight transfer / close |
+| `Esc` | cancel search · close (confirms if a transfer is in flight) |
 | `^c` | close |
 
 `Ctrl-Enter` collapses to a bare `Enter` on many terminals, so it is only a hidden alias. Entry: `sshrack sftp <name>` or `Ctrl-T` on a host. Full SFTP architecture → [`docs/sftp.md`](docs/sftp.md).
