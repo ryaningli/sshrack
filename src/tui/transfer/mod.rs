@@ -24,6 +24,7 @@
 //! [`Progress`]: sshrack_core::connect::sftp::proto::Progress
 //! [`Status`]: crate::tui::intent::Status
 
+pub(crate) mod close_confirm;
 pub mod ledger;
 pub mod open;
 pub mod overwrite;
