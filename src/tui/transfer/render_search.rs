@@ -99,6 +99,7 @@ pub(crate) fn draw_search_list(frame: &mut Frame, area: Rect, pane: &Pane, focus
             hi,
             sep,
             &prefix,
+            area.width,
         ));
     }
     frame.render_widget(Paragraph::new(lines), area);
@@ -129,15 +130,21 @@ fn draw_dot_row(is_cursor: bool, focused: bool) -> Line<'static> {
 
 /// Build one search-result row: 2-cell spacer + 2-cell focus marker +
 /// base-syntax prefix + joined path with per-segment highlight + trailing dim
-/// `/` for directories. Pure: returns a `Line` the caller renders. Mirrors
-/// [`draw_pane_row`]'s prefix and cursor styling so the two list surfaces
-/// (directory listing and find results) align column-for-column. Find mode has
-/// no marking, so there is no mark glyph here (unlike `draw_pane_row`).
+/// `/` for directories, tail-truncated to `row_width` so a long cross-directory
+/// path shows `…/<leaf>` instead of silently clipping. Pure: returns a `Line`
+/// the caller renders. Mirrors [`draw_pane_row`]'s prefix and cursor styling so
+/// the two list surfaces (directory listing and find results) align
+/// column-for-column.
+///
+/// Truncation is segment-aware (see [`fit_units_tail`]): the row is built as
+/// atomic units — each segment name plus its trailing `/`, with the base prefix
+/// folded into the first unit — then kept from the right until the next would
+/// overflow. Segment boundaries are never split, so each segment's per-char
+/// highlight `indices` stay valid. `row_width` is the full list-area width; the
+/// 4-cell leading prefix (spacer + focus marker) is reserved first.
 ///
 /// `prefix` is the query's base syntax (`/`, `~/`, `../`, or `""` for a
-/// relative query) — the path component `seg_matches` does not carry, prepended
-/// so an absolute query shows `/home/ryan/` not `home/ryan/`. Rendered in the
-/// dim separator style (it is structural, like the inter-segment slashes).
+/// relative query). Rendered in the dim separator style (structural).
 ///
 /// [`draw_pane_row`]: super::render::draw_pane_row
 fn draw_search_row(
@@ -147,6 +154,7 @@ fn draw_search_row(
     hi: Style,
     sep: Style,
     prefix: &str,
+    row_width: u16,
 ) -> Line<'static> {
     // Base style mirrors draw_pane_row: focused cursor = accent + bold, focused
     // non-cursor = plain, non-focused pane = dim overall.
@@ -158,37 +166,99 @@ fn draw_search_row(
         Style::new().dim()
     };
 
-    let mut spans: Vec<Span> = Vec::with_capacity(6);
+    let seg_len = pm.seg_matches.len();
 
-    // Leading 2-space prefix — the mark-glyph column from draw_pane_row, kept
-    // so columns line up with the directory listing. Find mode has no marking,
-    // so this is always blank (the `●` glyph never appears on a search row).
-    spans.push(Span::raw("  "));
-
-    spans.push(theme::focus_marker(focused && is_cursor));
-
-    // Base-syntax prefix (e.g. `/`, `~/`, `../`) — the path component the
-    // seg_matches below do not carry. Prepended so an absolute query renders
-    // `/home/ryan/` instead of `home/ryan/`. Empty (omitted) for a relative
-    // query. Dim like the inter-segment separators: it is structural.
-    if !prefix.is_empty() {
-        spans.push(Span::styled(prefix.to_string(), sep));
-    }
-
-    // Path body: join each SegMatch.name with a dim `/`, highlight the matched
-    // chars within each name (per its own `indices`), and append a trailing
-    // dim `/` for directories.
-    for (s_idx, seg) in pm.seg_matches.iter().enumerate() {
-        if s_idx > 0 {
-            spans.push(Span::styled("/", sep));
+    // Build atomic units (segment name + its trailing "/"), folding the base
+    // prefix into the first unit so the prefix never strands alone when the
+    // head is dropped. The trailing "/" after a segment is either the inter-
+    // segment separator (not-last segment) or the directory's trailing slash
+    // (last segment when is_dir). The last segment of a file gets no slash.
+    let mut units: Vec<Vec<Span<'static>>> = Vec::with_capacity(seg_len);
+    for (i, seg) in pm.seg_matches.iter().enumerate() {
+        let mut unit: Vec<Span<'static>> = Vec::new();
+        if i == 0 && !prefix.is_empty() {
+            unit.push(Span::styled(prefix.to_string(), sep));
         }
-        spans.extend(seg_spans(&seg.name, &seg.indices, base, hi));
-    }
-    if pm.is_dir {
-        spans.push(Span::styled("/", sep));
+        unit.extend(seg_spans(&seg.name, &seg.indices, base, hi));
+        let is_last = i + 1 == seg_len;
+        if !is_last || pm.is_dir {
+            unit.push(Span::styled("/", sep));
+        }
+        units.push(unit);
     }
 
+    let avail = (row_width as usize).saturating_sub(4); // spacer(2) + focus_marker(2)
+    let body = fit_units_tail(units, avail);
+
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(2 + body.len());
+    // Leading 2-space prefix (the mark-glyph column from draw_pane_row, kept so
+    // columns line up). Find mode has no marking, so this is always blank.
+    spans.push(Span::raw("  "));
+    spans.push(theme::focus_marker(focused && is_cursor));
+    spans.extend(body);
     Line::from(spans)
+}
+
+/// Tail-preserving truncation for an ordered list of span "units". Each inner
+/// `Vec<Span>` is an atomic group (a path segment name plus its trailing `/`,
+/// with the base prefix folded into the first group) — truncation never splits
+/// a group, so each segment's per-char fuzzy-highlight indices stay valid.
+///
+/// When everything fits within `avail`, all units are concatenated unchanged.
+/// Otherwise units are kept from the RIGHT until the next would overflow
+/// `avail - 1` (1 cell reserved for a leading `…`), and a dim `…` span is
+/// prepended. If even the last unit alone overflows the budget, that lone unit
+/// is flattened to a string and left-truncated via [`truncate_cells_head`] so
+/// the tail (a filename's extension, or a dir's trailing `/`) survives —
+/// consistent with this helper's tail-preserving strategy. Its highlight
+/// degrades to the unit's first-span style (a rare case where a single segment
+/// name is wider than the whole row). `avail == 0` or no units → empty. Pure.
+fn fit_units_tail(units: Vec<Vec<Span<'static>>>, avail: usize) -> Vec<Span<'static>> {
+    use crate::tui::fit::{cells, truncate_cells_head};
+
+    let n = units.len();
+    if avail == 0 || n == 0 {
+        return Vec::new();
+    }
+    // Width of one unit = sum of its spans' display widths (CJK-aware).
+    let widths: Vec<usize> = units
+        .iter()
+        .map(|u| u.iter().map(|s| cells(s.content.as_ref())).sum())
+        .collect();
+    let total: usize = widths.iter().sum();
+    if total <= avail {
+        return units.into_iter().flatten().collect();
+    }
+
+    // Reserve 1 cell for the leading ellipsis; greedily keep trailing units.
+    let budget = avail.saturating_sub(1);
+    let mut kept_from_right = 0usize;
+    let mut w = 0usize;
+    for i in (0..n).rev() {
+        if w + widths[i] > budget {
+            break;
+        }
+        w += widths[i];
+        kept_from_right += 1;
+    }
+
+    let mut out: Vec<Span<'static>> = Vec::new();
+    if kept_from_right == 0 {
+        // The last unit alone overflows: flatten + left-truncate it (keep the
+        // tail — a filename extension or a dir's trailing `/`).
+        let last = units.last().expect("invariant: n > 0 checked above");
+        let flat: String = last.iter().map(|s| s.content.as_ref()).collect();
+        let style = last.first().map(|s| s.style).unwrap_or_default();
+        out.push(Span::styled(truncate_cells_head(&flat, avail), style));
+        return out;
+    }
+
+    out.push(Span::styled("…", Style::new().dim()));
+    let start = n - kept_from_right;
+    for unit in units.into_iter().skip(start) {
+        out.extend(unit);
+    }
+    out
 }
 
 /// Render one segment's name as styled spans, splitting it into matched and
@@ -293,6 +363,36 @@ mod tests {
         insta::assert_snapshot!(term.backend());
     }
 
+    #[test]
+    fn draw_search_list_long_path_truncates_tail_with_ellipsis_snapshot() {
+        // A deeply-nested absolute path that overflows a 28-cell-wide pane.
+        // Base prefix "/" is folded into unit 0; seg_matches are the path parts.
+        // The leaf "main.rs" must survive at the tail; ancestors drop behind "…".
+        let mut pane = Pane::new(std::path::PathBuf::from("/srv"));
+        pane.core.query = "/home/ryan/projects/alpha/src".into();
+        let mut srch = PaneSearch::empty();
+        srch.searching = false;
+        srch.results = vec![PathMatch {
+            path: std::path::PathBuf::from("/home/ryan/projects/alpha/src/main.rs"),
+            is_dir: false,
+            seg_matches: vec![
+                seg("home", &[]),
+                seg("ryan", &[]),
+                seg("projects", &[]),
+                seg("alpha", &[]),
+                seg("src", &[]),
+                seg("main.rs", &[0, 1]),
+            ],
+        }];
+        srch.cursor = 0;
+        pane.search = Some(srch);
+        let backend = TestBackend::new(28, 3);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw_search_list(f, f.area(), &pane, true))
+            .unwrap();
+        insta::assert_snapshot!(term.backend());
+    }
+
     fn dot_pane(cursor: usize) -> Pane {
         let mut pane = Pane::new(std::path::PathBuf::from("/srv"));
         let mut srch = PaneSearch::empty();
@@ -371,7 +471,7 @@ mod tests {
         };
         let hi = Style::new().fg(theme::MATCH).add_modifier(Modifier::BOLD);
         let sep = Style::new().dim();
-        let line = draw_search_row(&pm, true, true, hi, sep, "/");
+        let line = draw_search_row(&pm, true, true, hi, sep, "/", 80);
         let joined = join_spans(&line);
         assert!(
             joined.contains("/home/ryan/"),
@@ -390,7 +490,7 @@ mod tests {
         };
         let hi = Style::new().fg(theme::MATCH).add_modifier(Modifier::BOLD);
         let sep = Style::new().dim();
-        let line = draw_search_row(&pm, false, true, hi, sep, "~/");
+        let line = draw_search_row(&pm, false, true, hi, sep, "~/", 80);
         let joined = join_spans(&line);
         assert!(
             joined.contains("~/proj/"),
@@ -411,7 +511,7 @@ mod tests {
         };
         let hi = Style::new().fg(theme::MATCH).add_modifier(Modifier::BOLD);
         let sep = Style::new().dim();
-        let line = draw_search_row(&pm, false, true, hi, sep, "");
+        let line = draw_search_row(&pm, false, true, hi, sep, "", 80);
         let joined = join_spans(&line);
         assert!(
             joined.contains("a/bdir/") && !joined.contains("/a/bdir/"),
@@ -504,5 +604,89 @@ mod tests {
         let spans = seg_spans("abc", &[99], Style::new(), hi_style());
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].content.as_ref(), "abc");
+    }
+
+    // ---- fit_units_tail: segment-aware tail-preserving truncation ----
+    // (Span / Style / Modifier arrive via `use super::*` at the top of the test
+    //  module — render_search already imports them. Do not re-import here.)
+
+    /// Join a unit list into the displayed string (style is irrelevant here).
+    fn join_units(units: &[Vec<Span<'static>>]) -> String {
+        units.iter().flatten().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// Join a produced span vec back to its display string.
+    fn join_spans_owned(spans: &[Span<'static>]) -> String {
+        spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn unit(s: &str) -> Vec<Span<'static>> {
+        vec![Span::raw(s.to_string())]
+    }
+
+    #[test]
+    fn fit_units_tail_avail_zero_returns_empty() {
+        let out = fit_units_tail(vec![unit("abc")], 0);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn fit_units_tail_empty_units_returns_empty() {
+        let out = fit_units_tail(vec![], 10);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn fit_units_tail_everything_fits_returns_all_flattened_no_ellipsis() {
+        // Two units, total 11 cells, avail 20 → everything kept, no "…".
+        let units = vec![unit("/home/"), unit("ryan/")];
+        let out = fit_units_tail(units.clone(), 20);
+        assert_eq!(join_spans_owned(&out), join_units(&units));
+        assert!(!out.iter().any(|s| s.content.as_ref() == "…"));
+    }
+
+    #[test]
+    fn fit_units_tail_drops_leading_unit_prepends_ellipsis_keeping_tail() {
+        // units: "/home/" (6) + "ryan/" (5) = 11. avail 8 → budget 7.
+        // From right: "ryan/" (5) ≤ 7 keep; "/home/" (6): 5+6=11 > 7 stop.
+        // Result: "…" + "ryan/" = "…ryan/".
+        let units = vec![unit("/home/"), unit("ryan/")];
+        let out = fit_units_tail(units, 8);
+        assert_eq!(join_spans_owned(&out), "…ryan/");
+    }
+
+    #[test]
+    fn fit_units_tail_keeps_multiple_trailing_units_drops_head() {
+        // units: "aaa/" (4) + "bbb/" (4) + "ccc" (3) = 11. avail 9 → budget 8.
+        // From right: "ccc" (3) keep; "bbb/" (4): 3+4=7 ≤ 8 keep;
+        // "aaa/" (4): 7+4=11 > 8 stop. Result: "…" + "bbb/ccc" = "…bbb/ccc".
+        let units = vec![unit("aaa/"), unit("bbb/"), unit("ccc")];
+        let out = fit_units_tail(units, 9);
+        assert_eq!(join_spans_owned(&out), "…bbb/ccc");
+    }
+
+    #[test]
+    fn fit_units_tail_degenerates_to_truncate_when_last_unit_alone_overflows() {
+        // Single unit wider than avail: flatten + left-truncate with "…", keeping
+        // the tail (a filename's extension) — consistent with this helper's
+        // tail-preserving strategy.
+        // "abcdefghi.txt" = 13 cells, avail 8 → truncate_cells_head(_, 8) = "…ghi.txt".
+        let units = vec![unit("abcdefghi.txt")];
+        let out = fit_units_tail(units, 8);
+        assert_eq!(join_spans_owned(&out), "…ghi.txt");
+    }
+
+    #[test]
+    fn fit_units_tail_ellipsis_span_is_dim_styled() {
+        let units = vec![unit("/home/"), unit("ryan/")];
+        let out = fit_units_tail(units, 8);
+        let ell = out
+            .iter()
+            .find(|s| s.content.as_ref() == "…")
+            .expect("ellipsis present");
+        assert!(
+            ell.style.add_modifier.contains(Modifier::DIM) || ell.style == Style::new().dim(),
+            "ellipsis must be dim-styled, got {ell:?}"
+        );
     }
 }
