@@ -37,13 +37,23 @@ use sshrack_core::id::new_id;
 ///
 /// The socket path is extracted from the `-o ControlPath=<path>` arg so the
 /// shim can create the sentinel file at the exact path the worker allocated.
-fn write_ssh_shim(shim_path: &Path) -> PathBuf {
+///
+/// `exit_sleep` controls the `-O exit` branch: `None` (the default) exits at
+/// once; `Some(secs)` sleeps first, used by the drop-not-blocked test to
+/// simulate a master that is slow to tear down.
+fn write_ssh_shim(shim_path: &Path, exit_sleep: Option<u64>) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let capture = shim_path
         .parent()
         .expect("shim has a parent dir")
         .join("capture.txt");
     let cap_str = capture.to_string_lossy();
+    // `-O exit` branch body: sleep first when asked, to emulate a slow master
+    // teardown (proves Drop does not block on `ssh -O exit`).
+    let exit_branch = match exit_sleep {
+        Some(secs) => format!("exit) sleep {secs}; exit 0 ;;"),
+        None => "exit) exit 0 ;;".to_string(),
+    };
     let script = format!(
         "#!/bin/sh\n\
          CAP='{cap_str}'\n\
@@ -65,6 +75,7 @@ fn write_ssh_shim(shim_path: &Path) -> PathBuf {
          done\n\
          for arg in \"$@\"; do\n\
          case \"$arg\" in\n\
+         {exit_branch}\n\
          -N) [ -n \"$SOCK\" ] && touch \"$SOCK\" 2>/dev/null; sleep 30 & wait; exit 0 ;;\n\
          esac\n\
          done\n\
@@ -168,7 +179,22 @@ fn fresh_shim_env() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf, SftpBin) {
     let dir = tempfile::tempdir().expect("temp dir");
     let ssh_shim = dir.path().join("ssh-shim");
     let sftp_shim = dir.path().join("sftp-shim");
-    let capture = write_ssh_shim(&ssh_shim);
+    let capture = write_ssh_shim(&ssh_shim, None);
+    write_sftp_shim(&sftp_shim);
+    let bin = SftpBin::new(ssh_shim.clone(), sftp_shim.clone());
+    (dir, ssh_shim, sftp_shim, capture, bin)
+}
+
+/// Like [`fresh_shim_env`], but the ssh-shim sleeps `exit_sleep_secs` on its
+/// `-O exit` branch — emulating a master that is slow to tear down. Used to
+/// prove [`SftpWorker::drop`] does not block on `ssh -O exit`.
+fn fresh_shim_env_slow_exit(
+    exit_sleep_secs: u64,
+) -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf, SftpBin) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let ssh_shim = dir.path().join("ssh-shim");
+    let sftp_shim = dir.path().join("sftp-shim");
+    let capture = write_ssh_shim(&ssh_shim, Some(exit_sleep_secs));
     write_sftp_shim(&sftp_shim);
     let bin = SftpBin::new(ssh_shim.clone(), sftp_shim.clone());
     (dir, ssh_shim, sftp_shim, capture, bin)
@@ -205,6 +231,26 @@ fn pw_files_in(dir: &Path) -> HashSet<PathBuf> {
             })
         })
         .collect()
+}
+
+/// Poll the shim capture until an invocation whose argv contains `token`
+/// appears, or `deadline` elapses. [`SftpWorker::drop`] fires `ssh -O exit`
+/// detached (it does not wait), so the shim records that invocation
+/// asynchronously — this waits for the write without a flaky fixed sleep.
+fn wait_for_invocation_with(capture: &Path, token: &str, deadline: Duration) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if read_all_invocations(capture)
+            .iter()
+            .any(|inv| inv.argv.iter().any(|a| a == token))
+        {
+            return true;
+        }
+        if start.elapsed() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 // ---- tests ----
@@ -481,11 +527,10 @@ fn sftp_worker_drop_tears_down_master_socket_and_pw_file() {
         "socket file must be removed after drop"
     );
 
-    // (b) An `ssh -O exit` invocation was sent (teardown).
+    // (b) An `ssh -O exit` invocation was sent (teardown). Drop fires it
+    // detached, so the shim writes its capture asynchronously — poll for it.
+    let exit_sent = wait_for_invocation_with(&capture, "exit", Duration::from_secs(2));
     let post_drop_invocations = read_all_invocations(&capture);
-    let exit_sent = post_drop_invocations
-        .iter()
-        .any(|inv| inv.argv.iter().any(|a| a == "exit"));
     assert!(
         exit_sent,
         "drop must send ssh -O exit (found in capture): {:?}",
@@ -517,5 +562,40 @@ fn sftp_worker_drop_tears_down_master_socket_and_pw_file() {
     assert!(
         leaked.is_empty(),
         "drop must remove the askpass pw-file it created; new pw-files leaked after drop: {leaked:?}"
+    );
+}
+
+/// `SftpWorker::drop` must not block on `ssh -O exit`: it fires the teardown
+/// command detached (no wait), so a master that takes its time to tear down —
+/// here the shim sleeps 3s on `-O exit` — cannot stall the UI thread that drops
+/// the worker. The synchronous SIGKILL + reap on the master child (fast) is the
+/// real teardown guarantee; `ssh -O exit` is best-effort.
+#[test]
+fn sftp_worker_drop_not_blocked_by_slow_control_exit() {
+    let (_dir, _ssh, _sftp, _capture, bin) = fresh_shim_env_slow_exit(3);
+    let self_exe = std::env::current_exe().expect("current_exe");
+
+    let (worker, _home) = SftpWorker::open(
+        resolved_none(),
+        key_only_host(),
+        sshrack_core::connect::ssh::Overrides::default(),
+        &self_exe,
+        PasswordSource::None,
+        None,
+        bin.clone(),
+    )
+    .expect("open");
+
+    let start = std::time::Instant::now();
+    drop(worker);
+    let elapsed = start.elapsed();
+
+    // The shim sleeps 3s on `-O exit`. A blocking drop (`.status()`) would take
+    // >=3s; a detached drop returns well under that. 2s is a comfortable upper
+    // bound — far clear of the 3s floor on any healthy machine, and it fails
+    // reliably against a blocking implementation.
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "drop blocked on slow ssh -O exit: {elapsed:?} (expected <<3s)"
     );
 }

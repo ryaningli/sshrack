@@ -326,8 +326,15 @@ impl Drop for SftpWorker {
             let _ = handle.join();
         }
 
-        // 3. Politely ask the master to exit via `ssh -O exit`. Best-effort —
-        //    a missing master is fine, a hung master falls through to step 4.
+        // 3. Politely ask the master to exit via `ssh -O exit`, but fire it
+        //    detached — do NOT wait. Drop runs on the UI thread, and the
+        //    master's remote teardown can take hundreds of ms to seconds (it
+        //    waits on the far end + TCP close); waiting would freeze the TUI on
+        //    every SFTP close. The SIGKILL + reap in step 4 is the real
+        //    guarantee the master is gone; `ssh -O exit` is best-effort and
+        //    races it (usually losing, which is fine). `Child`'s drop does not
+        //    kill the spawned process and all stdio is null, so it cannot block
+        //    us or leak a pipe.
         let sock_path = self
             .sock
             .as_ref()
@@ -339,7 +346,7 @@ impl Drop for SftpWorker {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status();
+            .spawn();
 
         // 4. Force-kill the master + reap it. SIGKILL + wait guarantees no
         //    lingering `ssh -N` process even if `ssh -O exit` was ignored.
