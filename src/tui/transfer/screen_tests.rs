@@ -2663,3 +2663,33 @@ fn esc_idle_quit_path_does_not_open_overlay() {
     assert_eq!(out, ScreenOutcome::CloseTransfer);
     assert!(s.close_confirm.is_none());
 }
+
+#[test]
+fn quit_confirm_behaves_when_transfer_completes_while_open() {
+    // The overlay is key-driven and snapshots the task at open time. If the
+    // transfer finishes while the dialog is up, confirm must still quit and
+    // cancel must still stay + close the overlay (the snapshot is just stale
+    // text — the overlay is not wired to the ledger's live state).
+    use sshrack_core::connect::sftp::proto::TransferOutcome;
+    let cwd = PathBuf::from("/srv");
+    let mut s = TransferScreen::new(cwd.clone(), PathBuf::from("/r"));
+    seed_inflight_upload(&mut s, "big.tar");
+    s.on_key(press(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(s.close_confirm.is_some());
+
+    // Transfer finishes while the overlay is open.
+    s.ledger.finish_inflight(TransferOutcome::Ok);
+    assert!(!s.has_inflight());
+
+    // Cancel: stay in SFTP, overlay closed.
+    let out = s.on_key(press(KeyCode::Char('n'), KeyModifiers::NONE));
+    assert_eq!(out, ScreenOutcome::Continue);
+    assert!(s.close_confirm.is_none());
+
+    // Re-open on a fresh in-flight task, finish it, then confirm: quits.
+    seed_inflight_upload(&mut s, "more.tar");
+    s.on_key(press(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    s.ledger.finish_inflight(TransferOutcome::Ok);
+    let out = s.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(out, ScreenOutcome::CloseTransfer);
+}
