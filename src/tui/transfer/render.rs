@@ -125,6 +125,11 @@ pub fn draw_pane(
     };
     draw_filter_row(frame, filter_area, &pane.core.query, &filter_label, focused);
 
+    // A listing is in flight (directory switch / initial open seed / post-
+    // transfer refresh on the REMOTE pane — local switches are synchronous and
+    // never render this frame). Show a centered dim placeholder and skip the
+    // file list so the pane never shows a stale listing under a mismatched cwd
+    // while the real one is pending.
     if pane.loading {
         frame.render_widget(
             Paragraph::new("loading…")

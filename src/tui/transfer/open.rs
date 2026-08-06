@@ -177,6 +177,10 @@ pub fn open_transfer(
     let mut screen = TransferScreen::new(local_cwd.clone(), home.clone());
     screen.remote_title = remote_title;
     screen.remote_home = Some(home.clone());
+    // The initial remote listing is async (WorkerCmd::List drained by the
+    // worker thread on its own clock); show "loading…" until the first Listing
+    // event lands and apply_remote_listing clears the flag.
+    screen.remote.loading = true;
     worker.send(sshrack_core::connect::sftp::proto::WorkerCmd::List(home));
 
     // Seed the local pane now (the local fs is fast and synchronous) so it is
@@ -185,11 +189,18 @@ pub fn open_transfer(
     // it and the pane just stays empty until the user navigates.
     {
         use sshrack_core::dirsource::{DirSource, LocalDirSource};
+        screen.local.loading = true;
         match LocalDirSource::new().list(&local_cwd) {
-            Ok(entries) => screen.local_mut().set_entries(entries),
-            Err(msg) => screen.set_status(crate::tui::intent::Status::error(format!(
-                "local list failed: {msg}"
-            ))),
+            Ok(entries) => {
+                screen.local_mut().set_entries(entries);
+                screen.local.loading = false;
+            }
+            Err(msg) => {
+                screen.local.loading = false;
+                screen.set_status(crate::tui::intent::Status::error(format!(
+                    "local list failed: {msg}"
+                )));
+            }
         }
     }
 

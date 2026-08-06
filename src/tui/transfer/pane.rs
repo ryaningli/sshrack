@@ -65,8 +65,14 @@ pub enum PaneOutcome {
 pub struct Pane {
     /// Shared browser state (cwd, entries, query, cursor, marks, history).
     pub(crate) core: BrowserCore,
-    /// Pending-list indicator the screen toggles around `set_entries`.
-    /// Render-only; the pane never mutates it.
+    /// In-flight list indicator: the run loop sets `true` when it sends a
+    /// listing request (directory switch, the initial open seed, or a
+    /// post-transfer refresh) and `apply_remote_listing` / the local drain arm
+    /// clear it once the result lands. Remote switches keep it `true` across
+    /// ticks so `draw_pane` shows its "loading…" placeholder; local switches
+    /// are synchronous, so it flips back to `false` within the same tick (never
+    /// rendered, kept for parity with this contract). Render-only; the pane
+    /// never mutates it.
     pub loading: bool,
     /// Active cross-directory find state. `None` in filter mode (≤1 query
     /// segment); `Some` in find mode (>1 segment). The screen sets/clears

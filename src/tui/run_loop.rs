@@ -517,11 +517,15 @@ fn drain_transfer_events(app: &mut App, handle: &TerminalHandle) {
                 if let Some(screen) = app.transfer.as_mut() {
                     screen.local.on_step();
                     screen.local.core.cwd = path.clone();
+                    screen.local.loading = true;
                 }
                 let listing = LocalDirSource::new().list(&path);
                 if let Some(screen) = app.transfer.as_mut() {
                     match listing {
-                        Ok(entries) => screen.local_mut().set_entries(entries),
+                        Ok(entries) => {
+                            screen.local_mut().set_entries(entries);
+                            screen.local.loading = false;
+                        }
                         Err(msg) => {
                             // The listing failed (the typed path does not exist
                             // or is unreadable): roll the pane back to the
@@ -531,6 +535,7 @@ fn drain_transfer_events(app: &mut App, handle: &TerminalHandle) {
                             // transfer bug. Without this, a later enqueue would
                             // build dst from the stale bad cwd.
                             screen.local.revert_switch();
+                            screen.local.loading = false;
                             screen.set_status(super::intent::Status::error(format!(
                                 "local list failed: {msg}"
                             )));
@@ -548,6 +553,7 @@ fn drain_transfer_events(app: &mut App, handle: &TerminalHandle) {
                 if let Some(screen) = app.transfer.as_mut() {
                     screen.remote.on_step();
                     screen.remote.core.cwd = path.clone();
+                    screen.remote.loading = true;
                 }
                 if let Some(worker) = app.transfer_worker.as_ref() {
                     worker.send(WorkerCmd::List(path));
@@ -759,13 +765,22 @@ fn drain_transfer_events(app: &mut App, handle: &TerminalHandle) {
             Direction::Download => {
                 let cwd = app.transfer.as_ref().map(|s| s.local.core.cwd.clone());
                 if let Some(cwd) = cwd {
+                    if let Some(screen) = app.transfer.as_mut() {
+                        screen.local.loading = true;
+                    }
                     let listing = LocalDirSource::new().list(&cwd);
                     if let Some(screen) = app.transfer.as_mut() {
                         match listing {
-                            Ok(entries) => screen.local_mut().set_entries(entries),
-                            Err(msg) => screen.set_status(super::intent::Status::error(format!(
-                                "local list failed: {msg}"
-                            ))),
+                            Ok(entries) => {
+                                screen.local_mut().set_entries(entries);
+                                screen.local.loading = false;
+                            }
+                            Err(msg) => {
+                                screen.local.loading = false;
+                                screen.set_status(super::intent::Status::error(format!(
+                                    "local list failed: {msg}"
+                                )));
+                            }
                         }
                     }
                 }
@@ -775,6 +790,9 @@ fn drain_transfer_events(app: &mut App, handle: &TerminalHandle) {
                 if let Some(cwd) = cwd
                     && let Some(worker) = app.transfer_worker.as_ref()
                 {
+                    if let Some(screen) = app.transfer.as_mut() {
+                        screen.remote.loading = true;
+                    }
                     worker.send(WorkerCmd::List(cwd));
                 }
             }
@@ -1312,6 +1330,33 @@ mod tests {
             screen.remote.core.cwd,
             PathBuf::from("/remote/start/sub"),
             "remote cwd must advance to the navigated path"
+        );
+    }
+
+    // ===============================================================
+    // Remote navigation must set pane.loading=true so draw_pane shows its
+    // "loading…" placeholder while the WorkerCmd::List is in flight. No
+    // transfer_worker is set here, so worker.send is a no-op — but loading is
+    // assigned BEFORE the send, so it is observable. The matching clear runs in
+    // apply_remote_listing when the Listing event lands (pinned in
+    // screen_tests.rs).
+    // ===============================================================
+    #[test]
+    fn drain_remote_pending_list_sets_loading_true() {
+        let mut app = app_with_host("web");
+        let screen = TransferScreen::new(PathBuf::from("/local"), PathBuf::from("/remote/start"));
+        assert!(!screen.remote.loading, "fixture: loading starts false");
+        app.transfer = Some(screen);
+        app.transfer.as_mut().unwrap().pending_list =
+            Some((Side::Remote, PathBuf::from("/remote/start/sub")));
+
+        let rc = Rc::new(RefCell::new(stdout_tui()));
+        let handle: TerminalHandle = Rc::downgrade(&rc);
+        drain_transfer_events(&mut app, &handle);
+
+        assert!(
+            app.transfer.as_ref().unwrap().remote.loading,
+            "remote pending_list must set loading=true while the list is in flight"
         );
     }
 
