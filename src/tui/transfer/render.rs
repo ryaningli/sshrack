@@ -179,11 +179,13 @@ fn draw_filter_row(frame: &mut Frame, area: Rect, query: &str, label: &str, focu
     } else {
         Style::new().dim()
     };
-    // Reserve the 2-cell "❯ " prefix; tail-truncate a query that overflows so
+    // Reserve the 2-cell "❯ " prefix AND 1 cell of separator before the
+    // right-aligned count label, then tail-truncate a query that overflows so
     // the visible tail (what the user is typing — the cursor is always at the
-    // end) survives behind a "…". `prompt_area.width` already excludes the
-    // right-hand count label (the Layout split it off).
-    let budget = (prompt_area.width as usize).saturating_sub(2);
+    // end) survives behind a "…". The separator keeps a query that fills the
+    // row from sitting flush against the count. `prompt_area.width` already
+    // excludes the count label (the Layout split it off).
+    let budget = (prompt_area.width as usize).saturating_sub(3);
     let shown = if cells(query) > budget {
         truncate_cells_head(query, budget)
     } else {
@@ -1933,6 +1935,31 @@ mod tests {
         // The tail "proj" must be visible; the head "/home" must not.
         assert!(txt.contains("proj"), "tail survives: {txt:?}");
         assert!(!txt.contains("/home"), "head dropped: {txt:?}");
+    }
+
+    #[test]
+    fn draw_filter_row_long_query_leaves_a_space_before_the_count() {
+        // A query that fills the row must not sit flush against the right-hand
+        // count label — one cell of breathing space is reserved between them.
+        // Width 14, label "3": prompt_area is 13 wide; budget = 13 - 3 (the
+        // 2-cell "❯ " prefix + 1 separator) = 10, so the 15-cell query
+        // tail-truncates to "…ryan/proj" (10 cells), leaving one blank cell
+        // before the count. Without the separator reservation the truncated
+        // query would end flush against "3" ("…/ryan/proj3").
+        use ratatui::{Terminal, backend::TestBackend};
+        let backend = TestBackend::new(14, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            draw_filter_row(f, f.area(), "/home/ryan/proj", "3", true);
+        })
+        .unwrap();
+        let txt = row_text(&term);
+        assert!(txt.contains("ryan/proj"), "query tail visible: {txt:?}");
+        let i = txt.find('3').expect("count label rendered");
+        assert!(
+            i > 0 && txt.as_bytes()[i - 1] == b' ',
+            "a space must separate the query from the count: {txt:?}"
+        );
     }
 }
 
