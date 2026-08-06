@@ -1327,6 +1327,9 @@ fn apply_remote_listing_ok_adopted_when_cwd_matches() {
         .remote
         .set_entries(vec![entry("old", &remote_cwd, false)]);
     let listed = vec![entry("fresh", &remote_cwd, false)];
+    // A list is in flight for this cwd (dir switch / initial seed /
+    // post-transfer refresh all set loading=true before sending List).
+    screen.remote.loading = true;
     screen.apply_remote_listing(remote_cwd.clone(), Ok(listed));
     assert!(
         screen.remote.core.entries.iter().any(|e| e.name == "fresh"),
@@ -1335,6 +1338,10 @@ fn apply_remote_listing_ok_adopted_when_cwd_matches() {
     assert!(
         !screen.remote.core.entries.iter().any(|e| e.name == "old"),
         "old entries replaced"
+    );
+    assert!(
+        !screen.remote.loading,
+        "adopted listing clears loading — the list completed"
     );
 }
 
@@ -1345,10 +1352,15 @@ fn apply_remote_listing_ok_dropped_when_user_navigated_away() {
     let mut screen = TransferScreen::new(PathBuf::from("/local"), PathBuf::from("/remote/here"));
     screen.remote.core.cwd = PathBuf::from("/remote/elsewhere"); // navigated away
     let listed = vec![entry("stale", &PathBuf::from("/remote/here"), false)];
+    screen.remote.loading = true;
     screen.apply_remote_listing(PathBuf::from("/remote/here"), Ok(listed));
     assert!(
         !screen.remote.core.entries.iter().any(|e| e.name == "stale"),
         "stale listing (cwd mismatch) must be dropped, not adopted"
+    );
+    assert!(
+        screen.remote.loading,
+        "stale drop must NOT clear loading — the current cwd's list is still in flight"
     );
 }
 
@@ -1366,6 +1378,7 @@ fn apply_remote_listing_err_reverts_cwd_and_surfaces_failure() {
     // captures the origin, the caller advances cwd to the target.
     screen.remote.on_step();
     screen.remote.core.cwd = PathBuf::from("/remote/ghost");
+    screen.remote.loading = true;
     screen.apply_remote_listing(
         PathBuf::from("/remote/ghost"),
         Err("no such directory".to_string()),
@@ -1389,6 +1402,10 @@ fn apply_remote_listing_err_reverts_cwd_and_surfaces_failure() {
             .contains("remote list failed"),
         "status names the failure: {:?}",
         screen.status.message
+    );
+    assert!(
+        !screen.remote.loading,
+        "loading cleared on revert — the failed list is done"
     );
 }
 

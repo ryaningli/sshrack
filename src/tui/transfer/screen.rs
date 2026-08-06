@@ -245,10 +245,20 @@ impl TransferScreen {
             Ok(entries) => {
                 if self.remote.core.cwd == listed_cwd {
                     self.remote.set_entries(entries);
+                    // The list completed and is current → clear the in-flight
+                    // indicator the run loop set when it sent List (dir switch
+                    // / initial seed / post-transfer refresh).
+                    self.remote.loading = false;
                 }
+                // cwd ≠ listed_cwd: the user navigated further while this list
+                // was in flight. Drop the stale result WITHOUT clearing loading
+                // — the current cwd's own list is still pending, and clearing
+                // here would flash the pane out of loading before its real
+                // listing lands.
             }
             Err(msg) => {
                 self.remote.revert_switch();
+                self.remote.loading = false;
                 self.status = Status::error(format!("remote list failed: {msg}"));
             }
         }
