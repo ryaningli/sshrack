@@ -46,8 +46,8 @@ pub(crate) enum InflightAction {
     Continue,
     /// Cancel the in-flight transfer: kill child, reap, remove partial.
     Cancel,
-    /// Propagate teardown: kill child, reap, remove partial, and tell
-    /// [`worker_loop`] to `break` instead of looping back to `recv()`.
+    /// Propagate teardown: kill child, reap, remove partial, and tell the
+    /// worker's service loop to `break` instead of looping back to `recv()`.
     Shutdown,
 }
 
@@ -64,7 +64,9 @@ pub(crate) fn classify_inflight_cmd(cmd: &WorkerCmd) -> InflightAction {
     match cmd {
         WorkerCmd::Cancel => InflightAction::Cancel,
         WorkerCmd::Shutdown => InflightAction::Shutdown,
-        WorkerCmd::List(_) | WorkerCmd::Transfer(_, _) => InflightAction::Continue,
+        WorkerCmd::List(_) | WorkerCmd::Transfer(_, _) | WorkerCmd::HostKeyConfirm(_) => {
+            InflightAction::Continue
+        }
     }
 }
 
@@ -78,8 +80,8 @@ mod tests {
     #[test]
     fn classify_inflight_cmd_shutdown_propagates() {
         // CRITICAL: Shutdown must map to InflightAction::Shutdown so run_transfer
-        // can break worker_loop instead of looping back to recv(). Swallowing it
-        // (the prior Ok(_) arm) deadlocks Drop: the dropping main thread holds
+        // can break the service loop instead of looping back to recv(). Swallowing
+        // it (the prior Ok(_) arm) deadlocks Drop: the dropping main thread holds
         // cmd_tx until join() returns, and join() waits for the worker — which
         // would block forever in recv() on a sender that is never dropped.
         assert_eq!(
@@ -115,6 +117,14 @@ mod tests {
         };
         assert_eq!(
             classify_inflight_cmd(&WorkerCmd::Transfer(job, OverwritePolicy::Overwrite)),
+            InflightAction::Continue
+        );
+        // HostKeyConfirm is a connect-phase reply; it can never arrive
+        // mid-transfer (the connect phase owns the thread until the master is
+        // up), but classifying it as Continue keeps the match exhaustive and
+        // safe against a future re-routing.
+        assert_eq!(
+            classify_inflight_cmd(&WorkerCmd::HostKeyConfirm(true)),
             InflightAction::Continue
         );
     }

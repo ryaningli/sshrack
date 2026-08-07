@@ -13,6 +13,7 @@ use ratatui::Frame;
 use sshrack_core::config::schema::{Host, SshrackConfig};
 use sshrack_core::connect::KeyArtifact;
 use sshrack_core::connect::sftp::SftpWorker;
+use sshrack_core::connect::sftp::proto::WorkerCmd;
 use sshrack_core::frecency::Frecency;
 use std::path::PathBuf;
 use ulid::Ulid;
@@ -833,7 +834,18 @@ impl App {
         // lingers on the footer until some later action overwrites it. A new
         // status set during THIS keypress's drain (a list error, queue
         // feedback) is written AFTER this clear, so it still surfaces.
-        if key.kind == crossterm::event::KeyEventKind::Press {
+        //
+        // Skip the clear while Connecting/ConnectFailed: in ConnectFailed the
+        // status carries the failure reason that `draw` shows in the banner,
+        // and the on_key gate swallows non-close keys anyway — clearing it on
+        // a stray keypress would erase the reason from the banner. Connecting
+        // has no transient feedback to clear.
+        if key.kind == crossterm::event::KeyEventKind::Press
+            && matches!(
+                screen.connect,
+                super::transfer::screen::ConnectState::Connected
+            )
+        {
             screen.set_status(Status::empty());
         }
         let out = screen.on_key(key);
@@ -855,6 +867,19 @@ impl App {
             }
             ScreenOutcome::CancelActive => {
                 self.pending_cancel = true;
+                self.transfer = Some(screen);
+                Outcome::Continue
+            }
+            ScreenOutcome::HostKeyConfirm(accept) => {
+                // Forward the user's fingerprint answer to the worker (the
+                // connect phase is blocked on cmd_rx awaiting it). Dismiss the
+                // overlay unconditionally — on accept the worker appends to
+                // known_hosts and resumes the master handshake; on reject it
+                // emits ConnectFailed and the screen transitions accordingly.
+                if let Some(worker) = self.transfer_worker.as_ref() {
+                    worker.send(WorkerCmd::HostKeyConfirm(accept));
+                }
+                screen.host_key = None;
                 self.transfer = Some(screen);
                 Outcome::Continue
             }
@@ -2649,15 +2674,20 @@ mod tests {
     // ===============================================================
 
     use crate::tui::transfer::pane::Side;
-    use crate::tui::transfer::screen::TransferScreen;
+    use crate::tui::transfer::screen::{ConnectState, TransferScreen};
 
     /// Build a hand-constructed TransferScreen for routing tests. Two empty
     /// panes at canned cwds; we do not need entries to assert focus flips.
+    /// `connect` defaults to Connected so on_key navigation/enqueue arms are
+    /// reachable (a fresh screen is Connecting — the async-connect gate would
+    /// swallow everything except Esc/Ctrl-C).
     fn canned_transfer_screen() -> TransferScreen {
-        TransferScreen::new(
+        let mut s = TransferScreen::new(
             std::path::PathBuf::from("/local"),
             std::path::PathBuf::from("/remote"),
-        )
+        );
+        s.connect = ConnectState::Connected;
+        s
     }
 
     #[test]
@@ -2835,6 +2865,55 @@ mod tests {
         assert!(
             !app.pending_advance,
             "close_transfer clears pending_advance"
+        );
+    }
+
+    #[test]
+    fn route_transfer_host_key_confirm_forwards_to_worker_and_drops_overlay() {
+        // ScreenOutcome::HostKeyConfirm(accept) — emitted by the host-key
+        // overlay's on_key — must forward WorkerCmd::HostKeyConfirm(accept) to
+        // the worker (the connect phase is blocked on cmd_rx awaiting it) and
+        // dismiss the overlay so the next render shows Connecting without the
+        // popup. Uses SftpWorker::new_for_test so the cmd channel is reachable
+        // without a real master handshake.
+        use crate::tui::transfer::screen::HostKeyPrompt;
+        use std::sync::mpsc;
+        let mut app = app_with_host("web");
+        let mut screen = TransferScreen::new(
+            std::path::PathBuf::from("/local"),
+            std::path::PathBuf::from("/remote"),
+        );
+        screen.connect = ConnectState::Connecting;
+        screen.host_key = Some(HostKeyPrompt {
+            host: "h.example".into(),
+            fingerprint: "SHA256:abc".into(),
+        });
+        app.transfer = Some(screen);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCmd>();
+        let (_event_tx, event_rx) =
+            mpsc::channel::<sshrack_core::connect::sftp::proto::WorkerEvent>();
+        app.transfer_worker = Some(SftpWorker::new_for_test(cmd_tx, event_rx));
+
+        // Enter on the overlay → ScreenOutcome::HostKeyConfirm(true) → forwarded.
+        let out = app.on_key(crate::tui::test_support::press(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ));
+        assert!(
+            matches!(out, Outcome::Continue),
+            "HostKeyConfirm maps to Continue (loop stays on the screen)"
+        );
+        let cmd = cmd_rx
+            .try_recv()
+            .expect("HostKeyConfirm(true) must reach the worker");
+        assert!(
+            matches!(cmd, WorkerCmd::HostKeyConfirm(true)),
+            "forwarded cmd must be HostKeyConfirm(true): {cmd:?}"
+        );
+        // Overlay dismissed — Connecting resumes without the popup.
+        assert!(
+            app.transfer.as_ref().is_some_and(|s| s.host_key.is_none()),
+            "overlay must be dropped after the outcome"
         );
     }
 }

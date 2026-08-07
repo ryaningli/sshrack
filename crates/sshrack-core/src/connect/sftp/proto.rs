@@ -53,6 +53,11 @@ pub enum WorkerCmd {
     Transfer(TransferJob, OverwritePolicy),
     Cancel,   // kill the in-flight transfer + delete partial
     Shutdown, // teardown master + exit thread
+    /// Reply to [`WorkerEvent::HostKeyNeedsConfirm`]. `true` = accept + append
+    /// to `~/.ssh/known_hosts` and continue to the master handshake; `false` =
+    /// reject (the worker sends `ConnectFailed` and exits). Sent by the run
+    /// loop when the user answers the in-screen host-key overlay.
+    HostKeyConfirm(bool),
 }
 
 // ---- WorkerEvent ----
@@ -63,6 +68,34 @@ pub enum WorkerEvent {
     Listing(PathBuf, Result<Vec<DirEntry>, String>), // entries for cwd (or error msg)
     Progress(Progress),
     Done(TransferOutcome),
+    /// Master handshake + `sftp pwd` succeeded. Carries everything the UI needs
+    /// to seed the remote pane and build the path-aware searcher now that the
+    /// master is up: `home` (remote cwd), `target` (`user@host`), and `sock`
+    /// (the live ControlPath). The handle exposes none of these (the worker
+    /// thread owns them), so they ride this event.
+    Connected {
+        home: PathBuf,
+        target: String,
+        sock: PathBuf,
+    },
+    /// Master handshake failed (auth refused, connection refused, timeout).
+    /// `reason` is the first meaningful stderr line or a synthesized message.
+    /// NOT sent on a user-initiated cancel (the worker just exits silently).
+    ConnectFailed(String),
+    /// Unknown host: the worker scanned the host's key and needs the user to
+    /// confirm the fingerprint before proceeding to the master handshake. The
+    /// UI shows a host-key overlay and replies with
+    /// [`WorkerCmd::HostKeyConfirm`]. Emitted only during the connect phase
+    /// (before [`Connected`](Self::Connected)); the overlay only appears while
+    /// the screen is `Connecting`.
+    HostKeyNeedsConfirm {
+        /// The `host` token (address) the worker scanned — shown in the overlay
+        /// title so the user knows which host the fingerprint belongs to.
+        host: String,
+        /// Multi-line confirm text built by [`hostkey::confirm_text`] (the
+        /// "authenticity of host …" message + algorithm + fingerprint).
+        fingerprint: String,
+    },
 }
 
 // ---- Progress ----

@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame,
-    layout::{Constraint, Layout, Rect},
+    layout::{Alignment, Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
@@ -33,6 +33,7 @@ use sshrack_core::connect::sftp::proto::{
 use sshrack_core::dirsource::DirEntry;
 use sshrack_core::pathfind::{ParsedQuery, SearchEvent};
 
+use crate::tui::dialog;
 use crate::tui::intent::Status;
 use crate::tui::theme;
 use crate::tui::transfer::close_confirm::CloseConfirm;
@@ -69,6 +70,49 @@ pub enum ScreenOutcome {
     /// [`TransferScreen::next_job`] to dispatch the first one if no transfer is
     /// currently in flight. `Ctrl-Enter` emits this.
     Enqueue,
+    /// Reply to the host-key overlay: the user accepted (`true`) or rejected
+    /// (`false`) an unknown host's fingerprint. The loop forwards it to the
+    /// worker as `WorkerCmd::HostKeyConfirm` and dismisses the overlay. Emitted
+    /// only while `Connecting` (the overlay is set by the
+    /// `WorkerEvent::HostKeyNeedsConfirm` drain and cleared on this outcome).
+    HostKeyConfirm(bool),
+}
+
+/// Where the SFTP session is in its connect lifecycle. Drives both `on_key`
+/// (gates keys until connected) and `draw` (Connecting / ConnectFailed hints).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectState {
+    /// Master handshake in progress on the worker thread. `Esc`/`Ctrl-C`
+    /// cancel (close the screen → drop the worker → it aborts the handshake).
+    Connecting,
+    /// Handshake done; the worker is in its service loop. Normal browsing.
+    Connected,
+    /// Handshake failed. The status bar already shows the reason; `Esc`/
+    /// `Ctrl-C` return to the launcher. No other keys do anything.
+    ConnectFailed,
+}
+
+/// Host-key confirmation overlay (unknown host). Owned by [`TransferScreen`]
+/// like [`CloseConfirm`] / [`QueueOverlay`]. Set by the run loop when a
+/// [`WorkerEvent::HostKeyNeedsConfirm`](sshrack_core::connect::sftp::proto::WorkerEvent::HostKeyNeedsConfirm)
+/// drains (only while `Connecting`); `Enter`/`y` accept, `n`/`Esc` reject via
+/// [`ScreenOutcome::HostKeyConfirm`], and the run loop dismisses the overlay on
+/// either outcome.
+///
+/// Unlike [`CloseConfirm`], this overlay has no `closed` flag: the run loop
+/// clears `host_key` to `None` unconditionally on every outcome (the worker
+/// reply is mandatory, so there is no "neutral key keeps it open" state that
+/// the screen needs to inspect later).
+///
+/// [`CloseConfirm`]: super::close_confirm::CloseConfirm
+/// [`QueueOverlay`]: super::queue_overlay::QueueOverlay
+#[derive(Debug, Clone)]
+pub struct HostKeyPrompt {
+    /// The host token (address) the worker scanned — shown in the overlay title.
+    pub host: String,
+    /// Multi-line confirm text from `hostkey::confirm_text` (the "authenticity
+    /// of host …" message + algorithm + fingerprint).
+    pub fingerprint: String,
 }
 
 /// The full-screen transfer view. Pure state plus a render entry point —
@@ -124,6 +168,12 @@ pub struct TransferScreen {
     /// stack) because the transfer screen bypasses that stack and owns its own
     /// popups, like [`queue_overlay`](Self::queue_overlay).
     pub close_confirm: Option<CloseConfirm>,
+    /// The host-key confirmation overlay. `None` unless the worker emitted
+    /// `WorkerEvent::HostKeyNeedsConfirm` for an unknown host (only while
+    /// `Connecting`). Owned here for the same reason as `close_confirm` — the
+    /// transfer screen owns its own popups. Dismissed by the run loop on
+    /// [`ScreenOutcome::HostKeyConfirm`].
+    pub host_key: Option<HostKeyPrompt>,
     /// Pending search launch: the focused side + parsed query that the run
     /// loop (Task 9) reads to spawn a
     /// [`PathSearch`](sshrack_core::pathfind::PathSearch). Set by
@@ -157,6 +207,11 @@ pub struct TransferScreen {
     /// Remote home directory (`open_transfer` fills this in Task 10); `None`
     /// until then, so remote `~`-expansion degrades to the remote cwd.
     pub remote_home: Option<PathBuf>,
+    /// Connect lifecycle. `Connecting` on entry (the screen shows while the
+    /// worker thread runs the master handshake); `Connected` once the worker's
+    /// `Connected` event drains; `ConnectFailed` on `ConnectFailed`. Gates
+    /// `on_key` and drives the Connecting/failed hints in `draw`.
+    pub connect: ConnectState,
     /// Global spinner phase for the find-mode "searching" filter-row label.
     /// Advanced once per run-loop tick ([`advance_spinner`](Self::advance_spinner))
     /// while any pane's search is in flight; read by `draw` → `draw_pane` →
@@ -186,12 +241,14 @@ impl TransferScreen {
             overwrite_policy: None,
             queue_overlay: None,
             close_confirm: None,
+            host_key: None,
             pending_search: None,
             search_rx: None,
             search_cancel: None,
             search_gen: 0,
             search_side: None,
             remote_home: None,
+            connect: ConnectState::Connecting,
             spinner: 0,
         }
     }
@@ -324,6 +381,45 @@ impl TransferScreen {
         if key.kind != KeyEventKind::Press {
             return ScreenOutcome::Continue;
         }
+        // Host-key confirmation overlay. Only set while `Connecting` (the
+        // worker emits `HostKeyNeedsConfirm` before the master handshake) and
+        // intercepted here BEFORE the connect-lifecycle close-key handling so
+        // `Enter`/`y`/`n`/`Esc` route to confirm/reject instead of closing the
+        // screen. Mirrors `CloseConfirm`/`QueueOverlay`'s modal shape: any
+        // other key re-seats the overlay and returns `Continue`.
+        if let Some(ov) = self.host_key.take() {
+            let accept = match key.code {
+                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => Some(true),
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(false),
+                _ => None,
+            };
+            match accept {
+                Some(decision) => return ScreenOutcome::HostKeyConfirm(decision),
+                None => {
+                    self.host_key = Some(ov);
+                    return ScreenOutcome::Continue;
+                }
+            }
+        }
+        // Connect lifecycle gates. Until the worker reports Connected, the
+        // panes have no usable entries — swallow everything except the close
+        // keys so a reflexive navigation cannot crash on an empty list. The
+        // close keys let the user cancel a Connecting handshake (Esc/Ctrl-C →
+        // CloseTransfer → the loop drops the worker → handshake aborts) or
+        // leave a ConnectFailed screen.
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let is_close_key =
+            matches!(key.code, KeyCode::Esc) || ctrl && matches!(key.code, KeyCode::Char('c'));
+        match self.connect {
+            ConnectState::Connecting | ConnectState::ConnectFailed => {
+                return if is_close_key {
+                    ScreenOutcome::CloseTransfer
+                } else {
+                    ScreenOutcome::Continue
+                };
+            }
+            ConnectState::Connected => {} // fall through to normal dispatch
+        }
         // The queue-manager overlay is modal: when open it owns every key.
         // The `is_some` gate proves `take()` yields `Some`, but the compiler
         // can not see through it, so the `None` arm stays panic-free (no
@@ -354,7 +450,6 @@ impl TransferScreen {
             }
             return out;
         }
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         // Find mode: when the focused pane has an active search, `Enter` jumps
         // to the selected result's directory and `Space` marks it (both
         // intercepted here so they never reach the dir-list path).
@@ -680,6 +775,29 @@ impl TransferScreen {
             self.spinner,
         );
 
+        // Connect-lifecycle overlay banners. While Connecting the remote pane
+        // is empty + loading; a one-line banner across its top frames that as
+        // intentional. After ConnectFailed the panes are dimmed and a centered
+        // line surfaces the failure reason (already on the status bar) + the
+        // Esc-to-return hint.
+        match self.connect {
+            ConnectState::Connecting => self.draw_connect_banner(
+                frame,
+                remote_area,
+                format!("Connecting to {}…", self.remote_title),
+                false,
+            ),
+            ConnectState::ConnectFailed => {
+                let reason = self
+                    .status
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| "sftp connection failed".to_string());
+                self.draw_connect_banner(frame, area, format!("{reason} · Esc to return"), true);
+            }
+            ConnectState::Connected => {}
+        }
+
         self.draw_progress_panel(frame, panel_area);
         self.draw_footer(frame, footer_area);
 
@@ -692,6 +810,40 @@ impl TransferScreen {
         if let Some(ov) = &self.close_confirm {
             ov.draw(frame);
         }
+        // The host-key overlay paints last so it sits above every band,
+        // including the close-confirm overlay. Only present while `Connecting`.
+        if let Some(ov) = &self.host_key {
+            ov.draw(frame);
+        }
+    }
+
+    /// One-line connect-lifecycle banner. `dim_full` widens the dim to cover a
+    /// full-screen area (ConnectFailed overlays everything) instead of just the
+    /// remote pane (Connecting). The text is centered horizontally on the first
+    /// row of `area`; a clear background lets the pane paint beneath it for
+    /// Connecting, while ConnectFailed dims the whole frame so the stale panes
+    /// read as inert. Pure: no I/O.
+    fn draw_connect_banner(&self, frame: &mut Frame, area: Rect, text: String, dim_full: bool) {
+        let span = if dim_full {
+            Span::styled(
+                text,
+                Style::new().fg(theme::DANGER).add_modifier(Modifier::DIM),
+            )
+        } else {
+            Span::styled(text, theme::accent().add_modifier(Modifier::DIM))
+        };
+        // Vertically position a 1-row banner inside `area`: Connecting rides
+        // near the top of the remote pane; ConnectFailed centers in the frame.
+        let row = if dim_full {
+            area.y + area.height.saturating_sub(1) / 2
+        } else {
+            area.y + 1
+        };
+        let banner_area = Rect::new(area.x, row, area.width, 1);
+        frame.render_widget(
+            Paragraph::new(Line::from(span)).alignment(Alignment::Center),
+            banner_area,
+        );
     }
 
     /// Title band: `sshrack sftp` accented on the left. The brand word goes
@@ -759,6 +911,25 @@ impl TransferScreen {
             spans.push(Span::styled(" …", Style::new().dim()));
         }
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
+}
+
+impl HostKeyPrompt {
+    /// Render the centered host-key confirmation dialog above the transfer
+    /// screen. Uses [`dialog::draw_dialog`] for the bordered box + hotkey
+    /// footer; the body is the multi-line confirm text from
+    /// `hostkey::confirm_text` (authenticity + algorithm + fingerprint).
+    pub(crate) fn draw(&self, frame: &mut Frame) {
+        // `fingerprint` is the multi-line confirm_text; count its rows so the
+        // dialog sizes to fit. Fall back to 1 for an empty message.
+        let body_rows = self.fingerprint.lines().count().max(1) as u16;
+        let body_area = dialog::draw_dialog(
+            frame,
+            &format!("Unknown host: {}", self.host),
+            body_rows,
+            &[("Enter/y", "accept"), ("n/Esc", "reject")],
+        );
+        frame.render_widget(Paragraph::new(self.fingerprint.clone()), body_area);
     }
 }
 

@@ -26,10 +26,10 @@
 //!    `SSHRACK_E2E_USER=$USER`
 //!    `SSHRACK_E2E_IDENTITY=/tmp/sshrack-e2e/user_key`
 //!
-//! The test then opens the master, lists `$HOME`, downloads `/etc/hostname`
+//! The test then spawns the master, lists `$HOME`, downloads `/etc/hostname`
 //! (or a fallback) to a temp path, and uploads it back to a temp remote path,
 //! asserting each step's outcome. It exercises the real
-//! [`SftpWorker::open`] / `send(WorkerCmd::List)` / `Transfer` / `try_event`
+//! [`SftpWorker::spawn`] / `send(WorkerCmd::List)` / `Transfer` / `try_event`
 //! path end-to-end.
 
 #![cfg(target_os = "linux")]
@@ -39,10 +39,54 @@ use std::time::{Duration, Instant};
 
 use sshrack_core::config::schema::{Auth, CredentialBody, Host};
 use sshrack_core::connect::sftp::SftpWorker;
-use sshrack_core::connect::sftp::proto::{Direction, OverwritePolicy, TransferJob, WorkerCmd};
+use sshrack_core::connect::sftp::proto::{
+    Direction, OverwritePolicy, TransferJob, WorkerCmd, WorkerEvent,
+};
 use sshrack_core::connect::ssh::Overrides;
 use sshrack_core::credential::{PasswordSource, ResolvedAuth};
 use sshrack_core::id::new_id;
+
+/// Spawn the worker and wait for its `Connected` event, mirroring the shape of
+/// the deleted blocking `SftpWorker::open` (returns `(worker, home)`). This
+/// `#[ignore]`'d e2e test runs against a real sshd, so a generous 30s deadline
+/// covers the first-connect handshake.
+fn open_worker(
+    resolved: ResolvedAuth,
+    host: Host,
+    overrides: Overrides,
+    self_exe: &std::path::Path,
+    bin: sshrack_core::connect::sftp::SftpBin,
+) -> (SftpWorker, PathBuf) {
+    let worker = SftpWorker::spawn(
+        resolved,
+        host,
+        overrides,
+        self_exe,
+        PasswordSource::None,
+        None,
+        bin,
+    )
+    .expect("spawn");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut home = None;
+    while Instant::now() < deadline {
+        match worker.try_event() {
+            Some(WorkerEvent::Connected {
+                home: h,
+                target: _,
+                sock: _,
+            }) => {
+                home = Some(h);
+                break;
+            }
+            Some(WorkerEvent::ConnectFailed(r)) => panic!("connect failed: {r}"),
+            Some(_) => {}
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+    let home = home.expect("no Connected event within 30s");
+    (worker, home)
+}
 
 /// Pull the e2e target coordinates from the environment, with the documented
 /// defaults. Returns `None` if the user key file is missing (so the test
@@ -105,16 +149,13 @@ fn sftp_round_trip_local_sshd() {
     let overrides = Overrides::default();
     let self_exe = std::env::current_exe().expect("current_exe");
 
-    let (worker, home) = SftpWorker::open(
+    let (worker, home) = open_worker(
         resolved,
         host_obj,
         overrides,
         &self_exe,
-        PasswordSource::None,
-        None,
         sshrack_core::connect::sftp::SftpBin::default(),
-    )
-    .expect("master open");
+    );
 
     // (1) List $HOME.
     worker.send(WorkerCmd::List(home.clone()));
@@ -212,16 +253,13 @@ fn sftp_progress_grows_local_sshd() {
     let resolved = e2e_resolved(&user, &identity);
     let overrides = Overrides::default();
     let self_exe = std::env::current_exe().expect("current_exe");
-    let (worker, _home) = SftpWorker::open(
+    let (worker, _home) = open_worker(
         resolved,
         host_obj,
         overrides,
         &self_exe,
-        PasswordSource::None,
-        None,
         sshrack_core::connect::sftp::SftpBin::default(),
-    )
-    .expect("master open");
+    );
 
     // A large local file so the transfer spans enough PROGRESS_POLL ticks to
     // observe growth (a few hundred ms on loopback). Sparse-allocated to avoid

@@ -38,10 +38,13 @@ use super::term::{TerminalHandle, Tui};
 use super::transfer::open::open_transfer;
 use super::transfer::overwrite;
 use super::transfer::pane::Side;
+use super::transfer::screen::{ConnectState, HostKeyPrompt};
 use crate::tui::transfer::search::NucleoSegmentMatcher;
 use sshrack_core::connect::sftp::SftpWorker;
 use sshrack_core::connect::sftp::proto::{Direction, TransferOutcome, WorkerCmd, WorkerEvent};
-use sshrack_core::pathfind::{ParsedQuery, PathSearch, SearchEvent};
+use sshrack_core::connect::sftp::{LocalSftpRunner, RemotePathSearch};
+use sshrack_core::pathfind::{DirListCache, ParsedQuery, PathSearch, SearchEvent};
+use std::sync::Arc;
 
 /// How long [`event::poll`] blocks for a key before the loop wakes to drain
 /// SFTP worker events and re-render. crossterm's `poll` watches only the
@@ -701,6 +704,49 @@ fn drain_transfer_events(app: &mut App, handle: &TerminalHandle) {
                     screen.set_active(Some(p));
                 }
             }
+            WorkerEvent::Connected { home, target, sock } => {
+                if let Some(screen) = app.transfer.as_mut() {
+                    screen.connect = ConnectState::Connected;
+                    screen.remote_home = Some(home.clone());
+                    screen.remote.core.cwd = home.clone();
+                    screen.remote.loading = true;
+                }
+                // Build the remote path-aware searcher now that the master is
+                // up. This moved here from open_transfer: target/sock are live
+                // only post-connect, and the worker handle exposes neither, so
+                // they ride the Connected event. Mirror the exact call open.rs
+                // used today (same five args).
+                app.remote_search = Some(RemotePathSearch::new(
+                    target,
+                    sock,
+                    Some(home.clone()),
+                    Arc::new(LocalSftpRunner::new()),
+                    Arc::new(std::sync::Mutex::new(
+                        DirListCache::default_with_real_clock(),
+                    )),
+                ));
+                // Request the first remote listing.
+                if let Some(worker) = app.transfer_worker.as_ref() {
+                    worker.send(WorkerCmd::List(home));
+                }
+            }
+            WorkerEvent::ConnectFailed(reason) => {
+                if let Some(screen) = app.transfer.as_mut() {
+                    screen.connect = ConnectState::ConnectFailed;
+                    screen.set_status(super::intent::Status::error(reason));
+                }
+            }
+            WorkerEvent::HostKeyNeedsConfirm { host, fingerprint } => {
+                // The worker hit an unknown host and needs the user to confirm
+                // the fingerprint before proceeding to the master handshake.
+                // Show the overlay (only renders while Connecting; the worker
+                // emits this only from the connect phase, so that invariant
+                // holds). The user's reply routes back via
+                // ScreenOutcome::HostKeyConfirm in route_transfer.
+                if let Some(screen) = app.transfer.as_mut() {
+                    screen.host_key = Some(HostKeyPrompt { host, fingerprint });
+                }
+            }
             WorkerEvent::Done(outcome) => {
                 // Snapshot the just-finished direction BEFORE finish_inflight
                 // flips the task to Done (it is still InFlight here). The
@@ -978,6 +1024,44 @@ mod tests {
     // snapshot and silently breaks the search-result feed.
     // ===============================================================
 
+    // ===============================================================
+    // Worker-event drain wiring (Task 2): drain_transfer_events must route
+    // a HostKeyNeedsConfirm event onto screen.host_key so the overlay shows
+    // while Connecting. Uses SftpWorker::new_for_test so a real master
+    // handshake is not needed — the test pre-seeds the event channel and
+    // asserts the drain writes the overlay state.
+    // ===============================================================
+
+    #[test]
+    fn drain_host_key_needs_confirm_sets_screen_host_key() {
+        use std::sync::mpsc;
+        let mut app = app_with_host("web");
+        let mut screen = TransferScreen::new(PathBuf::from("/local"), PathBuf::from("/remote"));
+        screen.connect = ConnectState::Connecting;
+        assert!(screen.host_key.is_none(), "no overlay before the event");
+        app.transfer = Some(screen);
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<WorkerCmd>();
+        let (event_tx, event_rx) = mpsc::channel::<WorkerEvent>();
+        event_tx
+            .send(WorkerEvent::HostKeyNeedsConfirm {
+                host: "h.example".into(),
+                fingerprint: "SHA256:abc".into(),
+            })
+            .expect("send event");
+        app.transfer_worker = Some(SftpWorker::new_for_test(cmd_tx, event_rx));
+        let rc = Rc::new(RefCell::new(stdout_tui()));
+        let handle: TerminalHandle = Rc::downgrade(&rc);
+
+        drain_transfer_events(&mut app, &handle);
+
+        let s = app.transfer.as_ref().expect("screen present");
+        let ov = s.host_key.as_ref().expect("overlay set by drain");
+        assert_eq!(ov.host, "h.example");
+        assert_eq!(ov.fingerprint, "SHA256:abc");
+        // Connecting is preserved — the overlay only renders while Connecting.
+        assert_eq!(s.connect, ConnectState::Connecting);
+    }
+
     #[test]
     fn drain_applies_buffered_search_events_to_active_pane_search() {
         use sshrack_core::pathfind::{PathMatch, SearchEvent, SearchEventKind};
@@ -986,6 +1070,7 @@ mod tests {
 
         let mut app = app_with_host("web");
         let mut screen = TransferScreen::new(PathBuf::from("/local"), PathBuf::from("/remote"));
+        screen.connect = ConnectState::Connected;
         // Active search on the LOCAL pane with gen 1. The remote pane has no
         // search so the drain's "active side" pick lands on Local.
         screen.local.search = Some(crate::tui::transfer::search::PaneSearch::empty());
@@ -1039,6 +1124,7 @@ mod tests {
 
         let mut app = app_with_host("web");
         let mut screen = TransferScreen::new(PathBuf::from("/local"), PathBuf::from("/remote"));
+        screen.connect = ConnectState::Connected;
         screen.local.search = Some(crate::tui::transfer::search::PaneSearch::empty());
         // Current gen is 2 — an event tagged gen 1 is from a superseded query.
         screen.search_gen = 2;
@@ -1092,6 +1178,7 @@ mod tests {
 
         let mut app = app_with_host("web");
         let mut screen = TransferScreen::new(PathBuf::from("/local"), PathBuf::from("/remote"));
+        screen.connect = ConnectState::Connected;
         let (_tx, rx) = mpsc::channel::<sshrack_core::pathfind::SearchEvent>();
         screen.search_rx = Some(rx);
         // No search_cancel — simulates the post-cancel_search state. The drain
@@ -1128,6 +1215,7 @@ mod tests {
 
         let mut app = app_with_host("web");
         let mut screen = TransferScreen::new(PathBuf::from("/local"), PathBuf::from("/remote"));
+        screen.connect = ConnectState::Connected;
         // Both panes carry search state: local is the stale leftover, remote
         // is the new in-flight find.
         screen.local.search = Some(crate::tui::transfer::search::PaneSearch::empty());
@@ -1413,6 +1501,7 @@ mod tests {
 
         let mut app = app_with_host("web");
         let mut screen = TransferScreen::new(dir.path().to_path_buf(), PathBuf::from("/remote"));
+        screen.connect = ConnectState::Connected;
         screen.local.core.query = dir.path().to_string_lossy().into_owned();
         assert!(!screen.local.core.query.is_empty(), "fixture: query seeded");
         app.transfer = Some(screen);
@@ -1459,7 +1548,10 @@ mod tests {
         let origin = dir.path().to_path_buf();
 
         let mut app = app_with_host("web");
-        let screen = TransferScreen::new(origin.clone(), PathBuf::from("/remote"));
+        let mut screen = TransferScreen::new(origin.clone(), PathBuf::from("/remote"));
+        // Connected so on_key navigation/auto-clear arms are reachable (a fresh
+        // screen is Connecting, whose gate swallows everything but Esc/Ctrl-C).
+        screen.connect = ConnectState::Connected;
         app.transfer = Some(screen);
         let rc = Rc::new(RefCell::new(stdout_tui()));
         let handle: TerminalHandle = Rc::downgrade(&rc);
@@ -1522,7 +1614,10 @@ mod tests {
         let origin = dir.path().to_path_buf();
 
         let mut app = app_with_host("web");
-        let screen = TransferScreen::new(origin.clone(), PathBuf::from("/remote"));
+        let mut screen = TransferScreen::new(origin.clone(), PathBuf::from("/remote"));
+        // Connected so on_key navigation/auto-clear arms are reachable (a fresh
+        // screen is Connecting, whose gate swallows everything but Esc/Ctrl-C).
+        screen.connect = ConnectState::Connected;
         app.transfer = Some(screen);
         let rc = Rc::new(RefCell::new(stdout_tui()));
         let handle: TerminalHandle = Rc::downgrade(&rc);
@@ -1561,6 +1656,7 @@ mod tests {
         use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
         let mut app = app_with_host("web");
         let mut screen = TransferScreen::new(PathBuf::from("/local"), PathBuf::from("/remote"));
+        screen.connect = ConnectState::Connected;
         screen.set_status(Status::error("seeded error"));
         app.transfer = Some(screen);
 
@@ -1596,6 +1692,7 @@ mod tests {
 
         let mut app = app_with_host("web");
         let mut screen = TransferScreen::new(origin.clone(), PathBuf::from("/remote"));
+        screen.connect = ConnectState::Connected;
         screen.focus = Side::Remote;
         // Remote pane shows a file the user will pull down.
         screen.remote.set_entries(vec![DirEntry {
