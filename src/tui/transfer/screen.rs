@@ -866,11 +866,12 @@ impl TransferScreen {
     }
 
     /// Progress + summary panel: a 2-row band. Row 1 holds the active transfer
-    /// text plus a visible-track bar (or the dim "no transfer in flight" placeholder when
-    /// idle). Row 2 is the `done X/Y · fail Z [· paused]` summary with any
-    /// transient status message appended — `summary_line` bounds the message so
-    /// it can not push the counts off the row. The hotkey reference lives in
-    /// the footer.
+    /// text plus a visible-track bar, and is left blank when idle (the row
+    /// height is reserved so a transfer starting does not reflow). Row 2 is the
+    /// `done X/Y [· fail Z] [· paused]` summary — shown only when the ledger has
+    /// work — with any transient status message appended; `summary_line` bounds
+    /// the message so it can not push the counts off the row. The hotkey
+    /// reference lives in the footer.
     fn draw_progress_panel(&self, frame: &mut Frame, area: Rect) {
         let [row1, row2] =
             Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);

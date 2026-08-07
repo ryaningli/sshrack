@@ -422,7 +422,7 @@ fn transfer_footer_advertises_f1_help() {
 }
 
 #[test]
-fn draw_renders_summary_when_idle() {
+fn draw_idle_panel_is_blank() {
     let backend = TestBackend::new(70, 20);
     let mut term = Terminal::new(backend).expect("test backend");
     let mut screen = canned_screen();
@@ -433,7 +433,12 @@ fn draw_renders_summary_when_idle() {
     let res = term.draw(|f| screen.draw(f, f.area()));
     assert!(res.is_ok(), "idle draw must not panic: {:?}", res.err());
     let view = buffer_view(term.backend().buffer());
-    assert!(view.contains("done"), "summary present when idle: {view}");
+    // Idle: no counts segment and no active-transfer placeholder — both rows
+    // of the progress panel stay blank (silence is normal).
+    assert!(
+        !view.contains("done") && !view.contains("no transfer in flight"),
+        "idle panel is blank — no counts, no placeholder: {view}"
+    );
 }
 
 #[test]
