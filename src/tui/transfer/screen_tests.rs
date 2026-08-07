@@ -316,10 +316,10 @@ fn draw_connecting_renders_banner_without_panic() {
 }
 
 #[test]
-fn draw_connect_failed_renders_reason_dialog_without_panic() {
-    // After ConnectFailed the status bar carries the reason; draw centers a
-    // solid danger dialog with the reason + an `Esc return to launcher` footer
-    // over the inert panes, without panicking.
+fn draw_connect_failed_renders_placeholder_and_status_without_panic() {
+    // After ConnectFailed the status bar carries the reason; the remote pane is
+    // a two-line placeholder (`connection failed` + dim `Esc to return`) and no
+    // modal dialog is drawn. Draws without panicking.
     let backend = TestBackend::new(80, 24);
     let mut term = Terminal::new(backend).expect("test backend");
     let mut screen = TransferScreen::new(PathBuf::from("/local"), PathBuf::from("/"));
@@ -335,11 +335,10 @@ fn draw_connect_failed_renders_reason_dialog_without_panic() {
     );
     let view = buffer_view(term.backend().buffer());
     assert!(
-        view.contains("Connection failed")
-            && view.contains("Permission denied")
-            && view.contains("Esc")
-            && view.contains("return to launcher"),
-        "connect-failed dialog shows title + reason + esc hint: {view}"
+        view.contains("connection failed")
+            && view.contains("Esc to return")
+            && view.contains("Permission denied"),
+        "connect-failed shows placeholder + esc hint + status reason, no modal: {view}"
     );
 }
 

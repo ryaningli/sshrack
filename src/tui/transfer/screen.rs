@@ -87,8 +87,9 @@ pub enum ConnectState {
     Connecting,
     /// Handshake done; the worker is in its service loop. Normal browsing.
     Connected,
-    /// Handshake failed. The status bar already shows the reason; `Esc`/
-    /// `Ctrl-C` return to the launcher. No other keys do anything.
+    /// Handshake failed. The status bar already shows the reason; the remote
+    /// placeholder shows `connection failed` + an `Esc to return` hint.
+    /// `Esc`/`Ctrl-C` return to the launcher. No other keys do anything.
     ConnectFailed,
 }
 
@@ -791,33 +792,6 @@ impl TransferScreen {
             }
         }
 
-        // A failed connection surfaces a solid, centered danger dialog
-        // (Clear-backed, same chrome as CloseConfirm/HostKeyPrompt) with the
-        // reason + an Esc-to-return hint. The status bar carries the same
-        // reason; this dialog is the unambiguous failure surface over the
-        // inert panes.
-        if matches!(self.connect, ConnectState::ConnectFailed) {
-            let reason = self
-                .status
-                .message
-                .clone()
-                .unwrap_or_else(|| "sftp connection failed".to_string());
-            let body = dialog::draw_dialog(
-                frame,
-                "Connection failed",
-                1,
-                &[("Esc", "return to launcher")],
-            );
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    reason,
-                    Style::new().fg(theme::DANGER),
-                )))
-                .alignment(Alignment::Center),
-                body,
-            );
-        }
-
         self.draw_progress_panel(frame, panel_area);
         self.draw_footer(frame, footer_area);
 
@@ -841,9 +815,9 @@ impl TransferScreen {
     /// host and a single centered status line. Replaces the live listing so a
     /// pending or failed connection never reads as an empty connected root
     /// (`/` + `0/0` + a stale listing). `danger` colors the message red
-    /// (ConnectFailed); otherwise it is dim (Connecting). The interior is
-    /// `Clear`ed every frame so no stale listing bleeds through across states.
-    /// Pure: no I/O.
+    /// (ConnectFailed) and appends a dim `Esc to return` hint below it;
+    /// otherwise it is dim (Connecting). The interior is `Clear`ed every frame
+    /// so no stale listing bleeds through across states. Pure: no I/O.
     fn draw_remote_pending(&self, frame: &mut Frame, area: Rect, message: &str, danger: bool) {
         let block = Block::new()
             .borders(Borders::ALL)
@@ -855,15 +829,29 @@ impl TransferScreen {
         let inner = block.inner(area);
         frame.render_widget(&block, area);
         frame.render_widget(Clear, inner);
-        let row = inner.y + inner.height / 2;
-        let style = if danger {
+
+        // Center vertically. On a failed connection (danger) append a dim
+        // `Esc to return` hint below the message: the modal dialog was removed
+        // (the status bar already carries the reason), so the placeholder is the
+        // visual anchor plus the single exit cue.
+        let msg_style = if danger {
             Style::new().fg(theme::DANGER)
         } else {
             Style::new().dim()
         };
+        let lines: Vec<Line> = if danger {
+            vec![
+                Line::from(Span::styled(message, msg_style)),
+                Line::from(Span::styled("Esc to return", Style::new().dim())),
+            ]
+        } else {
+            vec![Line::from(Span::styled(message, msg_style))]
+        };
+        let count = lines.len() as u16;
+        let top = inner.y + inner.height.saturating_sub(count) / 2;
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(message, style))).alignment(Alignment::Center),
-            Rect::new(inner.x, row, inner.width, 1),
+            Paragraph::new(lines).alignment(Alignment::Center),
+            Rect::new(inner.x, top, inner.width, count),
         );
     }
 
