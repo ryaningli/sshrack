@@ -33,6 +33,7 @@ use sshrack_core::connect::sftp::proto::{
 use sshrack_core::dirsource::DirEntry;
 use sshrack_core::pathfind::{ParsedQuery, SearchEvent};
 
+use crate::tui::dialog;
 use crate::tui::intent::Status;
 use crate::tui::theme;
 use crate::tui::transfer::close_confirm::CloseConfirm;
@@ -69,6 +70,12 @@ pub enum ScreenOutcome {
     /// [`TransferScreen::next_job`] to dispatch the first one if no transfer is
     /// currently in flight. `Ctrl-Enter` emits this.
     Enqueue,
+    /// Reply to the host-key overlay: the user accepted (`true`) or rejected
+    /// (`false`) an unknown host's fingerprint. The loop forwards it to the
+    /// worker as `WorkerCmd::HostKeyConfirm` and dismisses the overlay. Emitted
+    /// only while `Connecting` (the overlay is set by the
+    /// `WorkerEvent::HostKeyNeedsConfirm` drain and cleared on this outcome).
+    HostKeyConfirm(bool),
 }
 
 /// Where the SFTP session is in its connect lifecycle. Drives both `on_key`
@@ -83,6 +90,29 @@ pub enum ConnectState {
     /// Handshake failed. The status bar already shows the reason; `Esc`/
     /// `Ctrl-C` return to the launcher. No other keys do anything.
     ConnectFailed,
+}
+
+/// Host-key confirmation overlay (unknown host). Owned by [`TransferScreen`]
+/// like [`CloseConfirm`] / [`QueueOverlay`]. Set by the run loop when a
+/// [`WorkerEvent::HostKeyNeedsConfirm`](sshrack_core::connect::sftp::proto::WorkerEvent::HostKeyNeedsConfirm)
+/// drains (only while `Connecting`); `Enter`/`y` accept, `n`/`Esc` reject via
+/// [`ScreenOutcome::HostKeyConfirm`], and the run loop dismisses the overlay on
+/// either outcome.
+///
+/// Unlike [`CloseConfirm`], this overlay has no `closed` flag: the run loop
+/// clears `host_key` to `None` unconditionally on every outcome (the worker
+/// reply is mandatory, so there is no "neutral key keeps it open" state that
+/// the screen needs to inspect later).
+///
+/// [`CloseConfirm`]: super::close_confirm::CloseConfirm
+/// [`QueueOverlay`]: super::queue_overlay::QueueOverlay
+#[derive(Debug, Clone)]
+pub struct HostKeyPrompt {
+    /// The host token (address) the worker scanned — shown in the overlay title.
+    pub host: String,
+    /// Multi-line confirm text from `hostkey::confirm_text` (the "authenticity
+    /// of host …" message + algorithm + fingerprint).
+    pub fingerprint: String,
 }
 
 /// The full-screen transfer view. Pure state plus a render entry point —
@@ -138,6 +168,12 @@ pub struct TransferScreen {
     /// stack) because the transfer screen bypasses that stack and owns its own
     /// popups, like [`queue_overlay`](Self::queue_overlay).
     pub close_confirm: Option<CloseConfirm>,
+    /// The host-key confirmation overlay. `None` unless the worker emitted
+    /// `WorkerEvent::HostKeyNeedsConfirm` for an unknown host (only while
+    /// `Connecting`). Owned here for the same reason as `close_confirm` — the
+    /// transfer screen owns its own popups. Dismissed by the run loop on
+    /// [`ScreenOutcome::HostKeyConfirm`].
+    pub host_key: Option<HostKeyPrompt>,
     /// Pending search launch: the focused side + parsed query that the run
     /// loop (Task 9) reads to spawn a
     /// [`PathSearch`](sshrack_core::pathfind::PathSearch). Set by
@@ -205,6 +241,7 @@ impl TransferScreen {
             overwrite_policy: None,
             queue_overlay: None,
             close_confirm: None,
+            host_key: None,
             pending_search: None,
             search_rx: None,
             search_cancel: None,
@@ -343,6 +380,26 @@ impl TransferScreen {
     pub fn on_key(&mut self, key: KeyEvent) -> ScreenOutcome {
         if key.kind != KeyEventKind::Press {
             return ScreenOutcome::Continue;
+        }
+        // Host-key confirmation overlay. Only set while `Connecting` (the
+        // worker emits `HostKeyNeedsConfirm` before the master handshake) and
+        // intercepted here BEFORE the connect-lifecycle close-key handling so
+        // `Enter`/`y`/`n`/`Esc` route to confirm/reject instead of closing the
+        // screen. Mirrors `CloseConfirm`/`QueueOverlay`'s modal shape: any
+        // other key re-seats the overlay and returns `Continue`.
+        if let Some(ov) = self.host_key.take() {
+            let accept = match key.code {
+                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => Some(true),
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(false),
+                _ => None,
+            };
+            match accept {
+                Some(decision) => return ScreenOutcome::HostKeyConfirm(decision),
+                None => {
+                    self.host_key = Some(ov);
+                    return ScreenOutcome::Continue;
+                }
+            }
         }
         // Connect lifecycle gates. Until the worker reports Connected, the
         // panes have no usable entries — swallow everything except the close
@@ -753,6 +810,11 @@ impl TransferScreen {
         if let Some(ov) = &self.close_confirm {
             ov.draw(frame);
         }
+        // The host-key overlay paints last so it sits above every band,
+        // including the close-confirm overlay. Only present while `Connecting`.
+        if let Some(ov) = &self.host_key {
+            ov.draw(frame);
+        }
     }
 
     /// One-line connect-lifecycle banner. `dim_full` widens the dim to cover a
@@ -849,6 +911,25 @@ impl TransferScreen {
             spans.push(Span::styled(" …", Style::new().dim()));
         }
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
+}
+
+impl HostKeyPrompt {
+    /// Render the centered host-key confirmation dialog above the transfer
+    /// screen. Uses [`dialog::draw_dialog`] for the bordered box + hotkey
+    /// footer; the body is the multi-line confirm text from
+    /// `hostkey::confirm_text` (authenticity + algorithm + fingerprint).
+    pub(crate) fn draw(&self, frame: &mut Frame) {
+        // `fingerprint` is the multi-line confirm_text; count its rows so the
+        // dialog sizes to fit. Fall back to 1 for an empty message.
+        let body_rows = self.fingerprint.lines().count().max(1) as u16;
+        let body_area = dialog::draw_dialog(
+            frame,
+            &format!("Unknown host: {}", self.host),
+            body_rows,
+            &[("Enter/y", "accept"), ("n/Esc", "reject")],
+        );
+        frame.render_widget(Paragraph::new(self.fingerprint.clone()), body_area);
     }
 }
 

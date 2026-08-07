@@ -62,6 +62,7 @@ use crate::connect::ssh::Overrides;
 use crate::connect::{askpass_env_for_sftp, write_password_file};
 use crate::credential::{PasswordSource, ResolvedAuth};
 use crate::dirsource::DirSource;
+use crate::hostkey::{self, HostKeyAction};
 
 /// How long [`connect_phase`] polls `ssh -O check` before giving up. 30s is
 /// generous for slow first-connect handshakes on high-latency links but bounded
@@ -153,8 +154,8 @@ impl SftpWorker {
     /// aborts).
     ///
     /// `resolved`/`host`/`overrides`/`self_exe`/`source`/`config_path` mirror
-    /// the old `open`. `host_key` inputs are added in Task 2; for Task 1 the
-    /// host-key pre-flight still ran in `open_transfer` before this call.
+    /// the old `open`. The host-key pre-flight (Task 2) runs at the top of the
+    /// connect phase on the worker thread.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         resolved: ResolvedAuth,
@@ -164,6 +165,58 @@ impl SftpWorker {
         source: PasswordSource,
         config_path: Option<&Path>,
         bin: SftpBin,
+    ) -> Result<Self, String> {
+        Self::spawn_inner(
+            resolved,
+            host,
+            overrides,
+            self_exe,
+            source,
+            config_path,
+            bin,
+            /* host_key_preflight */ true,
+        )
+    }
+
+    /// Test-only spawn: like [`SftpWorker::spawn`] but skips the host-key
+    /// pre-flight. The shim-based seam tests use unresolvable hosts (e.g.
+    /// `sftp-shim.invalid`) that would fail `ssh-keyscan` before the master
+    /// handshake is reached; skipping the pre-flight lets those tests keep
+    /// exercising the master handshake + transfer path against the ssh/sftp
+    /// shims. Not part of the stable API.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_for_test(
+        resolved: ResolvedAuth,
+        host: Host,
+        overrides: Overrides,
+        self_exe: &Path,
+        source: PasswordSource,
+        config_path: Option<&Path>,
+        bin: SftpBin,
+    ) -> Result<Self, String> {
+        Self::spawn_inner(
+            resolved,
+            host,
+            overrides,
+            self_exe,
+            source,
+            config_path,
+            bin,
+            /* host_key_preflight */ false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_inner(
+        resolved: ResolvedAuth,
+        host: Host,
+        overrides: Overrides,
+        self_exe: &Path,
+        source: PasswordSource,
+        config_path: Option<&Path>,
+        bin: SftpBin,
+        host_key_preflight: bool,
     ) -> Result<Self, String> {
         let (event_tx, event_rx) = mpsc::channel::<WorkerEvent>();
         let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCmd>();
@@ -186,6 +239,7 @@ impl SftpWorker {
                     config_path_owned,
                     bin,
                     runner,
+                    host_key_preflight,
                 )
             })
             .map_err(|e| format!("sftp worker thread spawn failed: {e}"))?;
@@ -209,6 +263,25 @@ impl SftpWorker {
     pub fn try_event(&self) -> Option<WorkerEvent> {
         self.event_rx.try_recv().ok()
     }
+
+    /// Test-only constructor: build a handle around pre-seeded channel ends
+    /// WITHOUT spawning a worker thread. The drain reads events from
+    /// `event_rx` and (on `HostKeyConfirm`) writes commands to `cmd_tx`;
+    /// `Drop` sends `Shutdown` and skips the join (`join: None` → no thread to
+    /// reap). Used by `run_loop` drain tests that need to exercise the
+    /// event-routing logic without a real master handshake. Not part of the
+    /// stable API.
+    #[doc(hidden)]
+    pub fn new_for_test(
+        cmd_tx: mpsc::Sender<WorkerCmd>,
+        event_rx: mpsc::Receiver<WorkerEvent>,
+    ) -> Self {
+        Self {
+            cmd_tx,
+            event_rx,
+            join: None,
+        }
+    }
 }
 
 impl Drop for SftpWorker {
@@ -231,6 +304,8 @@ impl Drop for SftpWorker {
 /// loop). `session` moves into `service_loop` so its [`MasterSession::drop`]
 /// runs when that function returns — i.e. on every exit path. On a connect
 /// failure / cancel [`connect_phase`] already cleaned up and returned `Err`.
+/// `host_key_preflight` toggles the Task 2 host-key step (prod runs it; the
+/// shim seam tests skip it because their hosts are unresolvable).
 #[allow(clippy::too_many_arguments)]
 fn run_worker_thread(
     cmd_rx: mpsc::Receiver<WorkerCmd>,
@@ -243,9 +318,14 @@ fn run_worker_thread(
     config_path: Option<PathBuf>,
     bin: SftpBin,
     runner: Arc<LocalSftpRunner>,
+    host_key_preflight: bool,
 ) {
-    // Task 1: connect = master handshake + pwd. (Task 2 prepends host-key here.)
+    // Task 1: connect = master handshake + pwd. Task 2 prepends the host-key
+    // pre-flight (ssh-keyscan + fingerprint confirm) here, so `host_str`/`port`
+    // are read from `host` BEFORE the borrow and forwarded into connect_phase.
     // `connect_phase` reports + cleans up on Err, so only the Ok arm does work.
+    let host_str = host.host.as_str();
+    let port = host.port;
     if let Ok((session, home)) = connect_phase(
         &cmd_rx,
         &event_tx,
@@ -257,6 +337,9 @@ fn run_worker_thread(
         config_path.as_deref(),
         &bin,
         &runner,
+        host_str,
+        port,
+        host_key_preflight,
     ) {
         // service_loop takes ownership of the session; when it returns,
         // session drops and tears the master down.
@@ -275,11 +358,111 @@ fn run_worker_thread(
     }
 }
 
+/// Host-key pre-flight (Task 2). Runs on the worker thread BEFORE the master
+/// handshake. For a known host it is instant (`is_known` → launch); for an
+/// unknown host it scans, asks the UI via [`WorkerEvent::HostKeyNeedsConfirm`],
+/// and blocks on `cmd_rx` for the reply — all cancellable via `Shutdown` (Esc
+/// while the overlay is up lands here as a reject).
+///
+/// `host_str`/`port` thread from [`run_worker_thread`] (which owns `host`).
+/// Returns `Ok(())` to proceed to the master handshake; `Err(())` after
+/// emitting `ConnectFailed` (or silently on a channel disconnect = UI gone).
+///
+/// Known limitation: `ssh-keyscan` (unknown-host path only) runs via
+/// `Command::output` and is NOT cancellable mid-scan. If the user `Esc`s while
+/// the worker is inside the scan, `Drop`'s `join` waits up to the scan's 5s
+/// `-T` timeout before returning. The high-frequency paths (known host: no
+/// scan; master handshake: cancellable poll) are unaffected.
+fn host_key_check(
+    cmd_rx: &mpsc::Receiver<WorkerCmd>,
+    event_tx: &mpsc::Sender<WorkerEvent>,
+    host_str: &str,
+    port: u16,
+) -> Result<(), ()> {
+    // The TUI always runs on a tty and has no --accept-new flag, so `classify`
+    // returns Launch for known hosts and Prompt for unknown hosts. Reject is
+    // unreachable (no-tty + no-flag) but fail-safe.
+    let known_hosts = match hostkey::known_hosts_path() {
+        Some(p) => p,
+        None => {
+            let _ = event_tx.send(WorkerEvent::ConnectFailed("no known_hosts path".into()));
+            return Err(());
+        }
+    };
+    let known = hostkey::is_known(host_str, port, &known_hosts).unwrap_or(false);
+    match hostkey::classify(known, /*has_tty*/ true, /*accept_new*/ false) {
+        HostKeyAction::Launch => {} // known — proceed to master handshake
+        HostKeyAction::Accept | HostKeyAction::Prompt => {
+            // Unknown: scan (≤5s `-T`), ask, wait. `classify` returns Accept
+            // only with --accept-new, which the TUI never sets, so this is the
+            // Prompt path in practice — but Accept handles a future flag too.
+            let fps = match hostkey::scan_fingerprints(host_str, port) {
+                Ok(fps) if !fps.is_empty() => fps,
+                _ => {
+                    let _ = event_tx.send(WorkerEvent::ConnectFailed(format!(
+                        "host key scan failed for {host_str}"
+                    )));
+                    return Err(());
+                }
+            };
+            let primary = match hostkey::pick_primary(&fps) {
+                Some(p) => p,
+                None => {
+                    let _ = event_tx.send(WorkerEvent::ConnectFailed(format!(
+                        "host key scan returned no keys for {host_str}"
+                    )));
+                    return Err(());
+                }
+            };
+            let fingerprint = hostkey::confirm_text(host_str, primary);
+            let _ = event_tx.send(WorkerEvent::HostKeyNeedsConfirm {
+                host: host_str.to_string(),
+                fingerprint,
+            });
+            // Wait for the UI's reply. Esc/drop → Shutdown/Disconnect → reject.
+            // A channel disconnect (UI gone) is a silent cancel — no
+            // ConnectFailed, the user already chose to leave.
+            let accepted = match cmd_rx.recv() {
+                Ok(WorkerCmd::HostKeyConfirm(true)) => true,
+                Ok(WorkerCmd::HostKeyConfirm(false)) | Ok(WorkerCmd::Shutdown) => false,
+                Ok(_) => false,           // unexpected; treat as reject
+                Err(_) => return Err(()), // UI gone — silent cancel
+            };
+            if !accepted {
+                let _ = event_tx.send(WorkerEvent::ConnectFailed(format!(
+                    "host key not confirmed for {host_str}"
+                )));
+                return Err(());
+            }
+            if let Err(e) = hostkey::append_to_known_hosts(host_str, port, &known_hosts) {
+                let _ = event_tx.send(WorkerEvent::ConnectFailed(format!(
+                    "known_hosts write failed: {e}"
+                )));
+                return Err(());
+            }
+        }
+        HostKeyAction::Reject => {
+            // classify returns Reject only without a tty AND without
+            // accept_new; the TUI always has a tty, so this is unreachable —
+            // but fail safe.
+            let _ = event_tx.send(WorkerEvent::ConnectFailed("host key rejected".into()));
+            return Err(());
+        }
+    }
+    Ok(())
+}
+
 /// Spawn the master, poll until up (cancellable), probe home via `pwd`.
 /// Sends [`WorkerEvent::Connected`] on success; [`WorkerEvent::ConnectFailed`]
 /// on Exited/Timeout; nothing on Cancelled. Returns `Err(())` whenever the
 /// master did NOT come up (the partial [`MasterSession`] cleans itself up via
 /// `Drop`).
+///
+/// Task 2 prepends [`host_key_check`] (was `open_transfer` step 5 on the UI
+/// thread) when `host_key_preflight` is true; the shim-based seam tests pass
+/// `false` so their unresolvable hosts do not fail at `ssh-keyscan` before the
+/// master handshake is reached. `host_str`/`port` thread from
+/// [`run_worker_thread`] (which owns `host`).
 #[allow(clippy::too_many_arguments)]
 fn connect_phase(
     cmd_rx: &mpsc::Receiver<WorkerCmd>,
@@ -292,7 +475,14 @@ fn connect_phase(
     config_path: Option<&Path>,
     bin: &SftpBin,
     runner: &Arc<LocalSftpRunner>,
+    host_str: &str,
+    port: u16,
+    host_key_preflight: bool,
 ) -> Result<(MasterSession, PathBuf), ()> {
+    if host_key_preflight {
+        host_key_check(cmd_rx, event_tx, host_str, port)?;
+    }
+
     let sock = ControlSocket::new();
     let sock_path = sock.path().to_path_buf();
     let target = sftp_target(resolved, host);
@@ -469,6 +659,12 @@ fn service_loop(
             WorkerCmd::Cancel => {
                 // No transfer in flight — nothing to cancel. Drop silently.
             }
+            WorkerCmd::HostKeyConfirm(_) => {
+                // Connect-phase reply that arrived after the master was already
+                // up (impossible in normal flow — the connect phase owns
+                // cmd_rx until Connected). Drop silently rather than risk a
+                // mid-session state change.
+            }
             WorkerCmd::Shutdown => break,
         }
     }
@@ -485,7 +681,7 @@ fn service_loop(
 /// via [`classify_inflight_cmd`]: `Shutdown` propagates (kill + cleanup +
 /// signal), `Cancel` cancels, anything else is dropped.
 ///
-/// Returns `true` if `Shutdown` was received mid-transfer, so [`worker_loop`]
+/// Returns `true` if `Shutdown` was received mid-transfer, so [`service_loop`]
 /// `break`s instead of looping back to `recv()` (which would deadlock against
 /// `Drop`'s `join()`). Returns `false` on normal completion / cancel / spawn
 /// failure / channel disconnect.
@@ -611,7 +807,7 @@ fn run_transfer(
                             return false;
                         }
                         InflightAction::Shutdown => {
-                            // CRITICAL: propagate Shutdown so worker_loop breaks
+                            // CRITICAL: propagate Shutdown so service_loop breaks
                             // instead of looping back to recv(). Kill + reap the
                             // child + remove the partial so teardown is clean,
                             // then signal the loop to exit.

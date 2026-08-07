@@ -322,7 +322,7 @@ fn wait_for_invocation_with(capture: &Path, token: &str, deadline: Duration) -> 
 /// that previously handed back `(worker, home)` synchronously.
 fn spawn_and_connect(bin: SftpBin) -> (SftpWorker, PathBuf) {
     let self_exe = std::env::current_exe().expect("current_exe");
-    let worker = SftpWorker::spawn(
+    let worker = SftpWorker::spawn_for_test(
         resolved_none(),
         key_only_host(),
         sshrack_core::connect::ssh::Overrides::default(),
@@ -473,8 +473,11 @@ fn sftp_run_transfer_emits_progress_then_done_against_shim() {
             },
             Some(WorkerEvent::Listing(_, _)) => { /* ignore */ }
             // Connected/ConnectFailed arrive before Transfer (spawn_and_connect
-            // already drained Connected); safe to ignore here.
-            Some(WorkerEvent::Connected { .. }) | Some(WorkerEvent::ConnectFailed(_)) => {}
+            // already drained Connected); safe to ignore here. HostKeyNeedsConfirm
+            // only fires for an unknown host (the shim tests use a known host).
+            Some(WorkerEvent::Connected { .. })
+            | Some(WorkerEvent::ConnectFailed(_))
+            | Some(WorkerEvent::HostKeyNeedsConfirm { .. }) => {}
             None => std::thread::sleep(Duration::from_millis(50)),
         }
     }
@@ -561,7 +564,7 @@ fn sftp_worker_drop_tears_down_master_socket_and_pw_file() {
     // lives in std::env::temp_dir() with a pid+nanos name; the after-drop
     // snapshot (c) diffs against this set to prove Drop removed it.
     let before: HashSet<PathBuf> = pw_files_in(&std::env::temp_dir());
-    let worker = SftpWorker::spawn(
+    let worker = SftpWorker::spawn_for_test(
         resolved_inline("hunter2"),
         key_only_host(),
         sshrack_core::connect::ssh::Overrides::default(),
@@ -684,7 +687,7 @@ fn sftp_worker_drop_not_blocked_by_slow_control_exit() {
 fn sftp_worker_spawn_is_async_reports_connected() {
     let (_dir, _ssh, _sftp, _capture, bin) = fresh_shim_env();
     let self_exe = std::env::current_exe().expect("current_exe");
-    let worker = SftpWorker::spawn(
+    let worker = SftpWorker::spawn_for_test(
         resolved_none(),
         key_only_host(),
         sshrack_core::connect::ssh::Overrides::default(),
@@ -736,7 +739,7 @@ fn sftp_worker_spawn_is_async_reports_connected() {
 fn sftp_worker_spawn_drop_cancels_handshake_quickly() {
     let (_dir, _ssh, _sftp, _capture, bin) = fresh_shim_env_never_ready();
     let self_exe = std::env::current_exe().expect("current_exe");
-    let worker = SftpWorker::spawn(
+    let worker = SftpWorker::spawn_for_test(
         resolved_none(),
         key_only_host(),
         sshrack_core::connect::ssh::Overrides::default(),
@@ -758,4 +761,194 @@ fn sftp_worker_spawn_drop_cancels_handshake_quickly() {
         elapsed < Duration::from_secs(2),
         "drop did not cancel the handshake quickly: {elapsed:?} (expected <<30s)"
     );
+}
+
+// ---- Task 2: async host-key pre-flight (unknown-host integration test) ----
+//
+// The worker's host-key pre-flight calls `hostkey::known_hosts_path()` which
+// reads the real `$HOME/.ssh/known_hosts`. There is no hermetic seam to point
+// the worker at a temp known_hosts without env mutation (forbidden), so a full
+// unknown-host round-trip is an integration test against the real known_hosts
+// and a real sshd. It is `#[ignore]`'d by default — CI never runs it. Run
+// locally with:
+//
+//   SSHRACK_E2E_HOST=127.0.0.1 SSHRACK_E2E_PORT=2222 SSHRACK_E2E_USER=$USER \
+//     cargo test -p sshrack-core --test sftp_seam_test -- \
+//     --ignored --nocapture sftp_worker_async_host_key_unknown_host
+//
+// Preconditions (mirror sftp_e2e.rs):
+//   1. A local sshd is reachable at SSHRACK_E2E_HOST:SSHRACK_E2E_PORT with key
+//      auth for SSHRACK_E2E_USER already configured.
+//   2. The host is NOT already in `~/.ssh/known_hosts` (the test removes any
+//      matching entry before + after so it is repeatable).
+//
+// The hermetic backbone for Task 2 lives in: (a) the screen_tests on_key tests
+// (ScreenOutcome::HostKeyConfirm routing), (b) the run_loop drain test
+// (HostKeyNeedsConfirm → screen.host_key), (c) hostkey.rs's existing unit
+// tests (classify / scan_fingerprints / pick_primary / confirm_text).
+
+/// `#[ignore]`'d unknown-host round trip: spawn → HostKeyNeedsConfirm →
+/// HostKeyConfirm(true) → Connected. Verifies the worker surfaces the
+/// fingerprint, accepts the reply, appends to known_hosts, and resumes the
+/// master handshake. Requires a real sshd + a host not in known_hosts.
+#[test]
+#[ignore = "requires a local sshd + a host not in known_hosts; see test docs"]
+fn sftp_worker_async_host_key_unknown_host() {
+    use sshrack_core::hostkey;
+    use std::process::Stdio;
+
+    let host = std::env::var("SSHRACK_E2E_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let port: u16 = std::env::var("SSHRACK_E2E_PORT")
+        .unwrap_or_else(|_| "2222".to_string())
+        .parse()
+        .expect("SSHRACK_E2E_PORT parses as u16");
+    let user = std::env::var("SSHRACK_E2E_USER")
+        .unwrap_or_else(|_| std::env::var("USER").unwrap_or_default());
+    if user.is_empty() {
+        eprintln!("sftp_worker_async_host_key_unknown_host: no SSHRACK_E2E_USER — skipping");
+        return;
+    }
+    let known_hosts = match hostkey::known_hosts_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("no known_hosts path — skipping");
+            return;
+        }
+    };
+
+    // Pre-clean: remove any existing entry so the host is genuinely unknown
+    // (otherwise the worker skips the prompt and goes straight to Connected).
+    let _ = std::process::Command::new("ssh-keygen")
+        .args(["-R", &hostkey::host_query(&host, port)])
+        .arg(&known_hosts)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    // Re-verify: if the host is somehow still known, the test cannot exercise
+    // the unknown-host path — skip instead of false-passing.
+    if hostkey::is_known(&host, port, &known_hosts).unwrap_or(false) {
+        eprintln!(
+            "sftp_worker_async_host_key_unknown_host: {host}:{port} still in known_hosts after -R — skipping"
+        );
+        return;
+    }
+
+    let host_obj = Host {
+        id: sshrack_core::id::new_id(),
+        name: "host-key-e2e".into(),
+        host: host.clone(),
+        port,
+        auth: Auth::inline(CredentialBody::new(user.clone())),
+    };
+    let resolved = ResolvedAuth {
+        user,
+        key_path: None,
+        password: PasswordSource::None,
+        inline_key: None,
+    };
+    let self_exe = std::env::current_exe().expect("current_exe");
+    let worker = SftpWorker::spawn(
+        resolved,
+        host_obj,
+        sshrack_core::connect::ssh::Overrides::default(),
+        &self_exe,
+        PasswordSource::None,
+        None,
+        sshrack_core::connect::sftp::SftpBin::default(),
+    )
+    .expect("spawn");
+
+    // Drain HostKeyNeedsConfirm (unknown host → scan → ask). Bounded by the
+    // ssh-keyscan -T 5s timeout + a margin.
+    let mut got_prompt = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
+        if let Some(ev) = worker.try_event() {
+            match ev {
+                WorkerEvent::HostKeyNeedsConfirm {
+                    host: h,
+                    fingerprint,
+                } => {
+                    assert_eq!(h, host, "prompt host matches the spawned host");
+                    assert!(
+                        fingerprint.contains("SHA256:"),
+                        "fingerprint text must include the SHA256: prefix: {fingerprint}"
+                    );
+                    got_prompt = true;
+                    break;
+                }
+                WorkerEvent::ConnectFailed(r) => {
+                    // Cleanup before failing so a rerun is clean.
+                    let _ = std::process::Command::new("ssh-keygen")
+                        .args(["-R", &hostkey::host_query(&host, port)])
+                        .arg(&known_hosts)
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                    panic!("expected HostKeyNeedsConfirm, got ConnectFailed: {r}");
+                }
+                _ => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        got_prompt,
+        "no HostKeyNeedsConfirm within 15s — the host may already be known, or ssh-keyscan is unreachable"
+    );
+
+    // Accept the fingerprint. The worker appends to known_hosts and resumes the
+    // master handshake.
+    worker.send(WorkerCmd::HostKeyConfirm(true));
+
+    // Drain Connected (or ConnectFailed if the sshd is unreachable / auth
+    // fails). The handshake can take up to HANDSHAKE_TIMEOUT (30s) on a slow
+    // first-connect; allow the full window.
+    let mut got_connected = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(35);
+    while std::time::Instant::now() < deadline {
+        if let Some(ev) = worker.try_event() {
+            match ev {
+                WorkerEvent::Connected { .. } => {
+                    got_connected = true;
+                    break;
+                }
+                WorkerEvent::ConnectFailed(r) => {
+                    // The host-key path itself worked (we got the prompt + the
+                    // accept landed); the connect failure is downstream
+                    // (sshd down / auth refused). Cleanup + report.
+                    let _ = std::process::Command::new("ssh-keygen")
+                        .args(["-R", &hostkey::host_query(&host, port)])
+                        .arg(&known_hosts)
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                    panic!(
+                        "host-key prompt accepted but master handshake failed (is sshd up + auth configured?): {r}"
+                    );
+                }
+                _ => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        got_connected,
+        "no Connected within 35s after accepting the host key"
+    );
+    // Sanity: the host is now in known_hosts (the accept appended it).
+    assert!(
+        hostkey::is_known(&host, port, &known_hosts).unwrap_or(false),
+        "accepting the prompt must have appended the host to known_hosts"
+    );
+
+    // Cleanup: drop the worker (tears down the master) + remove the test's
+    // known_hosts entry so the test is repeatable.
+    drop(worker);
+    let _ = std::process::Command::new("ssh-keygen")
+        .args(["-R", &hostkey::host_query(&host, port)])
+        .arg(&known_hosts)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }

@@ -38,7 +38,7 @@ use super::term::{TerminalHandle, Tui};
 use super::transfer::open::open_transfer;
 use super::transfer::overwrite;
 use super::transfer::pane::Side;
-use super::transfer::screen::ConnectState;
+use super::transfer::screen::{ConnectState, HostKeyPrompt};
 use crate::tui::transfer::search::NucleoSegmentMatcher;
 use sshrack_core::connect::sftp::SftpWorker;
 use sshrack_core::connect::sftp::proto::{Direction, TransferOutcome, WorkerCmd, WorkerEvent};
@@ -736,6 +736,17 @@ fn drain_transfer_events(app: &mut App, handle: &TerminalHandle) {
                     screen.set_status(super::intent::Status::error(reason));
                 }
             }
+            WorkerEvent::HostKeyNeedsConfirm { host, fingerprint } => {
+                // The worker hit an unknown host and needs the user to confirm
+                // the fingerprint before proceeding to the master handshake.
+                // Show the overlay (only renders while Connecting; the worker
+                // emits this only from the connect phase, so that invariant
+                // holds). The user's reply routes back via
+                // ScreenOutcome::HostKeyConfirm in route_transfer.
+                if let Some(screen) = app.transfer.as_mut() {
+                    screen.host_key = Some(HostKeyPrompt { host, fingerprint });
+                }
+            }
             WorkerEvent::Done(outcome) => {
                 // Snapshot the just-finished direction BEFORE finish_inflight
                 // flips the task to Done (it is still InFlight here). The
@@ -1012,6 +1023,44 @@ mod tests {
     // load-bearing — pinning it here guards against a refactor that drops the
     // snapshot and silently breaks the search-result feed.
     // ===============================================================
+
+    // ===============================================================
+    // Worker-event drain wiring (Task 2): drain_transfer_events must route
+    // a HostKeyNeedsConfirm event onto screen.host_key so the overlay shows
+    // while Connecting. Uses SftpWorker::new_for_test so a real master
+    // handshake is not needed — the test pre-seeds the event channel and
+    // asserts the drain writes the overlay state.
+    // ===============================================================
+
+    #[test]
+    fn drain_host_key_needs_confirm_sets_screen_host_key() {
+        use std::sync::mpsc;
+        let mut app = app_with_host("web");
+        let mut screen = TransferScreen::new(PathBuf::from("/local"), PathBuf::from("/remote"));
+        screen.connect = ConnectState::Connecting;
+        assert!(screen.host_key.is_none(), "no overlay before the event");
+        app.transfer = Some(screen);
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<WorkerCmd>();
+        let (event_tx, event_rx) = mpsc::channel::<WorkerEvent>();
+        event_tx
+            .send(WorkerEvent::HostKeyNeedsConfirm {
+                host: "h.example".into(),
+                fingerprint: "SHA256:abc".into(),
+            })
+            .expect("send event");
+        app.transfer_worker = Some(SftpWorker::new_for_test(cmd_tx, event_rx));
+        let rc = Rc::new(RefCell::new(stdout_tui()));
+        let handle: TerminalHandle = Rc::downgrade(&rc);
+
+        drain_transfer_events(&mut app, &handle);
+
+        let s = app.transfer.as_ref().expect("screen present");
+        let ov = s.host_key.as_ref().expect("overlay set by drain");
+        assert_eq!(ov.host, "h.example");
+        assert_eq!(ov.fingerprint, "SHA256:abc");
+        // Connecting is preserved — the overlay only renders while Connecting.
+        assert_eq!(s.connect, ConnectState::Connecting);
+    }
 
     #[test]
     fn drain_applies_buffered_search_events_to_active_pane_search() {

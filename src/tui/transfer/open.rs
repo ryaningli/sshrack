@@ -1,16 +1,22 @@
 //! `open_transfer` — the sftp-screen analogue of
 //! [`crate::tui::connect::connect_host`]. Mirrors `connect_host`'s auth +
-//! vault-unlock + host-key pre-flight, then (instead of building an ssh argv)
-//! spawns the [`SftpWorker`] and seeds a fresh [`TransferScreen`].
+//! vault-unlock, then (instead of building an ssh argv) spawns the
+//! [`SftpWorker`] and seeds a fresh [`TransferScreen`]. The host-key
+//! pre-flight (was step 5 here, synchronous on the UI thread) moved onto the
+//! worker thread in Task 2 — it surfaces via `WorkerEvent::HostKeyNeedsConfirm`
+//! and an in-screen overlay, so `open_transfer` is now purely local work
+//! (vault/auth/inline-key) + `spawn` + screen seed and never touches the
+//! network.
 //!
 //! ## Cancel vs error
 //!
-//! A user cancel inside the vault or host-key popup (Esc / Ctrl-C) surfaces as
+//! A user cancel inside the vault popup (Esc / Ctrl-C) surfaces as
 //! [`SshrackError::Interrupted`]; [`crate::tui::run_loop`] maps that to "return
 //! to the launcher" — NOT an exit and NOT a status write. Any other error
-//! (vault unlock failed, host key rejected, dangling credential,
-//! no-password-no-key, worker spawn failed) is surfaced in the status bar via
-//! `App::report_failure` and returns to the launcher.
+//! (vault unlock failed, dangling credential, no-password-no-key, worker spawn
+//! failed) is surfaced in the status bar via `App::report_failure` and returns
+//! to the launcher. Host-key reject / cancel is owned by the worker thread now
+//! and arrives as `WorkerEvent::ConnectFailed`.
 //!
 //! ## Inline-key lifetime (load-bearing)
 //!
@@ -32,13 +38,12 @@ use sshrack_core::connect::ssh::Overrides;
 use sshrack_core::connect::{self, KeyArtifact};
 use sshrack_core::credential;
 use sshrack_core::error::SshrackError;
-use sshrack_core::hostkey;
 use sshrack_core::secret::OsKeyring;
 use sshrack_core::secret::vault;
 
 use crate::tui::TerminalHandle;
 use crate::tui::app::App;
-use crate::tui::prompt::{TuiPassphrase, host_key_confirm};
+use crate::tui::prompt::TuiPassphrase;
 use crate::tui::transfer::screen::TransferScreen;
 
 /// Run all pre-open side effects for an sftp session on `host` and seed a
@@ -57,9 +62,10 @@ use crate::tui::transfer::screen::TransferScreen;
 ///    it. The [`KeyArtifact`] is stored on [`App::transfer_key_artifact`] so
 ///    its `Drop` runs only when the screen closes (the master `ssh -N` needs
 ///    the temp file for its whole lifetime).
-/// 5. Host-key pre-flight via the TUI confirm closure (popup for new keys).
-/// 6. Spawn the [`SftpWorker`] (master `ssh -N` + worker thread).
-/// 7. Build a [`TransferScreen`] seeded with cwd = local `current_dir`, remote
+/// 5. Spawn the [`SftpWorker`] (master `ssh -N` + worker thread). The host-key
+///    pre-flight (ssh-keyscan + fingerprint confirm) runs ON the worker thread
+///    and surfaces via `WorkerEvent::HostKeyNeedsConfirm` for an unknown host.
+/// 6. Build a [`TransferScreen`] seeded with cwd = local `current_dir`, remote
 ///    = the worker's reported home, and send `WorkerCmd::List(home)` so the
 ///    remote pane populates once the worker drains the command.
 ///
@@ -80,10 +86,7 @@ pub fn open_transfer(
     let cfg: &SshrackConfig = app.config();
 
     // ── Step 1: Carry the resolved host. The caller already resolved it (saved
-    // name or ad-hoc literal), so there is no id→host lookup to redo. `port`
-    // is read before `host` moves into `resolved_host` (used by the host-key
-    // flow below). ─────────────────────────────────────────────────────────────
-    let port = host.port;
+    // name or ad-hoc literal), so there is no id→host lookup to redo. ─────────
     let resolved_host = host;
 
     // ── Step 2: Vault unlock (no-op unless vault mode). ──────────────────────
@@ -107,33 +110,22 @@ pub fn open_transfer(
     // has no credential fails inside the master and is reported by the
     // tty-safe deny path — mirroring SSH, not pre-empting it.
 
-    // ── Step 5: Host-key pre-flight via the TUI confirm closure. ─────────────
-    // A cancel inside the popup (Ctrl-C/Esc) flips the shared flag; we re-
-    // surface that as Interrupted so run_loop returns the user to the launcher
-    // (no status write), NOT the HostKeyNotConfirmed "sftp open failed" path.
-    let host_str = resolved_host.host.as_str();
     // Capture the remote pane title before `resolved_auth` / `resolved_host`
-    // are moved into SftpWorker::open below. Prefer the host's friendly name;
+    // are moved into SftpWorker::spawn below. Prefer the host's friendly name;
     // fall back to "<user>@<host>" for an unnamed (e.g. ad-hoc) host.
     let remote_title = remote_title(
         &resolved_host.name,
         &resolved_auth.user,
         &resolved_host.host,
     );
-    let (confirm, interrupted) = host_key_confirm(handle);
-    // The TUI always runs on a tty and has no --accept-new flag: a new key is
-    // confirmed solely via the popup (Prompt path).
-    hostkey::run_host_key_flow(host_str, port, true, false, confirm)?;
-    if interrupted.get() {
-        return Err(SshrackError::Interrupted);
-    }
 
-    // ── Step 6: Spawn the SftpWorker (non-blocking). ────────────────────────
-    // The master handshake + `sftp pwd` run ON the worker thread and surface
-    // later as WorkerEvent::Connected / ConnectFailed. The screen is shown
-    // immediately in a Connecting state; the run-loop drain flips it to
-    // Connected (building the RemotePathSearch + sending the first List there)
-    // or ConnectFailed.
+    // ── Step 5: Spawn the SftpWorker (non-blocking). ────────────────────────
+    // The host-key pre-flight + master handshake + `sftp pwd` ALL run ON the
+    // worker thread and surface later as WorkerEvent::HostKeyNeedsConfirm /
+    // Connected / ConnectFailed. The screen is shown immediately in a
+    // Connecting state; the run-loop drain surfaces the host-key overlay for
+    // an unknown host, flips to Connected (building the RemotePathSearch +
+    // sending the first List there), or surfaces ConnectFailed.
     //
     // resolved_auth.password is moved into SftpWorker::spawn; clone it first so
     // we can hand an owned PasswordSource in (it carries a Zeroizing<String>
@@ -153,7 +145,7 @@ pub fn open_transfer(
     )
     .map_err(|detail| SshrackError::SftpOpenFailed { detail })?;
 
-    // ── Step 7: Build the screen (Connecting), seed local pane, store on App. ─
+    // ── Step 6: Build the screen (Connecting), seed local pane, store on App. ─
     // local cwd = the user's actual cwd; remote cwd = `/` placeholder
     // (corrected on Connected when the worker reports home). The remote
     // path-aware searcher + the first `List(home)` are NOT built here — they

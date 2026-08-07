@@ -67,6 +67,120 @@ fn connect_failed_esc_closes_transfer() {
     );
 }
 
+// ---- Host-key overlay (Task 2: async host-key pre-flight) ----
+//
+// While Connecting, an unknown host surfaces a WorkerEvent::HostKeyNeedsConfirm
+// that the run loop writes into screen.host_key. The overlay must intercept
+// Enter/y (accept) and n/Esc (reject) BEFORE the Connecting close-key handling
+// so they route to ScreenOutcome::HostKeyConfirm(true/false) (the run loop
+// forwards the reply as WorkerCmd::HostKeyConfirm) instead of closing the
+// screen. Other keys re-seat the overlay and return Continue.
+
+#[test]
+fn host_key_overlay_enter_accepts() {
+    // Enter on the host-key overlay returns HostKeyConfirm(true) — the run
+    // loop forwards it as WorkerCmd::HostKeyConfirm(true) so the worker appends
+    // to known_hosts and resumes the master handshake.
+    let mut s = TransferScreen::new(PathBuf::from("/loc"), PathBuf::from("/"));
+    s.connect = ConnectState::Connecting;
+    s.host_key = Some(HostKeyPrompt {
+        host: "h".into(),
+        fingerprint: "SHA256:x".into(),
+    });
+    assert_eq!(
+        s.on_key(press(KeyCode::Enter, KeyModifiers::NONE)),
+        ScreenOutcome::HostKeyConfirm(true)
+    );
+}
+
+#[test]
+fn host_key_overlay_y_uppercase_accepts() {
+    // Mirrors CloseConfirm: both y and Y accept.
+    let mut s = TransferScreen::new(PathBuf::from("/loc"), PathBuf::from("/"));
+    s.connect = ConnectState::Connecting;
+    s.host_key = Some(HostKeyPrompt {
+        host: "h".into(),
+        fingerprint: "SHA256:x".into(),
+    });
+    assert_eq!(
+        s.on_key(press(KeyCode::Char('Y'), KeyModifiers::NONE)),
+        ScreenOutcome::HostKeyConfirm(true)
+    );
+}
+
+#[test]
+fn host_key_overlay_esc_rejects() {
+    // Esc on the host-key overlay returns HostKeyConfirm(false), NOT
+    // CloseTransfer — the reject path lets the worker send ConnectFailed and
+    // exit cleanly rather than dropping the worker mid-handshake (which would
+    // also exit, but loses the structured failure surface).
+    let mut s = TransferScreen::new(PathBuf::from("/loc"), PathBuf::from("/"));
+    s.connect = ConnectState::Connecting;
+    s.host_key = Some(HostKeyPrompt {
+        host: "h".into(),
+        fingerprint: "SHA256:x".into(),
+    });
+    assert_eq!(
+        s.on_key(press(KeyCode::Esc, KeyModifiers::NONE)),
+        ScreenOutcome::HostKeyConfirm(false)
+    );
+}
+
+#[test]
+fn host_key_overlay_n_rejects() {
+    // n / N also reject, mirroring CloseConfirm's cancel keys.
+    let mut s = TransferScreen::new(PathBuf::from("/loc"), PathBuf::from("/"));
+    s.connect = ConnectState::Connecting;
+    s.host_key = Some(HostKeyPrompt {
+        host: "h".into(),
+        fingerprint: "SHA256:x".into(),
+    });
+    assert_eq!(
+        s.on_key(press(KeyCode::Char('n'), KeyModifiers::NONE)),
+        ScreenOutcome::HostKeyConfirm(false)
+    );
+}
+
+#[test]
+fn host_key_overlay_neutral_key_keeps_overlay_and_returns_continue() {
+    // A non-accept/non-reject key (arrows, letters, etc.) re-seats the overlay
+    // and returns Continue — the overlay stays up, no worker reply is sent.
+    let mut s = TransferScreen::new(PathBuf::from("/loc"), PathBuf::from("/"));
+    s.connect = ConnectState::Connecting;
+    s.host_key = Some(HostKeyPrompt {
+        host: "h".into(),
+        fingerprint: "SHA256:x".into(),
+    });
+    let out = s.on_key(press(KeyCode::Down, KeyModifiers::NONE));
+    assert_eq!(out, ScreenOutcome::Continue);
+    assert!(
+        s.host_key.is_some(),
+        "neutral key must NOT dismiss the overlay"
+    );
+}
+
+#[test]
+fn host_key_overlay_intercepts_esc_before_close_key_handling() {
+    // Regression pin: while the overlay is up, Esc routes to HostKeyConfirm
+    // (reject), not CloseTransfer. Without the early overlay gate, the
+    // Connecting-arm close-key check would close the screen instead — hiding
+    // the structured reject path behind a worker drop.
+    let mut s = TransferScreen::new(PathBuf::from("/loc"), PathBuf::from("/"));
+    s.connect = ConnectState::Connecting;
+    s.host_key = Some(HostKeyPrompt {
+        host: "h".into(),
+        fingerprint: "SHA256:x".into(),
+    });
+    let out = s.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
+    assert_eq!(
+        out,
+        ScreenOutcome::HostKeyConfirm(false),
+        "Esc with overlay up must reject, not close"
+    );
+    // Overlay was consumed by the reject path.
+    assert!(s.host_key.is_none(), "reject consumes the overlay");
+}
+
 /// Build a `DirEntry` fixture: `name` carries a trailing `/` for dirs
 /// (matches `LocalDirSource::list`'s decoration); `path` is `parent/name`.
 fn entry(name: &str, parent: &Path, is_dir: bool) -> DirEntry {
