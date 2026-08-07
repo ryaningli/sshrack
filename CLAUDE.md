@@ -178,6 +178,19 @@ The CLI defaults to interactive when a TTY is present — it prompts for host-ke
 3. **Fail-fast validation precedes network IO** — duplicate/not-found/reserved-word + connection-path local checks (credential existence via `credential::resolve`) run *before* any network IO.
 4. **Passwords and key text never enter argv** — an inline (host-own) password is TUI-only; inline key contents reach sshrack only via stdin / a named file, never an argv value visible in `ps`.
 
+## Error Feedback Surfaces
+
+TUI failure feedback follows one rule: **the surface matches the interaction**.
+
+- **Failure/decision modal (`draw_dialog`)** — distinct from form/picker overlays (wizards, StorePicker, Help) that also reuse `draw_dialog`; only for a failure or decision that needs a user *response* (confirm / choose / retry). Today: `HostKeyPrompt`, `CloseConfirm`, `QueueOverlay`. A failure whose only exit is "close the screen" has no response and must NOT use a dialog.
+- **Status line** — failures with no interactive outlet. Launcher footer via `App::report_failure`; transfer screen via `screen.set_status(Status::error(..))`; store view via `v.status`. **Never double-write the same failure into both a dialog and a status line.**
+
+Wording (single source = the error's own `Display`):
+- A failure backed by a **self-describing `SshrackError`** uses `e.to_string()` verbatim — **no `"<action> failed:"` prefix** (it duplicates the error's wording; `App::report_failure` is the canonical site).
+- A failure backed by a **raw subprocess/io string** (sftp stderr, `io::Error`) keeps an action-subject prefix (`"remote list failed: {msg}"`) because the raw string is not self-describing. An `SshrackError` that *can* degrade to a generic `Io` (`"io error"`) only on a rare terminal-failure edge does not by itself justify a prefix — the canonical `App::report_failure` presents such a bare `Io` too; reserve the action-subject prefix for failures whose payload is raw/generic in the *typical* case (subprocess stderr, `io::Error`).
+
+> Pinning a regression: `bb4d1c6` re-introduced a modal `ConnectFailed` dialog over the status line (double-write); `ff16088` had established the status-line-only rule and deleted the `Alert` component. `ConnectFailed` now uses the status line + a bordered remote placeholder.
+
 ## Security Essentials
 
 - Passwords are `Zeroizing<String>` end-to-end; never logged, printed, in errors, or in argv/`ps`.

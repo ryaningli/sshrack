@@ -836,10 +836,10 @@ impl App {
         // feedback) is written AFTER this clear, so it still surfaces.
         //
         // Skip the clear while Connecting/ConnectFailed: in ConnectFailed the
-        // status carries the failure reason that `draw` shows in the banner,
-        // and the on_key gate swallows non-close keys anyway — clearing it on
-        // a stray keypress would erase the reason from the banner. Connecting
-        // has no transient feedback to clear.
+        // status carries the failure reason that `draw` shows in the status
+        // bar, and the on_key gate swallows non-close keys anyway — clearing it
+        // on a stray keypress would erase the reason from the status bar.
+        // Connecting has no transient feedback to clear.
         if key.kind == crossterm::event::KeyEventKind::Press
             && matches!(
                 screen.connect,
