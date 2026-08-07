@@ -17,6 +17,56 @@ use sshrack_core::dirsource::DirEntry;
 use sshrack_core::pathfind::{PathMatch, SearchEvent, SearchEventKind, SegMatch, parse_query};
 use std::path::{Path, PathBuf};
 
+// ---- ConnectState gating (Task 1: async connect) ----
+//
+// A freshly-opened screen is Connecting: the worker thread is still running the
+// master handshake, so the remote pane is empty and navigation/enqueue must be
+// gated (swallowed) until Connected lands. The close keys (Esc / Ctrl-C) are
+// the exception — they cancel the in-flight handshake by closing the screen,
+// which drops the worker. After ConnectFailed only the close keys act.
+
+#[test]
+fn connecting_esc_closes_transfer_to_cancel_handshake() {
+    // Arrange: a fresh screen is Connecting. Esc must close (so the loop drops
+    // the worker, aborting the in-flight handshake) — it must NOT navigate.
+    let mut s = TransferScreen::new(PathBuf::from("/loc"), PathBuf::from("/"));
+    assert!(matches!(s.connect, ConnectState::Connecting));
+    // Act
+    let out = s.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
+    // Assert
+    assert_eq!(out, ScreenOutcome::CloseTransfer);
+}
+
+#[test]
+fn connecting_arrows_are_swallowed_not_navigations() {
+    // While connecting the remote pane has no entries yet; arrows must do
+    // nothing (Continue), not crash on an empty ranked list.
+    let mut s = TransferScreen::new(PathBuf::from("/loc"), PathBuf::from("/"));
+    assert_eq!(
+        s.on_key(press(KeyCode::Down, KeyModifiers::NONE)),
+        ScreenOutcome::Continue
+    );
+    assert_eq!(
+        s.on_key(press(KeyCode::Enter, KeyModifiers::NONE)),
+        ScreenOutcome::Continue
+    );
+}
+
+#[test]
+fn connect_failed_esc_closes_transfer() {
+    // After ConnectFailed, only Esc/Ctrl-C act (return to launcher).
+    let mut s = TransferScreen::new(PathBuf::from("/loc"), PathBuf::from("/"));
+    s.connect = ConnectState::ConnectFailed;
+    assert_eq!(
+        s.on_key(press(KeyCode::Esc, KeyModifiers::NONE)),
+        ScreenOutcome::CloseTransfer
+    );
+    assert_eq!(
+        s.on_key(press(KeyCode::Down, KeyModifiers::NONE)),
+        ScreenOutcome::Continue
+    );
+}
+
 /// Build a `DirEntry` fixture: `name` carries a trailing `/` for dirs
 /// (matches `LocalDirSource::list`'s decoration); `path` is `parent/name`.
 fn entry(name: &str, parent: &Path, is_dir: bool) -> DirEntry {
@@ -129,6 +179,52 @@ fn draw_renders_without_panic_or_overflow() {
 }
 
 #[test]
+fn draw_connecting_renders_banner_without_panic() {
+    // A fresh screen is Connecting with an empty remote pane. draw must paint
+    // the `Connecting to …` banner over the remote pane without panicking.
+    let backend = TestBackend::new(80, 24);
+    let mut term = Terminal::new(backend).expect("test backend");
+    let mut screen = TransferScreen::new(PathBuf::from("/local"), PathBuf::from("/"));
+    screen.remote_title = "deploy@host".into();
+    assert!(matches!(screen.connect, ConnectState::Connecting));
+    let res = term.draw(|f| screen.draw(f, f.area()));
+    assert!(
+        res.is_ok(),
+        "connecting draw must not panic: {:?}",
+        res.err()
+    );
+    let view = buffer_view(term.backend().buffer());
+    assert!(
+        view.contains("Connecting to deploy@host"),
+        "connecting banner visible: {view}"
+    );
+}
+
+#[test]
+fn draw_connect_failed_renders_reason_banner_without_panic() {
+    // After ConnectFailed the status bar carries the reason; draw centers it
+    // + an `Esc to return` hint over a dim frame, without panicking.
+    let backend = TestBackend::new(80, 24);
+    let mut term = Terminal::new(backend).expect("test backend");
+    let mut screen = TransferScreen::new(PathBuf::from("/local"), PathBuf::from("/"));
+    screen.connect = ConnectState::ConnectFailed;
+    screen.set_status(crate::tui::intent::Status::error(
+        "sftp master failed: Permission denied",
+    ));
+    let res = term.draw(|f| screen.draw(f, f.area()));
+    assert!(
+        res.is_ok(),
+        "connect-failed draw must not panic: {:?}",
+        res.err()
+    );
+    let view = buffer_view(term.backend().buffer());
+    assert!(
+        view.contains("Permission denied") && view.contains("Esc to return"),
+        "connect-failed banner shows reason + hint: {view}"
+    );
+}
+
+#[test]
 fn draw_paints_title_panes_progress_and_footer() {
     let backend = TestBackend::new(80, 24);
     let mut term = Terminal::new(backend).expect("test backend");
@@ -172,6 +268,7 @@ fn draw_paints_title_panes_progress_and_footer() {
     // a fresh screen so the assertion reads cleanly.
     let local_cwd = PathBuf::from("/x");
     let mut evil = TransferScreen::new(local_cwd.clone(), PathBuf::from("/y"));
+    evil.connect = ConnectState::Connected;
     evil.local.set_entries(vec![DirEntry {
         name: "foo\x1b[2Jbar".into(),
         path: local_cwd.join("foo\x1b[2Jbar"),
@@ -266,6 +363,7 @@ fn draw_keeps_focused_row_visible_on_small_terminal() {
     let local_cwd = PathBuf::from("/local");
     let remote_cwd = PathBuf::from("/remote");
     let mut screen = TransferScreen::new(local_cwd.clone(), remote_cwd.clone());
+    screen.connect = ConnectState::Connected;
     // Lots of remote entries so the cursor sits at the tail of a long list.
     let remote_entries: Vec<DirEntry> = (0..30)
         .map(|i| entry(&format!("r{i:02}.dat"), &remote_cwd, false))
@@ -308,6 +406,7 @@ fn press(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
 #[test]
 fn tab_flips_focus_local_to_remote() {
     let mut screen = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
+    screen.connect = ConnectState::Connected;
     assert_eq!(screen.focus, Side::Local, "default focus is Local");
     let out = screen.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
     assert_eq!(out, ScreenOutcome::Continue);
@@ -317,6 +416,7 @@ fn tab_flips_focus_local_to_remote() {
 #[test]
 fn backtab_flips_focus_remote_to_local() {
     let mut screen = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
+    screen.connect = ConnectState::Connected;
     screen.focus = Side::Remote;
     let out = screen.on_key(press(KeyCode::BackTab, KeyModifiers::SHIFT));
     assert_eq!(out, ScreenOutcome::Continue);
@@ -329,6 +429,7 @@ fn backtab_flips_focus_remote_to_local() {
 fn space_toggles_mark_via_focused_pane_and_returns_continue() {
     let local_cwd = PathBuf::from("/l");
     let mut screen = TransferScreen::new(local_cwd.clone(), PathBuf::from("/r"));
+    screen.connect = ConnectState::Connected;
     screen
         .local
         .set_entries(vec![entry("alpha.txt", &local_cwd, false)]);
@@ -355,6 +456,7 @@ fn ctrl_enter_with_marked_file_enqueues_upload_job() {
     let local_cwd = PathBuf::from("/l");
     let remote_cwd = PathBuf::from("/r");
     let mut screen = TransferScreen::new(local_cwd.clone(), remote_cwd.clone());
+    screen.connect = ConnectState::Connected;
     screen
         .local
         .set_entries(vec![entry("alpha.txt", &local_cwd, false)]);
@@ -388,6 +490,7 @@ fn ctrl_enter_with_focus_remote_enqueues_download_job() {
     let local_cwd = PathBuf::from("/l");
     let remote_cwd = PathBuf::from("/r");
     let mut screen = TransferScreen::new(local_cwd.clone(), remote_cwd.clone());
+    screen.connect = ConnectState::Connected;
     screen.focus = Side::Remote;
     screen
         .remote
@@ -416,6 +519,7 @@ fn ctrl_enter_with_marked_dir_sets_recursive_true() {
     let local_cwd = PathBuf::from("/l");
     let remote_cwd = PathBuf::from("/r");
     let mut screen = TransferScreen::new(local_cwd.clone(), remote_cwd.clone());
+    screen.connect = ConnectState::Connected;
     screen
         .local
         .set_entries(vec![entry("docs", &local_cwd, true)]);
@@ -437,6 +541,7 @@ fn ctrl_enter_with_no_marks_enqueues_selected_file() {
     let local_cwd = PathBuf::from("/l");
     let remote_cwd = PathBuf::from("/r");
     let mut screen = TransferScreen::new(local_cwd.clone(), remote_cwd.clone());
+    screen.connect = ConnectState::Connected;
     screen
         .local
         .set_entries(vec![entry("alpha.txt", &local_cwd, false)]);
@@ -455,6 +560,7 @@ fn ctrl_enter_with_no_marks_enqueues_selected_file() {
 #[test]
 fn ctrl_enter_with_empty_pane_returns_continue_and_queues_nothing() {
     let mut screen = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
+    screen.connect = ConnectState::Connected;
     // No entries, no marks, no selected entry.
     let out = screen.on_key(press(KeyCode::Enter, KeyModifiers::CONTROL));
     assert_eq!(
@@ -470,6 +576,7 @@ fn ctrl_enter_enqueues_multiple_marked_files_in_entry_order() {
     let local_cwd = PathBuf::from("/l");
     let remote_cwd = PathBuf::from("/r");
     let mut screen = TransferScreen::new(local_cwd.clone(), remote_cwd.clone());
+    screen.connect = ConnectState::Connected;
     screen.local.set_entries(vec![
         entry("alpha.txt", &local_cwd, false),
         entry("beta.txt", &local_cwd, false),
@@ -512,6 +619,7 @@ fn ctrl_s_on_file_enqueues_upload_job() {
     let local_cwd = PathBuf::from("/l");
     let remote_cwd = PathBuf::from("/r");
     let mut screen = TransferScreen::new(local_cwd.clone(), remote_cwd.clone());
+    screen.connect = ConnectState::Connected;
     screen
         .local
         .set_entries(vec![entry("alpha.txt", &local_cwd, false)]);
@@ -531,6 +639,7 @@ fn ctrl_s_on_dir_enqueues_recursive_job() {
     let local_cwd = PathBuf::from("/l");
     let remote_cwd = PathBuf::from("/r");
     let mut screen = TransferScreen::new(local_cwd.clone(), remote_cwd.clone());
+    screen.connect = ConnectState::Connected;
     screen
         .local
         .set_entries(vec![entry("docs", &local_cwd, true)]);
@@ -551,6 +660,7 @@ fn ctrl_s_in_find_mode_enqueues_cursor_result_only_ignoring_marks() {
     // and could silently suppress the enqueue (stale-mark pollution). The
     // cursor file is enqueued with dst = opposite cwd / file name.
     let mut s = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
+    s.connect = ConnectState::Connected;
     let mut srch = PaneSearch::empty();
     srch.results = vec![
         PathMatch {
@@ -587,6 +697,7 @@ fn ctrl_s_focus_remote_enqueues_download_job() {
     let local_cwd = PathBuf::from("/l");
     let remote_cwd = PathBuf::from("/r");
     let mut screen = TransferScreen::new(local_cwd.clone(), remote_cwd.clone());
+    screen.connect = ConnectState::Connected;
     screen.focus = Side::Remote;
     screen
         .remote
@@ -609,6 +720,7 @@ fn ctrl_s_with_marks_enqueues_marked_batch() {
     let local_cwd = PathBuf::from("/l");
     let remote_cwd = PathBuf::from("/r");
     let mut screen = TransferScreen::new(local_cwd.clone(), remote_cwd.clone());
+    screen.connect = ConnectState::Connected;
     screen.local.set_entries(vec![
         entry("alpha.txt", &local_cwd, false),
         entry("beta.txt", &local_cwd, false),
@@ -632,6 +744,7 @@ fn enter_on_file_enqueues_upload_job() {
     let local_cwd = PathBuf::from("/l");
     let remote_cwd = PathBuf::from("/r");
     let mut screen = TransferScreen::new(local_cwd.clone(), remote_cwd.clone());
+    screen.connect = ConnectState::Connected;
     screen
         .local
         .set_entries(vec![entry("alpha.txt", &local_cwd, false)]);
@@ -650,6 +763,7 @@ fn enter_on_dir_steps_in_and_does_not_enqueue() {
     // recursive upload when the user means to look inside a directory.
     let local_cwd = PathBuf::from("/l");
     let mut screen = TransferScreen::new(local_cwd.clone(), PathBuf::from("/r"));
+    screen.connect = ConnectState::Connected;
     screen
         .local
         .set_entries(vec![entry("docs", &local_cwd, true)]);
@@ -678,6 +792,7 @@ fn plain_s_types_into_filter_and_does_not_enqueue() {
     // that drops the guard would silently enqueue on every 's' keystroke.
     let local_cwd = PathBuf::from("/l");
     let mut screen = TransferScreen::new(local_cwd.clone(), PathBuf::from("/r"));
+    screen.connect = ConnectState::Connected;
     screen
         .local
         .set_entries(vec![entry("alpha.txt", &local_cwd, false)]);
@@ -696,6 +811,7 @@ fn plain_s_types_into_filter_and_does_not_enqueue() {
 #[test]
 fn esc_without_active_transfer_returns_close_transfer() {
     let mut screen = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
+    screen.connect = ConnectState::Connected;
     assert!(!screen.has_inflight());
     let out = screen.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
     assert_eq!(
@@ -714,6 +830,7 @@ fn filter_esc_clears_non_empty_query_instead_of_closing() {
     // the user out of SFTP.
     let cwd = PathBuf::from("/srv");
     let mut s = TransferScreen::new(cwd.clone(), PathBuf::from("/r"));
+    s.connect = ConnectState::Connected;
     s.local.set_entries(vec![
         entry("alpha.txt", &cwd, false),
         entry("beta.txt", &cwd, false),
@@ -742,6 +859,7 @@ fn filter_esc_clears_query_before_opening_quit_confirm() {
     // queue manager, not with Esc.
     let cwd = PathBuf::from("/srv");
     let mut s = TransferScreen::new(cwd.clone(), PathBuf::from("/r"));
+    s.connect = ConnectState::Connected;
     s.local.set_entries(vec![entry("alpha.txt", &cwd, false)]);
     s.local.core.query = "alpha".into();
     s.local.core.recompute();
@@ -787,6 +905,7 @@ fn filter_esc_clears_query_before_opening_quit_confirm() {
 fn right_on_dir_sets_pending_list_for_focused_side() {
     let local_cwd = PathBuf::from("/l");
     let mut screen = TransferScreen::new(local_cwd.clone(), PathBuf::from("/r"));
+    screen.connect = ConnectState::Connected;
     screen
         .local
         .set_entries(vec![entry("subdir", &local_cwd, true)]);
@@ -805,6 +924,7 @@ fn right_on_dir_sets_pending_list_for_focused_side() {
 fn left_at_non_root_sets_pending_list_to_parent() {
     let local_cwd = PathBuf::from("/l/sub");
     let mut screen = TransferScreen::new(local_cwd.clone(), PathBuf::from("/r"));
+    screen.connect = ConnectState::Connected;
     screen
         .local
         .set_entries(vec![entry("x", &local_cwd, false)]);
@@ -821,6 +941,7 @@ fn left_at_non_root_sets_pending_list_to_parent() {
 fn pending_list_targets_remote_side_when_remote_focused() {
     let remote_cwd = PathBuf::from("/r");
     let mut screen = TransferScreen::new(PathBuf::from("/l"), remote_cwd.clone());
+    screen.connect = ConnectState::Connected;
     screen.focus = Side::Remote;
     screen
         .remote
@@ -839,6 +960,7 @@ fn pending_list_targets_remote_side_when_remote_focused() {
 #[test]
 fn next_job_pops_fifo_and_none_when_empty() {
     let mut screen = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
+    screen.connect = ConnectState::Connected;
     screen.ledger.enqueue(TransferJob {
         direction: Direction::Upload,
         src: PathBuf::from("/l/a"),
@@ -880,6 +1002,7 @@ fn finish_inflight_clears_inflight_task() {
     // None.
     use sshrack_core::connect::sftp::proto::TransferOutcome;
     let mut screen = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
+    screen.connect = ConnectState::Connected;
     screen.ledger.enqueue(TransferJob {
         direction: Direction::Upload,
         src: PathBuf::from("/l/x"),
@@ -911,6 +1034,7 @@ fn finish_inflight_clears_inflight_task() {
 #[test]
 fn non_press_key_returns_continue_and_does_not_mutate() {
     let mut screen = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
+    screen.connect = ConnectState::Connected;
     let release = KeyEvent::new_with_kind(KeyCode::Tab, KeyModifiers::NONE, KeyEventKind::Release);
     let out = screen.on_key(release);
     assert_eq!(out, ScreenOutcome::Continue);
@@ -926,6 +1050,7 @@ fn next_job_records_direction_for_post_done_refresh() {
     // the destination pane on Done even when no Progress arrived (a transfer
     // finishing inside the first 200ms poll).
     let mut screen = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
+    screen.connect = ConnectState::Connected;
     screen.ledger.enqueue(TransferJob {
         direction: Direction::Upload,
         src: PathBuf::from("/l/a"),
@@ -951,6 +1076,7 @@ fn next_job_empty_queue_leaves_last_direction_unchanged() {
     // finishing a Done task, then call next_job on the now-empty queue.
     use sshrack_core::connect::sftp::proto::TransferOutcome;
     let mut screen = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
+    screen.connect = ConnectState::Connected;
     screen.ledger.enqueue(TransferJob {
         direction: Direction::Download,
         src: PathBuf::from("/r/a"),
@@ -986,6 +1112,7 @@ fn new_screen_remote_title_defaults_to_remote() {
 fn ctrl_q_opens_the_queue_overlay() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     let mut screen = TransferScreen::new(PathBuf::from("/x"), PathBuf::from("/y"));
+    screen.connect = ConnectState::Connected;
     assert!(screen.queue_overlay.is_none());
     let out = screen.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
     assert_eq!(out, ScreenOutcome::Continue);
@@ -996,6 +1123,7 @@ fn ctrl_q_opens_the_queue_overlay() {
 fn bare_q_does_not_open_the_overlay_it_feeds_the_query() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     let mut screen = TransferScreen::new(PathBuf::from("/x"), PathBuf::from("/y"));
+    screen.connect = ConnectState::Connected;
     let _ = screen.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::empty()));
     assert!(
         screen.queue_overlay.is_none(),
@@ -1007,6 +1135,7 @@ fn bare_q_does_not_open_the_overlay_it_feeds_the_query() {
 fn esc_closes_the_overlay_instead_of_the_screen() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     let mut screen = TransferScreen::new(PathBuf::from("/x"), PathBuf::from("/y"));
+    screen.connect = ConnectState::Connected;
     // Open, then Esc.
     let _ = screen.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
     let out = screen.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
@@ -1023,6 +1152,7 @@ fn arrow_keys_move_the_overlay_selection() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     let local_cwd = PathBuf::from("/x");
     let mut screen = TransferScreen::new(local_cwd.clone(), PathBuf::from("/y"));
+    screen.connect = ConnectState::Connected;
     screen.ledger.enqueue(TransferJob {
         direction: Direction::Download,
         src: PathBuf::from("/y/a"),
@@ -1063,6 +1193,7 @@ fn overlay_retry_requeues_a_failed_task_and_signals_advance() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     let local_cwd = PathBuf::from("/x");
     let mut screen = TransferScreen::new(local_cwd.clone(), PathBuf::from("/y"));
+    screen.connect = ConnectState::Connected;
     let id = screen.ledger.enqueue(TransferJob {
         direction: Direction::Download,
         src: PathBuf::from("/y/a"),
@@ -1105,6 +1236,7 @@ fn overlay_remove_drops_a_queued_task() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     let local_cwd = PathBuf::from("/x");
     let mut screen = TransferScreen::new(local_cwd.clone(), PathBuf::from("/y"));
+    screen.connect = ConnectState::Connected;
     screen.ledger.enqueue(TransferJob {
         direction: Direction::Download,
         src: PathBuf::from("/y/a"),
@@ -1129,6 +1261,7 @@ fn overlay_cancel_on_inflight_signals_cancel_active() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     let local_cwd = PathBuf::from("/x");
     let mut screen = TransferScreen::new(local_cwd.clone(), PathBuf::from("/y"));
+    screen.connect = ConnectState::Connected;
     screen.ledger.enqueue(TransferJob {
         direction: Direction::Download,
         src: PathBuf::from("/y/a"),
@@ -1152,6 +1285,7 @@ fn overlay_pause_toggles_the_ledger_flag() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     let local_cwd = PathBuf::from("/x");
     let mut screen = TransferScreen::new(local_cwd.clone(), PathBuf::from("/y"));
+    screen.connect = ConnectState::Connected;
     let _ = screen.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
     let _ = screen.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::empty()));
     assert!(screen.ledger.is_paused());
@@ -1164,6 +1298,7 @@ fn overlay_resume_with_pending_and_idle_signals_advance() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     let local_cwd = PathBuf::from("/x");
     let mut screen = TransferScreen::new(local_cwd.clone(), PathBuf::from("/y"));
+    screen.connect = ConnectState::Connected;
     screen.ledger.enqueue(TransferJob {
         direction: Direction::Download,
         src: PathBuf::from("/y/a"),
@@ -1190,6 +1325,7 @@ fn tab_switches_to_failed_view_and_lists_the_failed_task() {
     use sshrack_core::connect::sftp::proto::TransferOutcome;
     let local_cwd = PathBuf::from("/x");
     let mut screen = TransferScreen::new(local_cwd.clone(), PathBuf::from("/y"));
+    screen.connect = ConnectState::Connected;
     // Enqueue `failed-one` first so FIFO dispatch lands the failure on it;
     // enqueueing `queued-one` first would make `queued-one` the failed task
     // and invert the assertions below.
@@ -1236,6 +1372,7 @@ fn shift_tab_cycles_back_to_completed_view() {
     use sshrack_core::connect::sftp::proto::TransferOutcome;
     let local_cwd = PathBuf::from("/x");
     let mut screen = TransferScreen::new(local_cwd.clone(), PathBuf::from("/y"));
+    screen.connect = ConnectState::Connected;
     screen.ledger.enqueue(TransferJob {
         direction: Direction::Download,
         src: PathBuf::from("/y/done-one"),
@@ -1264,6 +1401,7 @@ fn empty_view_shows_the_no_tasks_placeholder() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     let local_cwd = PathBuf::from("/x");
     let mut screen = TransferScreen::new(local_cwd.clone(), PathBuf::from("/y"));
+    screen.connect = ConnectState::Connected;
     // No tasks at all — every view is empty.
     let _ = screen.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)); // open (Active)
     let _ = screen.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty())); // -> Failed (empty)
@@ -1286,6 +1424,7 @@ fn apply_remote_listing_ok_adopted_when_cwd_matches() {
     // replacing the previous listing.
     let remote_cwd = PathBuf::from("/remote/here");
     let mut screen = TransferScreen::new(PathBuf::from("/local"), remote_cwd.clone());
+    screen.connect = ConnectState::Connected;
     screen
         .remote
         .set_entries(vec![entry("old", &remote_cwd, false)]);
@@ -1313,6 +1452,7 @@ fn apply_remote_listing_ok_dropped_when_user_navigated_away() {
     // The user navigated further while the listing was in flight: the pane's
     // cwd no longer matches the listed cwd, so the stale result is dropped.
     let mut screen = TransferScreen::new(PathBuf::from("/local"), PathBuf::from("/remote/here"));
+    screen.connect = ConnectState::Connected;
     screen.remote.core.cwd = PathBuf::from("/remote/elsewhere"); // navigated away
     let listed = vec![entry("stale", &PathBuf::from("/remote/here"), false)];
     screen.remote.loading = true;
@@ -1334,6 +1474,7 @@ fn apply_remote_listing_err_reverts_cwd_and_surfaces_failure() {
     // (not leave it on the unreachable path) and surface the error.
     let remote_cwd = PathBuf::from("/remote/start");
     let mut screen = TransferScreen::new(PathBuf::from("/local"), remote_cwd.clone());
+    screen.connect = ConnectState::Connected;
     screen
         .remote
         .set_entries(vec![entry("file", &remote_cwd, false)]);
@@ -1403,6 +1544,7 @@ fn apply_search_event_match_appends_and_ignores_stale_gen() {
     // A Match event whose `gen` matches `search_gen` is appended + re-ranked;
     // a stale-`gen` event (≠ `search_gen`) is dropped.
     let mut s = TransferScreen::new(PathBuf::from("/a"), PathBuf::from("/b"));
+    s.connect = ConnectState::Connected;
     s.local.search = Some(PaneSearch::empty());
     s.search_gen = 1;
     let m = PathMatch {
@@ -1438,6 +1580,7 @@ fn apply_search_event_drilled_sets_current_dir_before_matches() {
     // A Drilled event sets the synthetic "." row; subsequent Matches append
     // behind it; cursor lands on "." (index 0).
     let mut s = TransferScreen::new(PathBuf::from("/a"), PathBuf::from("/b"));
+    s.connect = ConnectState::Connected;
     s.local.search = Some(PaneSearch::empty());
     s.search_gen = 1;
     s.apply_search_event(
@@ -1473,6 +1616,7 @@ fn apply_search_event_drilled_sets_current_dir_before_matches() {
 fn apply_search_event_new_gen_clears_current_dir() {
     // A new generation's first event clears the previous "." row (stale dir).
     let mut s = TransferScreen::new(PathBuf::from("/a"), PathBuf::from("/b"));
+    s.connect = ConnectState::Connected;
     s.local.search = Some(PaneSearch::empty());
     s.search_gen = 1;
     s.apply_search_event(
@@ -1508,6 +1652,7 @@ fn apply_search_event_second_drilled_is_ambiguous_and_clears() {
     // Two Drilled events in one generation (multi-frontier resolution) → the
     // drilled target is ambiguous → suppress the "." row.
     let mut s = TransferScreen::new(PathBuf::from("/a"), PathBuf::from("/b"));
+    s.connect = ConnectState::Connected;
     s.local.search = Some(PaneSearch::empty());
     s.search_gen = 1;
     s.apply_search_event(
@@ -1539,6 +1684,7 @@ fn apply_search_event_error_clears_current_dir() {
     // would persist and mask the error: the renderer's empty-state gate only
     // surfaces the error when `current_dir.is_none()`.
     let mut s = TransferScreen::new(PathBuf::from("/a"), PathBuf::from("/b"));
+    s.connect = ConnectState::Connected;
     s.local.search = Some(PaneSearch::empty());
     s.search_gen = 1;
     s.apply_search_event(
@@ -1568,6 +1714,7 @@ fn completion_returns_none_when_cursor_on_dot() {
     // query, e.g. "/a/sub/" + "sub" + "/" → "/a/sub/sub/"). It returns None so
     // Tab is swallowed in find mode (no focus flip either).
     let mut s = TransferScreen::new(PathBuf::from("/a"), PathBuf::from("/b"));
+    s.connect = ConnectState::Connected;
     s.focus = Side::Local;
     s.local.core.query = "/a/sub/".into();
     let mut srch = PaneSearch::empty();
@@ -1593,6 +1740,7 @@ fn jump_to_result_noops_on_file() {
     // so reaching here with a file is a no-op — it must NOT jump to the file's
     // parent (that lost the user's selected file and left them to re-find it).
     let mut s = TransferScreen::new(PathBuf::from("/a"), PathBuf::from("/b"));
+    s.connect = ConnectState::Connected;
     s.local.search = Some(PaneSearch::empty());
     s.local.search.as_mut().unwrap().results = vec![PathMatch {
         path: PathBuf::from("/a/sub/f.txt"),
@@ -1617,6 +1765,7 @@ fn jump_to_result_jumps_into_directory() {
     // Enter on a DIRECTORY result jumps into the directory itself: clears
     // search + query and sets pending_list so the run loop lists the target.
     let mut s = TransferScreen::new(PathBuf::from("/a"), PathBuf::from("/b"));
+    s.connect = ConnectState::Connected;
     s.local.search = Some(PaneSearch::empty());
     s.local.search.as_mut().unwrap().results = vec![PathMatch {
         path: PathBuf::from("/a/sub"),
@@ -1647,6 +1796,7 @@ fn enter_after_drill_navigates_into_drilled_dir_not_first_child() {
     // run loop would drain (Drilled + Matches + Done), then exercises Enter via
     // jump_to_search_result (the on_key Enter-on-dir path).
     let mut s = TransferScreen::new(PathBuf::from("/a"), PathBuf::from("/b"));
+    s.connect = ConnectState::Connected;
     s.focus = Side::Local;
     s.local.search = Some(PaneSearch::empty());
     s.search_gen = 1;
@@ -1709,6 +1859,7 @@ fn enter_on_dot_navigates_into_empty_drilled_dir() {
     // Done. The "." row is the only entry; Enter navigates into it. Pre-feature
     // this was impossible (no match to select → Enter was a no-op).
     let mut s = TransferScreen::new(PathBuf::from("/a"), PathBuf::from("/b"));
+    s.connect = ConnectState::Connected;
     s.focus = Side::Local;
     s.local.search = Some(PaneSearch::empty());
     s.search_gen = 1;
@@ -1749,6 +1900,7 @@ fn find_enter_on_file_enqueues_instead_of_jumping() {
     let local_cwd = PathBuf::from("/a");
     let remote_cwd = PathBuf::from("/b");
     let mut s = TransferScreen::new(local_cwd.clone(), remote_cwd.clone());
+    s.connect = ConnectState::Connected;
     s.local.search = Some(PaneSearch::empty());
     s.local.search.as_mut().unwrap().results = vec![PathMatch {
         path: PathBuf::from("/a/sub/f.txt"),
@@ -1782,6 +1934,7 @@ fn find_enter_on_dir_jumps_into_directory() {
     // filter mode, where Enter on a dir enters. Regression pin: the file
     // enqueue change above must not alter directory behavior.
     let mut s = TransferScreen::new(PathBuf::from("/a"), PathBuf::from("/b"));
+    s.connect = ConnectState::Connected;
     s.local.search = Some(PaneSearch::empty());
     s.local.search.as_mut().unwrap().results = vec![PathMatch {
         path: PathBuf::from("/a/sub"),
@@ -1808,6 +1961,7 @@ fn find_mode_space_appends_to_query_instead_of_marking() {
     // across directories. Space now reaches the query box like any printable
     // char — filenames may contain spaces.
     let mut s = TransferScreen::new(PathBuf::from("/a"), PathBuf::from("/b"));
+    s.connect = ConnectState::Connected;
     s.local.search = Some(PaneSearch::empty());
     s.local.search.as_mut().unwrap().results = vec![PathMatch {
         path: PathBuf::from("/a/sub"),
@@ -1834,6 +1988,7 @@ fn search_request_find_mode_when_multi_segment() {
     // enters find mode: pane.search is Some, pending_search is set for the
     // run loop.
     let mut s = TransferScreen::new(PathBuf::from("/srv"), PathBuf::from("/r"));
+    s.connect = ConnectState::Connected;
     s.search_request(Side::Local, "a/b".into());
     assert!(s.local.search.is_some(), "multi-segment → find mode");
     assert!(
@@ -1848,6 +2003,7 @@ fn search_request_filter_mode_when_single_segment() {
     // existing synchronous core.recompute handles it. A prior find state is
     // cleared, and pending_search is NOT set.
     let mut s = TransferScreen::new(PathBuf::from("/srv"), PathBuf::from("/r"));
+    s.connect = ConnectState::Connected;
     // Simulate a prior find, then a single-segment query must clear it.
     s.local.search = Some(PaneSearch::empty());
     s.search_request(Side::Local, "a".into());
@@ -1867,6 +2023,7 @@ fn search_request_find_mode_when_trailing_slash() {
     // exact-drill into "a" then list it. It must NOT stay in filter mode (which
     // would only fuzzy-filter the current directory and never descend).
     let mut s = TransferScreen::new(PathBuf::from("/srv"), PathBuf::from("/r"));
+    s.connect = ConnectState::Connected;
     s.search_request(Side::Local, "a/".into());
     assert!(
         s.local.search.is_some(),
@@ -1886,6 +2043,7 @@ fn cancel_search_clears_pending_search() {
     // Reproduces the leak: cancel_search cleared search_rx/search_cancel/
     // pane.search but not pending_search.
     let mut s = TransferScreen::new(PathBuf::from("/srv"), PathBuf::from("/r"));
+    s.connect = ConnectState::Connected;
     let parsed = parse_query("a/b", Path::new("/srv"), None);
     s.local.search = Some(PaneSearch::empty());
     s.pending_search = Some((Side::Local, parsed));
@@ -1910,6 +2068,7 @@ fn begin_search_displaces_prior_side_and_stops_its_spinner() {
     // local pane's `searching` flag itself — otherwise the left pane spins
     // forever. Stale local results stay visible (stale-while-revalidate).
     let mut s = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
+    s.connect = ConnectState::Connected;
     s.search_side = Some(Side::Local);
     s.local.search = Some(PaneSearch::empty()); // searching == true
     s.begin_search(Side::Remote);
@@ -1934,6 +2093,7 @@ fn begin_search_same_side_keeps_spinner_running() {
     // Retyping in the SAME pane relaunches the search (new gen, new worker)
     // but the pane is not displaced — its spinner must keep running.
     let mut s = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
+    s.connect = ConnectState::Connected;
     s.search_side = Some(Side::Local);
     s.local.search = Some(PaneSearch::empty()); // searching == true
     s.begin_search(Side::Local);
@@ -1947,6 +2107,7 @@ fn begin_search_same_side_keeps_spinner_running() {
 #[test]
 fn begin_search_first_search_sets_side() {
     let mut s = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
+    s.connect = ConnectState::Connected;
     assert!(s.search_side.is_none(), "no in-flight search initially");
     s.begin_search(Side::Local);
     assert_eq!(s.search_side, Some(Side::Local));
@@ -1959,6 +2120,7 @@ fn cancel_search_clears_in_flight_side_pane_not_focus() {
     // (Shift-Tab) these differ; clearing the wrong one would leave the
     // cancelled search's pane stuck in find mode while the worker is dead.
     let mut s = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
+    s.connect = ConnectState::Connected;
     s.focus = Side::Remote; // user flipped to remote
     s.search_side = Some(Side::Local); // but the in-flight find is still local
     s.local.search = Some(PaneSearch::empty());
@@ -1986,6 +2148,7 @@ fn cancel_search_clears_query_and_restores_full_listing() {
     // it all away. Esc = abandon the search entirely.
     let local_cwd = PathBuf::from("/srv");
     let mut s = TransferScreen::new(local_cwd.clone(), PathBuf::from("/r"));
+    s.connect = ConnectState::Connected;
     s.local.set_entries(vec![
         entry("alpha.txt", &local_cwd, false),
         entry("beta.txt", &local_cwd, false),
@@ -2025,6 +2188,7 @@ fn tab_empty_query_flips_focus_not_complete() {
     // the cursor is ignored until the user starts typing).
     let cwd = PathBuf::from("/l");
     let mut s = TransferScreen::new(cwd.clone(), PathBuf::from("/r"));
+    s.connect = ConnectState::Connected;
     s.local.set_entries(vec![entry("bbb", &cwd, true)]);
     assert_eq!(s.focus, Side::Local, "default focus Local");
     let out = s.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
@@ -2037,6 +2201,7 @@ fn tab_empty_query_flips_focus_not_complete() {
 fn tab_filter_mode_completes_dir_with_trailing_slash_and_enters_find() {
     let cwd = PathBuf::from("/l");
     let mut s = TransferScreen::new(cwd.clone(), PathBuf::from("/r"));
+    s.connect = ConnectState::Connected;
     s.local.set_entries(vec![entry("bbb", &cwd, true)]);
     s.local.core.query = "bb".into();
     s.local.core.recompute();
@@ -2052,6 +2217,7 @@ fn tab_filter_mode_completes_dir_with_trailing_slash_and_enters_find() {
 fn tab_filter_mode_completes_file_without_slash_stays_filter() {
     let cwd = PathBuf::from("/l");
     let mut s = TransferScreen::new(cwd.clone(), PathBuf::from("/r"));
+    s.connect = ConnectState::Connected;
     s.local.set_entries(vec![entry("bbc.txt", &cwd, false)]);
     s.local.core.query = "bb".into();
     s.local.core.recompute();
@@ -2063,6 +2229,7 @@ fn tab_filter_mode_completes_file_without_slash_stays_filter() {
 #[test]
 fn tab_find_mode_completes_dir_by_joining_segments() {
     let mut s = TransferScreen::new(PathBuf::from("/srv"), PathBuf::from("/r"));
+    s.connect = ConnectState::Connected;
     let mut srch = PaneSearch::empty();
     srch.searching = false;
     srch.results = vec![PathMatch {
@@ -2093,6 +2260,7 @@ fn tab_find_mode_completes_dir_by_joining_segments() {
 #[test]
 fn tab_find_mode_completes_file_without_slash() {
     let mut s = TransferScreen::new(PathBuf::from("/srv"), PathBuf::from("/r"));
+    s.connect = ConnectState::Connected;
     let mut srch = PaneSearch::empty();
     srch.searching = false;
     srch.results = vec![PathMatch {
@@ -2125,6 +2293,7 @@ fn backtab_flips_focus_even_with_search_candidate() {
     // Shift-Tab is the dedicated pane-switch escape: it never completes,
     // even when a find candidate is under the cursor.
     let mut s = TransferScreen::new(PathBuf::from("/srv"), PathBuf::from("/r"));
+    s.connect = ConnectState::Connected;
     let mut srch = PaneSearch::empty();
     srch.searching = false;
     srch.results = vec![PathMatch {
@@ -2159,6 +2328,7 @@ fn tab_no_candidate_under_cursor_flips_focus() {
     // from the empty-query early return).
     let cwd = PathBuf::from("/l");
     let mut s = TransferScreen::new(cwd.clone(), PathBuf::from("/r"));
+    s.connect = ConnectState::Connected;
     s.local.set_entries(vec![entry("alpha.txt", &cwd, false)]);
     s.local.core.query = "zz".into();
     s.local.core.recompute();
@@ -2178,6 +2348,7 @@ fn tab_find_mode_completes_absolute_path_preserves_root_prefix() {
     // seg_matches alone dropped it (seg_matches is relative to the query base,
     // so it never carries the `/`/`~/`/`../` the user typed).
     let mut s = TransferScreen::new(PathBuf::from("/srv"), PathBuf::from("/r"));
+    s.connect = ConnectState::Connected;
     let mut srch = PaneSearch::empty();
     srch.searching = false;
     srch.results = vec![PathMatch {
@@ -2199,6 +2370,7 @@ fn tab_find_mode_completes_absolute_path_preserves_root_prefix() {
 fn tab_find_mode_completes_parent_path_preserves_dotdot_prefix() {
     let cwd = PathBuf::from("/srv/app");
     let mut s = TransferScreen::new(cwd, PathBuf::from("/r"));
+    s.connect = ConnectState::Connected;
     let mut srch = PaneSearch::empty();
     srch.searching = false;
     srch.results = vec![PathMatch {
@@ -2222,6 +2394,7 @@ fn tab_find_mode_completes_parent_path_preserves_dotdot_prefix() {
 #[test]
 fn tab_find_mode_completes_home_path_preserves_tilde_prefix() {
     let mut s = TransferScreen::new(PathBuf::from("/srv"), PathBuf::from("/r"));
+    s.connect = ConnectState::Connected;
     let mut srch = PaneSearch::empty();
     srch.searching = false;
     srch.results = vec![PathMatch {
@@ -2253,6 +2426,7 @@ fn search_request_find_mode_keeps_stale_results_until_first_event() {
     // `results_gen`: they stay visible (searching=true) so the renderer does
     // not flash empty. The first event of a NEW generation clears them.
     let mut s = TransferScreen::new(PathBuf::from("/srv"), PathBuf::from("/r"));
+    s.connect = ConnectState::Connected;
     let mut prior = PaneSearch::empty();
     prior.searching = false;
     prior.results_gen = Some(0);
@@ -2284,6 +2458,7 @@ fn apply_search_event_first_match_clears_stale_results() {
     // the stale results before pushing, so the list swaps cleanly old→new
     // instead of concatenating.
     let mut s = TransferScreen::new(PathBuf::from("/srv"), PathBuf::from("/r"));
+    s.connect = ConnectState::Connected;
     let mut srch = PaneSearch::empty();
     srch.searching = true;
     srch.results_gen = Some(0); // results belong to a previous generation
@@ -2316,6 +2491,7 @@ fn apply_search_event_done_zero_results_clears_stale() {
     // A search that finishes with zero matches must clear the stale results
     // so the renderer shows "no matches" instead of the previous query's hits.
     let mut s = TransferScreen::new(PathBuf::from("/srv"), PathBuf::from("/r"));
+    s.connect = ConnectState::Connected;
     let mut srch = PaneSearch::empty();
     srch.searching = true;
     srch.results_gen = Some(0);
@@ -2355,6 +2531,7 @@ fn apply_search_event_new_gen_clears_after_stale_drain_race() {
     //     differing from results_gen, so the late gen-0 drain (which left
     //     results_gen == Some(0)) cannot suppress it.
     let mut s = TransferScreen::new(PathBuf::from("/srv"), PathBuf::from("/r"));
+    s.connect = ConnectState::Connected;
     s.search_gen = 0;
     let mut srch = PaneSearch::empty();
     srch.results_gen = Some(0);
@@ -2427,6 +2604,7 @@ fn tab_while_searching_with_no_candidate_does_not_flip_focus() {
     // pane — the user's intent is completion, not switching. Swallow it until
     // the search produces a candidate; Shift-Tab remains the dedicated switch.
     let mut s = TransferScreen::new(PathBuf::from("/srv"), PathBuf::from("/r"));
+    s.connect = ConnectState::Connected;
     // PaneSearch::empty(): searching=true, results=[], results_gen=None.
     s.local.search = Some(PaneSearch::empty());
     s.local.core.query = "/ho".into();
@@ -2449,6 +2627,7 @@ fn tab_while_searching_does_not_complete_from_stale_results() {
     // stay `/home/ryan/w`, not jump to `/home/ryan/some_dir`. Swallow Tab
     // until the new search yields fresh results.
     let mut s = TransferScreen::new(PathBuf::from("/srv"), PathBuf::from("/r"));
+    s.connect = ConnectState::Connected;
     let mut srch = PaneSearch::empty();
     srch.searching = true; // new search in flight
     srch.results = vec![PathMatch {
@@ -2483,6 +2662,7 @@ fn tab_find_mode_zero_results_does_not_flip_focus() {
     // candidate is under the cursor — Tab must NOT flip focus. Only filter
     // mode (incl. an empty query) flips; Shift-Tab always flips.
     let mut s = TransferScreen::new(PathBuf::from("/srv"), PathBuf::from("/r"));
+    s.connect = ConnectState::Connected;
     let mut srch = PaneSearch::empty();
     srch.searching = false; // search finished
     srch.results = vec![]; // zero matches
@@ -2503,6 +2683,7 @@ fn tab_find_mode_zero_results_does_not_flip_focus() {
 #[test]
 fn advance_spinner_increments_while_local_pane_searching() {
     let mut s = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
+    s.connect = ConnectState::Connected;
     assert_eq!(s.spinner, 0, "fresh screen starts at frame 0");
     s.local.search = Some(PaneSearch::empty()); // PaneSearch::empty() has searching = true
     s.advance_spinner();
@@ -2514,6 +2695,7 @@ fn advance_spinner_increments_while_local_pane_searching() {
 #[test]
 fn advance_spinner_increments_while_remote_pane_searching() {
     let mut s = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
+    s.connect = ConnectState::Connected;
     s.remote.search = Some(PaneSearch::empty());
     s.advance_spinner();
     assert_eq!(s.spinner, 1);
@@ -2522,6 +2704,7 @@ fn advance_spinner_increments_while_remote_pane_searching() {
 #[test]
 fn advance_spinner_noop_when_no_search_in_flight() {
     let mut s = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
+    s.connect = ConnectState::Connected;
     // No search on either pane.
     s.advance_spinner();
     assert_eq!(s.spinner, 0);
@@ -2550,6 +2733,7 @@ fn ctrl_c_with_inflight_opens_quit_confirm_instead_of_quitting() {
     // stays. The in-flight task is untouched (still InFlight).
     let cwd = PathBuf::from("/srv");
     let mut s = TransferScreen::new(cwd.clone(), PathBuf::from("/r"));
+    s.connect = ConnectState::Connected;
     seed_inflight_upload(&mut s, "big.tar");
 
     let out = s.on_key(press(KeyCode::Char('c'), KeyModifiers::CONTROL));
@@ -2575,6 +2759,7 @@ fn esc_with_inflight_opens_quit_confirm_instead_of_cancelling() {
     // not an Esc side effect.
     let cwd = PathBuf::from("/srv");
     let mut s = TransferScreen::new(cwd.clone(), PathBuf::from("/r"));
+    s.connect = ConnectState::Connected;
     seed_inflight_upload(&mut s, "big.tar");
 
     let out = s.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
@@ -2595,6 +2780,7 @@ fn esc_with_inflight_opens_quit_confirm_instead_of_cancelling() {
 fn quit_confirm_enter_quits() {
     let cwd = PathBuf::from("/srv");
     let mut s = TransferScreen::new(cwd.clone(), PathBuf::from("/r"));
+    s.connect = ConnectState::Connected;
     seed_inflight_upload(&mut s, "big.tar");
     s.on_key(press(KeyCode::Char('c'), KeyModifiers::CONTROL));
     assert!(s.close_confirm.is_some());
@@ -2607,6 +2793,7 @@ fn quit_confirm_enter_quits() {
 fn quit_confirm_cancel_keeps_transfer_and_closes_overlay() {
     let cwd = PathBuf::from("/srv");
     let mut s = TransferScreen::new(cwd.clone(), PathBuf::from("/r"));
+    s.connect = ConnectState::Connected;
     seed_inflight_upload(&mut s, "big.tar");
     s.on_key(press(KeyCode::Char('c'), KeyModifiers::CONTROL));
     assert!(s.close_confirm.is_some());
@@ -2624,6 +2811,7 @@ fn quit_confirm_cancel_keeps_transfer_and_closes_overlay() {
 #[test]
 fn ctrl_c_idle_closes_immediately_without_overlay() {
     let mut s = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
+    s.connect = ConnectState::Connected;
     assert!(!s.has_inflight());
     let out = s.on_key(press(KeyCode::Char('c'), KeyModifiers::CONTROL));
     assert_eq!(out, ScreenOutcome::CloseTransfer);
@@ -2633,6 +2821,7 @@ fn ctrl_c_idle_closes_immediately_without_overlay() {
 #[test]
 fn esc_idle_quit_path_does_not_open_overlay() {
     let mut s = TransferScreen::new(PathBuf::from("/l"), PathBuf::from("/r"));
+    s.connect = ConnectState::Connected;
     assert!(!s.has_inflight());
     let out = s.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
     assert_eq!(out, ScreenOutcome::CloseTransfer);
@@ -2648,6 +2837,7 @@ fn quit_confirm_behaves_when_transfer_completes_while_open() {
     use sshrack_core::connect::sftp::proto::TransferOutcome;
     let cwd = PathBuf::from("/srv");
     let mut s = TransferScreen::new(cwd.clone(), PathBuf::from("/r"));
+    s.connect = ConnectState::Connected;
     seed_inflight_upload(&mut s, "big.tar");
     s.on_key(press(KeyCode::Char('c'), KeyModifiers::CONTROL));
     assert!(s.close_confirm.is_some());

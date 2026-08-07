@@ -833,7 +833,18 @@ impl App {
         // lingers on the footer until some later action overwrites it. A new
         // status set during THIS keypress's drain (a list error, queue
         // feedback) is written AFTER this clear, so it still surfaces.
-        if key.kind == crossterm::event::KeyEventKind::Press {
+        //
+        // Skip the clear while Connecting/ConnectFailed: in ConnectFailed the
+        // status carries the failure reason that `draw` shows in the banner,
+        // and the on_key gate swallows non-close keys anyway — clearing it on
+        // a stray keypress would erase the reason from the banner. Connecting
+        // has no transient feedback to clear.
+        if key.kind == crossterm::event::KeyEventKind::Press
+            && matches!(
+                screen.connect,
+                super::transfer::screen::ConnectState::Connected
+            )
+        {
             screen.set_status(Status::empty());
         }
         let out = screen.on_key(key);
@@ -2649,15 +2660,20 @@ mod tests {
     // ===============================================================
 
     use crate::tui::transfer::pane::Side;
-    use crate::tui::transfer::screen::TransferScreen;
+    use crate::tui::transfer::screen::{ConnectState, TransferScreen};
 
     /// Build a hand-constructed TransferScreen for routing tests. Two empty
     /// panes at canned cwds; we do not need entries to assert focus flips.
+    /// `connect` defaults to Connected so on_key navigation/enqueue arms are
+    /// reachable (a fresh screen is Connecting — the async-connect gate would
+    /// swallow everything except Esc/Ctrl-C).
     fn canned_transfer_screen() -> TransferScreen {
-        TransferScreen::new(
+        let mut s = TransferScreen::new(
             std::path::PathBuf::from("/local"),
             std::path::PathBuf::from("/remote"),
-        )
+        );
+        s.connect = ConnectState::Connected;
+        s
     }
 
     #[test]

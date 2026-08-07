@@ -63,6 +63,20 @@ pub enum WorkerEvent {
     Listing(PathBuf, Result<Vec<DirEntry>, String>), // entries for cwd (or error msg)
     Progress(Progress),
     Done(TransferOutcome),
+    /// Master handshake + `sftp pwd` succeeded. Carries everything the UI needs
+    /// to seed the remote pane and build the path-aware searcher now that the
+    /// master is up: `home` (remote cwd), `target` (`user@host`), and `sock`
+    /// (the live ControlPath). The handle exposes none of these (the worker
+    /// thread owns them), so they ride this event.
+    Connected {
+        home: PathBuf,
+        target: String,
+        sock: PathBuf,
+    },
+    /// Master handshake failed (auth refused, connection refused, timeout).
+    /// `reason` is the first meaningful stderr line or a synthesized message.
+    /// NOT sent on a user-initiated cancel (the worker just exits silently).
+    ConnectFailed(String),
 }
 
 // ---- Progress ----

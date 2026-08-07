@@ -87,6 +87,50 @@ fn write_ssh_shim(shim_path: &Path, exit_sleep: Option<u64>) -> PathBuf {
     capture
 }
 
+/// Like [`write_ssh_shim`] but the `-O check` branch exits 1 forever — the
+/// master (the `-N` arm) is alive but never reports ready, so the worker's
+/// handshake polls until cancelled. Used by the cancel-mid-handshake test.
+fn write_ssh_shim_never_ready(shim_path: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let capture = shim_path
+        .parent()
+        .expect("shim has a parent dir")
+        .join("capture.txt");
+    let cap_str = capture.to_string_lossy();
+    let script = format!(
+        "#!/bin/sh\n\
+         CAP='{cap_str}'\n\
+         BLOCK=$(\n\
+         for a in \"$0\" \"$@\"; do printf '%s\\n' \"$(printf '%s' \"$a\" | base64)\"; done\n\
+         printf '%s\\n' '---ENV---'\n\
+         for k in SSH_ASKPASS SSH_ASKPASS_REQUIRE DISPLAY SSHRACK_ASKPASS_FILE SSHRACK_KEYRING_KEY SSHRACK_HOST_ID SSHRACK_CONFIG SSHRACK_ASKPASS_DENY; do\n\
+         eval \"v=\\$$k\"\n\
+         if [ -n \"${{v:+set}}\" ]; then printf '%s=%s\\n' \"$k\" \"$v\"; fi\n\
+         done\n\
+         printf '%s\\n' '===END=='\n\
+         )\n\
+         printf '%s\\n' \"$BLOCK\" >> \"$CAP\"\n\
+         SOCK=''\n\
+         for arg in \"$@\"; do\n\
+         case \"$arg\" in\n\
+         ControlPath=*) SOCK=\"${{arg#ControlPath=}}\" ;;\n\
+         esac\n\
+         done\n\
+         for arg in \"$@\"; do\n\
+         case \"$arg\" in\n\
+         check) exit 1 ;;\n\
+         exit) exit 0 ;;\n\
+         -N) [ -n \"$SOCK\" ] && touch \"$SOCK\" 2>/dev/null; sleep 30 & wait; exit 0 ;;\n\
+         esac\n\
+         done\n\
+         exit 0\n",
+    );
+    std::fs::write(shim_path, script).expect("write ssh shim");
+    std::fs::set_permissions(shim_path, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod ssh shim");
+    capture
+}
+
 /// Write the sftp-shim script to `shim_path`. The shim drains stdin (so the
 /// parent's batch write does not SIGPIPE), sleeps a fixed duration, then exits
 /// 0. The fixed sleep is long enough for several progress polls (~200ms each)
@@ -200,6 +244,21 @@ fn fresh_shim_env_slow_exit(
     (dir, ssh_shim, sftp_shim, capture, bin)
 }
 
+/// Like [`fresh_shim_env`], but the ssh-shim's `-O check` branch exits 1
+/// forever — emulating a master that NEVER becomes ready. The `-N` arm still
+/// sleeps (the master is "alive" but never answers `-O check`), so the worker
+/// keeps polling until cancelled. Used to prove dropping a worker mid-handshake
+/// aborts within the handshake-poll window instead of waiting for the deadline.
+fn fresh_shim_env_never_ready() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf, SftpBin) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let ssh_shim = dir.path().join("ssh-shim");
+    let sftp_shim = dir.path().join("sftp-shim");
+    let capture = write_ssh_shim_never_ready(&ssh_shim);
+    write_sftp_shim(&sftp_shim);
+    let bin = SftpBin::new(ssh_shim.clone(), sftp_shim.clone());
+    (dir, ssh_shim, sftp_shim, capture, bin)
+}
+
 /// Build a download TransferJob whose dst is inside `dir`.
 fn download_job(dir: &Path, dst_name: &str, size_total: Option<u64>) -> TransferJob {
     TransferJob {
@@ -255,17 +314,15 @@ fn wait_for_invocation_with(capture: &Path, token: &str, deadline: Duration) -> 
 
 // ---- tests ----
 
-/// The master spawn's argv carries `-N`, `ControlMaster=yes`, and the socket
-/// path; its env carries the SFTP askpass shape (`SSH_ASKPASS` + deny even for
-/// `PasswordSource::None`); the password/key never appears in argv or env.
-#[test]
-fn sftp_master_spawn_env_shape_matches_askpass_env_for_sftp() {
-    let (_dir, _ssh, _sftp, capture, bin) = fresh_shim_env();
+/// Spawn a worker against `bin` (PasswordSource::None, key-only host) and wait
+/// for its `Connected` event — the master handshake + `sftp pwd` ran to
+/// completion on the worker thread. Returns `(worker, home)`. Panics on
+/// `ConnectFailed` or if no `Connected` lands within 5s (the shim master comes
+/// up quickly; a hang is a regression). Replaces the blocking `SftpWorker::open`
+/// that previously handed back `(worker, home)` synchronously.
+fn spawn_and_connect(bin: SftpBin) -> (SftpWorker, PathBuf) {
     let self_exe = std::env::current_exe().expect("current_exe");
-
-    // open spawns the master (shim), which records argv+env then sleeps. The
-    // control_check shim exits 0 → handshake succeeds on the first poll.
-    let result = SftpWorker::open(
+    let worker = SftpWorker::spawn(
         resolved_none(),
         key_only_host(),
         sshrack_core::connect::ssh::Overrides::default(),
@@ -273,8 +330,40 @@ fn sftp_master_spawn_env_shape_matches_askpass_env_for_sftp() {
         PasswordSource::None,
         None,
         bin,
-    );
-    let (worker, _home) = result.expect("open with shims succeeds");
+    )
+    .expect("spawn");
+    let mut home: Option<PathBuf> = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        match worker.try_event() {
+            Some(WorkerEvent::Connected {
+                home: h,
+                target: _,
+                sock: _,
+            }) => {
+                home = Some(h);
+                break;
+            }
+            Some(WorkerEvent::ConnectFailed(reason)) => {
+                panic!("worker reported ConnectFailed: {reason}");
+            }
+            Some(_) => {}
+            None => std::thread::sleep(Duration::from_millis(25)),
+        }
+    }
+    let home = home.expect("no Connected event within 5s");
+    (worker, home)
+}
+
+/// The master spawn's argv carries `-N`, `ControlMaster=yes`, and the socket
+/// path; its env carries the SFTP askpass shape (`SSH_ASKPASS` + deny even for
+/// `PasswordSource::None`); the password/key never appears in argv or env.
+#[test]
+fn sftp_master_spawn_env_shape_matches_askpass_env_for_sftp() {
+    let (_dir, _ssh, _sftp, capture, bin) = fresh_shim_env();
+    // spawn_and_connect waits for the master handshake to complete on the
+    // worker thread; by then the shim's master (-N) invocation is captured.
+    let (worker, _home) = spawn_and_connect(bin);
 
     let invocations = read_all_invocations(&capture);
     // Find the master invocation (the one containing `-N`).
@@ -340,20 +429,10 @@ fn sftp_master_spawn_env_shape_matches_askpass_env_for_sftp() {
 #[test]
 fn sftp_run_transfer_emits_progress_then_done_against_shim() {
     let (dir, _ssh, _sftp, _capture, bin) = fresh_shim_env();
-    let self_exe = std::env::current_exe().expect("current_exe");
     let dst = dir.path().join("downloaded.bin");
     std::fs::write(&dst, b"").expect("create empty dst");
 
-    let (worker, _home) = SftpWorker::open(
-        resolved_none(),
-        key_only_host(),
-        sshrack_core::connect::ssh::Overrides::default(),
-        &self_exe,
-        PasswordSource::None,
-        None,
-        bin,
-    )
-    .expect("open");
+    let (worker, _home) = spawn_and_connect(bin);
 
     // Side thread grows the dst file so poll_dst_size observes progress.
     let dst_clone = dst.clone();
@@ -393,6 +472,9 @@ fn sftp_run_transfer_emits_progress_then_done_against_shim() {
                 other => panic!("expected Done(Ok), got Done({other:?})"),
             },
             Some(WorkerEvent::Listing(_, _)) => { /* ignore */ }
+            // Connected/ConnectFailed arrive before Transfer (spawn_and_connect
+            // already drained Connected); safe to ignore here.
+            Some(WorkerEvent::Connected { .. }) | Some(WorkerEvent::ConnectFailed(_)) => {}
             None => std::thread::sleep(Duration::from_millis(50)),
         }
     }
@@ -409,21 +491,11 @@ fn sftp_run_transfer_emits_progress_then_done_against_shim() {
 #[test]
 fn sftp_run_transfer_cancel_kills_and_reaps_and_marks_cancelled() {
     let (dir, _ssh, _sftp, _capture, bin) = fresh_shim_env();
-    let self_exe = std::env::current_exe().expect("current_exe");
     let dst = dir.path().join("partial.bin");
     std::fs::write(&dst, b"partial-bytes").expect("seed partial dst");
     assert!(dst.exists(), "partial dst must exist before cancel");
 
-    let (worker, _home) = SftpWorker::open(
-        resolved_none(),
-        key_only_host(),
-        sshrack_core::connect::ssh::Overrides::default(),
-        &self_exe,
-        PasswordSource::None,
-        None,
-        bin,
-    )
-    .expect("open");
+    let (worker, _home) = spawn_and_connect(bin);
 
     // Enqueue a transfer then immediately cancel. The worker thread processes
     // Transfer first (spawning the sftp-shim, which sleeps 3s), then on its
@@ -485,13 +557,12 @@ fn sftp_worker_drop_tears_down_master_socket_and_pw_file() {
     let self_exe = std::env::current_exe().expect("current_exe");
 
     // Use an Inline password so a pw temp file is created and must be removed.
-    let resolved = resolved_inline("hunter2");
-    // Snapshot the shared temp dir BEFORE open. The pw-file `open` creates lives
-    // in std::env::temp_dir() with a pid+nanos name; the after-drop snapshot (c)
-    // diffs against this set to prove Drop removed it.
+    // Snapshot the shared temp dir BEFORE spawn. The pw-file the worker creates
+    // lives in std::env::temp_dir() with a pid+nanos name; the after-drop
+    // snapshot (c) diffs against this set to prove Drop removed it.
     let before: HashSet<PathBuf> = pw_files_in(&std::env::temp_dir());
-    let (worker, _home) = SftpWorker::open(
-        resolved,
+    let worker = SftpWorker::spawn(
+        resolved_inline("hunter2"),
         key_only_host(),
         sshrack_core::connect::ssh::Overrides::default(),
         &self_exe,
@@ -499,7 +570,23 @@ fn sftp_worker_drop_tears_down_master_socket_and_pw_file() {
         None,
         bin.clone(),
     )
-    .expect("open");
+    .expect("spawn");
+    // Drain Connected so the master is up + the socket is touched + the pw
+    // file is materialized before the assertions.
+    let mut connected = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        match worker.try_event() {
+            Some(WorkerEvent::Connected { .. }) => {
+                connected = true;
+                break;
+            }
+            Some(WorkerEvent::ConnectFailed(r)) => panic!("connect failed: {r}"),
+            Some(_) => {}
+            None => std::thread::sleep(Duration::from_millis(25)),
+        }
+    }
+    assert!(connected, "no Connected event within 5s");
 
     // Capture the socket path from the master invocation before drop.
     let pre_drop_invocations = read_all_invocations(&capture);
@@ -573,18 +660,7 @@ fn sftp_worker_drop_tears_down_master_socket_and_pw_file() {
 #[test]
 fn sftp_worker_drop_not_blocked_by_slow_control_exit() {
     let (_dir, _ssh, _sftp, _capture, bin) = fresh_shim_env_slow_exit(3);
-    let self_exe = std::env::current_exe().expect("current_exe");
-
-    let (worker, _home) = SftpWorker::open(
-        resolved_none(),
-        key_only_host(),
-        sshrack_core::connect::ssh::Overrides::default(),
-        &self_exe,
-        PasswordSource::None,
-        None,
-        bin.clone(),
-    )
-    .expect("open");
+    let (worker, _home) = spawn_and_connect(bin);
 
     let start = std::time::Instant::now();
     drop(worker);
@@ -597,5 +673,89 @@ fn sftp_worker_drop_not_blocked_by_slow_control_exit() {
     assert!(
         elapsed < Duration::from_secs(2),
         "drop blocked on slow ssh -O exit: {elapsed:?} (expected <<3s)"
+    );
+}
+
+/// `SftpWorker::spawn` returns immediately and the worker thread reports
+/// `Connected { home, .. }` once the master handshake completes — the spawn
+/// does NOT block on the handshake. Contrast with the deleted `open`, which
+/// blocked. Pins the struct form of the event (Step 5 FINAL shape).
+#[test]
+fn sftp_worker_spawn_is_async_reports_connected() {
+    let (_dir, _ssh, _sftp, _capture, bin) = fresh_shim_env();
+    let self_exe = std::env::current_exe().expect("current_exe");
+    let worker = SftpWorker::spawn(
+        resolved_none(),
+        key_only_host(),
+        sshrack_core::connect::ssh::Overrides::default(),
+        &self_exe,
+        PasswordSource::None,
+        None,
+        bin,
+    )
+    .expect("spawn");
+    // The call returned without waiting for the handshake. Now drain the
+    // Connected event (the shim master comes up quickly).
+    let mut connected_home = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if let Some(ev) = worker.try_event() {
+            match ev {
+                WorkerEvent::Connected { home, target, sock } => {
+                    // Struct form carries all three coordinates.
+                    assert!(
+                        !target.is_empty(),
+                        "Connected.target must be the user@host string"
+                    );
+                    assert!(
+                        !sock.as_os_str().is_empty(),
+                        "Connected.sock must be the live ControlPath"
+                    );
+                    connected_home = Some(home);
+                    break;
+                }
+                WorkerEvent::ConnectFailed(r) => {
+                    panic!("expected Connected, got ConnectFailed: {r}");
+                }
+                other => panic!("expected Connected, got {other:?}"),
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        connected_home.is_some(),
+        "no Connected event within 5s — spawn did not produce one"
+    );
+    drop(worker); // join must return promptly (service loop idles on recv)
+}
+
+/// Dropping the worker mid-handshake sends `Shutdown`; the connect phase aborts
+/// and `Drop`'s join returns within the handshake-poll window. Uses a shim whose
+/// `-O check` exits 1 forever so the handshake is still in progress when dropped.
+#[test]
+fn sftp_worker_spawn_drop_cancels_handshake_quickly() {
+    let (_dir, _ssh, _sftp, _capture, bin) = fresh_shim_env_never_ready();
+    let self_exe = std::env::current_exe().expect("current_exe");
+    let worker = SftpWorker::spawn(
+        resolved_none(),
+        key_only_host(),
+        sshrack_core::connect::ssh::Overrides::default(),
+        &self_exe,
+        PasswordSource::None,
+        None,
+        bin,
+    )
+    .expect("spawn");
+    let start = std::time::Instant::now();
+    drop(worker); // sends Shutdown + joins
+    let elapsed = start.elapsed();
+    // The connect phase polls every HANDSHAKE_POLL (250ms) and treats a
+    // Shutdown / channel disconnect as cancel (returns at once, then the
+    // partial MasterSession drops). 2s is a comfortable upper bound that is
+    // far clear of the 30s handshake deadline — it fails reliably if the
+    // cancel path regresses into waiting for the deadline.
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "drop did not cancel the handshake quickly: {elapsed:?} (expected <<30s)"
     );
 }

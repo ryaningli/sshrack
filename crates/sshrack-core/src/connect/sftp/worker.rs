@@ -1,34 +1,43 @@
-//! SFTP worker: owns the master `ssh -N` connection and serially executes every
-//! [`WorkerCmd`] the UI sends. The main thread pushes commands via
-//! [`SftpWorker::send`]; the UI polls [`WorkerEvent`]s each tick via
-//! [`SftpWorker::try_event`]. `Drop` tears the whole thing down: Shutdown → join
-//! → `ssh -O exit` → kill master → remove socket file → remove pw file.
+//! SFTP worker: spawns the master `ssh -N` connection on a worker thread and
+//! serially executes every [`WorkerCmd`] the UI sends. The main thread pushes
+//! commands via [`SftpWorker::send`]; the UI polls [`WorkerEvent`]s each tick via
+//! [`SftpWorker::try_event`]. [`SftpWorker::spawn`] returns immediately — the
+//! master handshake + `sftp pwd` run on the worker thread, surfacing via
+//! [`WorkerEvent::Connected`] / [`WorkerEvent::ConnectFailed`]. Dropping the
+//! handle sends `Shutdown` and joins; the worker thread owns the master/socket/
+//! pw-file via a [`MasterSession`] guard whose `Drop` is the single teardown
+//! path (so a dropped-while-Connecting handshake aborts within one poll).
 //!
 //! ## Threading shape
 //!
 //! ```text
 //!   main thread                         worker thread
 //!   ───────────                         ─────────────
-//!   SftpWorker {                        loop {
-//!     cmd_tx ──── WorkerCmd ────►         rx.recv()
-//!     event_rx ◄── WorkerEvent ─── tx     match cmd { List | Transfer | … }
-//!     join handle                        }
-//!     master_child                       (owns SftpDirSource + target + sock
-//!     ControlSocket                       for spawning sftp batches)
-//!   }
+//!   SftpWorker {                        connect_phase (master + pwd)
+//!     cmd_tx ──── WorkerCmd ────►         │  drains cmd_rx (Shutdown = cancel)
+//!     event_rx ◄── WorkerEvent ─── tx     ▼
+//!     join handle                        service_loop {
+//!   }                                      recv() → match { List | Transfer | … }
+//!                                         }
+//!                                         (MasterSession owned here → Drop on
+//!                                          any exit path tears the master down)
 //! ```
 //!
-//! The worker thread owns the listing source and the connection coordinates;
-//! the main thread owns the master `Child` and the [`ControlSocket`] RAII guard
-//! so dropping the worker handle always reaps both.
+//! The worker thread owns the master `Child`, the [`ControlSocket`] RAII guard,
+//! the password temp file, and the listing source + connection coordinates;
+//! the handle keeps only channel endpoints + the join handle. Teardown is
+//! entirely on the worker thread, so the UI thread does zero synchronous
+//! network I/O on close.
 //!
 //! ## Testability
 //!
 //! The thread + spawn paths are not unit-testable without a real sshd, so only
 //! the pure pieces are unit-tested (now extracted into [`super::pure`] —
 //! `parse_remote_home`, `parse_size_from_ls`, `classify_inflight_cmd`) plus the
-//! [`ControlSocket`] RAII behavior (in [`super`]). A `#[ignore]`'d e2e test
-//! lives in `tests/sftp_e2e.rs` for a future local-sshd run.
+//! [`ControlSocket`] RAII behavior (in [`super`]). The spawn / connect / cancel
+//! shape is exercised against a mock-ssh shim in `tests/sftp_seam_test.rs`. A
+//! `#[ignore]`'d e2e test lives in `tests/sftp_e2e.rs` for a future local-sshd
+//! run.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -54,9 +63,11 @@ use crate::connect::{askpass_env_for_sftp, write_password_file};
 use crate::credential::{PasswordSource, ResolvedAuth};
 use crate::dirsource::DirSource;
 
-/// How long [`SftpWorker::open`] polls `ssh -O check` before giving up. 30s is
+/// How long [`connect_phase`] polls `ssh -O check` before giving up. 30s is
 /// generous for slow first-connect handshakes on high-latency links but bounded
 /// so a misconfigured host surfaces a clear error instead of hanging forever.
+/// The UI may `Esc`-cancel a slow handshake within one [`HANDSHAKE_POLL`]
+/// (≤250ms) regardless of this deadline.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Polling interval during the master handshake.
@@ -65,45 +76,87 @@ const HANDSHAKE_POLL: Duration = Duration::from_millis(250);
 /// Polling interval during a transfer (size + cancel check).
 const PROGRESS_POLL: Duration = Duration::from_millis(200);
 
-// ---- SftpWorker ----
+// ---- MasterSession: worker-thread teardown owner ----
 
-/// Owns the worker thread + the master `ssh -N` connection. Push commands via
-/// [`SftpWorker::send`]; poll events via [`SftpWorker::try_event`]. `Drop`
-/// tears everything down (see the module docs).
-///
-/// Construction is via [`SftpWorker::open`], which spawns the master and the
-/// worker thread; nothing else constructs this type.
-pub struct SftpWorker {
-    cmd_tx: mpsc::Sender<WorkerCmd>,
-    event_rx: mpsc::Receiver<WorkerEvent>,
-    join: Option<JoinHandle<()>>,
-    sock: Option<ControlSocket>,
+/// Owned by the worker thread once the master is up. `Drop` tears the session
+/// down: kill + reap the master, detach `ssh -O exit`, drop the
+/// [`ControlSocket`] (removes the socket file), and remove + unregister the
+/// password temp file. Living on the worker thread means teardown runs on every
+/// exit path — normal `Shutdown`, connect failure, cancel, or the thread simply
+/// ending — without the UI thread doing any synchronous network I/O.
+struct MasterSession {
     master_child: Option<Child>,
+    sock: Option<ControlSocket>,
     pw_file: Option<PathBuf>,
     target: String,
     bin: SftpBin,
 }
 
+impl MasterSession {
+    /// Detach `ssh -O exit` (fire-and-forget, like the close path) and
+    /// force-kill + reap the master. Idempotent.
+    fn teardown(&mut self) {
+        let sock_path = self
+            .sock
+            .as_ref()
+            .map(|s| s.path().to_path_buf())
+            .unwrap_or_default();
+        let exit_argv = control_exit_argv(&self.target, &sock_path);
+        let _ = Command::new(&self.bin.ssh)
+            .args(&exit_argv[1..])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn(); // detached — see sftp-detach-control-exit memory
+        if let Some(child) = self.master_child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.sock.take(); // ControlSocket::drop removes the socket file
+        if let Some(p) = self.pw_file.take() {
+            crate::tempfile_registry::unregister(&p);
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+impl Drop for MasterSession {
+    fn drop(&mut self) {
+        self.teardown();
+    }
+}
+
+// ---- SftpWorker ----
+
+/// Handle to the worker thread. Push commands via [`SftpWorker::send`]; poll
+/// events via [`SftpWorker::try_event`]. `Drop` sends `Shutdown` and joins —
+/// the worker thread owns the master/socket/pw-file ([`MasterSession`]) and
+/// tears them down on any exit path.
+///
+/// Construction is via [`SftpWorker::spawn`], which returns immediately — the
+/// master handshake runs on the worker thread. `target()` / `sock_path()` are
+/// NOT exposed: the worker thread owns those coordinates, and they only go live
+/// once the master is up, so they ride the [`WorkerEvent::Connected`] event
+/// instead.
+pub struct SftpWorker {
+    cmd_tx: mpsc::Sender<WorkerCmd>,
+    event_rx: mpsc::Receiver<WorkerEvent>,
+    join: Option<JoinHandle<()>>,
+}
+
 impl SftpWorker {
-    /// Open the master and start the worker thread.
-    ///
-    /// 1. Allocate a [`ControlSocket`].
-    /// 2. Build askpass env via the shared [`askpass_env_for_sftp`] /
-    ///    [`write_password_file`] helpers (DRY: the worker never reinvents
-    ///    password materialization). The SFTP variant forces
-    ///    `SSH_ASKPASS_REQUIRE=force` and denies `/dev/tty` for `None`.
-    /// 3. Spawn the master `ssh -N` (NOT `status()` — the master must stay
-    ///    alive). Keep the `Child`. stderr is piped + drained on a side thread
-    ///    so an auth failure's reason is captured instead of corrupting the
-    ///    TUI's tty.
-    /// 4. Poll `ssh -O check` until "Master running" / exit 0, the master
-    ///    exits, or [`HANDSHAKE_TIMEOUT`] (30s).
-    /// 5. Probe the remote home via an `sftp pwd` batch (fall back to `/`).
-    /// 6. Spawn the worker thread; return `(worker, home)`.
+    /// Spawn the worker thread. Returns immediately — the master handshake and
+    /// `sftp pwd` happen ON the worker thread, surfaced later as
+    /// [`WorkerEvent::Connected`] / [`WorkerEvent::ConnectFailed`]. The UI
+    /// shows a `Connecting…` screen while these run and may `Esc`-cancel (the
+    /// handle's `Drop` sends `Shutdown`; the connect phase drains `cmd_rx` and
+    /// aborts).
     ///
     /// `resolved`/`host`/`overrides`/`self_exe`/`source`/`config_path` mirror
-    /// [`crate::connect::launch`].
-    pub fn open(
+    /// the old `open`. `host_key` inputs are added in Task 2; for Task 1 the
+    /// host-key pre-flight still ran in `open_transfer` before this call.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn(
         resolved: ResolvedAuth,
         host: Host,
         overrides: Overrides,
@@ -111,177 +164,36 @@ impl SftpWorker {
         source: PasswordSource,
         config_path: Option<&Path>,
         bin: SftpBin,
-    ) -> Result<(Self, PathBuf), String> {
-        let sock = ControlSocket::new();
-        let sock_path = sock.path().to_path_buf();
-        let target = sftp_target(&resolved, &host);
-
-        // (2) Materialize the password temp file (Inline only) and build the
-        // askpass env. Keyring carries no file; None carries no env at all.
-        let pw_file = match &source {
-            PasswordSource::Inline(pw) => Some(write_password_file(pw).map_err(|e| e.to_string())?),
-            _ => None,
-        };
-        let env = askpass_env_for_sftp(self_exe, &source, pw_file.as_deref(), config_path);
-
-        // Captured master stderr: drained on a side thread so (a) the pipe
-        // never fills and blocks the handshake, and (b) an auth failure's real
-        // reason is captured instead of being written to the TUI's tty.
-        let stderr_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-
-        // (3) Spawn the master `ssh -N`. stdin null (ssh -N never reads it),
-        // stdout null (ssh -N never writes it), stderr piped + drained on a
-        // side thread so an auth failure's reason is captured instead of
-        // corrupting the TUI's tty.
-        let master_argv = master_argv(&resolved, &host, &overrides, &sock_path);
-        let mut master_cmd = Command::new(&bin.ssh);
-        master_cmd
-            .args(&master_argv[1..])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-        for (k, v) in &env {
-            master_cmd.env(k, v);
-        }
-        let mut master_child = master_cmd
-            .spawn()
-            .map_err(|e| format!("sftp master spawn failed: {e}"))?;
-
-        // Drain master stderr into the buffer. Unlike run_transfer's drain
-        // (which is safe with `read_to_end` because the buffer is read only
-        // AFTER `try_wait` shows the child exited), this buffer is polled by
-        // `wait_for_master` every HANDSHAKE_POLL while the master is still
-        // alive. Holding the lock across a blocking `read_to_end` would lock
-        // out `wait_for_master`'s per-poll `lock()` for the master's entire
-        // lifetime (the happy path — `ssh -N` stays up, stderr never EOFs) and
-        // hang the handshake indefinitely. Read in chunks instead, holding the
-        // lock only briefly per chunk so `wait_for_master` can acquire it
-        // between reads.
-        {
-            let buf = Arc::clone(&stderr_buf);
-            if let Some(mut stderr) = master_child.stderr.take() {
-                let _ = thread::spawn(move || {
-                    use std::io::Read;
-                    let mut chunk = [0u8; 1024];
-                    loop {
-                        match stderr.read(&mut chunk) {
-                            Ok(0) => break, // EOF — master exited
-                            Ok(n) => {
-                                buf.lock()
-                                    .expect("invariant: stderr lock")
-                                    .extend_from_slice(&chunk[..n]);
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                });
-            }
-        }
-
-        // (4) Poll `ssh -O check` until ready, the master exits, or the deadline.
-        match wait_for_master(
-            &target,
-            &sock_path,
-            &bin.ssh,
-            Instant::now() + HANDSHAKE_TIMEOUT,
-            &mut master_child,
-            &stderr_buf,
-        ) {
-            HandshakeOutcome::Ready => {}
-            outcome => {
-                // Teardown on handshake failure: kill + reap the master, ask it
-                // to exit politely, drop the socket, remove the pw file.
-                let _ = master_child.kill();
-                let _ = master_child.wait();
-                let exit_argv = control_exit_argv(&target, &sock_path);
-                let _ = Command::new(&bin.ssh)
-                    .args(&exit_argv[1..])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
-                drop(sock);
-                if let Some(p) = pw_file {
-                    crate::tempfile_registry::unregister(&p);
-                    let _ = std::fs::remove_file(p);
-                }
-                let reason = match outcome {
-                    HandshakeOutcome::Exited(s) => match first_meaningful_line(&s) {
-                        "" => "sftp master failed (authentication rejected)".to_string(),
-                        line => format!("sftp master failed: {line}"),
-                    },
-                    HandshakeOutcome::Timeout => "sftp master handshake timed out".to_string(),
-                    HandshakeOutcome::Ready => unreachable!("handled above"),
-                };
-                return Err(reason);
-            }
-        }
-
-        // (5) Probe the remote home via `sftp pwd`. Falls back to `/` on any
-        // failure so the UI never blocks on home detection.
-        let runner = Arc::new(LocalSftpRunner::with_bin(bin.sftp.clone()));
-        let home = {
-            let batch = pwd_batch();
-            match runner.run_batch(&target, &sock_path, &batch) {
-                Ok(stdout) => parse_remote_home(&stdout).unwrap_or_else(|| PathBuf::from("/")),
-                Err(_) => PathBuf::from("/"),
-            }
-        };
-
-        // (6) Spawn the worker thread. The thread owns the listing source and
-        // the connection coordinates; the main thread keeps the master Child
-        // and the ControlSocket guard.
+    ) -> Result<Self, String> {
         let (event_tx, event_rx) = mpsc::channel::<WorkerEvent>();
         let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCmd>();
-
-        let worker_target = target.clone();
-        let worker_sock = sock_path.clone();
-        let worker_home = home.clone();
-        let worker_sftp_bin = bin.sftp.clone();
-        let join = match thread::Builder::new()
+        let runner = Arc::new(LocalSftpRunner::with_bin(bin.sftp.clone()));
+        // Convert borrowed inputs to owned BEFORE the closure: the thread is
+        // 'static, so neither &Path nor Option<&Path> can be captured.
+        let self_exe_owned = self_exe.to_path_buf();
+        let config_path_owned = config_path.map(|p| p.to_path_buf());
+        let join = thread::Builder::new()
             .name("sftp-worker".into())
             .spawn(move || {
-                worker_loop(
+                run_worker_thread(
                     cmd_rx,
                     event_tx,
+                    resolved,
+                    host,
+                    overrides,
+                    self_exe_owned,
+                    source,
+                    config_path_owned,
+                    bin,
                     runner,
-                    worker_target,
-                    worker_sock,
-                    worker_home,
-                    worker_sftp_bin,
-                );
-            }) {
-            Ok(handle) => Some(handle),
-            Err(e) => {
-                // Teardown on thread-spawn failure: be a good citizen and clean
-                // up everything we set up. The thread never got the inputs, so
-                // we own their lifetimes here.
-                let exit_argv = control_exit_argv(&target, &sock_path);
-                let _ = Command::new(&bin.ssh).args(&exit_argv[1..]).status();
-                let _ = master_child.kill();
-                let _ = master_child.wait();
-                drop(sock);
-                if let Some(p) = pw_file {
-                    crate::tempfile_registry::unregister(&p);
-                    let _ = std::fs::remove_file(p);
-                }
-                return Err(format!("sftp worker thread spawn failed: {e}"));
-            }
-        };
-
-        Ok((
-            SftpWorker {
-                cmd_tx,
-                event_rx,
-                join,
-                sock: Some(sock),
-                master_child: Some(master_child),
-                pw_file,
-                target,
-                bin,
-            },
-            home,
-        ))
+                )
+            })
+            .map_err(|e| format!("sftp worker thread spawn failed: {e}"))?;
+        Ok(Self {
+            cmd_tx,
+            event_rx,
+            join: Some(join),
+        })
     }
 
     /// Push a command onto the worker's queue. Non-blocking; the worker thread
@@ -297,83 +209,237 @@ impl SftpWorker {
     pub fn try_event(&self) -> Option<WorkerEvent> {
         self.event_rx.try_recv().ok()
     }
-
-    /// The `user@host` sftp target string the master authenticated as. Callers
-    /// (e.g. `open_transfer` building a `RemotePathSearch`) pass this to
-    /// [`crate::connect::sftp::source::SftpDirSource::new`] / the search.
-    pub fn target(&self) -> &str {
-        &self.target
-    }
-
-    /// The master `ControlPath` the worker mounts its sftp batches on, or
-    /// `None` if the socket has been torn down. Borrowed from `self.sock` so
-    /// the caller cannot outlive the worker.
-    pub fn sock_path(&self) -> Option<&Path> {
-        self.sock.as_ref().map(|c| c.path())
-    }
 }
 
 impl Drop for SftpWorker {
     fn drop(&mut self) {
-        // 1. Tell the worker thread to exit (best-effort — it may already be
-        //    gone if the channel is closed).
+        // Ask the worker to exit, then join. The connect phase and service loop
+        // both watch cmd_rx, so this returns within ~HANDSHAKE_POLL (250ms)
+        // once the worker reaches a recv point. On join, the worker thread's
+        // MasterSession has already torn the master down.
         let _ = self.cmd_tx.send(WorkerCmd::Shutdown);
-
-        // 2. Join the thread. A bounded wait would be nicer (the thread could
-        //    be mid-sftp-batch), but plain join is acceptable for MVP and
-        //    ensures the thread is reaped before we tear down its inputs.
         if let Some(handle) = self.join.take() {
             let _ = handle.join();
-        }
-
-        // 3. Politely ask the master to exit via `ssh -O exit`, but fire it
-        //    detached — do NOT wait. Drop runs on the UI thread, and the
-        //    master's remote teardown can take hundreds of ms to seconds (it
-        //    waits on the far end + TCP close); waiting would freeze the TUI on
-        //    every SFTP close. The SIGKILL + reap in step 4 is the real
-        //    guarantee the master is gone; `ssh -O exit` is best-effort and
-        //    races it (usually losing, which is fine). `Child`'s drop does not
-        //    kill the spawned process and all stdio is null, so it cannot block
-        //    us or leak a pipe.
-        let sock_path = self
-            .sock
-            .as_ref()
-            .map(|s| s.path().to_path_buf())
-            .unwrap_or_default();
-        let exit_argv = control_exit_argv(&self.target, &sock_path);
-        let _ = Command::new(&self.bin.ssh)
-            .args(&exit_argv[1..])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-
-        // 4. Force-kill the master + reap it. SIGKILL + wait guarantees no
-        //    lingering `ssh -N` process even if `ssh -O exit` was ignored.
-        if let Some(child) = self.master_child.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-
-        // 5. Drop the ControlSocket (removes the socket file). Taking the
-        //    Option makes the drop explicit and ordering-controllable here.
-        self.sock.take();
-
-        // 6. Remove the password temp file if we created one.
-        if let Some(p) = self.pw_file.take() {
-            crate::tempfile_registry::unregister(&p);
-            let _ = std::fs::remove_file(p);
         }
     }
 }
 
 // ---- worker thread ----
 
-/// The worker thread loop. Owns the listing source + connection coordinates;
-/// drains [`WorkerCmd`]s and emits [`WorkerEvent`]s.
-fn worker_loop(
+/// Worker thread entry point. Runs [`connect_phase`] (master handshake + pwd,
+/// cancellable) then [`service_loop`] (the Listing/Transfer/Cancel/Shutdown
+/// loop). `session` moves into `service_loop` so its [`MasterSession::drop`]
+/// runs when that function returns — i.e. on every exit path. On a connect
+/// failure / cancel [`connect_phase`] already cleaned up and returned `Err`.
+#[allow(clippy::too_many_arguments)]
+fn run_worker_thread(
     cmd_rx: mpsc::Receiver<WorkerCmd>,
     event_tx: mpsc::Sender<WorkerEvent>,
+    resolved: ResolvedAuth,
+    host: Host,
+    overrides: Overrides,
+    self_exe: PathBuf,
+    source: PasswordSource,
+    config_path: Option<PathBuf>,
+    bin: SftpBin,
+    runner: Arc<LocalSftpRunner>,
+) {
+    // Task 1: connect = master handshake + pwd. (Task 2 prepends host-key here.)
+    // `connect_phase` reports + cleans up on Err, so only the Ok arm does work.
+    if let Ok((session, home)) = connect_phase(
+        &cmd_rx,
+        &event_tx,
+        &resolved,
+        &host,
+        &overrides,
+        &self_exe,
+        &source,
+        config_path.as_deref(),
+        &bin,
+        &runner,
+    ) {
+        // service_loop takes ownership of the session; when it returns,
+        // session drops and tears the master down.
+        let target = session.target.clone();
+        let sock_path = session
+            .sock
+            .as_ref()
+            .map(|s| s.path().to_path_buf())
+            .expect("invariant: socket alive after connect");
+        let sftp_bin = bin.sftp.clone();
+        // Coercion Arc<LocalSftpRunner> → Arc<dyn SftpRunner> happens here.
+        let runner_dyn: Arc<dyn SftpRunner> = runner;
+        service_loop(
+            cmd_rx, event_tx, session, runner_dyn, target, sock_path, home, sftp_bin,
+        );
+    }
+}
+
+/// Spawn the master, poll until up (cancellable), probe home via `pwd`.
+/// Sends [`WorkerEvent::Connected`] on success; [`WorkerEvent::ConnectFailed`]
+/// on Exited/Timeout; nothing on Cancelled. Returns `Err(())` whenever the
+/// master did NOT come up (the partial [`MasterSession`] cleans itself up via
+/// `Drop`).
+#[allow(clippy::too_many_arguments)]
+fn connect_phase(
+    cmd_rx: &mpsc::Receiver<WorkerCmd>,
+    event_tx: &mpsc::Sender<WorkerEvent>,
+    resolved: &ResolvedAuth,
+    host: &Host,
+    overrides: &Overrides,
+    self_exe: &Path,
+    source: &PasswordSource,
+    config_path: Option<&Path>,
+    bin: &SftpBin,
+    runner: &Arc<LocalSftpRunner>,
+) -> Result<(MasterSession, PathBuf), ()> {
+    let sock = ControlSocket::new();
+    let sock_path = sock.path().to_path_buf();
+    let target = sftp_target(resolved, host);
+
+    // Materialize the password temp file (Inline only) and build the askpass
+    // env. Keyring carries no file; None carries no env at all. The SFTP
+    // variant forces SSH_ASKPASS_REQUIRE=force and denies /dev/tty for None.
+    let pw_file = match source {
+        PasswordSource::Inline(pw) => match write_password_file(pw) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                let _ = event_tx.send(WorkerEvent::ConnectFailed(format!(
+                    "sftp password file failed: {e}"
+                )));
+                return Err(());
+            }
+        },
+        _ => None,
+    };
+    let env = askpass_env_for_sftp(self_exe, source, pw_file.as_deref(), config_path);
+
+    // Captured master stderr: drained on a side thread so (a) the pipe never
+    // fills and blocks the handshake, and (b) an auth failure's real reason is
+    // captured instead of being written to the TUI's tty.
+    let stderr_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+
+    // Spawn the master `ssh -N`. stdin null (ssh -N never reads it), stdout
+    // null, stderr piped + drained on a side thread.
+    let master_argv = master_argv(resolved, host, overrides, &sock_path);
+    let mut master_cmd = Command::new(&bin.ssh);
+    master_cmd
+        .args(&master_argv[1..])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    for (k, v) in &env {
+        master_cmd.env(k, v);
+    }
+    let mut master_child = match master_cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = event_tx.send(WorkerEvent::ConnectFailed(format!(
+                "sftp master spawn failed: {e}"
+            )));
+            // Partial session: Drop removes pw_file + socket.
+            let partial = MasterSession {
+                master_child: None,
+                sock: Some(sock),
+                pw_file,
+                target,
+                bin: bin.clone(),
+            };
+            drop(partial);
+            return Err(());
+        }
+    };
+
+    // Drain master stderr into the buffer in chunks (see wait_for_master's
+    // per-poll lock): holding the lock across a blocking read would lock out
+    // the per-poll `lock()` for the master's whole lifetime and hang the
+    // handshake. Read in chunks so the poll can acquire the lock between reads.
+    {
+        let buf = Arc::clone(&stderr_buf);
+        if let Some(mut stderr) = master_child.stderr.take() {
+            let _ = thread::spawn(move || {
+                use std::io::Read;
+                let mut chunk = [0u8; 1024];
+                loop {
+                    match stderr.read(&mut chunk) {
+                        Ok(0) => break, // EOF — master exited
+                        Ok(n) => {
+                            buf.lock()
+                                .expect("invariant: stderr lock")
+                                .extend_from_slice(&chunk[..n]);
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+    }
+
+    let outcome = wait_for_master_cancellable(
+        cmd_rx,
+        &target,
+        &sock_path,
+        &bin.ssh,
+        Instant::now() + HANDSHAKE_TIMEOUT,
+        &mut master_child,
+        &stderr_buf,
+    );
+    let session = MasterSession {
+        master_child: Some(master_child),
+        sock: Some(sock),
+        pw_file,
+        target: target.clone(),
+        bin: bin.clone(),
+    };
+    match outcome {
+        HandshakeOutcome::Ready => {}
+        HandshakeOutcome::Cancelled => {
+            // Silent: user cancelled. session.drop cleans up.
+            return Err(());
+        }
+        HandshakeOutcome::Exited(s) => {
+            let reason = match first_meaningful_line(&s) {
+                "" => "sftp master failed (authentication rejected)".to_string(),
+                line => format!("sftp master failed: {line}"),
+            };
+            let _ = event_tx.send(WorkerEvent::ConnectFailed(reason));
+            return Err(());
+        }
+        HandshakeOutcome::Timeout => {
+            let _ = event_tx.send(WorkerEvent::ConnectFailed(
+                "sftp master handshake timed out".to_string(),
+            ));
+            return Err(());
+        }
+    }
+
+    // Probe home via `pwd` (falls back to `/`). Failing to detect home is NOT
+    // a connect failure — the screen still works with cwd `/`.
+    let home = {
+        let batch = pwd_batch();
+        match runner.run_batch(&target, &sock_path, &batch) {
+            Ok(stdout) => parse_remote_home(&stdout).unwrap_or_else(|| PathBuf::from("/")),
+            Err(_) => PathBuf::from("/"),
+        }
+    };
+    let _ = event_tx.send(WorkerEvent::Connected {
+        home: home.clone(),
+        target: target.clone(),
+        sock: sock_path.clone(),
+    });
+    Ok((session, home))
+}
+
+/// The worker thread service loop. Owns the [`MasterSession`] (so its `Drop`
+/// tears the master down on return), the listing source, and the connection
+/// coordinates; drains [`WorkerCmd`]s and emits [`WorkerEvent`]s. The body is
+/// unchanged from the old `worker_loop` — only the name and the added `session`
+/// parameter (so its teardown runs on every exit path) differ.
+#[allow(clippy::too_many_arguments)]
+fn service_loop(
+    cmd_rx: mpsc::Receiver<WorkerCmd>,
+    event_tx: mpsc::Sender<WorkerEvent>,
+    session: MasterSession,
     runner: Arc<dyn SftpRunner>,
     target: String,
     sock: PathBuf,
@@ -406,6 +472,9 @@ fn worker_loop(
             WorkerCmd::Shutdown => break,
         }
     }
+    // session drops here → MasterSession::teardown (kill + reap master,
+    // detached ssh -O exit, drop socket, remove pw file).
+    drop(session);
 }
 
 /// Run one transfer job to completion (or cancellation). Emits Progress while
@@ -632,8 +701,10 @@ fn poll_dst_size(
     }
 }
 
-/// Outcome of polling the master handshake. [`wait_for_master`] returns this;
-/// [`SftpWorker::open`] maps `Exited`/`Timeout` to a `Err` carrying the reason.
+/// Outcome of polling the master handshake. [`wait_for_master_cancellable`]
+/// returns this; [`connect_phase`] maps `Exited`/`Timeout` to a
+/// `WorkerEvent::ConnectFailed`, drops the partial session on `Cancelled`, and
+/// proceeds on `Ready`.
 enum HandshakeOutcome {
     /// `ssh -O check` succeeded — the master is up.
     Ready,
@@ -642,17 +713,28 @@ enum HandshakeOutcome {
     Exited(String),
     /// The master neither came up nor exited before the deadline.
     Timeout,
+    /// The UI dropped the worker mid-handshake (Esc while Connecting) — stop
+    /// polling, clean up, and exit silently (no `ConnectFailed`: the user chose
+    /// to cancel, so a red error would be noise).
+    Cancelled,
 }
 
-/// Pure decision over one handshake poll's signals, factored out so the logic
-/// (check wins; master-exit beats timeout; else keep polling) is unit-testable
-/// without a real sshd. `stderr` is attached only to [`HandshakeOutcome::Exited`].
+/// Pure decision over one handshake poll's signals. `cancelled` (a Shutdown /
+/// channel disconnect observed by the polling loop) beats everything: there is
+/// no point waiting once the UI is gone.
+///
+/// Precedence: `cancelled` > `check_ok` (Ready) > `master_exited` (Exited) >
+/// `timed_out` (Timeout). `stderr` is attached only to `Exited`.
 fn classify_poll(
     check_ok: bool,
     master_exited: bool,
     timed_out: bool,
     stderr: String,
+    cancelled: bool,
 ) -> Option<HandshakeOutcome> {
+    if cancelled {
+        return Some(HandshakeOutcome::Cancelled);
+    }
     if check_ok {
         return Some(HandshakeOutcome::Ready);
     }
@@ -678,10 +760,19 @@ fn first_meaningful_line(s: &str) -> &str {
     ""
 }
 
-/// Poll `ssh -O check <target>` until it exits 0 (master up) or the deadline.
-/// Pure-I/O wrapper: the readiness check is itself a process spawn (no stdout
-/// parsing — readiness is exit-0 only), so this is not unit-tested.
-fn wait_for_master(
+/// Poll `ssh -O check <target>` until it exits 0 (master up), the master
+/// exits, the deadline elapses, or the UI sends `Shutdown` (cancel). Pure-I/O
+/// wrapper: the readiness check is itself a process spawn (no stdout parsing —
+/// readiness is exit-0 only), so this is not unit-tested.
+///
+/// Between polls the function drains `cmd_rx` with a `recv_timeout(HANDSHAKE_POLL)`
+/// so the cancel lands within one poll window (≤250ms) instead of waiting for
+/// the deadline. A channel disconnect (UI gone) also cancels. Other commands
+/// arriving pre-`Connected` are dropped — the connect phase owns the thread
+/// until the master is up, and the UI holds `List`/`Transfer` until
+/// [`WorkerEvent::Connected`] lands.
+fn wait_for_master_cancellable(
+    cmd_rx: &mpsc::Receiver<WorkerCmd>,
     target: &str,
     sock: &Path,
     ssh_bin: &Path,
@@ -706,10 +797,20 @@ fn wait_for_master(
         let stderr =
             String::from_utf8_lossy(&stderr_buf.lock().expect("invariant: stderr lock").clone())
                 .into_owned();
-        if let Some(outcome) = classify_poll(check_ok, master_exited, timed_out, stderr) {
+        // Drain ANY command the UI sent during the handshake. Only `Shutdown`
+        // matters (cancel); `List`/`Transfer` arriving early are impossible
+        // (the UI holds them until `Connected`), but if one does arrive, drop
+        // it — the connect phase owns the thread until the master is up.
+        let cancelled = match cmd_rx.recv_timeout(HANDSHAKE_POLL) {
+            Ok(WorkerCmd::Shutdown) => true,
+            Ok(_) => false, // unexpected pre-Connected; ignore
+            Err(RecvTimeoutError::Timeout) => false,
+            Err(RecvTimeoutError::Disconnected) => true, // UI gone
+        };
+        if let Some(outcome) = classify_poll(check_ok, master_exited, timed_out, stderr, cancelled)
+        {
             return outcome;
         }
-        thread::sleep(HANDSHAKE_POLL);
     }
 }
 
@@ -740,7 +841,7 @@ mod tests {
     fn classify_poll_ready_wins() {
         // A successful ssh -O check means the master is up — ready, even if the
         // master also happened to exit (race) or the deadline passed.
-        let out = classify_poll(true, false, true, String::new());
+        let out = classify_poll(true, false, true, String::new(), false);
         assert!(matches!(out, Some(HandshakeOutcome::Ready)));
     }
 
@@ -748,7 +849,7 @@ mod tests {
     fn classify_poll_master_exit_beats_timeout() {
         // Master exited (auth failure) before the deadline: report Exited with
         // the captured stderr, not Timeout.
-        let out = classify_poll(false, true, true, "Permission denied".into());
+        let out = classify_poll(false, true, true, "Permission denied".into(), false);
         assert!(matches!(
             out,
             Some(HandshakeOutcome::Exited(s)) if s == "Permission denied"
@@ -756,15 +857,24 @@ mod tests {
     }
 
     #[test]
+    fn classify_poll_cancelled_wins_over_timeout() {
+        // A Shutdown arrived mid-handshake (user hit Esc while Connecting): cancel
+        // immediately, even if the deadline also passed. The UI dropped the worker;
+        // there is nothing to wait for.
+        let out = classify_poll(false, false, true, String::new(), true);
+        assert!(matches!(out, Some(HandshakeOutcome::Cancelled)));
+    }
+
+    #[test]
     fn classify_poll_timeout_when_only_deadline() {
-        let out = classify_poll(false, false, true, String::new());
+        let out = classify_poll(false, false, true, String::new(), false);
         assert!(matches!(out, Some(HandshakeOutcome::Timeout)));
     }
 
     #[test]
     fn classify_poll_none_keeps_polling() {
         // No signal yet: return None so the caller polls again.
-        let out = classify_poll(false, false, false, String::new());
+        let out = classify_poll(false, false, false, String::new(), false);
         assert!(out.is_none());
     }
 

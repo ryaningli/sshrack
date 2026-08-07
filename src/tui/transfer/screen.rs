@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame,
-    layout::{Constraint, Layout, Rect},
+    layout::{Alignment, Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
@@ -69,6 +69,20 @@ pub enum ScreenOutcome {
     /// [`TransferScreen::next_job`] to dispatch the first one if no transfer is
     /// currently in flight. `Ctrl-Enter` emits this.
     Enqueue,
+}
+
+/// Where the SFTP session is in its connect lifecycle. Drives both `on_key`
+/// (gates keys until connected) and `draw` (Connecting / ConnectFailed hints).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectState {
+    /// Master handshake in progress on the worker thread. `Esc`/`Ctrl-C`
+    /// cancel (close the screen → drop the worker → it aborts the handshake).
+    Connecting,
+    /// Handshake done; the worker is in its service loop. Normal browsing.
+    Connected,
+    /// Handshake failed. The status bar already shows the reason; `Esc`/
+    /// `Ctrl-C` return to the launcher. No other keys do anything.
+    ConnectFailed,
 }
 
 /// The full-screen transfer view. Pure state plus a render entry point —
@@ -157,6 +171,11 @@ pub struct TransferScreen {
     /// Remote home directory (`open_transfer` fills this in Task 10); `None`
     /// until then, so remote `~`-expansion degrades to the remote cwd.
     pub remote_home: Option<PathBuf>,
+    /// Connect lifecycle. `Connecting` on entry (the screen shows while the
+    /// worker thread runs the master handshake); `Connected` once the worker's
+    /// `Connected` event drains; `ConnectFailed` on `ConnectFailed`. Gates
+    /// `on_key` and drives the Connecting/failed hints in `draw`.
+    pub connect: ConnectState,
     /// Global spinner phase for the find-mode "searching" filter-row label.
     /// Advanced once per run-loop tick ([`advance_spinner`](Self::advance_spinner))
     /// while any pane's search is in flight; read by `draw` → `draw_pane` →
@@ -192,6 +211,7 @@ impl TransferScreen {
             search_gen: 0,
             search_side: None,
             remote_home: None,
+            connect: ConnectState::Connecting,
             spinner: 0,
         }
     }
@@ -324,6 +344,25 @@ impl TransferScreen {
         if key.kind != KeyEventKind::Press {
             return ScreenOutcome::Continue;
         }
+        // Connect lifecycle gates. Until the worker reports Connected, the
+        // panes have no usable entries — swallow everything except the close
+        // keys so a reflexive navigation cannot crash on an empty list. The
+        // close keys let the user cancel a Connecting handshake (Esc/Ctrl-C →
+        // CloseTransfer → the loop drops the worker → handshake aborts) or
+        // leave a ConnectFailed screen.
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let is_close_key =
+            matches!(key.code, KeyCode::Esc) || ctrl && matches!(key.code, KeyCode::Char('c'));
+        match self.connect {
+            ConnectState::Connecting | ConnectState::ConnectFailed => {
+                return if is_close_key {
+                    ScreenOutcome::CloseTransfer
+                } else {
+                    ScreenOutcome::Continue
+                };
+            }
+            ConnectState::Connected => {} // fall through to normal dispatch
+        }
         // The queue-manager overlay is modal: when open it owns every key.
         // The `is_some` gate proves `take()` yields `Some`, but the compiler
         // can not see through it, so the `None` arm stays panic-free (no
@@ -354,7 +393,6 @@ impl TransferScreen {
             }
             return out;
         }
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         // Find mode: when the focused pane has an active search, `Enter` jumps
         // to the selected result's directory and `Space` marks it (both
         // intercepted here so they never reach the dir-list path).
@@ -680,6 +718,29 @@ impl TransferScreen {
             self.spinner,
         );
 
+        // Connect-lifecycle overlay banners. While Connecting the remote pane
+        // is empty + loading; a one-line banner across its top frames that as
+        // intentional. After ConnectFailed the panes are dimmed and a centered
+        // line surfaces the failure reason (already on the status bar) + the
+        // Esc-to-return hint.
+        match self.connect {
+            ConnectState::Connecting => self.draw_connect_banner(
+                frame,
+                remote_area,
+                format!("Connecting to {}…", self.remote_title),
+                false,
+            ),
+            ConnectState::ConnectFailed => {
+                let reason = self
+                    .status
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| "sftp connection failed".to_string());
+                self.draw_connect_banner(frame, area, format!("{reason} · Esc to return"), true);
+            }
+            ConnectState::Connected => {}
+        }
+
         self.draw_progress_panel(frame, panel_area);
         self.draw_footer(frame, footer_area);
 
@@ -692,6 +753,35 @@ impl TransferScreen {
         if let Some(ov) = &self.close_confirm {
             ov.draw(frame);
         }
+    }
+
+    /// One-line connect-lifecycle banner. `dim_full` widens the dim to cover a
+    /// full-screen area (ConnectFailed overlays everything) instead of just the
+    /// remote pane (Connecting). The text is centered horizontally on the first
+    /// row of `area`; a clear background lets the pane paint beneath it for
+    /// Connecting, while ConnectFailed dims the whole frame so the stale panes
+    /// read as inert. Pure: no I/O.
+    fn draw_connect_banner(&self, frame: &mut Frame, area: Rect, text: String, dim_full: bool) {
+        let span = if dim_full {
+            Span::styled(
+                text,
+                Style::new().fg(theme::DANGER).add_modifier(Modifier::DIM),
+            )
+        } else {
+            Span::styled(text, theme::accent().add_modifier(Modifier::DIM))
+        };
+        // Vertically position a 1-row banner inside `area`: Connecting rides
+        // near the top of the remote pane; ConnectFailed centers in the frame.
+        let row = if dim_full {
+            area.y + area.height.saturating_sub(1) / 2
+        } else {
+            area.y + 1
+        };
+        let banner_area = Rect::new(area.x, row, area.width, 1);
+        frame.render_widget(
+            Paragraph::new(Line::from(span)).alignment(Alignment::Center),
+            banner_area,
+        );
     }
 
     /// Title band: `sshrack sftp` accented on the left. The brand word goes
