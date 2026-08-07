@@ -31,7 +31,7 @@ use super::connect::connect_host;
 use super::intent::{Outcome, Overlay};
 use super::persist::{
     StoreSwitchTarget, fulfill_save_cred, persist_cred_delete, persist_host_delete,
-    persist_host_save, persist_store_switch,
+    persist_host_save, persist_store_switch, set_store_status,
 };
 use super::prompt::TuiPassphrase;
 use super::term::{TerminalHandle, Tui};
@@ -261,12 +261,9 @@ pub fn run_loop(
                             // status write — the popup dismissing is the feedback.
                         }
                         Err(e) => {
-                            // `e` is a self-describing SshrackError (vault/keyring/config wording);
-                            // show its Display verbatim — no "switch failed:" prefix (mirrors
-                            // App::report_failure). The store-view context already implies "switch".
-                            if let Some(v) = app.store_view.as_mut() {
-                                v.status = Some(e.to_string());
-                            }
+                            // Self-describing SshrackError Display — no "switch failed:" prefix
+                            // (mirrors App::report_failure). The store-view context implies "switch".
+                            set_store_status(app, e.to_string());
                         }
                     }
                 }
@@ -284,12 +281,9 @@ pub fn run_loop(
                             // feedback.
                         }
                         Err(e) => {
-                            // `e` is a self-describing SshrackError (vault/keyring/config wording);
-                            // show its Display verbatim — no "switch failed:" prefix (mirrors
-                            // App::report_failure). The store-view context already implies "switch".
-                            if let Some(v) = app.store_view.as_mut() {
-                                v.status = Some(e.to_string());
-                            }
+                            // Self-describing SshrackError Display — no "switch failed:" prefix
+                            // (mirrors App::report_failure). The store-view context implies "switch".
+                            set_store_status(app, e.to_string());
                         }
                     }
                 }
@@ -308,12 +302,9 @@ pub fn run_loop(
                             // feedback.
                         }
                         Err(e) => {
-                            // `e` is a self-describing SshrackError (vault/keyring/config wording);
-                            // show its Display verbatim — no "switch failed:" prefix (mirrors
-                            // App::report_failure). The store-view context already implies "switch".
-                            if let Some(v) = app.store_view.as_mut() {
-                                v.status = Some(e.to_string());
-                            }
+                            // Self-describing SshrackError Display — no "switch failed:" prefix
+                            // (mirrors App::report_failure). The store-view context implies "switch".
+                            set_store_status(app, e.to_string());
                         }
                     }
                 }
