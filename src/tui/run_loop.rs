@@ -261,8 +261,11 @@ pub fn run_loop(
                             // status write — the popup dismissing is the feedback.
                         }
                         Err(e) => {
+                            // `e` is a self-describing SshrackError (vault/keyring/config wording);
+                            // show its Display verbatim — no "switch failed:" prefix (mirrors
+                            // App::report_failure). The store-view context already implies "switch".
                             if let Some(v) = app.store_view.as_mut() {
-                                v.status = Some(format!("switch failed: {e}"));
+                                v.status = Some(e.to_string());
                             }
                         }
                     }
@@ -281,8 +284,11 @@ pub fn run_loop(
                             // feedback.
                         }
                         Err(e) => {
+                            // `e` is a self-describing SshrackError (vault/keyring/config wording);
+                            // show its Display verbatim — no "switch failed:" prefix (mirrors
+                            // App::report_failure). The store-view context already implies "switch".
                             if let Some(v) = app.store_view.as_mut() {
-                                v.status = Some(format!("switch failed: {e}"));
+                                v.status = Some(e.to_string());
                             }
                         }
                     }
@@ -302,8 +308,11 @@ pub fn run_loop(
                             // feedback.
                         }
                         Err(e) => {
+                            // `e` is a self-describing SshrackError (vault/keyring/config wording);
+                            // show its Display verbatim — no "switch failed:" prefix (mirrors
+                            // App::report_failure). The store-view context already implies "switch".
                             if let Some(v) = app.store_view.as_mut() {
-                                v.status = Some(format!("switch failed: {e}"));
+                                v.status = Some(e.to_string());
                             }
                         }
                     }
