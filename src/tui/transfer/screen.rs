@@ -24,7 +24,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Block, Borders, Clear, Paragraph},
 };
 
 use sshrack_core::connect::sftp::proto::{
@@ -758,6 +758,11 @@ impl TransferScreen {
             Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .areas(panes_area);
 
+        // The local pane is always live (read-only browsing context while the
+        // remote connects). The remote pane only goes live once `Connected`;
+        // before that it is a bordered, host-titled placeholder so a pending or
+        // failed connection never reads as an empty connected root (`/` + `0/0`
+        // + a stale listing).
         render::draw_pane(
             frame,
             local_area,
@@ -766,36 +771,51 @@ impl TransferScreen {
             "local",
             self.spinner,
         );
-        render::draw_pane(
-            frame,
-            remote_area,
-            &self.remote,
-            self.focus == Side::Remote,
-            &self.remote_title,
-            self.spinner,
-        );
-
-        // Connect-lifecycle overlay banners. While Connecting the remote pane
-        // is empty + loading; a one-line banner across its top frames that as
-        // intentional. After ConnectFailed the panes are dimmed and a centered
-        // line surfaces the failure reason (already on the status bar) + the
-        // Esc-to-return hint.
         match self.connect {
-            ConnectState::Connecting => self.draw_connect_banner(
+            ConnectState::Connected => render::draw_pane(
                 frame,
                 remote_area,
-                format!("Connecting to {}…", self.remote_title),
+                &self.remote,
+                self.focus == Side::Remote,
+                &self.remote_title,
+                self.spinner,
+            ),
+            ConnectState::Connecting => self.draw_remote_pending(
+                frame,
+                remote_area,
+                &format!("Connecting to {}…", self.remote_title),
                 false,
             ),
             ConnectState::ConnectFailed => {
-                let reason = self
-                    .status
-                    .message
-                    .clone()
-                    .unwrap_or_else(|| "sftp connection failed".to_string());
-                self.draw_connect_banner(frame, area, format!("{reason} · Esc to return"), true);
+                self.draw_remote_pending(frame, remote_area, "connection failed", true);
             }
-            ConnectState::Connected => {}
+        }
+
+        // A failed connection surfaces a solid, centered danger dialog
+        // (Clear-backed, same chrome as CloseConfirm/HostKeyPrompt) with the
+        // reason + an Esc-to-return hint. The status bar carries the same
+        // reason; this dialog is the unambiguous failure surface over the
+        // inert panes.
+        if matches!(self.connect, ConnectState::ConnectFailed) {
+            let reason = self
+                .status
+                .message
+                .clone()
+                .unwrap_or_else(|| "sftp connection failed".to_string());
+            let body = dialog::draw_dialog(
+                frame,
+                "Connection failed",
+                1,
+                &[("Esc", "return to launcher")],
+            );
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    reason,
+                    Style::new().fg(theme::DANGER),
+                )))
+                .alignment(Alignment::Center),
+                body,
+            );
         }
 
         self.draw_progress_panel(frame, panel_area);
@@ -817,32 +837,33 @@ impl TransferScreen {
         }
     }
 
-    /// One-line connect-lifecycle banner. `dim_full` widens the dim to cover a
-    /// full-screen area (ConnectFailed overlays everything) instead of just the
-    /// remote pane (Connecting). The text is centered horizontally on the first
-    /// row of `area`; a clear background lets the pane paint beneath it for
-    /// Connecting, while ConnectFailed dims the whole frame so the stale panes
-    /// read as inert. Pure: no I/O.
-    fn draw_connect_banner(&self, frame: &mut Frame, area: Rect, text: String, dim_full: bool) {
-        let span = if dim_full {
-            Span::styled(
-                text,
-                Style::new().fg(theme::DANGER).add_modifier(Modifier::DIM),
-            )
+    /// Remote pane before `Connected`: a dim bordered frame titled with the
+    /// host and a single centered status line. Replaces the live listing so a
+    /// pending or failed connection never reads as an empty connected root
+    /// (`/` + `0/0` + a stale listing). `danger` colors the message red
+    /// (ConnectFailed); otherwise it is dim (Connecting). The interior is
+    /// `Clear`ed every frame so no stale listing bleeds through across states.
+    /// Pure: no I/O.
+    fn draw_remote_pending(&self, frame: &mut Frame, area: Rect, message: &str, danger: bool) {
+        let block = Block::new()
+            .borders(Borders::ALL)
+            .border_style(Style::new().dim())
+            .title(Span::styled(
+                format!(" {} ", self.remote_title),
+                Style::new().dim(),
+            ));
+        let inner = block.inner(area);
+        frame.render_widget(&block, area);
+        frame.render_widget(Clear, inner);
+        let row = inner.y + inner.height / 2;
+        let style = if danger {
+            Style::new().fg(theme::DANGER)
         } else {
-            Span::styled(text, theme::accent().add_modifier(Modifier::DIM))
+            Style::new().dim()
         };
-        // Vertically position a 1-row banner inside `area`: Connecting rides
-        // near the top of the remote pane; ConnectFailed centers in the frame.
-        let row = if dim_full {
-            area.y + area.height.saturating_sub(1) / 2
-        } else {
-            area.y + 1
-        };
-        let banner_area = Rect::new(area.x, row, area.width, 1);
         frame.render_widget(
-            Paragraph::new(Line::from(span)).alignment(Alignment::Center),
-            banner_area,
+            Paragraph::new(Line::from(Span::styled(message, style))).alignment(Alignment::Center),
+            Rect::new(inner.x, row, inner.width, 1),
         );
     }
 

@@ -295,7 +295,8 @@ fn draw_renders_without_panic_or_overflow() {
 #[test]
 fn draw_connecting_renders_banner_without_panic() {
     // A fresh screen is Connecting with an empty remote pane. draw must paint
-    // the `Connecting to …` banner over the remote pane without panicking.
+    // the remote placeholder (`Connecting to …`) instead of a fake live
+    // listing, without panicking.
     let backend = TestBackend::new(80, 24);
     let mut term = Terminal::new(backend).expect("test backend");
     let mut screen = TransferScreen::new(PathBuf::from("/local"), PathBuf::from("/"));
@@ -310,14 +311,15 @@ fn draw_connecting_renders_banner_without_panic() {
     let view = buffer_view(term.backend().buffer());
     assert!(
         view.contains("Connecting to deploy@host"),
-        "connecting banner visible: {view}"
+        "connecting placeholder visible: {view}"
     );
 }
 
 #[test]
-fn draw_connect_failed_renders_reason_banner_without_panic() {
-    // After ConnectFailed the status bar carries the reason; draw centers it
-    // + an `Esc to return` hint over a dim frame, without panicking.
+fn draw_connect_failed_renders_reason_dialog_without_panic() {
+    // After ConnectFailed the status bar carries the reason; draw centers a
+    // solid danger dialog with the reason + an `Esc return to launcher` footer
+    // over the inert panes, without panicking.
     let backend = TestBackend::new(80, 24);
     let mut term = Terminal::new(backend).expect("test backend");
     let mut screen = TransferScreen::new(PathBuf::from("/local"), PathBuf::from("/"));
@@ -333,8 +335,11 @@ fn draw_connect_failed_renders_reason_banner_without_panic() {
     );
     let view = buffer_view(term.backend().buffer());
     assert!(
-        view.contains("Permission denied") && view.contains("Esc to return"),
-        "connect-failed banner shows reason + hint: {view}"
+        view.contains("Connection failed")
+            && view.contains("Permission denied")
+            && view.contains("Esc")
+            && view.contains("return to launcher"),
+        "connect-failed dialog shows title + reason + esc hint: {view}"
     );
 }
 
