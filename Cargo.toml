@@ -8,6 +8,8 @@ edition = "2024"
 rust-version = "1.88"
 license = "MIT"
 authors = ["ryaningli"]
+repository = "https://github.com/ryaningli/sshrack"
+keywords = ["ssh", "sftp", "terminal", "tui", "remote"]
 
 [package]
 name = "sshrack"
@@ -16,9 +18,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
+description = "Terminal-native remote server management over ssh/scp/sftp: a config + credential layer with an interactive TUI and a scriptable CLI."
+repository.workspace = true
+keywords.workspace = true
+categories = ["command-line-utilities"]
+readme = "README.md"
 
 [dependencies]
-sshrack-core = { path = "crates/sshrack-core" }
+sshrack-core = { path = "crates/sshrack-core", version = "0.1.0" }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
