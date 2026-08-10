@@ -40,7 +40,15 @@ pub(crate) fn parse_yes_no(line: &str) -> bool {
 /// Print `text` to stderr and read one yes/no line. Returns `false` when there
 /// is no tty, on EOF, or on read error — the CLI never hangs.
 pub(crate) fn prompt_yes_no(text: &str) -> bool {
-    if !has_tty() {
+    prompt_yes_no_with(text, has_tty())
+}
+
+/// Tty-injectable core of [`prompt_yes_no`]. Tests pass `has_tty = false` to
+/// exercise the no-tty short-circuit without depending on the runtime tty
+/// state — CI runs the suite under a `script` pty, which would otherwise make
+/// `has_tty()` return true and block forever on `read_line`.
+fn prompt_yes_no_with(text: &str, has_tty: bool) -> bool {
+    if !has_tty {
         return false;
     }
     let _ = writeln!(std::io::stderr(), "{text}");
@@ -85,7 +93,13 @@ fn split_inline_question(message: &str) -> (String, String) {
 /// type. Returns `false` without a tty, on EOF (Ctrl-D), or on read error —
 /// the CLI never hangs.
 pub(crate) fn prompt_host_key(message: &str) -> bool {
-    if !has_tty() {
+    prompt_host_key_with(message, has_tty())
+}
+
+/// Tty-injectable core of [`prompt_host_key`]; see [`prompt_yes_no_with`] for
+/// why the `has_tty` parameter exists (test injection under CI's `script` pty).
+fn prompt_host_key_with(message: &str, has_tty: bool) -> bool {
+    if !has_tty {
         return false;
     }
     let (body, question) = split_inline_question(message);
@@ -201,10 +215,11 @@ mod tests {
 
     #[test]
     fn prompt_yes_no_returns_false_without_tty() {
-        // Under `cargo test` stdin/stderr are pipes, not a tty: the prompt must
-        // decline rather than block. This is the guarantee the CLI relies on so
-        // scripts never hang on a host-key prompt.
-        assert!(!prompt_yes_no("irrelevant without a tty"));
+        // Inject `has_tty = false`: the prompt must decline rather than block.
+        // CI runs the suite under a `script` pty, so the global tty state is
+        // "on" there — pass the flag explicitly instead of relying on it (the
+        // bare `prompt_yes_no` call would otherwise block on `read_line`).
+        assert!(!prompt_yes_no_with("irrelevant without a tty", false));
     }
 
     #[test]
@@ -249,6 +264,7 @@ mod tests {
     #[test]
     fn prompt_host_key_returns_false_without_tty() {
         // Mirror of prompt_yes_no's guarantee: no tty -> decline, never block.
-        assert!(!prompt_host_key("irrelevant without a tty"));
+        // `has_tty` injected for the same CI-pty reason as prompt_yes_no_with.
+        assert!(!prompt_host_key_with("irrelevant without a tty", false));
     }
 }
