@@ -365,7 +365,8 @@ fn draw_pane_row(
 /// row — `[name ↑/↓]` left, the surviving numeric segments (`size rate eta`)
 /// right-aligned against the gauge, and a visible-track bar hard against the right edge.
 /// An unknown total renders no gauge (just name + bytes-done + rate). `None`
-/// paints the dim "no transfer in flight" placeholder.
+/// paints nothing — the row stays blank when idle (its height is reserved by
+/// the caller's layout).
 ///
 /// Width handling is delegated to [`plan_active_row`]: the name is truncated
 /// with `…` (never silently clipped), numeric segments drop in priority order
@@ -375,13 +376,10 @@ fn draw_pane_row(
 /// wasted trailing space.
 pub fn draw_active_transfer(frame: &mut Frame, area: Rect, active: Option<&Progress>) {
     let Some(prog) = active else {
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "no transfer in flight",
-                Style::new().dim(),
-            ))),
-            area,
-        );
+        // Idle: render nothing. The row height is reserved by the outer
+        // `Layout::Length(1)`, so a transfer starting later does not reflow
+        // the panel — we just leave the row blank instead of restating the
+        // obvious ("no transfer in flight").
         return;
     };
 
@@ -464,15 +462,18 @@ pub fn draw_active_transfer(frame: &mut Frame, area: Rect, active: Option<&Progr
     frame.render_widget(Paragraph::new(Line::from(bar_spans)), gauge_area);
 }
 
-/// Build the 2-row status band's summary line: `done X/Y · fail Z [· paused]`
-/// on the left, and — when present — the transient status message on the right.
-/// Pure. `width` bounds the message so it can not push the counts off the row.
+/// Build the 2-row status band's summary line. With work in the ledger it
+/// reads `done X/Y [· fail Z] [· paused]` on the left, then — when present —
+/// the transient status message on the right. `fail` appears only when
+/// non-zero; an idle ledger (`total == 0`) shows no counts at all and the row
+/// degrades to a bare message (or empty). Pure; `width` bounds the message so
+/// it can not push the counts off the row.
 ///
 /// `done` counts successfully completed tasks only (`Done(Ok)`); failed and
 /// cancelled tasks count toward `total` (and `failed`, for failures only) but
 /// NOT toward `done`. This keeps the convention universal: `done` = success,
-/// `fail` = failure, disjoint — and matches the queue-overlay header's
-/// `ledger.done_count()`. So a single failed task reads `done 0/1 · fail 1`.
+/// `fail` = failure, disjoint — matching the queue tab bar's per-view counts.
+/// So a single failed task reads `done 0/1 · fail 1`.
 pub fn summary_line(
     ledger: &crate::tui::transfer::ledger::TransferLedger,
     status: &crate::tui::intent::Status,
@@ -481,25 +482,44 @@ pub fn summary_line(
     let total = ledger.total();
     let done = ledger.done_count();
     let failed = ledger.failed_count();
-    let counts = format!("done {done}/{total} · fail {failed}");
     let mut spans: Vec<Span> = Vec::new();
-    spans.push(Span::styled(
-        counts,
+
+    // Counts only when there has been work: `done X/Y [· fail Z] [· paused]`.
+    // An idle ledger (total == 0) shows no counts — silence is normal; the
+    // row degrades to a bare status message (or an empty line). `fail` is
+    // shown only when non-zero: a zero failure is not worth the noise.
+    if total > 0 {
+        let danger = failed > 0;
+        spans.push(Span::styled(
+            format!("done {done}/{total}"),
+            if danger {
+                Style::new().fg(crate::tui::theme::DANGER)
+            } else {
+                Style::new()
+            },
+        ));
         if failed > 0 {
-            Style::new().fg(crate::tui::theme::DANGER)
-        } else {
-            Style::new()
-        },
-    ));
-    if ledger.is_paused() {
-        spans.push(Span::styled(" · ", Style::new().dim()));
-        spans.push(Span::styled("paused", crate::tui::theme::accent()));
+            spans.push(Span::styled(" · ", Style::new().dim()));
+            spans.push(Span::styled(
+                format!("fail {failed}"),
+                Style::new().fg(crate::tui::theme::DANGER),
+            ));
+        }
+        if ledger.is_paused() {
+            spans.push(Span::styled(" · ", Style::new().dim()));
+            spans.push(Span::styled("paused", crate::tui::theme::accent()));
+        }
     }
+
     if let Some(msg) = &status.message {
         let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
         let budget = (width as usize).saturating_sub(used + 3); // " · "
         let trimmed = truncate_cells_head(msg, budget);
-        spans.push(Span::styled(" · ", Style::new().dim()));
+        // No leading separator when the counts segment is absent — the
+        // message stands alone on an idle row.
+        if !spans.is_empty() {
+            spans.push(Span::styled(" · ", Style::new().dim()));
+        }
         let style = if status.is_error {
             Style::new().fg(crate::tui::theme::DANGER)
         } else {
@@ -1311,6 +1331,19 @@ mod tests {
     }
 
     #[test]
+    fn draw_active_transfer_idle_paints_no_placeholder() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut term = Terminal::new(TestBackend::new(40, 1)).unwrap();
+        term.draw(|f| draw_active_transfer(f, f.area(), None))
+            .unwrap();
+        let text = row_text(&term);
+        assert!(
+            text.is_empty(),
+            "idle row is blank — no 'no transfer in flight' placeholder: {text:?}"
+        );
+    }
+
+    #[test]
     fn draw_active_transfer_renders_rate_with_one_per_sec() {
         // `fmt_rate` already returns `<size>/s`; the active-transfer text must
         // not append another `/s` (the `13.4M/s/s` regression that surfaced
@@ -1990,7 +2023,7 @@ mod summary_tests {
     }
 
     #[test]
-    fn summary_line_shows_done_over_total_and_fail() {
+    fn summary_line_shows_done_over_total_and_omits_fail_when_zero() {
         let mut l = TransferLedger::new();
         l.enqueue(job("a", Direction::Upload));
         l.enqueue(job("b", Direction::Upload));
@@ -1999,10 +2032,11 @@ mod summary_tests {
         l.finish_inflight(TransferOutcome::Ok); // a done
         let line = summary_line(&l, &Status::empty(), 60);
         let s = line_to_string(&line);
-        assert!(s.contains("done"), "label present: {s}");
-        assert!(s.contains("1/3"), "done/total: {s}");
-        assert!(s.contains("fail"), "fail label present: {s}");
-        assert!(s.contains("0"), "fail count: {s}");
+        assert!(s.contains("done 1/3"), "done/total shown: {s}");
+        assert!(
+            !s.contains("fail"),
+            "zero failures omit the fail segment: {s}"
+        );
     }
 
     #[test]
@@ -2037,6 +2071,32 @@ mod summary_tests {
             s.contains("transfer failed: boom"),
             "status message rendered: {s}"
         );
+        assert!(
+            !s.contains("done"),
+            "no counts segment when the ledger is idle: {s}"
+        );
+    }
+
+    #[test]
+    fn summary_line_omits_counts_when_no_tasks() {
+        let l = TransferLedger::new(); // total == 0
+        let line = summary_line(&l, &Status::error("scan refused"), 80);
+        let s = line_to_string(&line);
+        assert!(s.contains("scan refused"), "message still shown: {s}");
+        assert!(!s.contains("done"), "no counts when idle: {s}");
+        assert!(!s.contains("fail"), "no fail segment when idle: {s}");
+        assert!(
+            !s.starts_with('·'),
+            "no leading separator when counts absent: {s:?}"
+        );
+    }
+
+    #[test]
+    fn summary_line_is_empty_when_idle_and_no_message() {
+        let l = TransferLedger::new(); // total == 0, no status
+        let line = summary_line(&l, &Status::empty(), 80);
+        let s = line_to_string(&line);
+        assert!(s.is_empty(), "idle + no message = empty row: {s:?}");
     }
 }
 
