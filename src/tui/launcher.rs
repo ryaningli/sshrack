@@ -35,6 +35,7 @@ use sshrack_core::config::schema::{Auth, Credential, Host};
 use sshrack_core::frecency::Frecency;
 use ulid::Ulid;
 
+use super::fit;
 use super::intent::{Outcome, Status};
 use super::panel;
 use super::parts;
@@ -383,16 +384,37 @@ impl Launcher {
             return;
         }
 
-        // Adaptive name column: the widest visible name, capped at
-        // NAME_COL_CAP so a single very long name can't squeeze the address
-        // column off the row.
-        let name_w = self
+        // Adaptive columns: name + address share the width left after the
+        // focus marker (2) and the gap (2). Each takes its ideal width when
+        // both fit; when they contend the name is capped at HOST_NAME_SHARE
+        // of the width so the denser address keeps the majority, with floor
+        // guarantees so neither collapses on a narrow terminal. No hard-coded
+        // cap — the budget scales with the width.
+        let name_need = self
             .ranked
             .iter()
-            .map(|r| hosts[r.host_idx].name.chars().count())
+            .map(|r| fit::cells(&hosts[r.host_idx].name))
             .max()
-            .unwrap_or(0)
-            .min(NAME_COL_CAP);
+            .unwrap_or(0);
+        let addr_need = self
+            .ranked
+            .iter()
+            .map(|r| {
+                let h = &hosts[r.host_idx];
+                let u = host_user(h, credentials);
+                address_width(&u, &h.host, h.port)
+            })
+            .max()
+            .unwrap_or(0);
+        let avail = (area.width as usize).saturating_sub(4);
+        let (name_w, addr_w) = fit::column_widths(
+            avail,
+            name_need,
+            addr_need,
+            HOST_NAME_SHARE,
+            HOST_NAME_MIN,
+            ADDR_MIN,
+        );
 
         // Bake the marker into each item: the selected row carries
         // `theme::focus_marker(true)` (Cyan `▶ `); every other row carries
@@ -410,6 +432,7 @@ impl Launcher {
                     credentials,
                     i == self.selected,
                     name_w,
+                    addr_w,
                 )
             })
             .collect();
@@ -422,9 +445,27 @@ impl Launcher {
     }
 }
 
-/// Width cap for the adaptive name column. Names longer than this overflow
-/// gracefully into the gap rather than squeezing the address column.
-const NAME_COL_CAP: usize = 20;
+/// Column-width budget rules for the host list (see [`fit::column_widths`]).
+/// None is a hard cap — they steer how the name and address share the
+/// terminal width, which scales with it.
+/// The name's max share of the row when name and address contend (percent).
+const HOST_NAME_SHARE: usize = 40;
+/// Floor for the name column so it never collapses on a narrow terminal.
+const HOST_NAME_MIN: usize = 6;
+/// Floor for the address column — enough for `u@hostname:port`.
+const ADDR_MIN: usize = 12;
+
+/// Display width of the full `user@host[:port]` address (the default port 22
+/// is omitted, mirroring [`format_address`]). Pure; used to budget the
+/// address column before any truncation.
+fn address_width(user: &str, host: &str, port: u16) -> usize {
+    let port_cells = if port == 22 {
+        0
+    } else {
+        fit::cells(&format!(":{port}"))
+    };
+    fit::cells(user) + 1 + fit::cells(host) + port_cells
+}
 
 /// The connect user for a host: the referenced credential's user for
 /// [`Auth::Ref`] (resolved from the credential slice), or the inline body's
@@ -448,39 +489,65 @@ fn host_user(host: &Host, credentials: &[Credential]) -> String {
     }
 }
 
+/// Format a host's `user@host[:port]` address into at most `avail` display
+/// cells, host-king style: the default port 22 is hidden (non-default kept);
+/// when the whole thing overflows, `user@` and the port suffix are kept and
+/// the `host` segment is head-truncated with `…` (the machine identity's
+/// prefix is the load-bearing part). If even `user@` won't fit, the whole
+/// address is head-truncated as a fallback. Pure.
+fn format_address(user: &str, host: &str, port: u16, avail: usize) -> String {
+    let port_str = if port == 22 {
+        String::new()
+    } else {
+        format!(":{port}")
+    };
+    let full = format!("{user}@{host}{port_str}");
+    if fit::cells(&full) <= avail {
+        return full;
+    }
+    let overhead = fit::cells(user) + 1 + fit::cells(&port_str);
+    if avail <= overhead {
+        // Can't keep user@ — truncate the whole address head-first.
+        return fit::truncate_cells(&full, avail);
+    }
+    let host_budget = avail - overhead;
+    let host_trunc = fit::truncate_cells(host, host_budget);
+    format!("{user}@{host_trunc}{port_str}")
+}
+
 /// Build the display line for one host: the focus marker (`▶ ` when selected,
-/// two spaces otherwise), the name padded to `name_w`, and a `user@host:port`
-/// address column. The name and the address's `user`/`host` segments
-/// fuzzy-highlight the query (matched chars bold + `theme::MATCH`); the
-/// address sits on a dim base. The credential NAME is no longer shown — the
-/// user is the load-bearing piece for "who will I connect as".
+/// two spaces otherwise), the name head-truncated + padded to `name_w`, and a
+/// `user@host[:port]` address formatted to `addr_w` (host-king: the default
+/// port 22 is hidden). Both the name and the address fuzzy-highlight the query
+/// (matched chars bold + `theme::MATCH`); the address sits on a dim base. The
+/// credential NAME is no longer shown — the user is the load-bearing piece for
+/// "who will I connect as".
 fn host_line(
     host: &Host,
     query: &str,
     credentials: &[Credential],
     selected: bool,
     name_w: usize,
+    addr_w: usize,
 ) -> Line<'static> {
     let mut spans: Vec<Span> = Vec::with_capacity(6);
     spans.push(theme::focus_marker(selected));
 
-    // Name column (padded to name_w) with fuzzy-match highlighting.
-    spans.extend(panel::highlighted_spans(&host.name, query, Style::new()));
-    let name_pad = name_w.saturating_sub(host.name.chars().count());
-    spans.push(Span::raw(" ".repeat(name_pad)));
+    // Name column: head-truncate to name_w, fuzzy-highlight the visible text,
+    // then pad to name_w so the address column lines up across rows.
+    let name = fit::truncate_cells(&host.name, name_w);
+    spans.extend(panel::highlighted_spans(&name, query, Style::new()));
+    spans.push(Span::raw(
+        " ".repeat(name_w.saturating_sub(fit::cells(&name))),
+    ));
     spans.push(Span::raw("  ")); // gap between name and address
 
-    // Address column: user@host:port. The user and host segments are
-    // fuzzy-highlighted against the query (dim base; matched chars bold +
-    // theme::MATCH); the punctuation stays dim.
-    let dim = Style::new().dim();
+    // Address column: user@host[:port] formatted to addr_w (host-king), dim
+    // base with the query fuzzy-highlighted. Left-aligned; the line's
+    // remainder fills with the default background.
     let user = host_user(host, credentials);
-    let port_str = host.port.to_string();
-    spans.extend(panel::highlighted_spans(&user, query, dim));
-    spans.push(Span::styled("@", dim));
-    spans.extend(panel::highlighted_spans(&host.host, query, dim));
-    spans.push(Span::styled(":", dim));
-    spans.push(Span::styled(port_str, dim));
+    let addr = format_address(&user, &host.host, host.port, addr_w);
+    spans.extend(panel::highlighted_spans(&addr, query, Style::new().dim()));
 
     Line::from(spans)
 }
@@ -574,9 +641,11 @@ mod tests {
     fn host_line_renders_user_at_host_port_and_aligns_columns() {
         let cred = host_cred("root", 1);
         let host = host_referring(&cred, "web1", "1.2.3.4", 22);
-        let line = host_line(&host, "", &[cred], true, 8);
+        let line = host_line(&host, "", &[cred], true, 8, 30);
         let s = format!("{line}");
-        assert!(s.contains("root@1.2.3.4:22"), "row text was: {s}");
+        // The default port 22 is hidden (host-king formatting).
+        assert!(s.contains("root@1.2.3.4"), "row text was: {s}");
+        assert!(!s.contains(":22"), "default port 22 should be hidden: {s}");
         // Name column is padded to name_w=8: "web1" + 4 spaces, so the address
         // column starts at the same offset on every row.
         assert!(s.contains("web1    "), "name not padded to width 8: {s}");
@@ -587,8 +656,46 @@ mod tests {
         let host = host_with_auth(Auth::reference(
             Ulid::from_string("01J00000000000000000000000").unwrap(),
         ));
-        let line = host_line(&host, "", &[], false, 8);
+        let line = host_line(&host, "", &[], false, 8, 30);
         assert!(format!("{line}").contains("?@"));
+    }
+
+    // ---- format_address: host-king truncation ----
+
+    #[test]
+    fn format_address_hides_default_port_22() {
+        assert_eq!(
+            format_address("deploy", "10.0.0.1", 22, 30),
+            "deploy@10.0.0.1"
+        );
+    }
+
+    #[test]
+    fn format_address_keeps_non_default_port() {
+        assert_eq!(
+            format_address("deploy", "edge-7", 2222, 30),
+            "deploy@edge-7:2222"
+        );
+    }
+
+    #[test]
+    fn format_address_long_host_truncated_head_preserved() {
+        // user@ kept; host segment head-truncated with ellipsis.
+        assert_eq!(
+            format_address("deploy", "really-long-edge-node-7", 22, 18),
+            "deploy@really-lon…"
+        );
+    }
+
+    #[test]
+    fn format_address_unknown_user_question_mark() {
+        assert_eq!(format_address("?", "host", 22, 30), "?@host");
+    }
+
+    #[test]
+    fn format_address_tiny_avail_truncates_whole() {
+        // avail too small for even user@ — truncate the whole string head-first.
+        assert_eq!(format_address("deploy", "host", 22, 5), "depl…");
     }
 
     // ---- empty query: frecency order ----
@@ -801,9 +908,13 @@ mod tests {
         // must be gone (replaced by the wizard-style arrow marker).
         assert!(view.contains('▶'), "focus marker missing: {view}");
         assert!(!view.contains('▎'), "old gutter leaked: {view}");
-        // The new user@host:port address column renders (user "u" from the
-        // inline default, host "h", port 22).
-        assert!(view.contains("u@h:22"), "address column missing: {view}");
+        // The user@host address column renders (user "u" from the inline
+        // default, host "h"; the default port 22 is hidden).
+        assert!(view.contains("u@h"), "address column missing: {view}");
+        assert!(
+            !view.contains("u@h:22"),
+            "default port 22 should be hidden: {view}"
+        );
         // No dark-background selection: the selected host name is present.
         assert!(view.contains("web"), "host name missing: {view}");
     }
