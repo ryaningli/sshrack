@@ -2,6 +2,7 @@
 
 > Terminal-native remote server management. A config + credential layer over system `ssh` / `scp` / `sftp`, with an interactive TUI and a scriptable CLI.
 
+[![CI](https://github.com/ryaningli/sshrack/actions/workflows/ci.yml/badge.svg)](https://github.com/ryaningli/sshrack/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust: 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/tools/install)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey.svg)](#-supported-platforms)
@@ -31,6 +32,7 @@ Prerequisites:
 
 - [Rust](https://www.rust-lang.org/tools/install) toolchain (MSRV **1.88+**, edition 2024)
 - System `ssh`, `scp`, `sftp` (OpenSSH) on `PATH`
+- SFTP transfer needs OpenSSH with `ControlMaster` (default on; disabled by some hardened `ssh_config`)
 
 ```bash
 git clone https://github.com/ryaningli/sshrack.git
@@ -153,6 +155,10 @@ sshrack is being built out incrementally.
 ## 🤝 Contributing
 
 Contributions are welcome. Please read [`CLAUDE.md`](CLAUDE.md) first — it covers the architecture, routing rules, code style, and the quality gates every change must pass. For larger work, open an issue to discuss the direction first.
+
+## 🤖 Authorship
+
+This project is developed with AI.
 
 ## 📄 License
 

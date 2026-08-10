@@ -2,6 +2,7 @@
 
 > 终端原生的远程服务器管理工具。在系统 `ssh` / `scp` / `sftp` 之上叠加配置与凭据层，附带交互式 TUI 与可脚本化的 CLI。
 
+[![CI](https://github.com/ryaningli/sshrack/actions/workflows/ci.yml/badge.svg)](https://github.com/ryaningli/sshrack/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust: 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/tools/install)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey.svg)](#-支持平台)
@@ -31,6 +32,7 @@ sshrack 尚处预发布阶段，目前请从源码构建。打标签的发布版
 
 - [Rust](https://www.rust-lang.org/tools/install) 工具链（MSRV **1.88+**，edition 2024）
 - `PATH` 中可用的系统 `ssh`、`scp`、`sftp`（OpenSSH）
+- SFTP 传输需要 OpenSSH 的 `ControlMaster`（默认开启；部分加固的 `ssh_config` 会禁用）
 
 ```bash
 git clone https://github.com/ryaningli/sshrack.git
@@ -153,6 +155,10 @@ sshrack 正在分步构建。
 ## 🤝 贡献
 
 欢迎贡献。改动前请先阅读 [`CLAUDE.md`](CLAUDE.md) —— 它涵盖了架构、路由规则、代码风格，以及每次改动必须通过的质量门禁。较大改动建议先开 issue 讨论方向。
+
+## 🤖 关于作者
+
+本项目由 AI 开发。
 
 ## 📄 许可证
 
