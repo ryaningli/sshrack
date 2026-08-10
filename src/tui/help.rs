@@ -132,7 +132,7 @@ fn sftp_lines() -> Vec<Line<'static>> {
         binding("Ctrl-S", "transfer marked/selected (dirs recurse)"),
         binding("Enter", "file: enqueue · directory: enter"),
         binding("Ctrl-Q", "queue manager (retry / remove / cancel)"),
-        binding("Esc", "cancel in-flight transfer · close"),
+        binding("Esc", "cancel search · close"),
         binding("Ctrl-C", "close"),
     ]
 }
