@@ -16,7 +16,7 @@
 //! `sshrack ssh <name>`: clap's `external_subcommand` collects the name plus
 //! the verbatim remote command in [`Command::Connect`], so flags after the
 //! name reach ssh, not sshrack (the pass-through contract). A bare `sshrack`
-//! (no subcommand) prints help — there is no TUI in this phase.
+//! (no subcommand) opens the interactive TUI launcher.
 
 use std::path::PathBuf;
 
