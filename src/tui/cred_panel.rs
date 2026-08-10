@@ -32,6 +32,7 @@ use ratatui::{
 };
 use sshrack_core::config::schema::{Credential, SecretKind};
 
+use super::fit;
 use super::intent::{Outcome, Status};
 use super::panel;
 use super::parts;
@@ -215,22 +216,32 @@ impl CredPanel {
             return;
         }
 
-        // Adaptive column widths: the widest visible name / user, capped so a
-        // single very long value can't squeeze the kind column off the row.
-        let name_w = self
+        // Adaptive name/user columns: they share the width left after the
+        // focus marker (2), the inter-column gap (2), and the right-aligned
+        // kind block ("  {label}" = 2 + CRED_KIND_MAX). Each takes its ideal
+        // width when both fit; when they contend they split by CRED_NAME_SHARE
+        // with floor guarantees. No hard-coded cap — scales with the width.
+        let name_need = self
             .ranked
             .iter()
-            .map(|&i| creds[i].name.chars().count())
+            .map(|&i| fit::cells(&creds[i].name))
             .max()
-            .unwrap_or(0)
-            .min(CRED_NAME_COL_CAP);
-        let user_w = self
+            .unwrap_or(0);
+        let user_need = self
             .ranked
             .iter()
-            .map(|&i| creds[i].body.user.chars().count())
+            .map(|&i| fit::cells(&creds[i].body.user))
             .max()
-            .unwrap_or(0)
-            .min(CRED_USER_COL_CAP);
+            .unwrap_or(0);
+        let avail = (area.width as usize).saturating_sub(6 + CRED_KIND_MAX);
+        let (name_w, user_w) = fit::column_widths(
+            avail,
+            name_need,
+            user_need,
+            CRED_NAME_SHARE,
+            CRED_NAME_MIN,
+            CRED_USER_MIN,
+        );
 
         // Bake the marker into each item: the selected row carries
         // `theme::focus_marker(true)` (Cyan `▶ `); every other row carries
@@ -282,12 +293,18 @@ fn cred_search_fields(cred: &Credential) -> Vec<String> {
     vec![cred.name.clone(), cred.body.user.clone()]
 }
 
-/// Width cap for the adaptive name column. Names longer than this overflow
-/// gracefully into the gap rather than squeezing the user/kind columns.
-const CRED_NAME_COL_CAP: usize = 20;
-/// Width cap for the adaptive user column. Users longer than this overflow
-/// gracefully rather than squeezing the kind column off the row.
-const CRED_USER_COL_CAP: usize = 12;
+/// Column-width budget rules for the credential list (see
+/// [`fit::column_widths`]). None is a hard cap — they steer how the name and
+/// user share the terminal width, which scales with it.
+/// The name's max share of the row when name and user contend (percent).
+const CRED_NAME_SHARE: usize = 50;
+/// Floor for the name column so it never collapses on a narrow terminal.
+const CRED_NAME_MIN: usize = 6;
+/// Floor for the user column.
+const CRED_USER_MIN: usize = 4;
+/// Widest kind label ("password" / "identity" are 8); reserves the
+/// right-aligned kind block's "  {label}" tail.
+const CRED_KIND_MAX: usize = 8;
 
 /// Build the display line for one credential: the focus marker (`▶ ` when
 /// selected, two spaces otherwise), the name padded to `name_w`, a `user`
@@ -297,11 +314,11 @@ const CRED_USER_COL_CAP: usize = 12;
 /// / none; **no secret plaintext is ever read** — only
 /// [`CredentialBody::secret_kind`](SecretKind) is consulted.
 ///
-/// `name_w`/`user_w` are the maxima across the visible rows (computed in
-/// [`CredPanel::draw_list`], capped at [`CRED_NAME_COL_CAP`] /
-/// [`CRED_USER_COL_CAP`]); `width` is the list area width, used to right-align
-/// the kind column. Mirrors the launcher's `host_line` marker + column pattern
-/// so both lists line up visually.
+/// `name_w`/`user_w` are budgeted by [`fit::column_widths`] in
+/// [`CredPanel::draw_list`] (they share the width after the marker, the gap,
+/// and the kind block, scaling with the terminal); `width` is the list area
+/// width, used to right-align the kind column. Mirrors the launcher's
+/// `host_line` marker + column pattern so both lists line up visually.
 fn cred_row(
     cred: &Credential,
     query: &str,
@@ -317,16 +334,22 @@ fn cred_row(
         SecretKind::Default => "none",
     };
     let mut spans = vec![theme::focus_marker(selected)];
-    // Name column (padded to name_w) with fuzzy-match highlighting.
-    spans.extend(panel::highlighted_spans(&cred.name, query, Style::new()));
+    // Name column: head-truncate to name_w, highlight the visible text, pad.
+    let name = fit::truncate_cells(&cred.name, name_w);
+    spans.extend(panel::highlighted_spans(&name, query, Style::new()));
     spans.push(Span::raw(
-        " ".repeat(name_w.saturating_sub(cred.name.chars().count())),
+        " ".repeat(name_w.saturating_sub(fit::cells(&name))),
     ));
     spans.push(Span::raw("  ")); // gap between name and user columns
-    // User column (dim base, padded to user_w) with fuzzy-match highlighting.
-    spans.extend(panel::highlighted_spans(&user, query, Style::new().dim()));
+    // User column: head-truncate to user_w, highlight (dim base), pad.
+    let user_disp = fit::truncate_cells(&user, user_w);
+    spans.extend(panel::highlighted_spans(
+        &user_disp,
+        query,
+        Style::new().dim(),
+    ));
     spans.push(Span::raw(
-        " ".repeat(user_w.saturating_sub(user.chars().count())),
+        " ".repeat(user_w.saturating_sub(fit::cells(&user_disp))),
     ));
     // Kind column right-aligned to the list area's right edge.
     let used = 2 + name_w + 2 + user_w;

@@ -101,6 +101,48 @@ pub fn truncate_cells(s: &str, max: usize) -> String {
     out
 }
 
+/// Split `avail` cells between two elastic columns whose ideal widths are
+/// `a_need` and `b_need`. Column `a` is the primary label (a host/credential
+/// name), `b` the denser payload (an address, a user).
+///
+/// When both fit (`a_need + b_need <= avail`), `a` takes its need and `b` gets
+/// the remainder. When they contend, `a` is capped at `a_share` percent of
+/// `avail` so the denser `b` keeps the majority; if that would squeeze `b`
+/// below `b_min`, `a` shrinks to defend `b_min`, down to `a_min`. Returns
+/// `(a_width, b_width)` with `a_width + b_width == avail` (and `(0, 0)` when
+/// `avail == 0`).
+///
+/// Pure. The host list (a = name, b = address) and the credential list
+/// (a = name, b = user) share it so both adapt to the terminal width the
+/// same way — no hard-coded column cap.
+pub fn column_widths(
+    avail: usize,
+    a_need: usize,
+    b_need: usize,
+    a_share: usize,
+    a_min: usize,
+    b_min: usize,
+) -> (usize, usize) {
+    if avail == 0 {
+        return (0, 0);
+    }
+    let a_w = if a_need + b_need <= avail {
+        a_need
+    } else {
+        let cap = avail * a_share / 100;
+        let mut a = a_need.min(cap);
+        if avail - a < b_min {
+            // `b` would drop below its floor: hand cells back from `a`, down
+            // to `a_min` (if `avail < a_min + b_min`, `a` still holds `a_min`
+            // and `b` gets whatever remains — the degenerate narrow case).
+            let target = avail.saturating_sub(b_min);
+            a = a_min.max(target.min(a_need));
+        }
+        a
+    };
+    (a_w, avail - a_w)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,5 +288,47 @@ mod tests {
     fn cells_counts_wide_chars_as_two() {
         assert_eq!(cells("中文"), 4);
         assert_eq!(cells("a中"), 3);
+    }
+
+    // ---- column_widths ----
+
+    #[test]
+    fn column_widths_roomy_gives_a_its_need_and_b_the_rest() {
+        // 10 + 20 = 30 <= 80: a takes its need, b gets the remainder.
+        assert_eq!(column_widths(80, 10, 20, 40, 6, 12), (10, 70));
+    }
+
+    #[test]
+    fn column_widths_contended_caps_a_at_share_percent() {
+        // 30 avail, a wants 20, b wants 20 (40 > 30). a capped at 30*40% = 12; b=18 >= b_min.
+        assert_eq!(column_widths(30, 20, 20, 40, 6, 12), (12, 18));
+    }
+
+    #[test]
+    fn column_widths_contended_a_need_below_cap_keeps_a_need() {
+        // a only needs 8 (< cap 12) → a gets 8, not padded up to the cap.
+        assert_eq!(column_widths(30, 8, 25, 40, 6, 12), (8, 22));
+    }
+
+    #[test]
+    fn column_widths_floor_keeps_b_min_by_shrinking_a() {
+        // 18 avail: cap=7 → b_w=11 < b_min 12 → a shrinks to 6 so b keeps 12.
+        assert_eq!(column_widths(18, 20, 20, 40, 6, 12), (6, 12));
+    }
+
+    #[test]
+    fn column_widths_zero_avail_is_zero_zero() {
+        assert_eq!(column_widths(0, 10, 20, 40, 6, 12), (0, 0));
+    }
+
+    #[test]
+    fn column_widths_zero_a_need_gives_all_to_b() {
+        assert_eq!(column_widths(30, 0, 20, 40, 6, 12), (0, 30));
+    }
+
+    #[test]
+    fn column_widths_extreme_avail_below_mins_holds_a_min() {
+        // 10 avail < a_min(6)+b_min(12): can't satisfy both. a holds a_min, b gets the rest.
+        assert_eq!(column_widths(10, 20, 20, 40, 6, 12), (6, 4));
     }
 }
