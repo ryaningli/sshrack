@@ -125,20 +125,6 @@ fn host_search_fields(host: &Host, credentials: &[Credential]) -> Vec<String> {
 // View layer: Launcher state, render, and pure key handling.
 // ---------------------------------------------------------------------------
 
-/// A frecency tier label for display. Mirrors core's 4-tier decay so the user
-/// sees a meaningful bucket, not a raw float.
-fn frecency_tier(score: f64) -> &'static str {
-    if score <= 0.0 {
-        "—"
-    } else if score < 2.0 {
-        "low"
-    } else if score < 10.0 {
-        "mid"
-    } else {
-        "high"
-    }
-}
-
 /// Interactive launcher state: the live query, the cursor into the ranked
 /// list, the (recomputed on each keystroke) ranked list, and the
 /// pending-connect intent set by Enter.
@@ -334,7 +320,7 @@ impl Launcher {
     /// after the query and a right-aligned `matched/total` count; the ranked
     /// list fills the middle; the shared status row is rendered at the bottom
     /// via `parts::draw_status_row`. Reuses `host_line` / `highlighted_name` /
-    /// `host_user` / `frecency_tier`.
+    /// `host_user`.
     ///
     /// Selection styling: the selected row carries `theme::focus_marker(true)`
     /// (a Cyan `▶ `) as its first span and is rendered `BOLD`; every other row
@@ -348,7 +334,6 @@ impl Launcher {
         frame: &mut Frame,
         area: ratatui::layout::Rect,
         hosts: &[Host],
-        frecency: &Frecency,
         credentials: &[Credential],
         status: &Status,
         show_cursor: bool,
@@ -369,7 +354,7 @@ impl Launcher {
             show_cursor,
         );
 
-        self.draw_list(frame, list_area, hosts, frecency, credentials);
+        self.draw_list(frame, list_area, hosts, credentials);
         parts::draw_status_row(frame, status_area, status);
     }
 
@@ -381,7 +366,6 @@ impl Launcher {
         frame: &mut Frame,
         area: ratatui::layout::Rect,
         hosts: &[Host],
-        frecency: &Frecency,
         credentials: &[Credential],
     ) {
         if self.ranked.is_empty() {
@@ -424,10 +408,8 @@ impl Launcher {
                     &hosts[r.host_idx],
                     &self.query,
                     credentials,
-                    frecency,
                     i == self.selected,
                     name_w,
-                    area.width,
                 )
             })
             .collect();
@@ -467,22 +449,19 @@ fn host_user(host: &Host, credentials: &[Credential]) -> String {
 }
 
 /// Build the display line for one host: the focus marker (`▶ ` when selected,
-/// two spaces otherwise), the name padded to `name_w`, a `user@host:port`
-/// address column, and the frecency tier right-aligned to `width`. The name
-/// and the address's `user`/`host` segments fuzzy-highlight the query (matched
-/// chars bold + `theme::MATCH`); the address sits on a dim base. The
-/// credential NAME is no longer shown — the user is the load-bearing piece for
-/// "who will I connect as".
+/// two spaces otherwise), the name padded to `name_w`, and a `user@host:port`
+/// address column. The name and the address's `user`/`host` segments
+/// fuzzy-highlight the query (matched chars bold + `theme::MATCH`); the
+/// address sits on a dim base. The credential NAME is no longer shown — the
+/// user is the load-bearing piece for "who will I connect as".
 fn host_line(
     host: &Host,
     query: &str,
     credentials: &[Credential],
-    frecency: &Frecency,
     selected: bool,
     name_w: usize,
-    width: u16,
 ) -> Line<'static> {
-    let mut spans: Vec<Span> = Vec::with_capacity(8);
+    let mut spans: Vec<Span> = Vec::with_capacity(6);
     spans.push(theme::focus_marker(selected));
 
     // Name column (padded to name_w) with fuzzy-match highlighting.
@@ -501,20 +480,7 @@ fn host_line(
     spans.push(Span::styled("@", dim));
     spans.extend(panel::highlighted_spans(&host.host, query, dim));
     spans.push(Span::styled(":", dim));
-    spans.push(Span::styled(port_str.clone(), dim));
-    let addr_len = user.chars().count() + 1 + host.host.chars().count() + 1 + port_str.len();
-
-    // Tier badge right-aligned to the list area's right edge.
-    let tier = frecency_tier(frecency.score(&host.id));
-    let tier_str = format!("[{tier}]");
-    let used = 2 + name_w + 2 + addr_len;
-    let tier_block = format!("  {tier_str}"); // 2 leading spaces + badge
-    let fill = (width as usize).saturating_sub(used + tier_block.chars().count());
-    spans.push(Span::raw(" ".repeat(fill)));
-    spans.push(Span::styled(
-        tier_block,
-        Style::new().fg(theme::ACCENT).dim(),
-    ));
+    spans.push(Span::styled(port_str, dim));
 
     Line::from(spans)
 }
@@ -541,7 +507,7 @@ mod tests {
         }
     }
 
-    /// A fixed `SystemTime` well after the epoch, for deterministic decay tiers.
+    /// A fixed `SystemTime` well after the epoch, for deterministic frecency scores.
     fn now() -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(1_700_000_000)
     }
@@ -608,8 +574,7 @@ mod tests {
     fn host_line_renders_user_at_host_port_and_aligns_columns() {
         let cred = host_cred("root", 1);
         let host = host_referring(&cred, "web1", "1.2.3.4", 22);
-        let fr = Frecency::default();
-        let line = host_line(&host, "", &[cred], &fr, true, 8, 40);
+        let line = host_line(&host, "", &[cred], true, 8);
         let s = format!("{line}");
         assert!(s.contains("root@1.2.3.4:22"), "row text was: {s}");
         // Name column is padded to name_w=8: "web1" + 4 spaces, so the address
@@ -622,8 +587,7 @@ mod tests {
         let host = host_with_auth(Auth::reference(
             Ulid::from_string("01J00000000000000000000000").unwrap(),
         ));
-        let fr = Frecency::default();
-        let line = host_line(&host, "", &[], &fr, false, 8, 40);
+        let line = host_line(&host, "", &[], false, 8);
         assert!(format!("{line}").contains("?@"));
     }
 
@@ -820,7 +784,6 @@ mod tests {
                 f,
                 area,
                 &hosts,
-                &frecency,
                 &empty_creds(),
                 &crate::tui::intent::Status::empty(),
                 true,
@@ -869,7 +832,6 @@ mod tests {
                 f,
                 area,
                 &hosts,
-                &frecency,
                 &empty_creds(),
                 &crate::tui::intent::Status::empty(),
                 true,
@@ -1207,14 +1169,6 @@ mod tests {
     }
 
     #[test]
-    fn frecency_tier_buckets() {
-        assert_eq!(frecency_tier(0.0), "—");
-        assert_eq!(frecency_tier(1.0), "low");
-        assert_eq!(frecency_tier(5.0), "mid");
-        assert_eq!(frecency_tier(20.0), "high");
-    }
-
-    #[test]
     fn host_list_snapshots_two_hosts_in_name_order_with_empty_frecency() {
         // Snapshot the launcher list with two hosts and an EMPTY frecency. All
         // hosts score 0, so rank_hosts tie-breaks by name ascending — the order
@@ -1249,15 +1203,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| {
-            launcher.draw_in_shell(
-                f,
-                f.area(),
-                &hosts,
-                &Frecency::default(),
-                &[],
-                &Status::empty(),
-                false,
-            );
+            launcher.draw_in_shell(f, f.area(), &hosts, &[], &Status::empty(), false);
         })
         .unwrap();
         insta::assert_snapshot!(term.backend());

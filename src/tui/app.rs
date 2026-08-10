@@ -1155,7 +1155,6 @@ impl App {
                     frame,
                     panel_area,
                     &self.config.hosts,
-                    &self.frecency,
                     &self.config.credentials,
                     &self.status,
                     self.overlay.is_none(),
