@@ -24,7 +24,11 @@
 
 ## 📦 Installation
 
-sshrack is pre-release; build from source for now. Pre-built binaries will accompany tagged releases later.
+### From crates.io (recommended)
+
+```bash
+cargo install sshrack
+```
 
 ### Build from source
 
