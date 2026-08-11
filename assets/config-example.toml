@@ -1,0 +1,82 @@
+# Demo sshrack config — restores the 7 sample hosts used in the README TUI
+# recording (1 real loopback host + 6 fictional ones).
+#
+# Safe to commit: no passwords and no private-key material. `local` stores only
+# the *path* to a key (not the key itself), and the fictional hosts have no auth.
+#
+# Reproduce the demo:
+#   cp assets/config-example.toml ~/.config/sshrack/config.toml
+#   sshrack                       # TUI lists these 7 hosts; type "loc" -> local
+#
+# `local` uses SSH key auth against the loopback (127.0.0.1). Adjust `user` and
+# `key` to your own login/key path if you want `local` to actually connect.
+
+format_version = 1
+credentials = []
+
+[[hosts]]
+id = "01KZQBWEQ0B9S6GK6NGP5TM09S"
+name = "local"
+host = "127.0.0.1"
+port = 22
+
+[hosts.auth]
+user = "ryan"
+key = "/home/ryan/.ssh/id_rsa"
+
+[[hosts]]
+id = "01KZQBWEQ70396CQXZKFSBR5ND"
+name = "web-prod-01"
+host = "10.0.1.10"
+port = 22
+
+[hosts.auth]
+user = "deploy"
+
+[[hosts]]
+id = "01KZQBWEQAFQYRB0XKYSXCB2F4"
+name = "web-prod-02"
+host = "10.0.1.11"
+port = 22
+
+[hosts.auth]
+user = "deploy"
+
+[[hosts]]
+id = "01KZQBWEREVE2VZECAF8MG1EMM"
+name = "db-primary"
+host = "10.0.2.5"
+port = 22
+
+[hosts.auth]
+user = "postgres"
+
+[[hosts]]
+id = "01KZQBWERJG1BG1E9G9YBW14HJ"
+name = "api-staging"
+host = "10.0.3.20"
+port = 22
+
+[hosts.auth]
+user = "deploy"
+
+[[hosts]]
+id = "01KZQBWES5KN306NEJDF0TP7E8"
+name = "bastion"
+host = "203.0.113.10"
+port = 22
+
+[hosts.auth]
+user = "jump"
+
+[[hosts]]
+id = "01KZQBWES7JYT4T9D67TJSDAFR"
+name = "cache-redis"
+host = "10.0.2.20"
+port = 22
+
+[hosts.auth]
+user = "redis"
+
+[store]
+mode = "keyring"
