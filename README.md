@@ -10,6 +10,8 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
+![sshrack TUI demo](./assets/tui.gif)
+
 ## ✨ Features
 
 - **Config + credential layer** — Hosts and credentials live in one TOML file. A credential is reusable across hosts, and a rename or update takes effect everywhere — no duplicated entries. Keys preferred; passwords the fallback.
