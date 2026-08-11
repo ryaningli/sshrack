@@ -7,7 +7,7 @@ Guidance for Claude Code working in this repo. **Long-form reference lives in `d
 - TUI structural design (shell/tabs/overlays/wizards/file picker) → [`docs/tui.md`](docs/tui.md)
 - SFTP transfer design → [`docs/sftp.md`](docs/sftp.md)
 - Migration from `sshrack-old` → [`docs/migration.md`](docs/migration.md)
-- Release runbook → [`docs/release.md`](docs/release.md)
+- Release runbook (`v*` tag → CI auto-publish; don't `cargo publish` locally — CN mirror) → [`docs/release.md`](docs/release.md)
 - Dependency policy · Rust-skills routing → [`docs/dependency-policy.md`](docs/dependency-policy.md)
 
 ## Project Overview

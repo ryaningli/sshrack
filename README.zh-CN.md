@@ -24,7 +24,11 @@
 
 ## 📦 安装
 
-sshrack 尚处预发布阶段，目前请从源码构建。打标签的发布版会随后提供预编译二进制。
+### 从 crates.io 安装（推荐）
+
+```bash
+cargo install sshrack
+```
 
 ### 从源码构建
 
