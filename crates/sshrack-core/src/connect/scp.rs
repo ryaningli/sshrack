@@ -114,7 +114,16 @@ pub fn build(
             .as_deref()
             .or(overrides.user.as_deref())
             .unwrap_or(&auth.user);
-        out_args.push(format!("{user}@{}:{rest}", host_cfg.host));
+        // scp splits operands at the first ':', so an IPv6 address must be
+        // bracketed in the rewritten token (`user@[fe80::1]:/path`). ssh's
+        // known_hosts stores v6 bare at port 22 — host_query handles the
+        // lookup form — so only the operand token wraps.
+        let host_token = if host_cfg.host.contains(':') {
+            format!("[{}]", host_cfg.host)
+        } else {
+            host_cfg.host.clone()
+        };
+        out_args.push(format!("{user}@{host_token}:{rest}"));
         let port = overrides.port.unwrap_or(host_cfg.port);
         if host.is_none() {
             host = Some(host_cfg.clone());
@@ -469,7 +478,9 @@ mod tests {
             &FakeBackend::new(),
         )
         .unwrap();
-        assert!(plan.argv.iter().any(|a| a == "deploy@fe80::1:/tmp"));
+        // The rewritten operand re-brackets the v6 address: scp splits at the
+        // first ':', so `deploy@fe80::1:/tmp` would be unparseable.
+        assert!(plan.argv.iter().any(|a| a == "deploy@[fe80::1]:/tmp"));
     }
 
     #[test]

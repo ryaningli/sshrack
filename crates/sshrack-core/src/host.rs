@@ -243,6 +243,13 @@ pub fn resolve_target(
                 },
             });
         }
+        // `user@[v6]` — ssh's bracketed address form. Strip matching brackets
+        // so the host part is the bare v6 literal (ssh argv / known_hosts
+        // form) both for the config lookup and the ephemeral host.
+        let host_part = host_part
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .unwrap_or(host_part);
         if let Some(found) = cfg.find_host_by_name(host_part) {
             let mut r = with_overrides(found.clone(), overrides);
             r.target_user = Some(user.to_string());
@@ -1018,6 +1025,18 @@ mod tests {
             panic!("expected inline body for user@ without -c");
         };
         assert_eq!(body.user, "root");
+    }
+
+    #[test]
+    fn resolve_target_user_at_bracketed_ipv6_strips_brackets() {
+        let cfg = cfg_with("web1");
+        let r = resolve_target(&cfg, "root@[fe80::1]", &ro(None, None)).unwrap();
+        assert!(r.ephemeral);
+        assert_eq!(
+            r.host.host, "fe80::1",
+            "host must be bare v6 (ssh argv / known_hosts form)"
+        );
+        assert_eq!(r.target_user, Some("root".into()));
     }
 
     #[test]
