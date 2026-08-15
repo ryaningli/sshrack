@@ -84,10 +84,21 @@ pub fn build(
     };
 
     for arg in args {
-        // `[v6]:path` — scp's own IPv6 operand form. Split inside the
-        // brackets so a v6 literal's colons don't cut the address apart.
+        // `user@[v6]:path` — an '@' followed by a bracketed address: the
+        // brackets make the split point unambiguous (after the closing ']'
+        // + ':'), so the v6 literal's colons don't cut it apart. The left
+        // side keeps the brackets; `resolve_target`'s @-branch strips them
+        // for the host. A local path containing '@[' with no `]:` after it
+        // falls through to the plain split (and typically no ':' at all →
+        // passes through verbatim). `[v6]:path` — scp's own bracketed
+        // operand form — splits inside the brackets for the same reason.
         // Anything else splits at the first ':' (a bare operand is local).
-        let pair = if let Some(stripped) = arg.strip_prefix('[') {
+        let pair = if let Some(open) = arg.find("@[")
+            && let Some(close) = arg[open..].find(']').map(|i| i + open)
+            && let Some(rest) = arg[close + 1..].strip_prefix(':')
+        {
+            Some((&arg[..close + 1], rest))
+        } else if let Some(stripped) = arg.strip_prefix('[') {
             stripped
                 .split_once(']')
                 .and_then(|(addr, after)| after.strip_prefix(':').map(|rest| (addr, rest)))
@@ -481,6 +492,28 @@ mod tests {
         // The rewritten operand re-brackets the v6 address: scp splits at the
         // first ':', so `deploy@fe80::1:/tmp` would be unparseable.
         assert!(plan.argv.iter().any(|a| a == "deploy@[fe80::1]:/tmp"));
+    }
+
+    #[test]
+    fn user_at_bracketed_ipv6_operand_resolves() {
+        // `user@[v6]:path` splits after the closing bracket, resolves to the
+        // bare v6 host, and the rewritten operand re-brackets it. The
+        // explicit `root@` user wins over the credential's user.
+        let cfg = cfg_with_credential("ops", "/keys/ops_ed25519");
+        let plan = build(
+            &["f.txt".into(), "root@[fe80::1]:/tmp".into()],
+            &cfg,
+            &Overrides {
+                credential: Some(cred_id(&cfg, "ops")),
+                ..Default::default()
+            },
+            None,
+            &FakeBackend::new(),
+        )
+        .unwrap();
+        assert!(plan.argv.iter().any(|a| a == "root@[fe80::1]:/tmp"));
+        assert_eq!(plan.host.as_ref().map(|h| h.host.as_str()), Some("fe80::1"));
+        assert!(plan.remote_hosts.contains(&("fe80::1".to_string(), 22)));
     }
 
     #[test]
