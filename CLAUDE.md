@@ -169,6 +169,7 @@ The CLI defaults to interactive when a TTY is present — it prompts for host-ke
 | `--format json` (global) | Structured JSON output (locked field names); default is text. |
 | `SSHRACK_PASSPHRASE` (env) | Vault passphrase escape hatch (`store use vault`, `store rekey`); without it on a tty, the CLI prompts. |
 | `--identity-stdin`/`--identity-file` (+ `--certificate-*`) | Import identity-key/certificate **contents** as a sealed `Secret`, never in argv. `--identity <path>` is the unread path reference. Inline key renders as `"<inline>"`; key text never displayed. |
+| `--ssh-args <flags>` (host add/edit) | Raw ssh option flags stored on the host, shell-split and appended to every ssh/sftp connection (after sshrack's own `-o`, so user `-o Key=Value` overrides win); scp receives only the `-o` subset. `--clear-ssh-args` on edit drops them. |
 | Stable exit codes | `0` ok · `2` usage · `4` not-found · `5` duplicate · `6` validation · `7` connect · `8` store. |
 
 **Hard rules carried from prior pain:**
