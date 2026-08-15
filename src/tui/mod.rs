@@ -279,7 +279,7 @@ fn resolve_transfer_target(
         user: merged.user.as_deref(),
         identity: merged.identity.as_deref(),
     };
-    Ok(Some(host::resolve_target(cfg, name, &overrides)?))
+    Ok(Some(host::resolve_target(cfg, name, &overrides)?.host))
 }
 
 /// Map the parsed CLI command to an [`EntryMode`]. Only the
@@ -539,8 +539,9 @@ mod tests {
 
     #[test]
     fn resolve_transfer_target_ad_hoc_with_user_builds_inline_body() {
-        // `sshrack --ad-hoc --user ryan -p 2222 sftp host.example`: ad-hoc inline
-        // user (+ optional port) builds an ephemeral inline-auth host.
+        // `sshrack --ad-hoc --user ryan -p 2222 sftp 10.9.9.9`: an address
+        // target with -l builds an ephemeral inline-auth host (a bare word is
+        // never an address — the new decision table).
         let cfg = SshrackConfig::default();
         let opts = ConnectOptions {
             ad_hoc: true,
@@ -548,11 +549,10 @@ mod tests {
             port: Some(2222),
             ..Default::default()
         };
-        let host =
-            resolve_transfer_target(Some(&sftp_cmd("host.example", opts.clone())), &cfg, &opts)
-                .unwrap()
-                .expect("ad-hoc resolves");
-        assert_eq!(host.host, "host.example");
+        let host = resolve_transfer_target(Some(&sftp_cmd("10.9.9.9", opts.clone())), &cfg, &opts)
+            .unwrap()
+            .expect("ad-hoc resolves");
+        assert_eq!(host.host, "10.9.9.9");
         assert_eq!(host.port, 2222);
         let body = host.auth.inline_body().expect("inline auth");
         assert_eq!(body.user, "ryan");
@@ -561,7 +561,7 @@ mod tests {
     #[test]
     fn resolve_transfer_target_ad_hoc_without_identity_errors() {
         // `--ad-hoc` with neither --credential nor --user cannot log in; fail
-        // fast (MissingRequiredField) before the alternate screen.
+        // fast (AddressNeedsUser) before the alternate screen.
         let cfg = SshrackConfig::default();
         let opts = ConnectOptions {
             ad_hoc: true,
@@ -575,7 +575,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             err,
-            sshrack_core::error::SshrackError::MissingRequiredField { .. }
+            sshrack_core::error::SshrackError::AddressNeedsUser { .. }
         ));
     }
 
@@ -629,13 +629,13 @@ mod tests {
         };
         // Subcommand opts empty; top-level carries --ad-hoc + --user.
         let host = resolve_transfer_target(
-            Some(&sftp_cmd("host.example", ConnectOptions::default())),
+            Some(&sftp_cmd("10.0.0.4", ConnectOptions::default())),
             &cfg,
             &top,
         )
         .unwrap()
         .expect("top-level --ad-hoc applies");
-        assert_eq!(host.host, "host.example");
+        assert_eq!(host.host, "10.0.0.4");
         assert_eq!(host.auth.inline_body().unwrap().user, "ryan");
     }
 

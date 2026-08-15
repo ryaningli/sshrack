@@ -169,7 +169,8 @@ pub fn clone_host_as(src: &Host, dst_id: Ulid, dst_name: &str) -> Host {
 /// before constructing this), matching [`crate::connect::ssh::Overrides::credential`].
 #[derive(Debug, Clone, Copy)]
 pub struct ResolveOverrides<'a> {
-    /// `--ad-hoc`: treat an unknown target as a literal address, not a name.
+    /// Legacy `--ad-hoc` flag; unread by `resolve_target` since the user@host/IP
+    /// target table landed. Removed with the CLI flag.
     pub ad_hoc: bool,
     /// `--credential <id>`: reuse a `[[credentials]]` entry's identity.
     pub credential: Option<Ulid>,
@@ -184,55 +185,132 @@ pub struct ResolveOverrides<'a> {
 /// ssh default port, used for ad-hoc targets that have no config entry.
 const DEFAULT_PORT: u16 = 22;
 
-/// Resolve a connect `target` into a concrete [`Host`], whether it names a
-/// configured name or an ad-hoc address. Decision table:
+/// A connect target resolved by [`resolve_target`].
+#[derive(Debug, Clone)]
+pub struct ResolvedTarget {
+    /// The concrete host: a config entry, or an ephemeral literal (never
+    /// persisted, never frecency-recorded).
+    pub host: Host,
+    /// Login user explicitly embedded in the target (`user@host`). Wins over
+    /// `-l` (user precedence: `user@` > `-l` > credential user > config user).
+    pub target_user: Option<String>,
+    /// True when `host` was built from a literal address. Ephemeral hosts get
+    /// a fresh ULID per call, so they must never be frecency-recorded.
+    pub ephemeral: bool,
+}
+
+/// Resolve a connect `target` into a [`ResolvedTarget`]. Decision table
+/// (first match wins):
 ///
-/// | name hit  | `--ad-hoc` | result |
-/// |-----------|------------|--------|
-/// | yes       | any        | the host entry; `--credential` overrides its auth |
-/// | no        | yes        | an ephemeral host `{ host = target, … }` |
-/// | no        | no         | [`SshrackError::HostNotFound`] (+ did-you-mean) |
+/// | # | target                              | result |
+/// |---|-------------------------------------|--------|
+/// | 1 | exact config-name hit               | the entry (`--credential` overrides auth) |
+/// | 2 | `user@host` (split on the LAST `@`) | host-part hits config → entry + user overlay; otherwise an ephemeral literal |
+/// | 3 | bare IP literal (v4/v6, `%zone`, `[ ]`) | ephemeral literal; needs `-c` or `-l` for the user |
+/// | 4 | `<ip>:<port>`                       | [`SshrackError::TargetHasPort`] (ssh targets have no `:port`) |
+/// | 5 | anything else                       | [`SshrackError::HostNotFound`] + did-you-mean |
 ///
-/// An ad-hoc target must carry an identity — either `--credential` or `--user`
-/// — since sshrack has no implicit login user. `--credential` is not checked
-/// for existence here; a dangling reference surfaces as
-/// [`SshrackError::CredentialNotFound`] when the caller runs
+/// A bare word is NEVER an address: config names may contain dots
+/// (`web-1.db_2` is legal), so a dotted word cannot be told apart from a
+/// typo'd name. Unregistered hostnames go through `user@host`.
+///
+/// `--credential` is not checked for existence here; a dangling reference
+/// surfaces as [`SshrackError::CredentialNotFound`] when the caller runs
 /// [`crate::credential::resolve`].
 pub fn resolve_target(
     cfg: &SshrackConfig,
     target: &str,
     overrides: &ResolveOverrides<'_>,
-) -> Result<Host, SshrackError> {
+) -> Result<ResolvedTarget, SshrackError> {
+    // 1. Exact config hit wins over everything — even a name that looks like
+    // an address, and even when the target contains '@' (a hand-edited
+    // config could carry such a name).
     if let Some(found) = cfg.find_host_by_name(target) {
-        let mut host = found.clone();
-        if let Some(cred) = overrides.credential {
-            host.auth = Auth::reference(cred);
+        return Ok(with_overrides(found.clone(), overrides));
+    }
+
+    // 2. user@host — split on the LAST '@' so a user may itself contain '@'
+    // (user@realm@host). Mirrors `ssh root@web1` against a `Host web1`
+    // ssh-config entry: the config's address/port, the explicit user.
+    if let Some((user, host_part)) = target.rsplit_once('@') {
+        if user.is_empty() || host_part.is_empty() {
+            return Err(SshrackError::InvalidTarget {
+                target: target.into(),
+                reason: if user.is_empty() {
+                    "the user before '@' is empty".into()
+                } else {
+                    "the host after '@' is empty".into()
+                },
+            });
         }
-        return Ok(host);
+        if let Some(found) = cfg.find_host_by_name(host_part) {
+            let mut r = with_overrides(found.clone(), overrides);
+            r.target_user = Some(user.to_string());
+            return Ok(r);
+        }
+        // Ephemeral literal: the @user is the identity (no -c/-l required);
+        // -c, when given, contributes key/password and the @user still wins
+        // for the login name (via `target_user`).
+        let auth = match overrides.credential {
+            Some(cred) => Auth::reference(cred),
+            None => Auth::inline(CredentialBody::new(user)),
+        };
+        return Ok(ResolvedTarget {
+            host: address_host(host_part, overrides.port.unwrap_or(DEFAULT_PORT), auth),
+            target_user: Some(user.to_string()),
+            ephemeral: true,
+        });
     }
 
-    if !overrides.ad_hoc {
-        return Err(host_not_found(cfg, target));
+    // 4 (checked before 3's fallthrough so `ip:port` gets the precise error).
+    if let Some((left, right)) = target.rsplit_once(':')
+        && let Ok(port) = right.parse::<u16>()
+        && is_address_literal(left)
+    {
+        return Err(SshrackError::TargetHasPort {
+            host: left.to_string(),
+            port,
+        });
     }
 
-    let auth = ad_hoc_auth(overrides)?;
-    Ok(ad_hoc_host(
-        target,
-        overrides.port.unwrap_or(DEFAULT_PORT),
-        auth,
-    ))
+    // 3. Bare IP literal — the only unambiguous address form (names may
+    // contain dots, so a bare dotted word stays a name).
+    if is_address_literal(target) {
+        let auth = address_auth(target, overrides)?;
+        return Ok(ResolvedTarget {
+            host: address_host(target, overrides.port.unwrap_or(DEFAULT_PORT), auth),
+            target_user: None,
+            ephemeral: true,
+        });
+    }
+
+    // 5. Typo'd name (or an unregistered bare hostname — those need user@).
+    Err(host_not_found(cfg, target))
 }
 
-/// Build the auth for an ad-hoc target from the overrides: `--credential`
-/// wins; otherwise inline `--user` (with optional `--identity`); otherwise
-/// reject — an ad-hoc connection needs an explicit identity.
-fn ad_hoc_auth(overrides: &ResolveOverrides<'_>) -> Result<Auth, SshrackError> {
+/// Apply `--credential` auth override to a config hit and wrap it as a
+/// non-ephemeral [`ResolvedTarget`] with no target-embedded user.
+fn with_overrides(mut host: Host, overrides: &ResolveOverrides<'_>) -> ResolvedTarget {
+    if let Some(cred) = overrides.credential {
+        host.auth = Auth::reference(cred);
+    }
+    ResolvedTarget {
+        host,
+        target_user: None,
+        ephemeral: false,
+    }
+}
+
+/// Auth for a bare-address target: `--credential` wins; otherwise an inline
+/// body from `-l` (+ optional `-i`); otherwise the user gave no identity —
+/// an address cannot have an implicit login user.
+fn address_auth(target: &str, overrides: &ResolveOverrides<'_>) -> Result<Auth, SshrackError> {
     if let Some(cred) = overrides.credential {
         return Ok(Auth::reference(cred));
     }
     let Some(user) = overrides.user else {
-        return Err(SshrackError::MissingRequiredField {
-            field: "--credential or --user (required for --ad-hoc)",
+        return Err(SshrackError::AddressNeedsUser {
+            target: target.into(),
         });
     };
     let mut body = CredentialBody::new(user);
@@ -242,20 +320,29 @@ fn ad_hoc_auth(overrides: &ResolveOverrides<'_>) -> Result<Auth, SshrackError> {
     Ok(Auth::inline(body))
 }
 
-/// Build an ephemeral [`Host`] for an ad-hoc address + auth. Never persisted:
-/// `name` mirrors the address (cosmetic — ad-hoc hosts are never looked up by
-/// name after construction). The `id` is fresh so a keyring password (if any)
-/// keys off a stable identity.
-fn ad_hoc_host(address: &str, port: u16, auth: Auth) -> Host {
+/// Build an ephemeral [`Host`] for a literal address + auth. Never persisted:
+/// `name` mirrors the address (cosmetic — ephemeral hosts are never looked up
+/// by name after construction). The `id` is fresh.
+fn address_host(address: &str, port: u16, auth: Auth) -> Host {
     Host {
         id: new_id(),
         name: address.to_string(),
         host: address.to_string(),
         port,
-        // An ad-hoc target has no stored config, so it carries no ssh_args.
+        // An ephemeral target has no stored config, so it carries no ssh_args.
         ssh_args: None,
         auth,
     }
+}
+
+/// Whether `s` is a literal IP address: v4 or v6, optionally zoned
+/// (`fe80::1%eth0`) or bracketed (`[fe80::1]`, scp's operand form — the scp
+/// layer strips brackets itself, this is defensive). Pure; std-only.
+pub fn is_address_literal(s: &str) -> bool {
+    let s = s.strip_prefix('[').unwrap_or(s);
+    let s = s.strip_suffix(']').unwrap_or(s);
+    let s = s.rsplit_once('%').map_or(s, |(head, _)| head);
+    s.parse::<std::net::IpAddr>().is_ok()
 }
 
 // ===========================================================================
@@ -868,99 +955,195 @@ mod tests {
         assert!(validate_dst(&cfg, "web2").is_ok());
     }
 
-    // --- resolve_target / ad_hoc_host ---
+    // --- resolve_target: decision table (config / user@ / bare IP / errors) ---
 
-    fn ro_none() -> ResolveOverrides<'static> {
+    fn ro(credential: Option<Ulid>, user: Option<&str>) -> ResolveOverrides<'_> {
         ResolveOverrides {
-            ad_hoc: false,
-            credential: None,
+            ad_hoc: true, // legacy field, unread by the new table; removed in a later task
+            credential,
             port: None,
-            user: None,
+            user,
             identity: None,
         }
     }
 
     #[test]
-    fn resolve_target_name_hit_returns_entry_unchanged() {
+    fn resolve_target_name_hit_returns_entry() {
         let cfg = cfg_with("web1");
-        let host = resolve_target(&cfg, "web1", &ro_none()).unwrap();
-        assert_eq!(host.name, "web1");
-        assert_eq!(host.host, "h");
-        assert_eq!(host.port, 22);
-        assert!(host.auth.inline_body().is_some());
+        let r = resolve_target(&cfg, "web1", &ro(None, None)).unwrap();
+        assert_eq!(r.host.name, "web1");
+        assert_eq!(r.target_user, None);
+        assert!(!r.ephemeral);
     }
 
     #[test]
     fn resolve_target_name_hit_with_credential_overrides_auth() {
         let cfg = cfg_with("web1");
         let cid = new_id();
-        let mut o = ro_none();
-        o.credential = Some(cid);
-        let host = resolve_target(&cfg, "web1", &o).unwrap();
-        assert_eq!(host.host, "h");
-        assert_eq!(host.port, 22);
-        assert_eq!(host.auth.credential_id(), Some(cid));
+        let r = resolve_target(&cfg, "web1", &ro(Some(cid), None)).unwrap();
+        assert!(matches!(r.host.auth, Auth::Ref { credential } if credential == cid));
     }
 
     #[test]
-    fn resolve_target_ad_hoc_with_credential_builds_ephemeral_ref() {
-        let cfg = cfg_with("web1"); // "1.2.3.4" is not a name here
+    fn resolve_target_config_name_that_looks_like_an_ip_still_hits() {
+        // Hand-edited config with a numeric name: the config hit is checked
+        // first, so it wins over the address branch.
+        let cfg = cfg_with("10.0.0.4");
+        let r = resolve_target(&cfg, "10.0.0.4", &ro(None, None)).unwrap();
+        assert_eq!(r.host.name, "10.0.0.4");
+        assert!(!r.ephemeral, "a config entry is never ephemeral");
+    }
+
+    #[test]
+    fn resolve_target_user_at_config_name_overlays_user() {
+        // `root@web1` where web1 is configured: config address/port + explicit
+        // user (mirrors `ssh root@web1` with a Host web1 ssh-config entry).
+        let cfg = cfg_with("web1");
+        let r = resolve_target(&cfg, "root@web1", &ro(None, None)).unwrap();
+        assert_eq!(r.host.name, "web1");
+        assert_eq!(r.host.host, cfg.hosts[0].host);
+        assert_eq!(r.target_user, Some("root".into()));
+        assert!(!r.ephemeral);
+    }
+
+    #[test]
+    fn resolve_target_user_at_address_builds_ephemeral_inline() {
+        let cfg = cfg_with("web1");
+        let r = resolve_target(&cfg, "root@10.0.0.9", &ro(None, None)).unwrap();
+        assert!(r.ephemeral);
+        assert_eq!(r.host.host, "10.0.0.9");
+        assert_eq!(r.host.port, 22);
+        assert_eq!(r.target_user, Some("root".into()));
+        let Auth::Inline(body) = &r.host.auth else {
+            panic!("expected inline body for user@ without -c");
+        };
+        assert_eq!(body.user, "root");
+    }
+
+    #[test]
+    fn resolve_target_user_at_with_credential_references_and_keeps_user() {
+        // `-c ops root@10.0.0.9`: the credential contributes key/password,
+        // the explicit @user wins over the credential's user.
+        let cfg = cfg_with("web1");
         let cid = new_id();
-        let mut o = ro_none();
-        o.ad_hoc = true;
-        o.credential = Some(cid);
-        let host = resolve_target(&cfg, "1.2.3.4", &o).unwrap();
-        assert_eq!(host.host, "1.2.3.4");
-        assert_eq!(host.port, 22);
-        assert_eq!(host.auth.credential_id(), Some(cid));
+        let r = resolve_target(&cfg, "deploy@10.0.0.9", &ro(Some(cid), None)).unwrap();
+        assert!(r.ephemeral);
+        assert!(matches!(r.host.auth, Auth::Ref { credential } if credential == cid));
+        assert_eq!(r.target_user, Some("deploy".into()));
     }
 
     #[test]
-    fn resolve_target_ad_hoc_with_user_builds_inline_body() {
-        let cfg = SshrackConfig::default();
-        let mut o = ro_none();
-        o.ad_hoc = true;
-        o.user = Some("deploy");
-        o.identity = Some(std::path::Path::new("/k"));
-        o.port = Some(2222);
-        let host = resolve_target(&cfg, "host.example.com", &o).unwrap();
-        assert_eq!(host.host, "host.example.com");
-        assert_eq!(host.port, 2222);
-        let body = host.auth.inline_body().unwrap();
-        assert_eq!(body.user, "deploy");
+    fn resolve_target_user_at_with_dash_l_ignores_dash_l_user() {
+        // user@ beats -l (most specific wins).
+        let cfg = cfg_with("web1");
+        let r = resolve_target(&cfg, "root@10.0.0.9", &ro(None, Some("admin"))).unwrap();
+        let Auth::Inline(body) = &r.host.auth else {
+            panic!("expected inline")
+        };
+        assert_eq!(body.user, "root", "the @ user, not -l, lands in the body");
+    }
+
+    #[test]
+    fn resolve_target_user_at_realm_user_splits_on_last_at() {
+        let cfg = cfg_with("web1");
+        let r = resolve_target(&cfg, "user@realm@10.0.0.9", &ro(None, None)).unwrap();
+        assert_eq!(r.host.host, "10.0.0.9");
+        assert_eq!(r.target_user, Some("user@realm".into()));
+    }
+
+    #[test]
+    fn resolve_target_empty_user_or_host_rejected() {
+        let cfg = cfg_with("web1");
+        for bad in ["@10.0.0.9", "root@", "@"] {
+            let err = resolve_target(&cfg, bad, &ro(None, None)).unwrap_err();
+            assert!(
+                matches!(err, SshrackError::InvalidTarget { .. }),
+                "expected InvalidTarget for {bad}, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_target_bare_ip_with_credential_builds_ephemeral_ref() {
+        let cfg = cfg_with("web1");
+        let cid = new_id();
+        let r = resolve_target(&cfg, "1.2.3.4", &ro(Some(cid), None)).unwrap();
+        assert!(r.ephemeral);
+        assert_eq!(r.host.host, "1.2.3.4");
+        assert_eq!(r.target_user, None);
+        assert!(matches!(r.host.auth, Auth::Ref { .. }));
+    }
+
+    #[test]
+    fn resolve_target_bare_ip_with_user_builds_inline_body() {
+        let cfg = cfg_with("web1");
+        let r = resolve_target(&cfg, "10.0.0.9", &ro(None, Some("root"))).unwrap();
+        assert!(r.ephemeral);
+        let Auth::Inline(body) = &r.host.auth else {
+            panic!("expected inline")
+        };
+        assert_eq!(body.user, "root");
+    }
+
+    #[test]
+    fn resolve_target_bare_ip_without_identity_errors_with_fix() {
+        let cfg = cfg_with("web1");
+        let err = resolve_target(&cfg, "10.0.0.9", &ro(None, None)).unwrap_err();
+        assert!(matches!(err, SshrackError::AddressNeedsUser { .. }));
         assert_eq!(
-            body.key.as_ref().and_then(KeySource::as_path),
-            Some(std::path::Path::new("/k"))
+            err.to_string(),
+            "address target '10.0.0.9' needs a user: pass -c/-l or use user@10.0.0.9"
         );
     }
 
     #[test]
-    fn resolve_target_ad_hoc_without_identity_errors() {
-        let cfg = SshrackConfig::default();
-        let mut o = ro_none();
-        o.ad_hoc = true;
-        let err = resolve_target(&cfg, "1.2.3.4", &o).unwrap_err();
-        assert!(matches!(err, SshrackError::MissingRequiredField { .. }));
-    }
-
-    #[test]
-    fn resolve_target_miss_without_ad_hoc_is_host_not_found() {
+    fn resolve_target_ipv6_literals_are_addresses() {
         let cfg = cfg_with("web1");
-        let err = resolve_target(&cfg, "web2", &ro_none()).unwrap_err();
-        assert!(matches!(
-            err,
-            SshrackError::HostNotFound { name, .. } if name == "web2"
-        ));
+        for v6 in ["fe80::1", "2001:db8::1", "::1", "fe80::1%eth0", "[fe80::1]"] {
+            let r = resolve_target(&cfg, v6, &ro(None, Some("root"))).unwrap();
+            assert!(r.ephemeral, "{v6} must parse as an address literal");
+        }
     }
 
     #[test]
-    fn ad_hoc_host_mirrors_address_and_carries_auth() {
+    fn resolve_target_ip_with_port_gets_friendly_error() {
+        let cfg = cfg_with("web1");
+        let err = resolve_target(&cfg, "10.0.0.4:2222", &ro(None, Some("root"))).unwrap_err();
+        assert!(
+            matches!(err, SshrackError::TargetHasPort { ref host, port } if host == "10.0.0.4" && port == 2222)
+        );
+        assert_eq!(
+            err.to_string(),
+            "port goes in -p, not the target: write '10.0.0.4' and pass -p 2222"
+        );
+    }
+
+    #[test]
+    fn resolve_target_bare_hostname_without_at_is_host_not_found() {
+        // A bare word (even dotted) is never an address — typo protection.
+        let cfg = cfg_with("web1");
+        let err = resolve_target(&cfg, "host.example.com", &ro(None, Some("root"))).unwrap_err();
+        assert!(matches!(err, SshrackError::HostNotFound { .. }));
+    }
+
+    #[test]
+    fn resolve_target_name_typo_without_at_is_host_not_found_with_hint() {
+        let cfg = cfg_with("ets-pc");
+        let err = resolve_target(&cfg, "ets-pcc", &ro(None, None)).unwrap_err();
+        let SshrackError::HostNotFound { hint, .. } = &err else {
+            panic!("expected HostNotFound");
+        };
+        assert_eq!(hint.to_string(), " (did you mean 'ets-pc'?)");
+    }
+
+    #[test]
+    fn address_host_mirrors_address_and_carries_auth() {
         let cid = new_id();
-        let host = ad_hoc_host("10.0.0.5", 2222, Auth::reference(cid));
-        assert_eq!(host.name, "10.0.0.5");
-        assert_eq!(host.host, "10.0.0.5");
-        assert_eq!(host.port, 2222);
-        assert_eq!(host.auth.credential_id(), Some(cid));
+        let h = address_host("10.0.0.5", 2222, Auth::reference(cid));
+        assert_eq!(h.host, "10.0.0.5");
+        assert_eq!(h.name, "10.0.0.5");
+        assert_eq!(h.port, 2222);
+        assert!(matches!(h.auth, Auth::Ref { .. }));
     }
 
     // --- add helpers (build_auth / auth_supplied_by_flags / merge_fields) ---
@@ -2133,21 +2316,18 @@ mod tests {
     }
 
     #[test]
-    fn ad_hoc_auth_user_without_identity_yields_inline_no_key() {
-        // --ad-hoc --user with no --identity and no --credential builds an inline
-        // body whose key is None (the no-identity branch of ad_hoc_auth, which is
-        // private; exercised here through resolve_target).
+    fn resolve_target_bare_ip_user_without_identity_yields_inline_no_key() {
+        // -l with no --identity and no --credential builds an inline body whose
+        // key is None (the no-identity branch of address_auth, which is private;
+        // exercised here through resolve_target).
         let cfg = SshrackConfig::default();
-        let mut o = ro_none();
-        o.ad_hoc = true;
-        o.user = Some("dep");
-        o.port = Some(22);
-        let host = resolve_target(&cfg, "10.0.0.5", &o).unwrap();
-        assert_eq!(host.host, "10.0.0.5");
-        let body = host
+        let r = resolve_target(&cfg, "10.0.0.5", &ro(None, Some("dep"))).unwrap();
+        assert_eq!(r.host.host, "10.0.0.5");
+        let body = r
+            .host
             .auth
             .inline_body()
-            .expect("ad-hoc with user must yield Inline auth");
+            .expect("address with -l must yield Inline auth");
         assert_eq!(body.user, "dep");
         assert!(
             body.key.is_none(),

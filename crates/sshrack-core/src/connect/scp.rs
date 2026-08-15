@@ -103,7 +103,7 @@ pub fn build(
         // surface a misleading DNS error.
         let host_cfg = match cfg.find_host_by_name(left) {
             Some(h) => h.clone(),
-            None if overrides.ad_hoc => resolve_target(cfg, left, &resolve_overrides)?,
+            None if overrides.ad_hoc => resolve_target(cfg, left, &resolve_overrides)?.host,
             None => return Err(host_not_found(cfg, left)),
         };
         let mut auth = credential::resolve(&host_cfg, cfg, vault, backend)?;
@@ -438,6 +438,6 @@ mod tests {
             &FakeBackend::new(),
         )
         .unwrap_err();
-        assert!(matches!(err, SshrackError::MissingRequiredField { .. }));
+        assert!(matches!(err, SshrackError::AddressNeedsUser { .. }));
     }
 }

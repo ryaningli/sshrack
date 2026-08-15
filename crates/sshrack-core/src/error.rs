@@ -56,6 +56,15 @@ pub enum SshrackError {
     #[error("invalid ssh args: {reason}")]
     InvalidSshArgs { reason: String },
 
+    #[error("address target '{target}' needs a user: pass -c/-l or use user@{target}")]
+    AddressNeedsUser { target: String },
+
+    #[error("port goes in -p, not the target: write '{host}' and pass -p {port}")]
+    TargetHasPort { host: String, port: u16 },
+
+    #[error("invalid target '{target}': {reason}")]
+    InvalidTarget { target: String, reason: String },
+
     #[error("host name already exists: {name} (use --force to overwrite)")]
     HostAlreadyExists { name: String },
 

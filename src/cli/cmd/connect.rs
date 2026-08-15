@@ -102,7 +102,7 @@ pub fn run(cli: &Cli) -> i32 {
         identity: opts.identity.as_deref(),
     };
     let resolved_host = match host::resolve_target(&cfg, target, &resolve_overrides) {
-        Ok(h) => h,
+        Ok(r) => r.host,
         Err(SshrackError::HostNotFound { name, hint }) => {
             eprintln!("sshrack: host not found: {name}{hint}");
             return exit_code::NOT_FOUND;
