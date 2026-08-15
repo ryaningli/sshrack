@@ -67,6 +67,9 @@ pub struct HostDetailRow<'a> {
     pub id: &'a str,
     pub host: &'a str,
     pub port: u16,
+    /// Raw ssh flags stored on the host (absent when unset).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_args: Option<&'a str>,
     pub user: &'a str,
     pub auth_kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -180,6 +183,7 @@ pub fn host_detail_row<'a>(
         id: id_str,
         host: &host.host,
         port: host.port,
+        ssh_args: host.ssh_args.as_deref(),
         user: user_of(host.auth.inline_body()),
         auth_kind: auth_kind_label(&host.auth),
         credential_name,
@@ -288,6 +292,7 @@ mod tests {
             name: "web1".into(),
             host: "10.0.0.5".into(),
             port: 2222,
+            ssh_args: None,
             auth: Auth::Inline(CredentialBody::new("deploy").with_password("hunter2")),
         }
     }
@@ -299,6 +304,7 @@ mod tests {
             name: "db1".into(),
             host: "db.internal".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::reference(cred_id),
         }
     }
@@ -352,6 +358,7 @@ mod tests {
             name: "box".into(),
             host: "1.2.3.4".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::Inline(CredentialBody::new("root").with_key("/home/u/.ssh/id_ed25519")),
         };
         let id_str = host.id.to_string();
@@ -367,6 +374,29 @@ mod tests {
     }
 
     #[test]
+    fn host_detail_row_serializes_ssh_args_additively() {
+        let host = Host {
+            id: Ulid::new(),
+            name: "web1".into(),
+            host: "10.0.0.4".into(),
+            port: 22,
+            ssh_args: Some("-X".into()),
+            auth: Auth::inline(CredentialBody::new("deploy")),
+        };
+        let row = host_detail_row(&host, "01TEST", None, None);
+        let json = serde_json::to_string(&row).expect("invariant: serializable row");
+        assert!(json.contains("\"ssh_args\":\"-X\""));
+
+        let host = Host {
+            ssh_args: None,
+            ..host
+        };
+        let row = host_detail_row(&host, "01TEST", None, None);
+        let json = serde_json::to_string(&row).expect("invariant: serializable row");
+        assert!(!json.contains("ssh_args"));
+    }
+
+    #[test]
     fn host_detail_row_masks_inline_key_text_in_identity() {
         // Security contract: an inline (pasted) private key must NEVER appear
         // in `ls`/`show` JSON or text — it is as sensitive as a password. The
@@ -378,6 +408,7 @@ mod tests {
             name: "box".into(),
             host: "1.2.3.4".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::Inline(CredentialBody {
                 user: "root".into(),
                 password: None,

@@ -58,6 +58,7 @@ sshrack scp ./app.tar web1:/tmp/         # 脚本化文件传输
 sshrack sftp web1                        # 双面板传输屏
 
 sshrack host add web1 --host 10.0.0.4 --user deploy --identity ~/.ssh/id_ed25519
+sshrack host add web1 --host 10.0.0.4 --user deploy --ssh-args "-o ServerAliveInterval=30"
 sshrack host ls --sort frecency          # 列出主机，按 frecency 排序
 sshrack cred add deploy --user deploy --identity ~/.ssh/id_ed25519
 sshrack --format json host ls            # 供脚本消费的 JSON 输出

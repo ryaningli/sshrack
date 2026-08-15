@@ -98,23 +98,31 @@ pub fn validate_dst(cfg: &SshrackConfig, dst: &str) -> Result<(), SshrackError> 
 }
 
 /// Return a new config with a fresh host appended, or `Err` on a forbidden
-/// name character. Pure: does not mutate `cfg`, does not touch the filesystem.
-/// The caller supplies the stable `id` (generated via [`new_id`]).
+/// name character or invalid `ssh_args`. Pure: does not mutate `cfg`, does not
+/// touch the filesystem. The caller supplies the stable `id` (generated via
+/// [`new_id`]).
 pub fn add_host(
     cfg: &SshrackConfig,
     id: Ulid,
     name: &str,
     host: &str,
     port: u16,
+    ssh_args: Option<String>,
     auth: Auth,
 ) -> Result<SshrackConfig, SshrackError> {
     validate_name_chars(name)?;
+    let raw = ssh_args.as_deref();
+    if let Some(raw) = raw {
+        crate::sshargs::validate(raw)?;
+    }
+    let ssh_args = crate::sshargs::normalize(raw);
     let mut next = cfg.clone();
     next.hosts.push(Host {
         id,
         name: name.into(),
         host: host.into(),
         port,
+        ssh_args,
         auth,
     });
     Ok(next)
@@ -149,6 +157,7 @@ pub fn clone_host_as(src: &Host, dst_id: Ulid, dst_name: &str) -> Host {
         name: dst_name.to_string(),
         host: src.host.clone(),
         port: src.port,
+        ssh_args: src.ssh_args.clone(),
         auth: src.auth.clone(),
     }
 }
@@ -243,6 +252,8 @@ fn ad_hoc_host(address: &str, port: u16, auth: Auth) -> Host {
         name: address.to_string(),
         host: address.to_string(),
         port,
+        // An ad-hoc target has no stored config, so it carries no ssh_args.
+        ssh_args: None,
         auth,
     }
 }
@@ -267,6 +278,8 @@ pub struct AddOptions {
     pub user: Option<String>,
     /// Inline private key path.
     pub identity: Option<PathBuf>,
+    /// Raw ssh option flags (`--ssh-args`); validated + normalized at merge.
+    pub ssh_args: Option<String>,
     /// Overwrite an existing name.
     pub force: bool,
 }
@@ -303,11 +316,16 @@ pub fn merge_fields(id: Ulid, name: &str, opts: &AddOptions) -> Result<Host, Ssh
         .host
         .clone()
         .ok_or(SshrackError::MissingRequiredField { field: "host" })?;
+    let raw = opts.ssh_args.as_deref();
+    if let Some(raw) = raw {
+        crate::sshargs::validate(raw)?;
+    }
     Ok(Host {
         id,
         name: name.into(),
         host: host_addr,
         port: opts.port.unwrap_or(DEFAULT_PORT),
+        ssh_args: crate::sshargs::normalize(raw),
         auth: build_auth(opts),
     })
 }
@@ -328,6 +346,10 @@ pub struct EditOptions {
     pub rename: Option<String>,
     pub clear_identity: bool,
     pub clear_password: bool,
+    /// New raw ssh flags (`--ssh-args`); replaces the existing value.
+    pub ssh_args: Option<String>,
+    /// Drop the host's raw ssh flags (`--clear-ssh-args`).
+    pub clear_ssh_args: bool,
     /// Drop any credential reference, falling back to inline default user.
     pub clear_credential: bool,
 }
@@ -346,6 +368,17 @@ pub fn apply_patch(orig: &Host, opts: &EditOptions) -> Result<Host, SshrackError
     let name = opts.rename.clone().unwrap_or_else(|| orig.name.clone());
     let host = opts.host.clone().unwrap_or_else(|| orig.host.clone());
     let port = opts.port.unwrap_or(orig.port);
+    let ssh_args = if opts.clear_ssh_args {
+        None
+    } else {
+        match opts.ssh_args.as_deref() {
+            Some(raw) => {
+                crate::sshargs::validate(raw)?;
+                crate::sshargs::normalize(Some(raw))
+            }
+            None => orig.ssh_args.clone(),
+        }
+    };
 
     let auth = if let Some(cred) = opts.credential {
         Auth::reference(cred)
@@ -367,6 +400,7 @@ pub fn apply_patch(orig: &Host, opts: &EditOptions) -> Result<Host, SshrackError
         name,
         host,
         port,
+        ssh_args,
         auth,
     })
 }
@@ -412,12 +446,22 @@ fn patch_body(body: &CredentialBody, opts: &EditOptions) -> Result<CredentialBod
 /// `edit.rs` did this via `new_body.retain_id(orig_body)`; with the id now on
 /// the host (not the body), the equivalent is to stamp the original id onto the
 /// freshly prompted host. Returns a [`Host`] with `orig_id` and the new fields.
-pub fn finalize_body(orig_id: Ulid, name: &str, host: &str, port: u16, auth: Auth) -> Host {
+/// `ssh_args` is stored verbatim — the caller validated it (the interactive
+/// path re-validates nothing here).
+pub fn finalize_body(
+    orig_id: Ulid,
+    name: &str,
+    host: &str,
+    port: u16,
+    ssh_args: Option<String>,
+    auth: Auth,
+) -> Host {
     Host {
         id: orig_id,
         name: name.into(),
         host: host.into(),
         port,
+        ssh_args,
         auth,
     }
 }
@@ -431,8 +475,10 @@ pub fn edit_has_any_flag(opts: &EditOptions) -> bool {
         || opts.user.is_some()
         || opts.identity.is_some()
         || opts.rename.is_some()
+        || opts.ssh_args.is_some()
         || opts.clear_identity
         || opts.clear_password
+        || opts.clear_ssh_args
         || opts.clear_credential
 }
 
@@ -537,6 +583,7 @@ mod tests {
                 name: name.into(),
                 host: "h".into(),
                 port: 22,
+                ssh_args: None,
                 auth: Auth::inline(CredentialBody::new("u")),
             }],
             ..Default::default()
@@ -552,6 +599,7 @@ mod tests {
                     name: n.into(),
                     host: "h".into(),
                     port: 22,
+                    ssh_args: None,
                     auth: Auth::inline(CredentialBody::new("u")),
                 })
                 .collect(),
@@ -572,6 +620,7 @@ mod tests {
             name: name.into(),
             host: format!("{name}.example.com"),
             port: 2222,
+            ssh_args: None,
             auth: Auth::inline(body),
         }
     }
@@ -661,6 +710,7 @@ mod tests {
             "web1",
             "10.0.0.5",
             2222,
+            None,
             Auth::inline(CredentialBody::new("deploy")),
         )
         .unwrap();
@@ -682,6 +732,7 @@ mod tests {
             "a:b",
             "h",
             22,
+            None,
             Auth::inline(CredentialBody::new("u")),
         )
         .unwrap_err();
@@ -726,6 +777,7 @@ mod tests {
                 name: "web1".into(),
                 host: "h".into(),
                 port: 22,
+                ssh_args: None,
                 auth: Auth::inline(CredentialBody::new("u")),
             }],
             credentials: vec![crate::config::schema::Credential {
@@ -778,6 +830,7 @@ mod tests {
             name: "web1".into(),
             host: "10.0.0.5".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::reference(cid),
         };
         let cloned = clone_host_as(&src, new_id(), "web2");
@@ -1044,6 +1097,7 @@ mod tests {
             name: "web1".into(),
             host: "10.0.0.5".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::reference(old_cid),
         };
         let new_cid = new_id();
@@ -1089,6 +1143,7 @@ mod tests {
             name: "web1".into(),
             host: "10.0.0.5".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::inline(CredentialBody {
                 user: "deploy".into(),
                 password: None,
@@ -1114,6 +1169,7 @@ mod tests {
             name: "web1".into(),
             host: "10.0.0.5".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::inline(CredentialBody {
                 user: "deploy".into(),
                 password: None,
@@ -1153,6 +1209,7 @@ mod tests {
             name: "web1".into(),
             host: "10.0.0.5".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::inline(CredentialBody {
                 user: "deploy".into(),
                 password: None,
@@ -1189,6 +1246,7 @@ mod tests {
             name: "web1".into(),
             host: "10.0.0.5".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::inline(CredentialBody {
                 user: "deploy".into(),
                 password: None,
@@ -1226,6 +1284,7 @@ mod tests {
             name: "web1".into(),
             host: "10.0.0.5".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::inline(CredentialBody {
                 user: "deploy".into(),
                 password: None,
@@ -1260,6 +1319,7 @@ mod tests {
             name: "web1".into(),
             host: "10.0.0.5".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::inline(CredentialBody {
                 user: "deploy".into(),
                 password: None,
@@ -1284,6 +1344,7 @@ mod tests {
             "web1",
             "10.0.0.5",
             2222,
+            None,
             Auth::inline(CredentialBody::new("deploy")),
         );
         assert_eq!(h.id, id);
@@ -1303,6 +1364,149 @@ mod tests {
         }));
     }
 
+    // ---- ssh_args: store-time validation, patch semantics, propagation ----
+
+    #[test]
+    fn add_host_stores_normalized_ssh_args() {
+        let cfg = SshrackConfig::default();
+        let next = add_host(
+            &cfg,
+            crate::id::new_id(),
+            "web1",
+            "10.0.0.4",
+            22,
+            Some("  -o ServerAliveInterval=30  ".into()),
+            Auth::inline(CredentialBody::new("deploy")),
+        )
+        .unwrap_or_else(|e| panic!("invariant: valid add: {e}"));
+        assert_eq!(
+            next.hosts[0].ssh_args.as_deref(),
+            Some("-o ServerAliveInterval=30")
+        );
+    }
+
+    #[test]
+    fn add_host_rejects_control_characters_in_ssh_args() {
+        let cfg = SshrackConfig::default();
+        let err = add_host(
+            &cfg,
+            crate::id::new_id(),
+            "web1",
+            "10.0.0.4",
+            22,
+            Some("-o X=1\nrm -rf".into()),
+            Auth::inline(CredentialBody::new("deploy")),
+        )
+        .unwrap_err();
+        assert!(matches!(err, SshrackError::InvalidSshArgs { .. }));
+    }
+
+    #[test]
+    fn apply_patch_patches_and_clears_ssh_args() {
+        let orig = Host {
+            id: crate::id::new_id(),
+            name: "web1".into(),
+            host: "10.0.0.4".into(),
+            port: 22,
+            ssh_args: Some("-o ServerAliveInterval=30".into()),
+            auth: Auth::inline(CredentialBody::new("deploy")),
+        };
+        // Unrelated patch preserves ssh_args.
+        let kept = apply_patch(
+            &orig,
+            &EditOptions {
+                port: Some(2222),
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("invariant: valid patch: {e}"));
+        assert_eq!(kept.ssh_args.as_deref(), Some("-o ServerAliveInterval=30"));
+
+        // --ssh-args replaces.
+        let patched = apply_patch(
+            &orig,
+            &EditOptions {
+                ssh_args: Some("-X".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("invariant: valid patch: {e}"));
+        assert_eq!(patched.ssh_args.as_deref(), Some("-X"));
+
+        // --clear-ssh-args drops.
+        let cleared = apply_patch(
+            &orig,
+            &EditOptions {
+                clear_ssh_args: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("invariant: valid patch: {e}"));
+        assert_eq!(cleared.ssh_args, None);
+    }
+
+    #[test]
+    fn apply_patch_rejects_invalid_ssh_args() {
+        let orig = Host {
+            id: crate::id::new_id(),
+            name: "web1".into(),
+            host: "10.0.0.4".into(),
+            port: 22,
+            ssh_args: None,
+            auth: Auth::inline(CredentialBody::new("deploy")),
+        };
+        let err = apply_patch(
+            &orig,
+            &EditOptions {
+                ssh_args: Some("-o \"unterminated".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, SshrackError::InvalidSshArgs { .. }));
+    }
+
+    #[test]
+    fn merge_fields_carries_ssh_args() {
+        let h = merge_fields(
+            crate::id::new_id(),
+            "web1",
+            &AddOptions {
+                host: Some("10.0.0.4".into()),
+                ssh_args: Some("-o ServerAliveInterval=30".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("invariant: valid merge: {e}"));
+        assert_eq!(h.ssh_args.as_deref(), Some("-o ServerAliveInterval=30"));
+    }
+
+    #[test]
+    fn clone_host_as_copies_ssh_args() {
+        let src = Host {
+            id: crate::id::new_id(),
+            name: "web1".into(),
+            host: "10.0.0.4".into(),
+            port: 22,
+            ssh_args: Some("-o ServerAliveInterval=30".into()),
+            auth: Auth::inline(CredentialBody::new("deploy")),
+        };
+        let copy = clone_host_as(&src, crate::id::new_id(), "web1-copy");
+        assert_eq!(copy.ssh_args, src.ssh_args);
+    }
+
+    #[test]
+    fn edit_has_any_flag_counts_ssh_args_flags() {
+        assert!(edit_has_any_flag(&EditOptions {
+            ssh_args: Some("-X".into()),
+            ..Default::default()
+        }));
+        assert!(edit_has_any_flag(&EditOptions {
+            clear_ssh_args: true,
+            ..Default::default()
+        }));
+    }
+
     // --- delete_host_with_secret / copy_keyring_entry ---
 
     #[test]
@@ -1316,6 +1520,7 @@ mod tests {
                 name: "kr-rm".into(),
                 host: "10.0.0.99".into(),
                 port: 22,
+                ssh_args: None,
                 auth: Auth::inline(CredentialBody {
                     user: "root".into(),
                     password: None,
@@ -1370,6 +1575,7 @@ mod tests {
                 name: "kr-overwrite".into(),
                 host: "10.0.0.99".into(),
                 port: 22,
+                ssh_args: None,
                 auth: Auth::inline(CredentialBody {
                     user: "root".into(),
                     password: None,
@@ -1432,6 +1638,7 @@ mod tests {
             name: "web1".into(),
             host: "h".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::inline(CredentialBody {
                 user: "root".into(),
                 password: None,
@@ -1469,6 +1676,7 @@ mod tests {
             name: "web1".into(),
             host: "h".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::inline(CredentialBody {
                 user: "root".into(),
                 password: None,
@@ -1490,6 +1698,7 @@ mod tests {
             name: "web1".into(),
             host: "h".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::reference(cid),
         };
         let dst = clone_host_as(&src, new_id(), "web2");
@@ -1508,6 +1717,7 @@ mod tests {
             name: name.into(),
             host: "h".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::inline(CredentialBody {
                 user: "root".into(),
                 password: None,
@@ -1581,6 +1791,7 @@ mod tests {
                 name: "vault-ik".into(),
                 host: "h".into(),
                 port: 22,
+                ssh_args: None,
                 auth: Auth::inline(CredentialBody {
                     user: "root".into(),
                     password: None,
@@ -1724,6 +1935,7 @@ mod tests {
             name: "src".into(),
             host: "h".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::inline(CredentialBody {
                 user: "root".into(),
                 password: None,
@@ -1759,6 +1971,7 @@ mod tests {
             name: "pw-src".into(),
             host: "h".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::inline(CredentialBody {
                 user: "root".into(),
                 password: None,
@@ -1814,6 +2027,7 @@ mod tests {
             name: "web1".into(),
             host: "10.0.0.5".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::reference(cid),
         };
         let opts = EditOptions {
@@ -2031,6 +2245,7 @@ mod tests {
             name: "web1".into(),
             host: "h".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::inline(CredentialBody {
                 user: "root".into(),
                 password: None,

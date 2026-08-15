@@ -33,6 +33,7 @@ fn ref_by_id_survives_credential_name_rename_across_disk() {
             name: "web1".into(),
             host: "10.0.0.5".into(),
             port: 2222,
+            ssh_args: None,
             auth: Auth::reference(cred_id),
         }],
         credentials: vec![Credential {
@@ -100,6 +101,7 @@ fn ref_by_id_dangles_when_credential_deleted_across_disk() {
             name: "web1".into(),
             host: "10.0.0.5".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::reference(cred_id),
         }],
         credentials: vec![Credential {

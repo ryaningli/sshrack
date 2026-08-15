@@ -200,6 +200,7 @@ mod tests {
             name: "web1".into(),
             host: "192.168.1.10".into(),
             port: 2222,
+            ssh_args: None,
             auth: Auth::inline(CredentialBody::new("deploy").with_key("~/.ssh/id_ed25519")),
         }
     }
@@ -335,6 +336,21 @@ mod tests {
         assert!(argv.contains(&"-N".to_string()));
         assert!(argv.contains(&"ControlMaster=yes".to_string()));
         assert_eq!(argv.last(), Some(&"192.168.1.10".to_string()));
+    }
+
+    #[test]
+    fn master_argv_carries_host_ssh_args() {
+        let h = Host {
+            ssh_args: Some("-o ServerAliveInterval=60".into()),
+            ..host()
+        };
+        let argv = master_argv(
+            &resolved(),
+            &h,
+            &Overrides::default(),
+            Path::new("/tmp/m.sock"),
+        );
+        assert!(argv.contains(&"ServerAliveInterval=60".to_string()));
     }
 
     #[test]

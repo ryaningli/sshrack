@@ -245,6 +245,13 @@ pub enum HostAction {
         /// SSH port (defaults to `22`).
         #[arg(long)]
         port: Option<u16>,
+        /// Raw ssh option flags stored on this host and appended to every
+        /// ssh/sftp connection (shell-split; quotes survive), e.g.
+        /// `--ssh-args "-o ServerAliveInterval=30 -X"`. Applied after
+        /// sshrack's own options, so `-o Key=Value` entries override its
+        /// defaults; scp receives only the `-o …` subset.
+        #[arg(long = "ssh-args", value_name = "SSH_ARGS", allow_hyphen_values = true)]
+        ssh_args: Option<String>,
         /// Path to a private key for independent auth. Ignored when
         /// `--credential` is set.
         #[arg(long)]
@@ -322,6 +329,16 @@ pub enum HostAction {
         /// New SSH port.
         #[arg(long)]
         port: Option<u16>,
+        /// Raw ssh option flags stored on this host and appended to every
+        /// ssh/sftp connection (shell-split; quotes survive), e.g.
+        /// `--ssh-args "-o ServerAliveInterval=30 -X"`. Applied after
+        /// sshrack's own options, so `-o Key=Value` entries override its
+        /// defaults; scp receives only the `-o …` subset.
+        #[arg(long = "ssh-args", value_name = "SSH_ARGS", allow_hyphen_values = true)]
+        ssh_args: Option<String>,
+        /// Remove the stored raw ssh flags. Mutually exclusive with `--ssh-args`.
+        #[arg(long, conflicts_with = "ssh_args")]
+        clear_ssh_args: bool,
         /// New identity file path (Independent hosts only).
         #[arg(long)]
         identity: Option<PathBuf>,
@@ -711,6 +728,26 @@ mod tests {
             "--identity",
             "/p",
             "--certificate-stdin",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    // `--ssh-args X --clear-ssh-args` on `host edit` would silently drop X
+    // (core's apply_patch treats clear as winning). clap rejects the combo at
+    // parse time so the user gets a clear conflict error instead, mirroring
+    // the `--clear-identity` precedent.
+
+    #[test]
+    fn host_edit_rejects_ssh_args_with_clear_ssh_args() {
+        let err = Cli::try_parse_from([
+            "sshrack",
+            "host",
+            "edit",
+            "somename",
+            "--ssh-args",
+            "-o ServerAliveInterval=30",
+            "--clear-ssh-args",
         ])
         .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ArgumentConflict);

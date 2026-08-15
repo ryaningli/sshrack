@@ -44,6 +44,7 @@ pub fn run(cli: &Cli, action: &HostAction) -> i32 {
             host,
             user,
             port,
+            ssh_args,
             identity,
             identity_stdin,
             identity_file,
@@ -57,6 +58,7 @@ pub fn run(cli: &Cli, action: &HostAction) -> i32 {
             host.as_deref(),
             user.as_deref(),
             *port,
+            ssh_args.as_deref(),
             identity.as_deref(),
             *identity_stdin,
             identity_file.as_deref(),
@@ -72,6 +74,8 @@ pub fn run(cli: &Cli, action: &HostAction) -> i32 {
             host,
             user,
             port,
+            ssh_args,
+            clear_ssh_args,
             identity,
             identity_stdin,
             identity_file,
@@ -88,6 +92,8 @@ pub fn run(cli: &Cli, action: &HostAction) -> i32 {
             host.as_deref(),
             user.as_deref(),
             *port,
+            ssh_args.as_deref(),
+            *clear_ssh_args,
             identity.as_deref(),
             *identity_stdin,
             identity_file.as_deref(),
@@ -115,6 +121,7 @@ fn add(
     host_addr: Option<&str>,
     user: Option<&str>,
     port: Option<u16>,
+    ssh_args: Option<&str>,
     identity: Option<&std::path::Path>,
     identity_stdin: bool,
     identity_file: Option<&std::path::Path>,
@@ -135,6 +142,11 @@ fn add(
         Err(ret) => return ret,
     };
     if let Err(e) = host::validate_name_chars(&name) {
+        return fail(&format!("sshrack: {e}"), exit_code::VALIDATION);
+    }
+    if let Some(raw) = ssh_args
+        && let Err(e) = sshrack_core::sshargs::validate(raw)
+    {
         return fail(&format!("sshrack: {e}"), exit_code::VALIDATION);
     }
     if let Err(e) = host::validate_no_duplicate(&cfg, &name, force) {
@@ -205,6 +217,7 @@ fn add(
             name: name.clone(),
             host: host_addr_owned.clone(),
             port: port.unwrap_or(22),
+            ssh_args: sshrack_core::sshargs::normalize(ssh_args),
             auth: Auth::inline(sealed_body),
         }
     } else {
@@ -214,6 +227,7 @@ fn add(
             credential: cred_ulid,
             user: user.map(Into::into),
             identity: identity.map(std::path::PathBuf::from),
+            ssh_args: ssh_args.map(Into::into),
             force,
         };
         match host::merge_fields(host_id, &name, &opts) {
@@ -247,6 +261,7 @@ fn add(
             &name,
             &new_host.host,
             new_host.port,
+            ssh_args.map(Into::into),
             new_host.auth.clone(),
         ) {
             Ok(next) => next,
@@ -361,6 +376,8 @@ fn edit(
     host_addr: Option<&str>,
     user: Option<&str>,
     port: Option<u16>,
+    ssh_args: Option<&str>,
+    clear_ssh_args: bool,
     identity: Option<&std::path::Path>,
     identity_stdin: bool,
     identity_file: Option<&std::path::Path>,
@@ -392,10 +409,17 @@ fn edit(
     {
         return fail(&format!("sshrack: {e}"), exit_code::DUPLICATE);
     }
+    if let Some(raw) = ssh_args
+        && let Err(e) = sshrack_core::sshargs::validate(raw)
+    {
+        return fail(&format!("sshrack: {e}"), exit_code::VALIDATION);
+    }
 
     let has_any_flag = host_addr.is_some()
         || port.is_some()
         || user.is_some()
+        || ssh_args.is_some()
+        || clear_ssh_args
         || identity.is_some()
         || identity_stdin
         || identity_file.is_some()
@@ -466,6 +490,14 @@ fn edit(
         if let Some(new_port) = port {
             h.port = new_port;
         }
+        h.ssh_args = if clear_ssh_args {
+            None
+        } else {
+            match ssh_args {
+                Some(raw) => sshrack_core::sshargs::normalize(Some(raw)),
+                None => orig.ssh_args.clone(),
+            }
+        };
         h
     } else {
         let opts = host::EditOptions {
@@ -475,8 +507,10 @@ fn edit(
             user: user.map(Into::into),
             identity: identity.map(std::path::PathBuf::from),
             rename: rename.map(Into::into),
+            ssh_args: ssh_args.map(Into::into),
             clear_identity,
             clear_password,
+            clear_ssh_args,
             clear_credential,
         };
         match host::apply_patch(&orig, &opts) {
@@ -761,6 +795,9 @@ fn format_detail(
     out.push_str(&format!("id:       {}\n", host.id));
     out.push_str(&format!("host:     {}\n", host.host));
     out.push_str(&format!("port:     {}\n", host.port));
+    if let Some(args) = &host.ssh_args {
+        out.push_str(&format!("ssh-args: {args}\n"));
+    }
     match &host.auth {
         Auth::Ref { credential } => match cfg.find_credential_by_id(credential) {
             Some(c) => {
@@ -841,6 +878,7 @@ mod tests {
             name: "web1".into(),
             host: "10.0.0.5".into(),
             port: 2222,
+            ssh_args: None,
             auth: Auth::Inline(CredentialBody::new("deploy").with_password("hunter2")),
         }
     }
@@ -895,6 +933,7 @@ mod tests {
             name: "db1".into(),
             host: "db.internal".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::reference(cred_id),
         };
         assert_eq!(cell("user", &h, &cfg), "deploy");
@@ -980,6 +1019,7 @@ mod tests {
             name: "db1".into(),
             host: "db".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::reference(cred_id),
         };
         assert_eq!(credential_name_for_host(&cfg, &host), Some("team-dev"));
@@ -993,6 +1033,7 @@ mod tests {
             name: "orphan".into(),
             host: "db".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::reference(Ulid::new()),
         };
         assert_eq!(credential_name_for_host(&cfg, &host), None);
@@ -1015,6 +1056,7 @@ mod tests {
             name: "db1".into(),
             host: "db.internal".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::reference(cred_id),
         };
         let out = format_detail(&cfg, &host, Some("team-dev"), &RevealedPassword::Masked);
@@ -1042,6 +1084,7 @@ mod tests {
             name: "orphan".into(),
             host: "h".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::reference(dangling_id),
         };
         // cred_name None → the ulid string is used in the auth line.
@@ -1054,6 +1097,36 @@ mod tests {
             out.contains(&dangling_id.to_string()),
             "expected the ulid in the auth line, got: {out}"
         );
+    }
+
+    #[test]
+    fn format_detail_includes_ssh_args_line_when_present() {
+        let cfg = SshrackConfig::default();
+        let host = Host {
+            id: Ulid::new(),
+            name: "web1".into(),
+            host: "10.0.0.4".into(),
+            port: 22,
+            ssh_args: Some("-o ServerAliveInterval=30".into()),
+            auth: Auth::inline(CredentialBody::new("deploy")),
+        };
+        let out = format_detail(&cfg, &host, None, &RevealedPassword::None);
+        assert!(out.contains("ssh-args: -o ServerAliveInterval=30\n"));
+    }
+
+    #[test]
+    fn format_detail_omits_ssh_args_line_when_absent() {
+        let cfg = SshrackConfig::default();
+        let host = Host {
+            id: Ulid::new(),
+            name: "web1".into(),
+            host: "10.0.0.4".into(),
+            port: 22,
+            ssh_args: None,
+            auth: Auth::inline(CredentialBody::new("deploy")),
+        };
+        let out = format_detail(&cfg, &host, None, &RevealedPassword::None);
+        assert!(!out.contains("ssh-args"));
     }
 
     #[test]

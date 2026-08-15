@@ -72,6 +72,14 @@ pub fn connect_opts(resolved: &ResolvedAuth, host: &Host, overrides: &Overrides)
         opts.push("PasswordAuthentication=no".into());
     }
 
+    // Host-level raw ssh flags, appended AFTER sshrack's own options above:
+    // ssh applies the last `-o` for a repeated key, so a user's
+    // `-o IdentitiesOnly=no` deliberately overrides the default. Invalid
+    // input (hand-edited config) is dropped with a warning by `tokens`.
+    if let Some(raw) = &host.ssh_args {
+        opts.extend(crate::sshargs::tokens(raw));
+    }
+
     opts
 }
 
@@ -79,7 +87,9 @@ pub fn connect_opts(resolved: &ResolvedAuth, host: &Host, overrides: &Overrides)
 ///
 /// `resolved` supplies the auth identity (user, key, password — password is
 /// consumed by the caller via `connect::launch`, not here). `host` supplies the
-/// network endpoint (`host`, `port`). Overrides win over both.
+/// network endpoint (`host`, `port`). Overrides win over both. The host's
+/// `ssh_args` flags land at the end of the option block (via
+/// [`connect_opts`]), before the destination.
 pub fn build(
     resolved: &ResolvedAuth,
     host: &Host,
@@ -106,6 +116,7 @@ mod tests {
             name: "web1".into(),
             host: "192.168.1.10".into(),
             port: 2222,
+            ssh_args: None,
             auth: Auth::inline(CredentialBody::new("deploy").with_key("~/.ssh/id_ed25519")),
         }
     }
@@ -262,6 +273,38 @@ mod tests {
         let opts = connect_opts(&r, &host(), &Overrides::default());
         assert!(!opts.iter().any(|a| a == "PasswordAuthentication=no"));
         assert!(!opts.iter().any(|a| a == "IdentitiesOnly=yes"));
+    }
+
+    #[test]
+    fn connect_opts_appends_ssh_args_after_sshrack_options() {
+        let h = Host {
+            ssh_args: Some("-o ServerAliveInterval=30 -o IdentitiesOnly=no".into()),
+            ..host()
+        };
+        let opts = connect_opts(&resolved(), &h, &Overrides::default());
+        let ident_idx = opts
+            .iter()
+            .position(|a| a == "IdentitiesOnly=yes")
+            .expect("invariant: key-only fixture appends IdentitiesOnly");
+        let alive_idx = opts
+            .iter()
+            .position(|a| a == "ServerAliveInterval=30")
+            .expect("invariant: ssh_args appended");
+        // User args come AFTER sshrack's own -o pair so repeated keys override.
+        assert!(alive_idx > ident_idx);
+        // ssh's last-wins rule makes the user's override meaningful:
+        assert!(opts.contains(&"IdentitiesOnly=no".to_string()));
+    }
+
+    #[test]
+    fn build_keeps_destination_last_with_ssh_args() {
+        let h = Host {
+            ssh_args: Some("-X".into()),
+            ..host()
+        };
+        let argv = build(&resolved(), &h, &Overrides::default(), &[]);
+        assert_eq!(argv.last(), Some(&"192.168.1.10".to_string()));
+        assert!(argv.contains(&"-X".to_string()));
     }
 
     #[test]

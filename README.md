@@ -58,6 +58,7 @@ sshrack scp ./app.tar web1:/tmp/         # scripted file transfer
 sshrack sftp web1                        # dual-pane transfer screen
 
 sshrack host add web1 --host 10.0.0.4 --user deploy --identity ~/.ssh/id_ed25519
+sshrack host add web1 --host 10.0.0.4 --user deploy --ssh-args "-o ServerAliveInterval=30"
 sshrack host ls --sort frecency          # list hosts, frecency-ordered
 sshrack cred add deploy --user deploy --identity ~/.ssh/id_ed25519
 sshrack --format json host ls            # JSON output for scripts

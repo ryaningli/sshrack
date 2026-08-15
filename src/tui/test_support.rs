@@ -25,6 +25,7 @@ pub(crate) fn app_with_host(name: &str) -> App {
         name: name.into(),
         host: "h".into(),
         port: 22,
+        ssh_args: None,
         auth: Auth::inline(CredentialBody::new("u")),
     };
     let cfg = SshrackConfig {

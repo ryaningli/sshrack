@@ -570,6 +570,7 @@ mod tests {
             name: name.into(),
             host: "h".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::inline(CredentialBody::new("u")),
         }
     }
@@ -595,6 +596,7 @@ mod tests {
             name: "h".into(),
             host: "h".into(),
             port: 22,
+            ssh_args: None,
             auth,
         }
     }
@@ -606,6 +608,7 @@ mod tests {
             name: name.into(),
             host: host.into(),
             port,
+            ssh_args: None,
             auth: Auth::reference(cred.id),
         }
     }
@@ -1300,6 +1303,7 @@ mod tests {
                 name: "web-prod".into(),
                 host: "10.0.0.1".into(),
                 port: 22,
+                ssh_args: None,
                 auth: Auth::inline(CredentialBody::new("deploy")),
             },
             Host {
@@ -1307,6 +1311,7 @@ mod tests {
                 name: "db-staging".into(),
                 host: "10.0.0.2".into(),
                 port: 22,
+                ssh_args: None,
                 auth: Auth::inline(CredentialBody::new("root")),
             },
         ];

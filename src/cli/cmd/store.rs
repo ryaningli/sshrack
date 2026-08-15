@@ -708,6 +708,7 @@ mod tests {
             name: "plain-host".into(),
             host: "h".into(),
             port: 22,
+            ssh_args: None,
             auth: sshrack_core::config::schema::Auth::Inline(CredentialBody {
                 user: "u".into(),
                 password: Some(Secret::Plain("p".into())),
@@ -720,6 +721,7 @@ mod tests {
             name: "kr-host".into(),
             host: "k".into(),
             port: 22,
+            ssh_args: None,
             auth: sshrack_core::config::schema::Auth::Inline(CredentialBody {
                 user: "u".into(),
                 password: None,

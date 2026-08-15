@@ -191,6 +191,7 @@ fn key_only_host() -> Host {
         name: "test-host".into(),
         host: "sftp-shim.invalid".into(),
         port: 2222,
+        ssh_args: None,
         auth: Auth::inline(CredentialBody::new("deploy")),
     }
 }
@@ -838,6 +839,7 @@ fn sftp_worker_async_host_key_unknown_host() {
         name: "host-key-e2e".into(),
         host: host.clone(),
         port,
+        ssh_args: None,
         auth: Auth::inline(CredentialBody::new(user.clone())),
     };
     let resolved = ResolvedAuth {

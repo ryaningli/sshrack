@@ -53,6 +53,9 @@ pub enum SshrackError {
     #[error("name '{name}' must not contain {ch:?}")]
     InvalidNameChar { name: String, ch: char },
 
+    #[error("invalid ssh args: {reason}")]
+    InvalidSshArgs { reason: String },
+
     #[error("host name already exists: {name} (use --force to overwrite)")]
     HostAlreadyExists { name: String },
 

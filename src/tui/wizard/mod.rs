@@ -123,6 +123,13 @@ pub enum Field {
     InlineCert,
     Identity,
     Password,
+    /// Raw ssh option flags for this host (free text; validated at save).
+    /// Reachable under every auth mode — it describes the machine's
+    /// network/compat, not identity. Ordered LAST: it is an advanced
+    /// escape-hatch field most hosts leave empty, so the common path
+    /// (Name → Host → Port → Auth …) stays contiguous and `Enter` on the
+    /// final row saves.
+    SshArgs,
 }
 
 impl Field {
@@ -130,7 +137,9 @@ impl Field {
     /// rows it gates so the Independent form reads top-down: pick the kind,
     /// then the source, then fill the slot it exposes. The slot rows are
     /// filtered at navigation time by [`HostForm::reachable_fields`] according
-    /// to the (auth, secret, source) matrix.
+    /// to the (auth, secret, source) matrix. `SshArgs` is deliberately last:
+    /// an advanced escape-hatch row most hosts leave empty, kept out of the
+    /// common path so `Enter` on the final reachable row saves.
     const ORDER: &'static [Field] = &[
         Field::Name,
         Field::Host,
@@ -144,6 +153,7 @@ impl Field {
         Field::InlinePrivate,
         Field::InlineCert,
         Field::Password,
+        Field::SshArgs,
     ];
 
     /// Human label shown in the form. Capitalized so the add/edit forms read
@@ -153,6 +163,7 @@ impl Field {
             Field::Name => "Name",
             Field::Host => "Host",
             Field::Port => "Port",
+            Field::SshArgs => "SSH args",
             Field::User => "User",
             Field::Auth => "Auth",
             Field::Credential => "Credential",
@@ -179,6 +190,9 @@ pub enum SaveError {
     InvalidName,
     /// Host address is empty / whitespace-only.
     MissingHost,
+    /// ssh_args failed core validation (control char / unterminated quote /
+    /// empty token).
+    InvalidSshArgs,
 }
 
 impl SaveError {
@@ -187,6 +201,7 @@ impl SaveError {
         match self {
             SaveError::MissingName | SaveError::InvalidName => Field::Name,
             SaveError::MissingHost => Field::Host,
+            SaveError::InvalidSshArgs => Field::SshArgs,
         }
     }
 
@@ -196,6 +211,9 @@ impl SaveError {
             SaveError::MissingName => "name is required",
             SaveError::InvalidName => "name contains a forbidden character (:, @, or whitespace)",
             SaveError::MissingHost => "host is required",
+            SaveError::InvalidSshArgs => {
+                "ssh args are invalid (control character, unterminated quote, or empty argument)"
+            }
         }
     }
 }
@@ -212,6 +230,9 @@ pub fn validate(form: &HostForm) -> Result<(), SaveError> {
     }
     if form.host_addr.trim().is_empty() {
         return Err(SaveError::MissingHost);
+    }
+    if sshrack_core::sshargs::validate(&form.ssh_args).is_err() {
+        return Err(SaveError::InvalidSshArgs);
     }
     Ok(())
 }
@@ -744,6 +765,7 @@ mod tests {
         assert_eq!(Field::Name.label(), "Name");
         assert_eq!(Field::Host.label(), "Host");
         assert_eq!(Field::Port.label(), "Port");
+        assert_eq!(Field::SshArgs.label(), "SSH args");
         assert_eq!(Field::User.label(), "User");
         assert_eq!(Field::Auth.label(), "Auth");
         assert_eq!(Field::Credential.label(), "Credential");

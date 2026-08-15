@@ -26,6 +26,7 @@ getrandom = "0.4.3"
 base64 = "0.22.1"
 tracing = "0.1"
 strsim = "0.11.1"
+shlex = "1"
 
 # v4 unified the platform stores under the default `v1` feature set
 # (apple-native-keychain on macOS, zbus-secret-service on Linux), so the
