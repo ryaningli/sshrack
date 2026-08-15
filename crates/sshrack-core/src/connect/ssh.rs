@@ -15,13 +15,11 @@ pub struct Overrides {
     pub port: Option<u16>,
     pub identity: Option<PathBuf>,
     /// `--credential <name>`: reuse a `[[credentials]]` entry for this one
-    /// connection (overlays the resolved auth). For an ad-hoc target this is
-    /// the identity source. The CLI resolves the name to the credential's
-    /// stable [`Ulid`] before constructing this; the argv builder never sees
-    /// the name.
+    /// connection (overlays the resolved auth). For an address target
+    /// (unregistered `user@host`/IP) this is the identity source. The CLI
+    /// resolves the name to the credential's stable [`Ulid`] before
+    /// constructing this; the argv builder never sees the name.
     pub credential: Option<Ulid>,
-    /// `--ad-hoc`: the target is a literal address, not a config name.
-    pub ad_hoc: bool,
 }
 
 /// The ssh connection options shared by the interactive `ssh` argv and the

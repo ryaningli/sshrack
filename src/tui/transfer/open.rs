@@ -54,8 +54,8 @@ use crate::tui::transfer::screen::TransferScreen;
 /// Side effects, in order:
 /// 1. Carry the resolved `host` + `user_override` — the caller (launcher
 ///    `Ctrl-T`, or the `sshrack sftp` entry) already resolved the target (a
-///    saved name OR an ad-hoc literal built by `host::resolve_target`), so
-///    there is no id→host re-lookup here. An ad-hoc host is never in the
+///    saved name OR an address literal built by `host::resolve_target`), so
+///    there is no id→host re-lookup here. An ephemeral host is never in the
 ///    config. The override carries the entry target's embedded `user@`/`-l`
 ///    (previously the sftp entry ignored `-l` entirely — fixed here);
 ///    `None` for the launcher Ctrl-T path.
@@ -90,7 +90,7 @@ pub fn open_transfer(
     let cfg: &SshrackConfig = app.config();
 
     // ── Step 1: Carry the resolved host. The caller already resolved it (saved
-    // name or ad-hoc literal), so there is no id→host lookup to redo. ─────────
+    // name or address literal), so there is no id→host lookup to redo. ─────────
     let resolved_host = host;
 
     // ── Step 2: Vault unlock (no-op unless vault mode). ──────────────────────
@@ -116,7 +116,7 @@ pub fn open_transfer(
 
     // Capture the remote pane title before `resolved_auth` / `resolved_host`
     // are moved into SftpWorker::spawn below. Prefer the host's friendly name;
-    // fall back to "<user>@<host>" for an unnamed (e.g. ad-hoc) host.
+    // fall back to "<user>@<host>" for an unnamed (e.g. ephemeral) host.
     let remote_title = remote_title(
         &resolved_host.name,
         &resolved_auth.user,
@@ -195,7 +195,7 @@ pub fn open_transfer(
 
 /// Build the remote pane's title: prefer the host's friendly `name`; fall back
 /// to `<user>@<host>` when there is no real name. A saved host carries a name
-/// distinct from its address; an ad-hoc host (built by `host::resolve_target`'s
+/// distinct from its address; an ephemeral host (built by `host::resolve_target`'s
 /// `address_host`) has `name == address` — no real name — so it shows
 /// `<user>@<host>` to surface the login identity. Pure.
 fn remote_title(name: &str, user: &str, host: &str) -> String {
@@ -244,15 +244,16 @@ mod tests {
 
     #[test]
     fn remote_title_falls_back_to_user_at_host_when_unnamed() {
-        // An ad-hoc / unnamed host falls back to <user>@<host> so the title is
-        // never empty.
+        // An ephemeral / unnamed host falls back to <user>@<host> so the title
+        // is never empty.
         assert_eq!(remote_title("", "ryan", "10.0.0.4"), "ryan@10.0.0.4");
     }
 
     #[test]
-    fn remote_title_shows_user_at_host_for_an_ad_hoc_address_name() {
-        // An ad-hoc host built by host::resolve_target carries name == address;
-        // the title surfaces the login user (user@ip), not the bare address.
+    fn remote_title_shows_user_at_host_for_an_ephemeral_address_name() {
+        // An ephemeral host built by host::resolve_target carries name ==
+        // address; the title surfaces the login user (user@ip), not the bare
+        // address.
         assert_eq!(
             remote_title("192.168.20.18", "yushi", "192.168.20.18"),
             "yushi@192.168.20.18"

@@ -169,9 +169,6 @@ pub fn clone_host_as(src: &Host, dst_id: Ulid, dst_name: &str) -> Host {
 /// before constructing this), matching [`crate::connect::ssh::Overrides::credential`].
 #[derive(Debug, Clone, Copy)]
 pub struct ResolveOverrides<'a> {
-    /// Legacy `--ad-hoc` flag; unread by `resolve_target` since the user@host/IP
-    /// target table landed. Removed with the CLI flag.
-    pub ad_hoc: bool,
     /// `--credential <id>`: reuse a `[[credentials]]` entry's identity.
     pub credential: Option<Ulid>,
     /// `--port <n>`: override the resolved port.
@@ -182,7 +179,7 @@ pub struct ResolveOverrides<'a> {
     pub identity: Option<&'a std::path::Path>,
 }
 
-/// ssh default port, used for ad-hoc targets that have no config entry.
+/// ssh default port, used for address (ephemeral) targets that have no config entry.
 const DEFAULT_PORT: u16 = 22;
 
 /// A connect target resolved by [`resolve_target`].
@@ -966,7 +963,6 @@ mod tests {
 
     fn ro(credential: Option<Ulid>, user: Option<&str>) -> ResolveOverrides<'_> {
         ResolveOverrides {
-            ad_hoc: true, // legacy field, unread by the new table; removed in a later task
             credential,
             port: None,
             user,
@@ -2216,7 +2212,7 @@ mod tests {
     }
 
     // ---- Task 1.3 backfill: apply_patch clear_credential, patch_body validate,
-    // validate_rename, ad_hoc_auth/build_auth/merge_fields edges, from_plain
+    // validate_rename, build_auth/merge_fields edges, from_plain
     // mutual exclusion, copy_keyring_entry I/O propagation. ----
 
     #[test]

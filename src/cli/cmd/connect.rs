@@ -44,7 +44,7 @@ use crate::shared::exit_code;
 /// Dispatch for the `Ssh`/`Connect` arms of the CLI.
 ///
 /// Merges the top-level `--port`/`--user`/`--identity`/`--credential`/
-/// `--ad-hoc`/`--accept-new` flags with any subcommand-level flags, then runs
+/// `--accept-new` flags with any subcommand-level flags, then runs
 /// the 8-step connect flow. Returns the ssh exit code, or an [`exit_code`]
 /// constant on a local error.
 pub fn run(cli: &Cli) -> i32 {
@@ -97,7 +97,6 @@ pub fn run(cli: &Cli) -> i32 {
 
     // ── Step 2: Resolve name → Host (fail-fast, no network I/O). ─────────────
     let resolve_overrides = host::ResolveOverrides {
-        ad_hoc: opts.ad_hoc,
         credential: cred_ulid,
         port: opts.port,
         user: opts.user.as_deref(),
@@ -201,7 +200,6 @@ pub fn run(cli: &Cli) -> i32 {
         port: opts.port,
         identity: opts.identity.clone(),
         credential: cred_ulid,
-        ad_hoc: opts.ad_hoc,
     };
     let argv = connect::ssh::build(
         &resolved_auth,

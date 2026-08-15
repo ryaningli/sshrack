@@ -127,7 +127,8 @@ pub enum Outcome {
     /// loop clears `App::overlay` and surfaces a default status.
     CloseOverlay,
     /// Pure intent: the user pressed `Ctrl-T` on the Hosts tab with a host
-    /// selected. `on_key` set `App::pending_transfer_host` to the selected host. The
+    /// selected. `on_key` set `App::pending_transfer_host` to the
+    /// `(selected host, None)` pair. The
     /// event loop reads the Host, runs [`crate::tui::transfer::open::open_transfer`]
     /// (which mirrors `connect_host`'s auth/hostkey steps then opens the
     /// `SftpWorker`), and assigns `App::transfer` + `App::transfer_worker`. A

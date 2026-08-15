@@ -76,7 +76,6 @@ pub fn build(
     let mut key_artifact: Option<KeyArtifact> = None;
 
     let resolve_overrides = ResolveOverrides {
-        ad_hoc: overrides.ad_hoc,
         credential: overrides.credential,
         port: overrides.port,
         user: overrides.user.as_deref(),
@@ -385,7 +384,6 @@ mod tests {
         // (and re-validates) after the network host-key check.
         let (cfg, cid) = cfg_with_password_credential();
         let o = Overrides {
-            ad_hoc: true,
             credential: Some(cid),
             ..Default::default()
         };

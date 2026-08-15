@@ -109,7 +109,6 @@ pub fn run(cli: &Cli) -> i32 {
         port: opts.port,
         identity: opts.identity.clone(),
         credential: cred_ulid,
-        ad_hoc: opts.ad_hoc,
     };
     let backend = OsKeyring;
     let plan = match connect::scp::build(args, &cfg, &overrides, vault_key.as_ref(), &backend) {
@@ -204,8 +203,8 @@ fn credential_msg(
 }
 
 /// Best-effort reverse-lookup of the host name whose `name:path` operand
-/// triggered a dangling-credential error. Returns `None` for an ad-hoc operand
-/// (no registered name) or when the operand was not in `name:path` form.
+/// triggered a dangling-credential error. Returns `None` for an address
+/// operand (no registered name) or when the operand was not in `name:path` form.
 ///
 /// Used only to improve the dangling-credential error message (Task-8
 /// follow-up); never affects control flow.
@@ -217,7 +216,7 @@ fn plan_host_name<'a>(
         let Some((left, _rest)) = arg.split_once(':') else {
             continue;
         };
-        // `user@host:path` and ad-hoc literals have no registered name.
+        // `user@host:path` and address literals have no registered name.
         if left.contains('@') {
             continue;
         }
@@ -338,7 +337,7 @@ mod tests {
 
     #[test]
     fn plan_host_name_user_at_host_is_skipped() {
-        // `user@host:path` is an ad-hoc literal, never a registered name.
+        // `user@host:path` is an address literal, never a registered name.
         let cfg = cfg_with_hosts(&["web1"]);
         assert_eq!(plan_host_name(&cfg, &args(&["user@host:/tmp"])), None);
     }

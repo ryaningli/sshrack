@@ -128,8 +128,9 @@ pub struct App {
     /// outside a transfer session.
     pub(crate) transfer_key_artifact: Option<KeyArtifact>,
     /// [`super::transfer::open::open_transfer`]. Mirrors `pending_connect`.
-    /// Holds the resolved `Host` (a saved host from the launcher, or an ad-hoc
-    /// host built at the `sshrack sftp` entry) — `open_transfer` consumes it
+    /// Holds the resolved `Host` (a saved host from the launcher, or an
+    /// ephemeral host built at the `sshrack sftp` entry) — `open_transfer`
+    /// consumes it
     /// directly, no id→host re-lookup. The host plus the effective login-user
     /// override (`user@` > `-l`; `None` for the launcher Ctrl-T path).
     pub(super) pending_transfer_host: Option<(Host, Option<String>)>,
@@ -2766,7 +2767,8 @@ mod tests {
     #[test]
     fn ctrl_t_on_hosts_with_host_signals_open_transfer() {
         // Ctrl-T on the Hosts tab with a host under the cursor sets
-        // pending_transfer_host to that host and returns OpenTransfer. on_key
+        // pending_transfer_host to that (host, None) pair and returns
+        // OpenTransfer. on_key
         // performs NO I/O — the loop runs open_transfer.
         let mut app = app_with_host("web");
         let expected_id = app.config.hosts[0].id;
