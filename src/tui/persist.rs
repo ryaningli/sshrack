@@ -102,6 +102,7 @@ pub(crate) fn persist_host_save(
     let name = form.name.trim().to_string();
     let host_addr = form.host_addr.trim().to_string();
     let port = form.parsed_port();
+    let ssh_args = form.normalized_ssh_args();
 
     // The id that will own this host (and any keyring entry). Fresh for add,
     // original for edit (so the keyring entry is not orphaned).
@@ -183,16 +184,8 @@ pub(crate) fn persist_host_save(
         if orig.name != name {
             host::validate_rename(&app.config, &orig.name, &name)?;
         }
-        let edited = host::finalize_body(
-            target_id,
-            &name,
-            &host_addr,
-            port,
-            // The wizard has no ssh-args field yet (wired later); preserve the
-            // original host's flags across an edit instead of wiping them.
-            orig.ssh_args.clone(),
-            auth,
-        );
+        let edited =
+            host::finalize_body(target_id, &name, &host_addr, port, ssh_args.clone(), auth);
         let mut next = app.config.clone();
         if let Some(slot) = next.hosts.iter_mut().find(|h| h.id == target_id) {
             *slot = edited;
@@ -204,9 +197,15 @@ pub(crate) fn persist_host_save(
         // run it here so the error surfaces before the append (add_host itself
         // only checks forbidden chars).
         host::validate_no_duplicate(&app.config, &name, false)?;
-        // The wizard has no ssh-args field yet (wired later); a fresh host
-        // starts with no flags.
-        host::add_host(&app.config, target_id, &name, &host_addr, port, None, auth)?
+        host::add_host(
+            &app.config,
+            target_id,
+            &name,
+            &host_addr,
+            port,
+            ssh_args,
+            auth,
+        )?
     };
 
     // Persist + reload (so the on-disk file is the source of truth and the
@@ -705,6 +704,76 @@ mod tests {
         assert_eq!(reloaded.hosts[0].host, "10.0.0.5");
         assert_eq!(reloaded.hosts[0].port, 2222);
         assert_eq!(reloaded.hosts[0].auth.inline_body().unwrap().user, "deploy");
+    }
+
+    #[test]
+    fn persist_host_save_add_threads_normalized_ssh_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        sshrack_core::config::store::save(&path, &SshrackConfig::default()).unwrap();
+        let cfg = sshrack_core::config::store::load(&path).unwrap();
+        let mut app = App::new(cfg, Some(path.clone()), Frecency::default(), HashMap::new());
+
+        app.open_host_wizard_add();
+        let Overlay::HostWizard(mut w) = app.overlay.take().unwrap() else {
+            unreachable!("host wizard open");
+        };
+        w.name = "web-prod".into();
+        w.host_addr = "10.0.0.5".into();
+        // Whitespace-only padding must normalize away, not persist as "  …  ".
+        w.ssh_args = "  -o ServerAliveInterval=30  ".into();
+        app.overlay = Some(Overlay::HostWizard(w));
+
+        persist_host_save(&mut app, &dead_handle(), &OsKeyring).expect("add save should succeed");
+
+        let reloaded = sshrack_core::config::store::load(&path).unwrap();
+        assert_eq!(
+            reloaded.hosts[0].ssh_args,
+            Some("-o ServerAliveInterval=30".into())
+        );
+    }
+
+    #[test]
+    fn persist_host_save_edit_updates_and_preserves_ssh_args() {
+        use ulid::Ulid;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let orig_id = Ulid::new();
+        let cfg = SshrackConfig {
+            hosts: vec![Host {
+                id: orig_id,
+                name: "web".into(),
+                host: "10.0.0.5".into(),
+                port: 22,
+                ssh_args: Some("-o ServerAliveInterval=30".into()),
+                auth: Auth::inline(CredentialBody::new("ops")),
+            }],
+            ..SshrackConfig::default()
+        };
+        sshrack_core::config::store::save(&path, &cfg).unwrap();
+        let mut app = App::new(cfg, Some(path.clone()), Frecency::default(), HashMap::new());
+
+        // Edit without touching the SSH args row: the prefilled form value
+        // preserves the original flags.
+        assert!(app.open_host_wizard_edit(orig_id));
+        persist_host_save(&mut app, &dead_handle(), &OsKeyring).expect("edit save should succeed");
+        let reloaded = sshrack_core::config::store::load(&path).unwrap();
+        assert_eq!(
+            reloaded.hosts[0].ssh_args,
+            Some("-o ServerAliveInterval=30".into())
+        );
+
+        // Edit again, this time clearing the row: whitespace-only normalizes
+        // to None (a clean config never serializes an empty field).
+        assert!(app.open_host_wizard_edit(orig_id));
+        let Overlay::HostWizard(mut w) = app.overlay.take().unwrap() else {
+            unreachable!("host wizard open");
+        };
+        w.ssh_args = "   ".into();
+        app.overlay = Some(Overlay::HostWizard(w));
+        persist_host_save(&mut app, &dead_handle(), &OsKeyring).expect("edit save should succeed");
+        let reloaded = sshrack_core::config::store::load(&path).unwrap();
+        assert_eq!(reloaded.hosts[0].ssh_args, None);
     }
 
     #[test]

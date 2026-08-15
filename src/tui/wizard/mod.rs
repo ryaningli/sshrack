@@ -99,6 +99,10 @@ pub enum Field {
     Name,
     Host,
     Port,
+    /// Raw ssh option flags for this host (free text; validated at save).
+    /// Reachable under every auth mode — it describes the machine's
+    /// network/compat, not identity.
+    SshArgs,
     User,
     Auth,
     /// Pick which `[[credentials]]` entry this host reuses (Reference branch
@@ -135,6 +139,7 @@ impl Field {
         Field::Name,
         Field::Host,
         Field::Port,
+        Field::SshArgs,
         Field::Auth,
         Field::Credential,
         Field::User,
@@ -153,6 +158,7 @@ impl Field {
             Field::Name => "Name",
             Field::Host => "Host",
             Field::Port => "Port",
+            Field::SshArgs => "SSH args",
             Field::User => "User",
             Field::Auth => "Auth",
             Field::Credential => "Credential",
@@ -179,6 +185,9 @@ pub enum SaveError {
     InvalidName,
     /// Host address is empty / whitespace-only.
     MissingHost,
+    /// ssh_args failed core validation (control char / unterminated quote /
+    /// empty token).
+    InvalidSshArgs,
 }
 
 impl SaveError {
@@ -187,6 +196,7 @@ impl SaveError {
         match self {
             SaveError::MissingName | SaveError::InvalidName => Field::Name,
             SaveError::MissingHost => Field::Host,
+            SaveError::InvalidSshArgs => Field::SshArgs,
         }
     }
 
@@ -196,6 +206,9 @@ impl SaveError {
             SaveError::MissingName => "name is required",
             SaveError::InvalidName => "name contains a forbidden character (:, @, or whitespace)",
             SaveError::MissingHost => "host is required",
+            SaveError::InvalidSshArgs => {
+                "ssh args are invalid (control character, unterminated quote, or empty argument)"
+            }
         }
     }
 }
@@ -212,6 +225,9 @@ pub fn validate(form: &HostForm) -> Result<(), SaveError> {
     }
     if form.host_addr.trim().is_empty() {
         return Err(SaveError::MissingHost);
+    }
+    if sshrack_core::sshargs::validate(&form.ssh_args).is_err() {
+        return Err(SaveError::InvalidSshArgs);
     }
     Ok(())
 }
@@ -744,6 +760,7 @@ mod tests {
         assert_eq!(Field::Name.label(), "Name");
         assert_eq!(Field::Host.label(), "Host");
         assert_eq!(Field::Port.label(), "Port");
+        assert_eq!(Field::SshArgs.label(), "SSH args");
         assert_eq!(Field::User.label(), "User");
         assert_eq!(Field::Auth.label(), "Auth");
         assert_eq!(Field::Credential.label(), "Credential");

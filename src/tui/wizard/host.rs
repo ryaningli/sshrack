@@ -51,6 +51,8 @@ pub struct HostForm {
     /// Editable port (kept as a string so the user can clear / retype it; parsed
     /// at save time). Empty string falls back to the ssh default (22).
     pub port: String,
+    /// Raw ssh option flags (kept verbatim; validated at save). Empty = none.
+    pub ssh_args: String,
     /// Inline login user. Used only under Independent (Reference pulls the user
     /// from the referenced credential). Empty falls back to "root" at save.
     pub user: String,
@@ -152,6 +154,7 @@ impl std::fmt::Debug for HostForm {
             .field("name", &self.name)
             .field("host_addr", &self.host_addr)
             .field("port", &self.port)
+            .field("ssh_args", &self.ssh_args)
             .field("user", &self.user)
             .field("auth_choice", &self.auth_choice)
             .field("secret_kind", &self.secret_kind)
@@ -181,6 +184,7 @@ impl HostForm {
             name: String::new(),
             host_addr: String::new(),
             port: String::new(),
+            ssh_args: String::new(),
             user: String::new(),
             auth_choice: AuthChoice::Independent,
             secret_kind: SecretChoice::None,
@@ -276,6 +280,7 @@ impl HostForm {
             name: host.name.clone(),
             host_addr: host.host.clone(),
             port: host.port.to_string(),
+            ssh_args: host.ssh_args.clone().unwrap_or_default(),
             user,
             auth_choice,
             secret_kind,
@@ -365,6 +370,11 @@ impl HostForm {
     /// when blank or unparseable. Used by the loop when building the Host.
     pub fn parsed_port(&self) -> u16 {
         self.port.trim().parse::<u16>().unwrap_or(22)
+    }
+
+    /// The normalized ssh_args value for persist: trimmed, `None` when empty.
+    pub fn normalized_ssh_args(&self) -> Option<String> {
+        sshrack_core::sshargs::normalize(Some(self.ssh_args.trim()))
     }
 
     /// Build the inline [`CredentialBody`] for the Independent branch. Pure.
@@ -477,9 +487,11 @@ impl HostForm {
     /// stable worst-case height without cloning the form.
     ///
     /// The matrix mirrors the wizard's top-down reading:
-    /// - **Reference** — only Name / Host / Port / Auth / Credential are
-    ///   reachable (the user + secret come from the referenced credential). The
-    ///   Source / Identity / Inline* / Password rows are all unreachable.
+    /// - **Reference** — only Name / Host / Port / SSH args / Auth /
+    ///   Credential are reachable (the user + secret come from the referenced
+    ///   credential). The Source / Identity / Inline* / Password rows are all
+    ///   unreachable. SSH args is reachable under every auth mode (it describes
+    ///   the machine's network/compat, not identity).
     /// - **Independent + None** — Name / Host / Port / Auth / User / Secret
     ///   (no secret slot, no Source chooser).
     /// - **Independent + Password** — adds Password (no Source / Identity /
@@ -497,7 +509,12 @@ impl HostForm {
         match auth {
             AuthChoice::Reference { .. } => matches!(
                 field,
-                Field::Name | Field::Host | Field::Port | Field::Auth | Field::Credential
+                Field::Name
+                    | Field::Host
+                    | Field::Port
+                    | Field::SshArgs
+                    | Field::Auth
+                    | Field::Credential
             ),
             AuthChoice::Independent => match secret {
                 SecretChoice::None => !matches!(
@@ -870,6 +887,9 @@ impl HostForm {
                     self.cursor = insert_char_at(&mut self.port, self.cursor, c);
                 }
             }
+            // Free text: every printable char is accepted (validation is at
+            // save time, mirroring the CLI's raw `--ssh-args` value).
+            Field::SshArgs => self.cursor = insert_char_at(&mut self.ssh_args, self.cursor, c),
             Field::User => self.cursor = insert_char_at(&mut self.user, self.cursor, c),
             Field::Password if self.secret_kind == SecretChoice::Password => {
                 self.cursor = insert_char_at(&mut self.password, self.cursor, c)
@@ -903,6 +923,7 @@ impl HostForm {
             Field::Name => self.cursor = backspace_at(&mut self.name, self.cursor),
             Field::Host => self.cursor = backspace_at(&mut self.host_addr, self.cursor),
             Field::Port => self.cursor = backspace_at(&mut self.port, self.cursor),
+            Field::SshArgs => self.cursor = backspace_at(&mut self.ssh_args, self.cursor),
             Field::User => self.cursor = backspace_at(&mut self.user, self.cursor),
             Field::Password if self.secret_kind == SecretChoice::Password => {
                 self.cursor = backspace_at(&mut self.password, self.cursor)
@@ -1068,6 +1089,7 @@ impl HostForm {
             Field::Name => self.name.chars().count(),
             Field::Host => self.host_addr.chars().count(),
             Field::Port => self.port.chars().count(),
+            Field::SshArgs => self.ssh_args.chars().count(),
             Field::User => self.user.chars().count(),
             Field::Password => self.password.chars().count(),
             // Identity is a trigger row (Enter opens the FilePicker overlay);
@@ -1098,6 +1120,7 @@ impl HostForm {
             Field::Name => self.cursor.min(self.name.chars().count()),
             Field::Host => self.cursor.min(self.host_addr.chars().count()),
             Field::Port => self.cursor.min(self.port.chars().count()),
+            Field::SshArgs => self.cursor.min(self.ssh_args.chars().count()),
             Field::User => self.cursor.min(self.user.chars().count()),
             Field::Password => self.cursor.min(self.password.chars().count()),
             // Identity is a trigger row (Enter opens the FilePicker overlay, no
@@ -1161,7 +1184,9 @@ impl HostForm {
     /// empty picker and the `▸` would promise an action that yields nothing.
     fn field_kind(&self, field: Field) -> FieldKind {
         match field {
-            Field::Name | Field::Host | Field::Port | Field::User => FieldKind::Text,
+            Field::Name | Field::Host | Field::Port | Field::SshArgs | Field::User => {
+                FieldKind::Text
+            }
             Field::Password => FieldKind::Password,
             Field::Auth | Field::Secret | Field::Source => FieldKind::Switch,
             Field::Identity => FieldKind::Trigger,
@@ -1207,6 +1232,15 @@ impl HostForm {
                 let v = self.port.clone();
                 let ph = if v.is_empty() {
                     Some("22 (default)")
+                } else {
+                    None
+                };
+                (v, ph)
+            }
+            Field::SshArgs => {
+                let v = self.ssh_args.clone();
+                let ph = if v.is_empty() {
+                    Some("e.g. -o ServerAliveInterval=30 (optional)")
                 } else {
                     None
                 };
@@ -1373,7 +1407,7 @@ mod tests {
         // Sync the cursor to the end of the pre-filled Host field, as if the
         // user had just typed it — cursor_target then reports that position.
         f.cursor = f.focused_text_len();
-        // Independent + None: reachable rows are Name(0)/Host(1)/Port(2)/Auth(3)/User(4)/Secret(5).
+        // Independent + None: reachable rows are Name(0)/Host(1)/Port(2)/SshArgs(3)/Auth(4)/User(5)/Secret(6).
         assert_eq!(f.cursor_target(), Some((1, 8)));
     }
 
@@ -1398,8 +1432,8 @@ mod tests {
         f.focus = Field::Password;
         f.password = Zeroizing::new("hunter2".into());
         f.cursor = f.focused_text_len();
-        // Independent + Password: Name(0)/Host(1)/Port(2)/Auth(3)/User(4)/Secret(5)/Password(6).
-        assert_eq!(f.cursor_target(), Some((6, 7)));
+        // Independent + Password: Name(0)/Host(1)/Port(2)/SshArgs(3)/Auth(4)/User(5)/Secret(6)/Password(7).
+        assert_eq!(f.cursor_target(), Some((7, 7)));
     }
 
     #[test]
@@ -1493,12 +1527,14 @@ mod tests {
 
     #[test]
     fn tab_moves_focus_forward_through_independent_none_rows() {
-        // Independent + None: Name→Host→Port→Auth→User→Secret, then wraps.
+        // Independent + None: Name→Host→Port→SSH args→Auth→User→Secret, then
+        // wraps.
         let mut f = blank_form();
         assert_eq!(f.focus, Field::Name);
         for next in [
             Field::Host,
             Field::Port,
+            Field::SshArgs,
             Field::Auth,
             Field::User,
             Field::Secret,
@@ -1516,9 +1552,9 @@ mod tests {
         let mut f = blank_form();
         f.focus = Field::Auth;
         f.on_key(press(KeyCode::BackTab, KeyModifiers::SHIFT));
-        // Independent + None order: Name(0)/Host(1)/Port(2)/Auth(3)/User(4)/Secret(5);
-        // BackTab from Auth(3) lands on Port(2).
-        assert_eq!(f.focus, Field::Port);
+        // Independent + None order: Name(0)/Host(1)/Port(2)/SshArgs(3)/Auth(4)/User(5)/Secret(6);
+        // BackTab from Auth(4) lands on SshArgs(3).
+        assert_eq!(f.focus, Field::SshArgs);
     }
 
     #[test]
@@ -2286,7 +2322,8 @@ mod tests {
         // Focus Auth, then Left must cycle (to Reference) — cursor stays 0 (chooser).
         form.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // Name -> Host
         form.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // Host -> Port
-        form.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // Port -> Auth
+        form.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // Port -> SshArgs
+        form.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // SshArgs -> Auth
         // sanity: focus is Auth
         assert_eq!(form.focus, Field::Auth);
         form.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
@@ -2333,11 +2370,11 @@ mod tests {
 
     #[test]
     fn body_rows_is_stable_across_auth_secret_and_source_states() {
-        // Independent + IdentityKey + Inline is the widest state (9 reachable
-        // fields: Name/Host/Port/Auth/User/Secret/Source/InlinePrivate/InlineCert);
-        // Reference is the narrowest (5). body_rows() must report the SAME value
-        // for every (auth, secret, source) state — the max (9) + error + hint =
-        // 11 — so the dialog box stays a fixed height while the form is open.
+        // Independent + IdentityKey + Inline is the widest state (10 reachable
+        // fields: Name/Host/Port/SshArgs/Auth/User/Secret/Source/InlinePrivate/InlineCert);
+        // Reference is the narrowest (6). body_rows() must report the SAME value
+        // for every (auth, secret, source) state — the max (10) + error + hint =
+        // 12 — so the dialog box stays a fixed height while the form is open.
         // Toggling Auth/Secret/Source changes which rows are filled, not the
         // border size. body_rows is focus-INDEPENDENT (inline editing lives in
         // the modal KeyPaste popup, so the body never grows an editor block).
@@ -2346,8 +2383,8 @@ mod tests {
         form.host_addr = "10.0.0.5".into();
         let stable = form.body_rows();
         assert_eq!(
-            stable, 11,
-            "max = Independent + IdentityKey + Inline (9) + error + hint"
+            stable, 12,
+            "max = Independent + IdentityKey + Inline (10) + error + hint"
         );
         for auth in [AuthChoice::Independent, AuthChoice::Reference { idx: 0 }] {
             for secret in [
@@ -3064,6 +3101,92 @@ mod tests {
         });
     }
 
+    // ---- host ssh_args: SSH args text row after Port (RED -> GREEN) ----
+
+    #[test]
+    fn ssh_args_field_kind_is_text() {
+        let f = HostForm::new_add(vec![]);
+        assert_eq!(f.field_kind(Field::SshArgs), FieldKind::Text);
+    }
+
+    #[test]
+    fn ssh_args_reachable_under_reference_auth() {
+        // The row sits with Name/Host/Port under Reference too: the flags
+        // describe the machine's network/compat, not identity.
+        let mut f = HostForm::new_add(vec!["ops".into()]);
+        f.auth_choice = AuthChoice::Reference { idx: 0 };
+        assert!(f.reachable_fields().contains(&Field::SshArgs));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_ssh_args_and_focuses_the_field() {
+        let mut f = form_with("web", "10.0.0.5");
+        f.ssh_args = "-o \"unterminated".into();
+        let err = validate(&f).unwrap_err();
+        assert_eq!(err, SaveError::InvalidSshArgs);
+        assert_eq!(err.field(), Field::SshArgs);
+    }
+
+    #[test]
+    fn accepts_complete_form_with_valid_ssh_args() {
+        let mut f = complete_form();
+        f.ssh_args = "-o ServerAliveInterval=30".into();
+        assert!(validate(&f).is_ok());
+    }
+
+    #[test]
+    fn new_edit_prefills_ssh_args() {
+        let host = Host {
+            id: Ulid::new(),
+            name: "web1".into(),
+            host: "10.0.0.4".into(),
+            port: 22,
+            ssh_args: Some("-o ServerAliveInterval=30".into()),
+            auth: Auth::inline(CredentialBody::new("deploy")),
+        };
+        let f = HostForm::new_edit(&host, vec![], None);
+        assert_eq!(f.ssh_args, "-o ServerAliveInterval=30");
+    }
+
+    #[test]
+    fn new_edit_without_ssh_args_starts_blank() {
+        let host = Host {
+            id: Ulid::new(),
+            name: "web1".into(),
+            host: "10.0.0.4".into(),
+            port: 22,
+            ssh_args: None,
+            auth: Auth::inline(CredentialBody::new("deploy")),
+        };
+        let f = HostForm::new_edit(&host, vec![], None);
+        assert_eq!(f.ssh_args, "");
+    }
+
+    #[test]
+    fn normalized_ssh_args_trims_and_drops_empty() {
+        let mut f = blank_form();
+        assert_eq!(f.normalized_ssh_args(), None, "empty -> None");
+        f.ssh_args = "   ".into();
+        assert_eq!(f.normalized_ssh_args(), None, "whitespace-only -> None");
+        f.ssh_args = "  -o ServerAliveInterval=30  ".into();
+        assert_eq!(
+            f.normalized_ssh_args(),
+            Some("-o ServerAliveInterval=30".into())
+        );
+    }
+
+    #[test]
+    fn typing_and_backspace_edit_ssh_args_in_place() {
+        let mut f = blank_form();
+        f.focus = Field::SshArgs;
+        for c in "-o x".chars() {
+            f.on_key(press(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(f.ssh_args, "-o x");
+        f.on_key(press(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(f.ssh_args, "-o ");
+    }
+
     #[test]
     fn host_field_kind_maps_each_field_to_its_affordance() {
         // `field_kind` does not depend on auth_choice, so a default form is
@@ -3073,6 +3196,7 @@ mod tests {
         assert_eq!(f.field_kind(Field::Name), FieldKind::Text);
         assert_eq!(f.field_kind(Field::Host), FieldKind::Text);
         assert_eq!(f.field_kind(Field::Port), FieldKind::Text);
+        assert_eq!(f.field_kind(Field::SshArgs), FieldKind::Text);
         assert_eq!(f.field_kind(Field::User), FieldKind::Text);
         assert_eq!(f.field_kind(Field::Auth), FieldKind::Switch);
         assert_eq!(f.field_kind(Field::Secret), FieldKind::Switch);
