@@ -200,6 +200,7 @@ fn host_add_or_edit_is_empty(action: &HostAction) -> bool {
             host,
             user,
             port,
+            ssh_args,
             identity,
             identity_stdin,
             identity_file,
@@ -219,6 +220,7 @@ fn host_add_or_edit_is_empty(action: &HostAction) -> bool {
                 && host.is_none()
                 && user.is_none()
                 && port.is_none()
+                && ssh_args.is_none()
                 && identity.is_none()
                 && !*identity_stdin
                 && identity_file.is_none()
@@ -232,6 +234,8 @@ fn host_add_or_edit_is_empty(action: &HostAction) -> bool {
             host,
             user,
             port,
+            ssh_args,
+            clear_ssh_args,
             identity,
             identity_stdin,
             identity_file,
@@ -249,6 +253,8 @@ fn host_add_or_edit_is_empty(action: &HostAction) -> bool {
                 && host.is_none()
                 && user.is_none()
                 && port.is_none()
+                && ssh_args.is_none()
+                && !*clear_ssh_args
                 && identity.is_none()
                 && !*identity_stdin
                 && identity_file.is_none()
@@ -363,6 +369,7 @@ mod tests {
                 host: None,
                 user: None,
                 port: None,
+                ssh_args: None,
                 identity: None,
                 identity_stdin: false,
                 identity_file: None,
@@ -372,6 +379,7 @@ mod tests {
                 credential: None,
                 clear_identity: false,
                 clear_password: false,
+                clear_ssh_args: false,
                 clear_credential: false,
             },
         };
@@ -387,6 +395,7 @@ mod tests {
                 host: None,
                 user: None,
                 port: None,
+                ssh_args: None,
                 identity: None,
                 identity_stdin: false,
                 identity_file: None,
@@ -396,6 +405,7 @@ mod tests {
                 credential: None,
                 clear_identity: false,
                 clear_password: false,
+                clear_ssh_args: false,
                 clear_credential: false,
             },
         };
@@ -433,6 +443,7 @@ mod tests {
                 host: None,
                 user: None,
                 port: None,
+                ssh_args: None,
                 identity: None,
                 identity_stdin: false,
                 identity_file: None,
@@ -442,6 +453,7 @@ mod tests {
                 credential: None,
                 clear_identity: false,
                 clear_password: false,
+                clear_ssh_args: false,
                 clear_credential: false,
             },
         };
@@ -458,6 +470,7 @@ mod tests {
                 host: None,
                 user: None,
                 port: None,
+                ssh_args: None,
                 identity: None,
                 identity_stdin: false,
                 identity_file: None,
@@ -480,6 +493,7 @@ mod tests {
                 host: None,
                 user: None,
                 port: None,
+                ssh_args: None,
                 identity: None,
                 identity_stdin: false,
                 identity_file: None,
@@ -500,6 +514,7 @@ mod tests {
                 host: Some("1.2.3.4".into()),
                 user: None,
                 port: None,
+                ssh_args: None,
                 identity: None,
                 identity_stdin: false,
                 identity_file: None,
@@ -522,6 +537,7 @@ mod tests {
                 host: None,
                 user: None,
                 port: None,
+                ssh_args: None,
                 identity: None,
                 identity_stdin: false,
                 identity_file: None,
@@ -542,6 +558,7 @@ mod tests {
                 host: None,
                 user: None,
                 port: None,
+                ssh_args: None,
                 identity: None,
                 identity_stdin: false,
                 identity_file: None,
@@ -551,6 +568,7 @@ mod tests {
                 credential: None,
                 clear_identity: false,
                 clear_password: false,
+                clear_ssh_args: false,
                 clear_credential: false,
             },
         };
@@ -565,6 +583,7 @@ mod tests {
                 host: None,
                 user: None,
                 port: Some(22),
+                ssh_args: None,
                 identity: None,
                 identity_stdin: false,
                 identity_file: None,
@@ -574,6 +593,7 @@ mod tests {
                 credential: None,
                 clear_identity: false,
                 clear_password: false,
+                clear_ssh_args: false,
                 clear_credential: false,
             },
         };
@@ -588,6 +608,7 @@ mod tests {
                 host: None,
                 user: None,
                 port: None,
+                ssh_args: None,
                 identity: None,
                 identity_stdin: false,
                 identity_file: None,
@@ -597,6 +618,7 @@ mod tests {
                 credential: None,
                 clear_identity: true,
                 clear_password: false,
+                clear_ssh_args: false,
                 clear_credential: false,
             },
         };

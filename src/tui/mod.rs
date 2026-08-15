@@ -337,6 +337,7 @@ mod tests {
                 host: None,
                 user: None,
                 port: None,
+                ssh_args: None,
                 identity: None,
                 identity_stdin: false,
                 identity_file: None,
@@ -359,6 +360,7 @@ mod tests {
                 host: None,
                 user: None,
                 port: None,
+                ssh_args: None,
                 identity: None,
                 identity_stdin: false,
                 identity_file: None,
@@ -368,6 +370,7 @@ mod tests {
                 credential: None,
                 clear_identity: false,
                 clear_password: false,
+                clear_ssh_args: false,
                 clear_credential: false,
             },
         };

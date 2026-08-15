@@ -67,6 +67,9 @@ pub struct HostDetailRow<'a> {
     pub id: &'a str,
     pub host: &'a str,
     pub port: u16,
+    /// Raw ssh flags stored on the host (absent when unset).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_args: Option<&'a str>,
     pub user: &'a str,
     pub auth_kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -180,6 +183,7 @@ pub fn host_detail_row<'a>(
         id: id_str,
         host: &host.host,
         port: host.port,
+        ssh_args: host.ssh_args.as_deref(),
         user: user_of(host.auth.inline_body()),
         auth_kind: auth_kind_label(&host.auth),
         credential_name,
@@ -367,6 +371,29 @@ mod tests {
         assert_eq!(obj["id"], id_str);
         assert_eq!(obj["auth_kind"], "key");
         assert_eq!(obj["identity"], "/home/u/.ssh/id_ed25519");
+    }
+
+    #[test]
+    fn host_detail_row_serializes_ssh_args_additively() {
+        let host = Host {
+            id: Ulid::new(),
+            name: "web1".into(),
+            host: "10.0.0.4".into(),
+            port: 22,
+            ssh_args: Some("-X".into()),
+            auth: Auth::inline(CredentialBody::new("deploy")),
+        };
+        let row = host_detail_row(&host, "01TEST", None, None);
+        let json = serde_json::to_string(&row).expect("invariant: serializable row");
+        assert!(json.contains("\"ssh_args\":\"-X\""));
+
+        let host = Host {
+            ssh_args: None,
+            ..host
+        };
+        let row = host_detail_row(&host, "01TEST", None, None);
+        let json = serde_json::to_string(&row).expect("invariant: serializable row");
+        assert!(!json.contains("ssh_args"));
     }
 
     #[test]
