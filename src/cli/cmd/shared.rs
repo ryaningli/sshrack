@@ -140,6 +140,18 @@ pub fn seal_inline_body(
     })
 }
 
+/// One-line guidance printed after a connect-path `HostNotFound`: how to
+/// reach a host that is not registered. `None` when the target already
+/// carries a user or is an address literal (those get their own
+/// self-describing errors), so the line never contradicts the error.
+pub(crate) fn unregistered_host_hint(target: &str) -> Option<&'static str> {
+    if target.contains('@') || sshrack_core::host::is_address_literal(target) {
+        None
+    } else {
+        Some("to reach a host that is not registered, use user@host (or an IP with -c/-l)")
+    }
+}
+
 // ===========================================================================
 // field selection + table rendering (shared by host ls and cred ls)
 // ===========================================================================
@@ -686,6 +698,42 @@ mod tests {
             !out.iter().any(|f| f.is_empty()),
             "no field should be empty, got: {out:?}"
         );
+    }
+
+    // ---- unregistered_host_hint: only a bare (typo'd) name gets the line ----
+    //
+    // A target that already carries a user (`root@host`) or is an address
+    // literal gets its own self-describing error (AddressNeedsUser /
+    // TargetHasPort / the ephemeral path); the hint would contradict those,
+    // so it must be None there.
+
+    #[test]
+    fn unregistered_host_hint_bare_name_gets_the_user_at_line() {
+        let hint = unregistered_host_hint("web1").expect("bare name gets the hint");
+        assert_eq!(
+            hint,
+            "to reach a host that is not registered, use user@host (or an IP with -c/-l)"
+        );
+    }
+
+    #[test]
+    fn unregistered_host_hint_dotted_name_still_gets_the_line() {
+        // A dotted bare word is a (typo'd) NAME, never an address literal —
+        // core's decision table says unregistered hostnames go through user@.
+        assert!(unregistered_host_hint("web.example.internal").is_some());
+    }
+
+    #[test]
+    fn unregistered_host_hint_user_at_target_is_none() {
+        // `user@host` already carries the identity; no hint.
+        assert!(unregistered_host_hint("root@10.0.0.9").is_none());
+    }
+
+    #[test]
+    fn unregistered_host_hint_address_literal_is_none() {
+        assert!(unregistered_host_hint("10.0.0.9").is_none());
+        assert!(unregistered_host_hint("::1").is_none());
+        assert!(unregistered_host_hint("[2001:db8::1]").is_none());
     }
 
     // ---- sort_hosts: None preserves order, Name sorts alphabetically ----

@@ -116,6 +116,9 @@ pub fn run(cli: &Cli) -> i32 {
         Ok(p) => p,
         Err(SshrackError::HostNotFound { name, hint }) => {
             eprintln!("sshrack: host not found: {name}{hint}");
+            if let Some(hint_line) = crate::cli::cmd::shared::unregistered_host_hint(&name) {
+                eprintln!("sshrack: {hint_line}");
+            }
             return exit_code::NOT_FOUND;
         }
         Err(SshrackError::CredentialNotFound { name, hint }) => {

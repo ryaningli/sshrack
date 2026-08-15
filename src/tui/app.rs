@@ -130,8 +130,9 @@ pub struct App {
     /// [`super::transfer::open::open_transfer`]. Mirrors `pending_connect`.
     /// Holds the resolved `Host` (a saved host from the launcher, or an ad-hoc
     /// host built at the `sshrack sftp` entry) — `open_transfer` consumes it
-    /// directly, no id→host re-lookup.
-    pub(super) pending_transfer_host: Option<Host>,
+    /// directly, no id→host re-lookup. The host plus the effective login-user
+    /// override (`user@` > `-l`; `None` for the launcher Ctrl-T path).
+    pub(super) pending_transfer_host: Option<(Host, Option<String>)>,
     /// Set by [`App::route_transfer`] when the screen signals
     /// [`ScreenOutcome::CancelActive`]. The loop reads (and clears) this and
     /// sends `WorkerCmd::Cancel` to the worker. Pure-intent bridge: `on_key`
@@ -585,7 +586,7 @@ impl App {
     /// drive the open intent keep reading an id.
     #[cfg(test)]
     pub fn pending_transfer_id(&self) -> Option<Ulid> {
-        self.pending_transfer_host.as_ref().map(|h| h.id)
+        self.pending_transfer_host.as_ref().map(|(h, _)| h.id)
     }
 
     /// Take the pending-cancel flag. Returns `true` when the loop should send
@@ -737,7 +738,7 @@ impl App {
             && matches!(self.active_tab, Tab::Hosts)
         {
             if let Some(h) = self.launcher.selected_host(&self.config.hosts) {
-                self.pending_transfer_host = Some(h.clone());
+                self.pending_transfer_host = Some((h.clone(), None));
                 return Outcome::OpenTransfer;
             }
             // No host selected: silent no-op. The launcher already shows an

@@ -247,7 +247,8 @@ impl EntryMode {
 /// the merged `--ad-hoc`/`--credential`/`--user`/`--port`/`--identity` flags
 /// exactly like the ssh/scp connect path — a thin wrapper over
 /// [`host::resolve_target`]. Returns `Ok(None)` when the CLI is not an `sftp`
-/// command.
+/// command. The returned user is the effective login-user override for the
+/// worker (`user@` > `-l`).
 ///
 /// Pure: no I/O, no terminal. The sftp entry path in [`run`] calls this BEFORE
 /// the alternate screen so an unknown name, a dangling `--credential`, or an
@@ -259,7 +260,7 @@ fn resolve_transfer_target(
     cmd: Option<&Command>,
     cfg: &SshrackConfig,
     top: &ConnectOptions,
-) -> Result<Option<Host>, SshrackError> {
+) -> Result<Option<(Host, Option<String>)>, SshrackError> {
     let Some(Command::Sftp { opts, name }) = cmd else {
         return Ok(None);
     };
@@ -279,7 +280,9 @@ fn resolve_transfer_target(
         user: merged.user.as_deref(),
         identity: merged.identity.as_deref(),
     };
-    Ok(Some(host::resolve_target(cfg, name, &overrides)?.host))
+    let resolved = host::resolve_target(cfg, name, &overrides)?;
+    let user_override = resolved.target_user.or_else(|| merged.user.clone());
+    Ok(Some((resolved.host, user_override)))
 }
 
 /// Map the parsed CLI command to an [`EntryMode`]. Only the
@@ -495,9 +498,10 @@ mod tests {
 
     #[test]
     fn resolve_transfer_target_named_host_returns_the_entry() {
-        // `sshrack sftp web1` (no overrides) resolves to the saved host as-is.
+        // `sshrack sftp web1` (no overrides) resolves to the saved host as-is
+        // with NO user override (the credential user applies).
         let cfg = named_host_cfg();
-        let host = resolve_transfer_target(
+        let (host, user) = resolve_transfer_target(
             Some(&sftp_cmd("web1", ConnectOptions::default())),
             &cfg,
             &ConnectOptions::default(),
@@ -507,6 +511,7 @@ mod tests {
         assert_eq!(host.name, "web1");
         assert_eq!(host.host, "10.0.0.5");
         assert_eq!(host.port, 2222);
+        assert_eq!(user, None);
     }
 
     #[test]
@@ -528,13 +533,14 @@ mod tests {
             credential: Some("yushi".into()),
             ..Default::default()
         };
-        let host =
+        let (host, user) =
             resolve_transfer_target(Some(&sftp_cmd("192.168.20.18", top.clone())), &cfg, &top)
                 .unwrap()
                 .expect("ad-hoc resolves");
         assert_eq!(host.host, "192.168.20.18");
         assert_eq!(host.port, 22);
         assert_eq!(host.auth.credential_id(), Some(cred_id));
+        assert_eq!(user, None, "-c contributes no user override");
     }
 
     #[test]
@@ -549,13 +555,15 @@ mod tests {
             port: Some(2222),
             ..Default::default()
         };
-        let host = resolve_transfer_target(Some(&sftp_cmd("10.9.9.9", opts.clone())), &cfg, &opts)
-            .unwrap()
-            .expect("ad-hoc resolves");
+        let (host, user) =
+            resolve_transfer_target(Some(&sftp_cmd("10.9.9.9", opts.clone())), &cfg, &opts)
+                .unwrap()
+                .expect("ad-hoc resolves");
         assert_eq!(host.host, "10.9.9.9");
         assert_eq!(host.port, 2222);
         let body = host.auth.inline_body().expect("inline auth");
         assert_eq!(body.user, "ryan");
+        assert_eq!(user, Some("ryan".into()), "-l also flows as the override");
     }
 
     #[test]
@@ -628,7 +636,7 @@ mod tests {
             ..Default::default()
         };
         // Subcommand opts empty; top-level carries --ad-hoc + --user.
-        let host = resolve_transfer_target(
+        let (host, user) = resolve_transfer_target(
             Some(&sftp_cmd("10.0.0.4", ConnectOptions::default())),
             &cfg,
             &top,
@@ -637,6 +645,42 @@ mod tests {
         .expect("top-level --ad-hoc applies");
         assert_eq!(host.host, "10.0.0.4");
         assert_eq!(host.auth.inline_body().unwrap().user, "ryan");
+        assert_eq!(user, Some("ryan".into()));
+    }
+
+    #[test]
+    fn resolve_transfer_target_user_at_address_carries_user() {
+        // `sshrack sftp root@10.0.0.9`: the @user must reach the worker as the
+        // user override (a bare IP without one cannot log in).
+        let cfg = SshrackConfig::default();
+        let opts = ConnectOptions::default();
+        let (host, user) =
+            resolve_transfer_target(Some(&sftp_cmd("root@10.0.0.9", opts.clone())), &cfg, &opts)
+                .unwrap()
+                .expect("sftp command resolves");
+        assert_eq!(host.host, "10.0.0.9");
+        assert_eq!(
+            user,
+            Some("root".into()),
+            "user@ must reach the worker as the user override"
+        );
+    }
+
+    #[test]
+    fn resolve_transfer_target_dash_l_flows_as_user_override() {
+        // -l applies to the sftp entry too now (previously silently ignored
+        // on the TUI path).
+        let cfg = SshrackConfig::default();
+        let top = ConnectOptions::default();
+        let opts = ConnectOptions {
+            user: Some("admin".into()),
+            ..Default::default()
+        };
+        let (host, user) = resolve_transfer_target(Some(&sftp_cmd("10.0.0.9", opts)), &cfg, &top)
+            .unwrap()
+            .expect("resolves");
+        assert_eq!(host.host, "10.0.0.9");
+        assert_eq!(user, Some("admin".into()));
     }
 
     #[test]

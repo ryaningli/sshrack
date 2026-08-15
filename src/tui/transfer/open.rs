@@ -52,10 +52,13 @@ use crate::tui::transfer::screen::TransferScreen;
 /// (auth/hostkey), then opens the worker and seeds the remote pane.
 ///
 /// Side effects, in order:
-/// 1. Carry the resolved `host` — the caller (launcher `Ctrl-T`, or the
-///    `sshrack sftp` entry) already resolved the target (a saved name OR an
-///    ad-hoc literal built by `host::resolve_target`), so there is no id→host
-///    re-lookup here. An ad-hoc host is never in the config.
+/// 1. Carry the resolved `host` + `user_override` — the caller (launcher
+///    `Ctrl-T`, or the `sshrack sftp` entry) already resolved the target (a
+///    saved name OR an ad-hoc literal built by `host::resolve_target`), so
+///    there is no id→host re-lookup here. An ad-hoc host is never in the
+///    config. The override carries the entry target's embedded `user@`/`-l`
+///    (previously the sftp entry ignored `-l` entirely — fixed here);
+///    `None` for the launcher Ctrl-T path.
 /// 2. Vault unlock via [`TuiPassphrase`] (no-op unless vault mode).
 /// 3. Resolve auth → [`credential::PasswordSource`] (dangling ref fails here).
 /// 4. Materialize an inline (pasted) key to a temp file so `ssh -i` can read
@@ -79,6 +82,7 @@ use crate::tui::transfer::screen::TransferScreen;
 /// [`connect_host`]: crate::tui::connect::connect_host
 pub fn open_transfer(
     host: Host,
+    user_override: Option<String>,
     app: &mut App,
     handle: TerminalHandle,
     _data_dir: Option<&Path>,
@@ -137,7 +141,10 @@ pub fn open_transfer(
     let worker = SftpWorker::spawn(
         resolved_auth,
         resolved_host,
-        Overrides::default(),
+        Overrides {
+            user: user_override,
+            ..Default::default()
+        },
         &self_exe,
         pw_source,
         app.config_path(),
@@ -189,7 +196,7 @@ pub fn open_transfer(
 /// Build the remote pane's title: prefer the host's friendly `name`; fall back
 /// to `<user>@<host>` when there is no real name. A saved host carries a name
 /// distinct from its address; an ad-hoc host (built by `host::resolve_target`'s
-/// `ad_hoc_host`) has `name == address` — no real name — so it shows
+/// `address_host`) has `name == address` — no real name — so it shows
 /// `<user>@<host>` to surface the login identity. Pure.
 fn remote_title(name: &str, user: &str, host: &str) -> String {
     if name.is_empty() || name == host {
@@ -287,5 +294,37 @@ mod tests {
         );
         // The last token is the host (the master carries NO remote command).
         assert_eq!(argv.last().map(String::as_str), Some("h.example"));
+    }
+
+    #[test]
+    fn master_argv_carries_the_user_override_as_dash_l() {
+        // REGRESSION: the sftp entry used to pass `Overrides::default()` to
+        // SftpWorker::spawn, so `-l` (and the target's embedded `user@`) was
+        // silently ignored on the TUI path — the worker logged in as the
+        // credential user instead. open_transfer now threads the resolved
+        // user override into the Overrides; pin that it lands as `-l <user>`,
+        // beating the resolved auth user.
+        let host = host_with_inline_user("web"); // inline user "u"
+        let cfg = SshrackConfig::default();
+        let auth = credential::resolve(&host, &cfg, None, &OsKeyring).unwrap();
+        let sock = Path::new("/tmp/sshrack-mux-test.sock");
+        let argv = master_argv(
+            &auth,
+            &host,
+            &Overrides {
+                user: Some("admin".into()),
+                ..Default::default()
+            },
+            sock,
+        );
+        let has_override = argv.windows(2).any(|w| w[0] == "-l" && w[1] == "admin");
+        assert!(
+            has_override,
+            "the user override must beat the credential user in the master argv: {argv:?}"
+        );
+        assert!(
+            !argv.windows(2).any(|w| w[0] == "-l" && w[1] == "u"),
+            "the credential user must NOT also appear as -l: {argv:?}"
+        );
     }
 }
