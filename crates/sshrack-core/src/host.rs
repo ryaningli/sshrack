@@ -247,6 +247,20 @@ pub fn resolve_target(
             .strip_prefix('[')
             .and_then(|s| s.strip_suffix(']'))
             .unwrap_or(host_part);
+        // `user@<ip>:<port>` gets the same friendly TargetHasPort error as a
+        // bare `<ip>:<port>` (rule 4 below) instead of being handed to ssh as a
+        // garbage hostname. The rsplit check is IPv6-safe: `fe80::1` splits to
+        // left `fe80:` which fails `is_address_literal` (trailing colon is not
+        // a valid IpAddr), so a v6 literal falls through to the normal path.
+        if let Some((left, right)) = host_part.rsplit_once(':')
+            && let Ok(port) = right.parse::<u16>()
+            && is_address_literal(left)
+        {
+            return Err(SshrackError::TargetHasPort {
+                host: left.to_string(),
+                port,
+            });
+        }
         if let Some(found) = cfg.find_host_by_name(host_part) {
             let mut r = with_overrides(found.clone(), overrides);
             r.target_user = Some(user.to_string());
@@ -1021,6 +1035,32 @@ mod tests {
             panic!("expected inline body for user@ without -c");
         };
         assert_eq!(body.user, "root");
+    }
+
+    #[test]
+    fn resolve_target_user_at_ip_with_port_errors_target_has_port() {
+        // `root@10.0.0.4:2222` must get the friendly TargetHasPort error (port
+        // goes in -p), not an ephemeral host whose "hostname" is the garbage
+        // literal `10.0.0.4:2222`.
+        let cfg = cfg_with("web1");
+        let err = resolve_target(&cfg, "root@10.0.0.4:2222", &ro(None, None)).unwrap_err();
+        assert!(
+            matches!(err, SshrackError::TargetHasPort { ref host, port } if host == "10.0.0.4" && port == 2222),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_target_user_at_ipv6_literal_is_not_a_false_target_has_port() {
+        // IPv6 literals contain ':' and end in a u16-parseable group; the
+        // rsplit check must NOT misread `root@fe80::1` as host `fe80:` + port
+        // 1 — left `fe80:` fails is_address_literal, so it stays a normal
+        // ephemeral target.
+        let cfg = cfg_with("web1");
+        let r = resolve_target(&cfg, "root@fe80::1", &ro(None, None)).unwrap();
+        assert!(r.ephemeral);
+        assert_eq!(r.host.host, "fe80::1");
+        assert_eq!(r.target_user, Some("root".into()));
     }
 
     #[test]
