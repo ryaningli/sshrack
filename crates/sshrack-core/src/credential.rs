@@ -914,6 +914,7 @@ mod tests {
             name: "k".into(),
             host: "x".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::inline(CredentialBody {
                 user: "u".into(),
                 password: None,
@@ -966,6 +967,7 @@ mod tests {
             name: "h".into(),
             host: "x".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::inline(b),
         }
     }
@@ -976,6 +978,7 @@ mod tests {
             name: "h".into(),
             host: "x".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::reference(cred_id),
         }
     }
@@ -1144,6 +1147,7 @@ mod tests {
                 name: "web1".into(),
                 host: "h".into(),
                 port: 22,
+                ssh_args: None,
                 auth: Auth::reference(cid),
             }],
             credentials: vec![Credential {
@@ -1176,6 +1180,7 @@ mod tests {
                     name: "web1".into(),
                     host: "h".into(),
                     port: 22,
+                    ssh_args: None,
                     auth: Auth::reference(cid),
                 },
                 Host {
@@ -1183,6 +1188,7 @@ mod tests {
                     name: "web2".into(),
                     host: "h".into(),
                     port: 22,
+                    ssh_args: None,
                     auth: Auth::reference(cid),
                 },
                 Host {
@@ -1190,6 +1196,7 @@ mod tests {
                     name: "db".into(),
                     host: "h".into(),
                     port: 22,
+                    ssh_args: None,
                     auth: Auth::inline(body("pg")),
                 },
             ],
@@ -1212,6 +1219,7 @@ mod tests {
                 name: "web1".into(),
                 host: "h".into(),
                 port: 22,
+                ssh_args: None,
                 auth: Auth::inline(body("u")),
             }],
             credentials: vec![],
@@ -1230,6 +1238,7 @@ mod tests {
             name: "h".into(),
             host: "x".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::inline(CredentialBody {
                 user: "root".into(),
                 password: None,
@@ -1357,6 +1366,7 @@ mod tests {
             name: "web1".into(),
             host: "x".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::inline(CredentialBody {
                 user: "root".into(),
                 password: Some(Secret::Encrypted(enc)),
@@ -1394,6 +1404,7 @@ mod tests {
             name: "h".into(),
             host: "x".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::inline(CredentialBody::new("root").with_password("secret")),
         };
         let cfg = SshrackConfig {
@@ -1426,6 +1437,7 @@ mod tests {
             name: "h".into(),
             host: "x".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::reference(cid),
         };
         let cfg = SshrackConfig {
@@ -1495,6 +1507,7 @@ mod tests {
             name: "h".into(),
             host: "x".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::inline(CredentialBody {
                 user: "root".into(),
                 password: None,
@@ -1530,6 +1543,7 @@ mod tests {
             name: "web1".into(),
             host: "x".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::reference(cid),
         };
         // Credential exists under name "team-dev".

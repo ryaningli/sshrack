@@ -177,6 +177,7 @@ mod tests {
             name: name.into(),
             host: "h".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::inline(CredentialBody::new("u")),
         }
     }

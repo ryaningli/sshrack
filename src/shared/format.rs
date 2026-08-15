@@ -288,6 +288,7 @@ mod tests {
             name: "web1".into(),
             host: "10.0.0.5".into(),
             port: 2222,
+            ssh_args: None,
             auth: Auth::Inline(CredentialBody::new("deploy").with_password("hunter2")),
         }
     }
@@ -299,6 +300,7 @@ mod tests {
             name: "db1".into(),
             host: "db.internal".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::reference(cred_id),
         }
     }
@@ -352,6 +354,7 @@ mod tests {
             name: "box".into(),
             host: "1.2.3.4".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::Inline(CredentialBody::new("root").with_key("/home/u/.ssh/id_ed25519")),
         };
         let id_str = host.id.to_string();
@@ -378,6 +381,7 @@ mod tests {
             name: "box".into(),
             host: "1.2.3.4".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::Inline(CredentialBody {
                 user: "root".into(),
                 password: None,

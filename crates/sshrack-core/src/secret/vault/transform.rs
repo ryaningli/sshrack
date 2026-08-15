@@ -719,6 +719,7 @@ mod tests {
                 name: "h".into(),
                 host: "x".into(),
                 port: 22,
+                ssh_args: None,
                 auth: Auth::inline(CredentialBody {
                     user: "u".into(),
                     password: None,
@@ -749,6 +750,7 @@ mod tests {
                 name: "h".into(),
                 host: "x".into(),
                 port: 22,
+                ssh_args: None,
                 auth: Auth::inline(plain_body("u", "p2")),
             }],
             ..SshrackConfig::default()
@@ -1186,6 +1188,7 @@ mod tests {
                 name: "h".into(),
                 host: "x".into(),
                 port: 22,
+                ssh_args: None,
                 auth: Auth::inline(CredentialBody {
                     user: "u".into(),
                     password: None,
@@ -1232,6 +1235,7 @@ mod tests {
                 name: "h".into(),
                 host: "x".into(),
                 port: 22,
+                ssh_args: None,
                 auth: Auth::inline(CredentialBody {
                     user: "u".into(),
                     password: None,
@@ -1396,6 +1400,7 @@ mod tests {
                 name: "h".into(),
                 host: "x".into(),
                 port: 22,
+                ssh_args: None,
                 auth: Auth::inline(plain_body("u", "p3")),
             }],
             ..SshrackConfig::default()
@@ -1461,6 +1466,7 @@ mod tests {
                     name: "ref-host".into(),
                     host: "x".into(),
                     port: 22,
+                    ssh_args: None,
                     auth: Auth::reference(cid),
                 },
                 Host {
@@ -1468,6 +1474,7 @@ mod tests {
                     name: "inline-host".into(),
                     host: "y".into(),
                     port: 22,
+                    ssh_args: None,
                     auth: Auth::inline(plain_body("u", "inline-pw")),
                 },
             ],
@@ -1734,6 +1741,7 @@ mod tests {
                 name: "h".into(),
                 host: "x".into(),
                 port: 22,
+                ssh_args: None,
                 auth: Auth::inline(CredentialBody {
                     user: "u".into(),
                     password: None,
@@ -1856,6 +1864,7 @@ mod tests {
                 name: "h".into(),
                 host: "x".into(),
                 port: 22,
+                ssh_args: None,
                 auth: Auth::inline(CredentialBody {
                     user: "u".into(),
                     password: None,

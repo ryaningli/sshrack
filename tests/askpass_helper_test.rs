@@ -81,6 +81,7 @@ fn config_with_inline_password(password: &str) -> (PathBuf, String, tempfile::Te
         name: "h".into(),
         host: "x".into(),
         port: 22,
+        ssh_args: None,
         auth: Auth::inline(CredentialBody::new("u").with_password(password)),
     };
     let cfg = SshrackConfig {

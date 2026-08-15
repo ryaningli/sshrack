@@ -544,6 +544,8 @@ fn reveal_password(
         name: cred.name.clone(),
         host: String::new(),
         port: 22,
+        // Synthetic shell host: transports only the credential id, never connects.
+        ssh_args: None,
         auth: Auth::reference(cred.id),
     };
     let resolved = match cred_core::resolve(&host_shell, cfg, vault_key.as_ref(), &backend) {

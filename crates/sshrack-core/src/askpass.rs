@@ -222,6 +222,7 @@ mod tests {
             name: "h".into(),
             host: "x".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::inline(CredentialBody::new("u").with_password(password)),
         };
         let cfg = SshrackConfig {
@@ -270,6 +271,7 @@ mod tests {
             name: "h".into(),
             host: "x".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::inline(CredentialBody::new("u").with_key("/k")),
         };
         let cfg = SshrackConfig {
@@ -312,6 +314,7 @@ mod tests {
             name: "h".into(),
             host: "x".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::reference(cid),
         };
         let cfg = SshrackConfig {

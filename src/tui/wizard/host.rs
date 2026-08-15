@@ -2077,6 +2077,7 @@ mod tests {
             name: "web".into(),
             host: "10.0.0.5".into(),
             port: 2222,
+            ssh_args: None,
             auth: Auth::inline(CredentialBody::new("ops")),
         };
         let f = HostForm::new_edit(&host, vec![], None);
@@ -2097,6 +2098,7 @@ mod tests {
             name: "gw".into(),
             host: "gw.example.com".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::inline(CredentialBody::new("ops").with_key("/k/id")),
         };
         let f = HostForm::new_edit(&host, vec![], None);
@@ -2112,6 +2114,7 @@ mod tests {
             name: "h".into(),
             host: "1.1.1.1".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::inline(CredentialBody::new("root").with_password("hunter2")),
         };
         let f = HostForm::new_edit(&host, vec![], None);
@@ -2132,6 +2135,7 @@ mod tests {
             name: "web".into(),
             host: "10.0.0.5".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::reference(Ulid::new()),
         };
         let names = vec!["alpha".to_string(), "ops".to_string(), "team".to_string()];
@@ -2153,6 +2157,7 @@ mod tests {
             name: "web".into(),
             host: "10.0.0.5".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::reference(Ulid::new()),
         };
         let names = vec!["alpha".to_string(), "team".to_string()];
@@ -2596,6 +2601,7 @@ mod tests {
             name: "h".into(),
             host: "10.0.0.5".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::inline(
                 CredentialBody::new("u").with_inline_key(Secret::Plain("SECRET-TEXT".into()), None),
             ),
@@ -2622,6 +2628,7 @@ mod tests {
             name: "h".into(),
             host: "10.0.0.5".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::inline(
                 CredentialBody::new("u").with_inline_key(Secret::Plain("abc\ndef\n".into()), None),
             ),
@@ -2644,6 +2651,7 @@ mod tests {
             name: "h".into(),
             host: "10.0.0.5".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::inline(CredentialBody::new("u").with_inline_key(
                 Secret::Plain("pk".into()),
                 Some(Secret::Plain("c1\nc2\nc3\n".into())),
@@ -2670,6 +2678,7 @@ mod tests {
             name: "h".into(),
             host: "10.0.0.5".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::inline(CredentialBody::new("u").with_inline_key(enc, None)),
         };
         let f = HostForm::new_edit(&host, vec![], None);
@@ -2704,6 +2713,7 @@ mod tests {
             name: "h".into(),
             host: "10.0.0.5".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::inline(CredentialBody::new("u").with_key("/home/me/.ssh/id_ed25519")),
         };
         let f = HostForm::new_edit(&host, vec![], None);

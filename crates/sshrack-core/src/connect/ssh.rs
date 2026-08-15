@@ -106,6 +106,7 @@ mod tests {
             name: "web1".into(),
             host: "192.168.1.10".into(),
             port: 2222,
+            ssh_args: None,
             auth: Auth::inline(CredentialBody::new("deploy").with_key("~/.ssh/id_ed25519")),
         }
     }

@@ -205,6 +205,8 @@ fn add(
             name: name.clone(),
             host: host_addr_owned.clone(),
             port: port.unwrap_or(22),
+            // No --ssh-args flag exists on this path yet; wired with the CLI flag.
+            ssh_args: None,
             auth: Auth::inline(sealed_body),
         }
     } else {
@@ -214,6 +216,7 @@ fn add(
             credential: cred_ulid,
             user: user.map(Into::into),
             identity: identity.map(std::path::PathBuf::from),
+            ssh_args: None,
             force,
         };
         match host::merge_fields(host_id, &name, &opts) {
@@ -247,6 +250,8 @@ fn add(
             &name,
             &new_host.host,
             new_host.port,
+            // No --ssh-args flag exists yet; wired with the CLI flag.
+            None,
             new_host.auth.clone(),
         ) {
             Ok(next) => next,
@@ -475,8 +480,10 @@ fn edit(
             user: user.map(Into::into),
             identity: identity.map(std::path::PathBuf::from),
             rename: rename.map(Into::into),
+            ssh_args: None,
             clear_identity,
             clear_password,
+            clear_ssh_args: false,
             clear_credential,
         };
         match host::apply_patch(&orig, &opts) {
@@ -841,6 +848,7 @@ mod tests {
             name: "web1".into(),
             host: "10.0.0.5".into(),
             port: 2222,
+            ssh_args: None,
             auth: Auth::Inline(CredentialBody::new("deploy").with_password("hunter2")),
         }
     }
@@ -895,6 +903,7 @@ mod tests {
             name: "db1".into(),
             host: "db.internal".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::reference(cred_id),
         };
         assert_eq!(cell("user", &h, &cfg), "deploy");
@@ -980,6 +989,7 @@ mod tests {
             name: "db1".into(),
             host: "db".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::reference(cred_id),
         };
         assert_eq!(credential_name_for_host(&cfg, &host), Some("team-dev"));
@@ -993,6 +1003,7 @@ mod tests {
             name: "orphan".into(),
             host: "db".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::reference(Ulid::new()),
         };
         assert_eq!(credential_name_for_host(&cfg, &host), None);
@@ -1015,6 +1026,7 @@ mod tests {
             name: "db1".into(),
             host: "db.internal".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::reference(cred_id),
         };
         let out = format_detail(&cfg, &host, Some("team-dev"), &RevealedPassword::Masked);
@@ -1042,6 +1054,7 @@ mod tests {
             name: "orphan".into(),
             host: "h".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::reference(dangling_id),
         };
         // cred_name None → the ulid string is used in the auth line.

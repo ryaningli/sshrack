@@ -118,6 +118,7 @@ fn e2e_host(host: &str, port: u16) -> Host {
         name: "e2e".into(),
         host: host.into(),
         port,
+        ssh_args: None,
         auth: Auth::inline(CredentialBody::new("ignored-under-key-auth")),
     }
 }

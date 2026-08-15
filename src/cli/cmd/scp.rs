@@ -247,6 +247,7 @@ mod tests {
                     name: (*n).into(),
                     host: format!("{n}.internal"),
                     port: 22,
+                    ssh_args: None,
                     auth: Auth::Inline(CredentialBody::new("u")),
                 })
                 .collect(),

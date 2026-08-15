@@ -340,6 +340,7 @@ fn plaintext_mode_host_resolves_to_config_channel_and_writes_no_temp_file() {
         name: "web1".into(),
         host: "10.0.0.5".into(),
         port: 22,
+        ssh_args: None,
         auth: Auth::inline(CredentialBody::new("deploy").with_password("hunter2")),
     };
     let cfg = SshrackConfig {
@@ -481,6 +482,7 @@ fn keyring_mode_inline_key_materializes_temp_file_and_never_leaks_to_argv() {
         name: "kr-ik-host".into(),
         host: "10.0.0.5".into(),
         port: 22,
+        ssh_args: None,
         auth: Auth::inline(CredentialBody {
             user: "deploy".into(),
             password: None,
@@ -639,6 +641,7 @@ fn scp_build_drives_launch_with_shim_argv_and_password_never_in_argv() {
             name: "web1".into(),
             host: "10.0.0.5".into(),
             port: 2222,
+            ssh_args: None,
             auth: Auth::inline(CredentialBody::new("deploy").with_password("hunter2")),
         }],
         ..Default::default()
@@ -731,6 +734,7 @@ fn scp_multi_remote_first_host_wins_password() {
                 name: "web1".into(),
                 host: "10.0.0.5".into(),
                 port: 2222,
+                ssh_args: None,
                 auth: Auth::inline(CredentialBody::new("deploy").with_password("pw1-first")),
             },
             Host {
@@ -738,6 +742,7 @@ fn scp_multi_remote_first_host_wins_password() {
                 name: "web2".into(),
                 host: "10.0.0.6".into(),
                 port: 3322,
+                ssh_args: None,
                 auth: Auth::inline(CredentialBody::new("ops").with_password("pw2-second")),
             },
         ],
@@ -815,6 +820,7 @@ fn scp_identity_temp_file_is_referenced_not_inlined() {
             name: "ik-host".into(),
             host: "10.0.0.5".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::inline(CredentialBody {
                 user: "deploy".into(),
                 password: None,

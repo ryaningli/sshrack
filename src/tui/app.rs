@@ -1442,6 +1442,7 @@ mod tests {
             name: "alpha".into(),
             host: "h".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::inline(CredentialBody::new("u")),
         };
         let h2 = Host {
@@ -1449,6 +1450,7 @@ mod tests {
             name: "bravo".into(),
             host: "h".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::inline(CredentialBody::new("u")),
         };
         let cfg = SshrackConfig {
@@ -1597,6 +1599,7 @@ mod tests {
                 name: "web".into(),
                 host: "10.0.0.5".into(),
                 port: 22,
+                ssh_args: None,
                 auth: Auth::inline(CredentialBody::new("ops")),
             }],
             ..SshrackConfig::default()

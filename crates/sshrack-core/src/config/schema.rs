@@ -466,6 +466,12 @@ pub struct Host {
     pub host: String,
     #[serde(default = "default_port")]
     pub port: u16,
+    /// Raw ssh option flags appended to every connection to this host
+    /// (shell-split at connect time), e.g. `-o ServerAliveInterval=30`.
+    /// Applied after sshrack's own options so `-o Key=Value` entries override
+    /// its defaults. scp receives only the `-o` subset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_args: Option<String>,
     pub auth: Auth,
 }
 
@@ -606,6 +612,7 @@ auth = { user = "root" }
             name: "h".into(),
             host: "x".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::inline(CredentialBody::new("u")),
         };
         let c = Credential {
@@ -614,6 +621,32 @@ auth = { user = "root" }
             body: CredentialBody::new("u"),
         };
         assert_ne!(h.id, c.id);
+    }
+
+    #[test]
+    fn host_ssh_args_round_trips_and_absent_stays_absent() {
+        let with = Host {
+            id: crate::id::new_id(),
+            name: "web1".into(),
+            host: "10.0.0.4".into(),
+            port: 22,
+            ssh_args: Some("-o ServerAliveInterval=30".into()),
+            auth: Auth::inline(CredentialBody::new("deploy")),
+        };
+        let text = toml::to_string(&with).expect("invariant: serializable host");
+        assert!(text.contains("ssh_args = \"-o ServerAliveInterval=30\""));
+        let back: Host = toml::from_str(&text).expect("invariant: parseable host");
+        assert_eq!(back.ssh_args, with.ssh_args);
+
+        let without = Host {
+            ssh_args: None,
+            ..with
+        };
+        let text = toml::to_string(&without).expect("invariant: serializable host");
+        assert!(!text.contains("ssh_args"));
+        // A config written before this feature still parses (serde default).
+        let legacy = text.replace("ssh_args", ""); // no-op guard: field absent above
+        let _: Host = toml::from_str(&legacy).expect("invariant: legacy parse");
     }
 
     #[test]
@@ -757,6 +790,7 @@ auth = { user = "root" }
                 name: "web1".into(),
                 host: "10.0.0.5".into(),
                 port: 22,
+                ssh_args: None,
                 auth: Auth::reference(cid),
             }],
             credentials: vec![Credential {
@@ -779,6 +813,7 @@ auth = { user = "root" }
             name: "web1".into(),
             host: "10.0.0.5".into(),
             port: 22,
+            ssh_args: None,
             auth: Auth::reference(cid),
         };
         let s = toml::to_string(&h).unwrap();
@@ -1023,6 +1058,7 @@ key = "/old/path"
                 name: "h".into(),
                 host: "x".into(),
                 port: 22,
+                ssh_args: None,
                 auth: Auth::inline(CredentialBody::new("u")),
             }],
             credentials: vec![Credential {

@@ -183,7 +183,16 @@ pub(crate) fn persist_host_save(
         if orig.name != name {
             host::validate_rename(&app.config, &orig.name, &name)?;
         }
-        let edited = host::finalize_body(target_id, &name, &host_addr, port, auth);
+        let edited = host::finalize_body(
+            target_id,
+            &name,
+            &host_addr,
+            port,
+            // The wizard has no ssh-args field yet (wired later); preserve the
+            // original host's flags across an edit instead of wiping them.
+            orig.ssh_args.clone(),
+            auth,
+        );
         let mut next = app.config.clone();
         if let Some(slot) = next.hosts.iter_mut().find(|h| h.id == target_id) {
             *slot = edited;
@@ -195,7 +204,9 @@ pub(crate) fn persist_host_save(
         // run it here so the error surfaces before the append (add_host itself
         // only checks forbidden chars).
         host::validate_no_duplicate(&app.config, &name, false)?;
-        host::add_host(&app.config, target_id, &name, &host_addr, port, auth)?
+        // The wizard has no ssh-args field yet (wired later); a fresh host
+        // starts with no flags.
+        host::add_host(&app.config, target_id, &name, &host_addr, port, None, auth)?
     };
 
     // Persist + reload (so the on-disk file is the source of truth and the
@@ -708,6 +719,7 @@ mod tests {
                 name: "web".into(),
                 host: "10.0.0.5".into(),
                 port: 22,
+                ssh_args: None,
                 auth: Auth::inline(CredentialBody::new("ops")),
             }],
             ..SshrackConfig::default()
@@ -745,6 +757,7 @@ mod tests {
                 name: "web".into(),
                 host: "h".into(),
                 port: 22,
+                ssh_args: None,
                 auth: Auth::inline(CredentialBody::new("u")),
             }],
             ..SshrackConfig::default()
@@ -1251,6 +1264,7 @@ mod tests {
                     name: "web".into(),
                     host: "h".into(),
                     port: 22,
+                    ssh_args: None,
                     auth: Auth::inline(CredentialBody::new("u")),
                 },
                 Host {
@@ -1258,6 +1272,7 @@ mod tests {
                     name: "db".into(),
                     host: "h2".into(),
                     port: 22,
+                    ssh_args: None,
                     auth: Auth::inline(CredentialBody::new("u")),
                 },
             ],

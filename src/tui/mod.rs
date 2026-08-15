@@ -465,6 +465,7 @@ mod tests {
                 name: "web1".into(),
                 host: "10.0.0.5".into(),
                 port: 2222,
+                ssh_args: None,
                 auth: Auth::inline(CredentialBody::new("u")),
             }],
             ..Default::default()
