@@ -1,5 +1,6 @@
-//! Assemble the `scp` argv from raw scp arguments, resolving any `name:path`
-//! token against the config (following credential references for user/key).
+//! Assemble the `scp` argv from raw scp arguments, resolving every remote
+//! operand (`name:path`, `user@host:path`, `[v6]:path`) through the shared
+//! connect-target table (following credential references for user/key).
 //! Mirrors the system `scp` calling convention; the caller hands the result to
 //! `connect::launch`.
 
@@ -10,7 +11,7 @@ use super::ssh::Overrides;
 use crate::config::schema::{Host, SshrackConfig};
 use crate::credential::{self, PasswordSource};
 use crate::error::SshrackError;
-use crate::host::{ResolveOverrides, host_not_found, resolve_target};
+use crate::host::{ResolveOverrides, resolve_target};
 use crate::secret::SecretBackend;
 
 /// The assembled scp invocation plus the resolved remote host (if any), so the
@@ -40,22 +41,19 @@ pub struct ScpPlan {
     pub key_artifact: Option<KeyArtifact>,
 }
 
-/// Build the scp argv from raw arguments. A `left:rest` operand is rewritten
-/// to `user@host:rest` (user/key resolved through the host's auth, following
-/// credential references) when `left` is a known name — or, with `--ad-hoc`,
-/// a literal address. The first rewritten operand also contributes `-P <port>`
-/// and `-i <identity>` (from override or the resolved key).
+/// Build the scp argv from raw arguments. Every remote operand (`x:path`,
+/// `user@x:path`, `[v6]:path`) resolves through [`crate::host::resolve_target`]
+/// — a config name, a `user@host` literal (explicit user; a config-name host
+/// part keeps the config's address/port), or a bare IP literal (needs
+/// `-c`/`-l`). A bare word that matches nothing errors with
+/// [`SshrackError::HostNotFound`] instead of reaching scp as a hostname.
+/// The first resolved remote also contributes `-P <port>` and `-i <identity>`
+/// (from override or the resolved key).
 ///
-/// Operands with no `:`, or in scp's `user@host:path` form (`left` has `@`),
-/// pass through verbatim — the escape hatch for reaching a host with no
-/// registered name. A `name:path` whose `name` is neither a known name nor
-/// (under `--ad-hoc`) an address is a typo'd name: it errors with
-/// [`SshrackError::HostNotFound`] instead of being forwarded to scp as a
-/// hostname.
-///
+/// An operand with no `:` is a local path and passes through untouched.
 /// Returns `CredentialNotFound` for a dangling credential reference, and
-/// `MissingRequiredField` for an ad-hoc operand with neither `--credential`
-/// nor `--user`.
+/// `AddressNeedsUser` for a bare-IP operand with neither `--credential` nor
+/// `--user`.
 ///
 /// `vault` is the unlocked master key (from [`crate::secret::vault`]) used to
 /// decrypt any stored password; `None` means the config is not in encrypted
@@ -86,28 +84,36 @@ pub fn build(
     };
 
     for arg in args {
-        let Some((left, rest)) = arg.split_once(':') else {
+        // `[v6]:path` — scp's own IPv6 operand form. Split inside the
+        // brackets so a v6 literal's colons don't cut the address apart.
+        // Anything else splits at the first ':' (a bare operand is local).
+        let pair = if let Some(stripped) = arg.strip_prefix('[') {
+            stripped
+                .split_once(']')
+                .and_then(|(addr, after)| after.strip_prefix(':').map(|rest| (addr, rest)))
+        } else {
+            arg.split_once(':')
+        };
+        let Some((left, rest)) = pair else {
             out_args.push(arg.clone());
             continue;
         };
-        // `user@host:path` (left contains @) is an explicit host in scp's
-        // native syntax, not a name — pass it through so scp can still reach
-        // any host without a registered name.
-        if left.contains('@') {
-            out_args.push(arg.clone());
-            continue;
-        }
-        // `name:path` (no @): a known name, or (with --ad-hoc) a literal
-        // address. Anything else is a typo'd name — refuse with HostNotFound
-        // + did-you-mean rather than letting scp treat it as a hostname and
-        // surface a misleading DNS error.
-        let host_cfg = match cfg.find_host_by_name(left) {
-            Some(h) => h.clone(),
-            None if overrides.ad_hoc => resolve_target(cfg, left, &resolve_overrides)?.host,
-            None => return Err(host_not_found(cfg, left)),
-        };
+
+        // Every remote operand resolves through the same table: a config
+        // name, `user@host` (explicit user; the host part may itself be a
+        // config name = address + user overlay), or a bare IP literal with
+        // -c/-l. A bare word that matches nothing is a typo'd name —
+        // HostNotFound beats a misleading DNS error out of scp.
+        let resolved =
+            resolve_target(cfg, left, &resolve_overrides).map_err(|e| operand_err(e, left, arg))?;
+        let host_cfg = resolved.host;
         let mut auth = credential::resolve(&host_cfg, cfg, vault, backend)?;
-        let user = overrides.user.as_deref().unwrap_or(&auth.user);
+        // User precedence: user@ (target) > -l (flag) > resolved auth user.
+        let user = resolved
+            .target_user
+            .as_deref()
+            .or(overrides.user.as_deref())
+            .unwrap_or(&auth.user);
         out_args.push(format!("{user}@{}:{rest}", host_cfg.host));
         let port = overrides.port.unwrap_or(host_cfg.port);
         if host.is_none() {
@@ -156,6 +162,25 @@ pub fn build(
         remote_hosts,
         key_artifact,
     })
+}
+
+/// Upgrade a `HostNotFound` on an operand that looks like an unbracketed
+/// IPv6 literal (`fe80::1:/tmp` — scp splits at the first colon, so the
+/// mangled host segment is all-hex) into a targeted hint instead of a
+/// confusing "host not found: fe80". Other errors pass through unchanged.
+fn operand_err(e: SshrackError, left: &str, arg: &str) -> SshrackError {
+    if matches!(e, SshrackError::HostNotFound { .. })
+        && !arg.starts_with('[')
+        && arg.contains("::")
+        && !left.is_empty()
+        && left.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return SshrackError::InvalidTarget {
+            target: arg.into(),
+            reason: "this looks like an IPv6 address; write it bracketed as [addr]:path".into(),
+        };
+    }
+    e
 }
 
 #[cfg(test)]
@@ -295,18 +320,28 @@ mod tests {
         assert!(matches!(err, SshrackError::CredentialNotFound { .. }));
     }
 
-    fn cfg_with_key_credential() -> (SshrackConfig, Ulid) {
-        let cid = crate::id::new_id();
-        let cfg = SshrackConfig {
-            hosts: vec![],
+    /// A config with one reusable key credential named `name` (user `deploy`,
+    /// key at `key_path`) and no hosts — the fixture for operand-level
+    /// `-c`-injection tests.
+    fn cfg_with_credential(name: &str, key_path: &str) -> SshrackConfig {
+        SshrackConfig {
             credentials: vec![Credential {
-                id: cid,
-                name: "team-dev".into(),
-                body: CredentialBody::new("deploy").with_key("/team_ed25519"),
+                id: crate::id::new_id(),
+                name: name.into(),
+                body: CredentialBody::new("deploy").with_key(key_path),
             }],
             ..Default::default()
-        };
-        (cfg, cid)
+        }
+    }
+
+    /// The ULID of the named fixture credential (mirrors how the production
+    /// CLI resolves a `--credential <name>` before calling `build`).
+    fn cred_id(cfg: &SshrackConfig, name: &str) -> Ulid {
+        cfg.credentials
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.id)
+            .unwrap_or_else(|| panic!("invariant: fixture credential '{name}' exists"))
     }
 
     fn cfg_with_password_credential() -> (SshrackConfig, Ulid) {
@@ -349,62 +384,149 @@ mod tests {
     }
 
     #[test]
-    fn ad_hoc_operand_with_credential_is_injected() {
-        let (cfg, cid) = cfg_with_key_credential();
-        let o = Overrides {
-            ad_hoc: true,
-            credential: Some(cid),
-            ..Default::default()
-        };
+    fn user_at_operand_resolves_and_injects_credential() {
+        // user@host:path used to pass through verbatim (no -i/-P injection, so
+        // -c was silently ignored). It now resolves through the same table.
+        let cfg = cfg_with_credential("ops", "/keys/ops_ed25519");
         let plan = build(
-            &["file.txt".into(), "1.2.3.4:/tmp/".into()],
+            &["f.txt".into(), "root@10.0.0.9:/tmp".into()],
             &cfg,
-            &o,
+            &Overrides {
+                credential: Some(cred_id(&cfg, "ops")),
+                ..Default::default()
+            },
             None,
             &FakeBackend::new(),
         )
         .unwrap();
-        assert!(plan.argv.iter().any(|a| a == "deploy@1.2.3.4:/tmp/"));
-        assert!(plan.argv.contains(&"-P".to_string()));
-        assert!(plan.argv.contains(&"22".to_string()));
+        assert!(plan.argv.iter().any(|a| a == "root@10.0.0.9:/tmp"));
         assert!(plan.argv.contains(&"-i".to_string()));
-        assert_eq!(plan.host.unwrap().host, "1.2.3.4");
-        assert!(plan.remote_hosts.contains(&("1.2.3.4".to_string(), 22)));
-        // A key credential carries no password.
-        assert!(matches!(plan.password, PasswordSource::None));
+        assert!(plan.argv.iter().any(|a| a.contains("ops_ed25519")));
+        assert!(
+            plan.host.is_some(),
+            "the operand contributed a host for auth"
+        );
     }
 
     #[test]
-    fn bare_address_without_ad_hoc_errors() {
-        // A `host:path` operand with no @ and no --ad-hoc is treated as a
-        // typo'd name and refused. Use --ad-hoc (or `user@host:path`) to
-        // reach a host that is not a registered name.
-        let (cfg, cid) = cfg_with_key_credential();
-        let o = Overrides {
-            ad_hoc: false,
-            credential: Some(cid),
-            ..Default::default()
-        };
-        let err = build(&["1.2.3.4:/x".into()], &cfg, &o, None, &FakeBackend::new()).unwrap_err();
-        assert!(matches!(err, SshrackError::HostNotFound { .. }));
-    }
-
-    #[test]
-    fn user_at_host_token_passes_through() {
-        // `user@host:path` is scp's native explicit-host syntax, not a name,
-        // so it passes through verbatim — the escape hatch for reaching a host
-        // that has no registered name.
-        let (cfg, _cid) = cfg_with_key_credential();
+    fn bare_ip_operand_with_credential_injected() {
+        // A bare-IP operand with -c: the credential supplies user + key, so
+        // the operand rewrites to <cred-user>@<ip>:<path> with -i injected.
+        let cfg = cfg_with_credential("ops", "/keys/ops_ed25519");
         let plan = build(
-            &["root@1.2.3.4:/x".into()],
+            &["file.txt".into(), "10.0.0.9:/tmp/".into()],
             &cfg,
+            &Overrides {
+                credential: Some(cred_id(&cfg, "ops")),
+                ..Default::default()
+            },
+            None,
+            &FakeBackend::new(),
+        )
+        .unwrap();
+        assert!(plan.argv.iter().any(|a| a == "deploy@10.0.0.9:/tmp/"));
+        assert!(plan.argv.contains(&"-i".to_string()));
+        assert!(plan.argv.iter().any(|a| a.contains("ops_ed25519")));
+        assert_eq!(
+            plan.host.expect("operand contributed a host").host,
+            "10.0.0.9"
+        );
+    }
+
+    #[test]
+    fn bare_ip_operand_without_identity_errors_with_fix() {
+        // A bare-IP operand with neither -c nor -l has no login user; the
+        // error states the fix instead of a bare "not found".
+        let err = build(
+            &["10.0.0.9:/tmp".into()],
+            &SshrackConfig::default(),
+            &Overrides::default(),
+            None,
+            &FakeBackend::new(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, SshrackError::AddressNeedsUser { .. }));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("pass -c/-l or use user@10.0.0.9"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn bracketed_ipv6_operand_resolves() {
+        // scp's `[v6]:path` operand form: split inside the brackets so the
+        // address's colons do not cut it apart.
+        let cfg = cfg_with_credential("ops", "/keys/ops_ed25519");
+        let plan = build(
+            &["[fe80::1]:/tmp".into()],
+            &cfg,
+            &Overrides {
+                credential: Some(cred_id(&cfg, "ops")),
+                ..Default::default()
+            },
+            None,
+            &FakeBackend::new(),
+        )
+        .unwrap();
+        assert!(plan.argv.iter().any(|a| a == "deploy@fe80::1:/tmp"));
+    }
+
+    #[test]
+    fn unbracketed_ipv6_operand_gets_bracket_hint() {
+        // `fe80::1:/tmp` splits at the first colon (host segment `fe80`), so
+        // the HostNotFound is upgraded to a bracket-hint InvalidTarget.
+        let cfg = cfg_with_credential("ops", "/keys/ops_ed25519");
+        let err = build(
+            &["fe80::1:/tmp".into()],
+            &cfg,
+            &Overrides {
+                credential: Some(cred_id(&cfg, "ops")),
+                ..Default::default()
+            },
+            None,
+            &FakeBackend::new(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, SshrackError::InvalidTarget { .. }));
+        let msg = err.to_string();
+        assert!(msg.contains("bracketed as [addr]:path"), "got: {msg}");
+    }
+
+    #[test]
+    fn ghost_name_operand_still_host_not_found() {
+        // Typo protection unchanged: a bare word that matches nothing errors
+        // with HostNotFound. `ghost:/tmp/a::b` contains `::` but `ghost` is
+        // not all-hex, so it must NOT hit the IPv6 hint.
+        for operand in ["ghost:/tmp", "ghost:/tmp/a::b"] {
+            let err = build(
+                &[operand.into()],
+                &SshrackConfig::default(),
+                &Overrides::default(),
+                None,
+                &FakeBackend::new(),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, SshrackError::HostNotFound { ref name, .. } if name == "ghost"),
+                "{operand}: got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn user_at_config_name_rewrites_with_explicit_user() {
+        // `root@web1:/srv`: the host part hits the config, so the config's
+        // address is used with the explicit user — NOT the config's user.
+        let plan = build(
+            &["root@web1:/srv".into()],
+            &cfg_with_key_host("web1"),
             &Overrides::default(),
             None,
             &FakeBackend::new(),
         )
         .unwrap();
-        assert_eq!(plan.argv, vec!["scp", "root@1.2.3.4:/x"]);
-        assert!(plan.host.is_none());
+        assert!(plan.argv.iter().any(|a| a == "root@10.0.0.5:/srv"));
     }
 
     #[test]
@@ -422,22 +544,5 @@ mod tests {
         assert!(plan.argv.contains(&"ServerAliveInterval=30".to_string()));
         assert!(!plan.argv.iter().any(|a| a == "-X"));
         assert!(!plan.argv.iter().any(|a| a.starts_with("-L")));
-    }
-
-    #[test]
-    fn ad_hoc_operand_without_identity_errors() {
-        let o = Overrides {
-            ad_hoc: true,
-            ..Default::default()
-        };
-        let err = build(
-            &["1.2.3.4:/x".into()],
-            &SshrackConfig::default(),
-            &o,
-            None,
-            &FakeBackend::new(),
-        )
-        .unwrap_err();
-        assert!(matches!(err, SshrackError::AddressNeedsUser { .. }));
     }
 }
