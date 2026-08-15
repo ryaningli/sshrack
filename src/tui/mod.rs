@@ -155,8 +155,8 @@ pub fn run(cli: &Cli) -> Result<Option<ConnectRequest>, SshrackError> {
     // Resolve the sftp entry target (saved name OR address literal) BEFORE the
     // alternate screen: an unknown name / dangling --credential /
     // address-without-identity errors here, on the normal terminal, mapped to
-    // exit NOT_FOUND by
-    // main (mirroring the CLI connect path). Non-sftp commands resolve to None.
+    // exit NOT_FOUND by main (mirroring the CLI connect path).
+    // Non-sftp commands resolve to None.
     let pending_transfer_host = resolve_transfer_target(cli.cmd.as_ref(), &cfg, &cli.connect_opts)?;
 
     let app = App::new(cfg, config_path, frecency, credential_names);

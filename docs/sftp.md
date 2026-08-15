@@ -11,7 +11,7 @@ A background `ssh -N -o ControlMaster=yes` owns one authenticated connection (bu
 
 ## Entry
 
-- `sshrack sftp <name>` (CLI — opens the TUI straight into the transfer screen for that host; a missing host fails `HostNotFound` BEFORE the alternate screen, exit 4). Honors the same per-connection flags as `ssh`/`scp` — `--ad-hoc`, `-c/--credential`, `-l/--user`, `-p/--port`, `-i/--identity` — so `sshrack --ad-hoc -c yushi sftp 192.168.20.18` opens the screen for an unsaved host (remote pane title = the address). `--accept-new` is a no-op here: a first-seen host key is confirmed via the interactive popup, same as `Ctrl-T`.
+- `sshrack sftp <name>` (CLI — opens the TUI straight into the transfer screen for that host; a missing host fails `HostNotFound` BEFORE the alternate screen, exit 4). Honors the same per-connection flags as `ssh`/`scp` — `-c/--credential`, `-l/--user`, `-p/--port`, `-i/--identity` — so `sshrack yushi@192.168.20.18` opens the screen for an unsaved host (remote pane title = the address). `--accept-new` is a no-op here: a first-seen host key is confirmed via the interactive popup, same as `Ctrl-T`.
 - `Ctrl-T` on a host in the launcher.
 
 ## Screen (`tui/transfer/`)

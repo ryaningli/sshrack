@@ -53,6 +53,7 @@ cargo build --release
 
 ```bash
 sshrack web1 df -h                       # connect, run a one-off command
+sshrack root@10.0.0.50 uptime            # ad-hoc target without saved host
 sshrack ssh web1                         # interactive remote shell
 sshrack scp ./app.tar web1:/tmp/         # scripted file transfer
 sshrack sftp web1                        # dual-pane transfer screen
@@ -64,7 +65,7 @@ sshrack cred add deploy --user deploy --identity ~/.ssh/id_ed25519
 sshrack --format json host ls            # JSON output for scripts
 ```
 
-Per-connection overrides (`-l`/`-p`/`-i`/`-c`/`--ad-hoc`/`--accept-new`) layer over the resolved config for that one connection.
+Per-connection overrides (`-l`/`-p`/`-i`/`-c`/`--accept-new`) layer over the resolved config for that one connection. Targets that are not registered use ssh syntax: `sshrack root@10.0.0.50 df -h`, or a bare IP with `-c`/`-l` (`sshrack -c ops 10.0.0.4 uptime`).
 
 ### TUI (interactive)
 

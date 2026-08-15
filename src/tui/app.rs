@@ -2768,8 +2768,7 @@ mod tests {
     fn ctrl_t_on_hosts_with_host_signals_open_transfer() {
         // Ctrl-T on the Hosts tab with a host under the cursor sets
         // pending_transfer_host to that (host, None) pair and returns
-        // OpenTransfer. on_key
-        // performs NO I/O — the loop runs open_transfer.
+        // OpenTransfer. on_key performs NO I/O — the loop runs open_transfer.
         let mut app = app_with_host("web");
         let expected_id = app.config.hosts[0].id;
         let out = app.on_key(press(KeyCode::Char('t'), KeyModifiers::CONTROL));

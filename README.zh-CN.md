@@ -53,6 +53,7 @@ cargo build --release
 
 ```bash
 sshrack web1 df -h                       # 连接并跑一次性命令
+sshrack root@10.0.0.50 uptime            # 无需保存主机的临时目标
 sshrack ssh web1                         # 交互式远程 shell
 sshrack scp ./app.tar web1:/tmp/         # 脚本化文件传输
 sshrack sftp web1                        # 双面板传输屏
@@ -64,7 +65,7 @@ sshrack cred add deploy --user deploy --identity ~/.ssh/id_ed25519
 sshrack --format json host ls            # 供脚本消费的 JSON 输出
 ```
 
-单次连接覆盖项（`-l`/`-p`/`-i`/`-c`/`--ad-hoc`/`--accept-new`）会叠加在已解析的配置之上，仅对本次连接生效。
+单次连接覆盖项（`-l`/`-p`/`-i`/`-c`/`--accept-new`）会叠加在已解析的配置之上，仅对本次连接生效。未注册的主机直接用 ssh 语法：`sshrack root@10.0.0.50 df -h`，或裸 IP 配 `-c`/`-l`（`sshrack -c ops 10.0.0.4 uptime`）。
 
 ### TUI（交互）
 
