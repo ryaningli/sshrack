@@ -116,10 +116,12 @@ pub fn open_transfer(
 
     // Capture the remote pane title before `resolved_auth` / `resolved_host`
     // are moved into SftpWorker::spawn below. Prefer the host's friendly name;
-    // fall back to "<user>@<host>" for an unnamed (e.g. ephemeral) host.
+    // fall back to "<user>@<host>" for an unnamed (e.g. ephemeral) host. The
+    // user shown is the EFFECTIVE one (the `user@` override wins over the
+    // credential user) so the title matches the login the master negotiates.
     let remote_title = remote_title(
         &resolved_host.name,
-        &resolved_auth.user,
+        effective_user(user_override.as_deref(), &resolved_auth.user),
         &resolved_host.host,
     );
 
@@ -204,6 +206,14 @@ fn remote_title(name: &str, user: &str, host: &str) -> String {
     } else {
         name.to_string()
     }
+}
+
+/// The login user the UI should show for this session: the entry target's
+/// `user@` override wins, else the resolved credential user. Mirrors the
+/// effective user the master logs in as (`Overrides.user` beats
+/// `resolved.user` in `connect_opts`). Pure.
+fn effective_user<'a>(user_override: Option<&'a str>, resolved_user: &'a str) -> &'a str {
+    user_override.unwrap_or(resolved_user)
 }
 
 #[cfg(test)]
@@ -295,6 +305,24 @@ mod tests {
         );
         // The last token is the host (the master carries NO remote command).
         assert_eq!(argv.last().map(String::as_str), Some("h.example"));
+    }
+
+    #[test]
+    fn remote_title_user_override_beats_the_credential_user() {
+        // REGRESSION (user@host targets): the master logs in as the override
+        // user, so an ephemeral host's title must show that SAME user — the
+        // credential user in the title would misreport the login identity.
+        // Ephemeral shape: name == address (resolve_target's `address_host`).
+        let mut host = host_with_inline_user("tmp"); // inline user "u"
+        host.name = "192.168.20.18".into();
+        host.host = "192.168.20.18".into();
+        let cfg = SshrackConfig::default();
+        let auth = credential::resolve(&host, &cfg, None, &OsKeyring).unwrap();
+        let title_user = effective_user(Some("admin"), &auth.user);
+        assert_eq!(
+            remote_title(&host.name, title_user, &host.host),
+            "admin@192.168.20.18"
+        );
     }
 
     #[test]

@@ -157,10 +157,12 @@ pub fn control_exit_argv(target: &str, sock: &Path) -> Vec<String> {
 }
 
 /// The sftp target string `<user>@<host>` used as sftp's last argv token. The
-/// user comes from the resolved identity (so overrides are already applied);
-/// the host is the network endpoint.
-pub fn sftp_target(resolved: &ResolvedAuth, host: &Host) -> String {
-    format!("{}@{}", resolved.user, host.host)
+/// user is the EFFECTIVE one (`overrides.user` — e.g. a `user@` entry target —
+/// beats the resolved identity's user) so the batch target logs in as the same
+/// user the master's `-l` negotiated; the host is the network endpoint.
+pub fn sftp_target(resolved: &ResolvedAuth, host: &Host, overrides: &Overrides) -> String {
+    let user = overrides.user.as_deref().unwrap_or(&resolved.user);
+    format!("{user}@{}", host.host)
 }
 
 /// Shell-quote a path for an sftp batch line (`get`/`put` operands). Wraps the
@@ -421,7 +423,10 @@ mod tests {
 
     #[test]
     fn sftp_target_is_user_at_host() {
-        assert_eq!(sftp_target(&resolved(), &host()), "deploy@192.168.1.10");
+        assert_eq!(
+            sftp_target(&resolved(), &host(), &Overrides::default()),
+            "deploy@192.168.1.10"
+        );
     }
 
     #[test]
@@ -431,7 +436,23 @@ mod tests {
         // precedence ssh::build applies for `-l`.
         let mut r = resolved();
         r.user = "release".into();
-        assert_eq!(sftp_target(&r, &host()), "release@192.168.1.10");
+        assert_eq!(
+            sftp_target(&r, &host(), &Overrides::default()),
+            "release@192.168.1.10"
+        );
+    }
+
+    #[test]
+    fn sftp_target_carries_the_user_override_over_the_credential_user() {
+        // REGRESSION (user@host targets): the master logs in as the override
+        // user (`-l admin` via connect_opts), so the batch target must name the
+        // SAME user — a credential-user target would make sftp re-authenticate
+        // (or fail) against a muxed session opened as someone else.
+        let o = Overrides {
+            user: Some("admin".into()),
+            ..Default::default()
+        };
+        assert_eq!(sftp_target(&resolved(), &host(), &o), "admin@192.168.1.10");
     }
 
     // ---- shell_quote ----
