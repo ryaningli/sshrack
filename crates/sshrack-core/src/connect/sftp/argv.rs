@@ -339,6 +339,21 @@ mod tests {
     }
 
     #[test]
+    fn master_argv_carries_host_ssh_args() {
+        let h = Host {
+            ssh_args: Some("-o ServerAliveInterval=60".into()),
+            ..host()
+        };
+        let argv = master_argv(
+            &resolved(),
+            &h,
+            &Overrides::default(),
+            Path::new("/tmp/m.sock"),
+        );
+        assert!(argv.contains(&"ServerAliveInterval=60".to_string()));
+    }
+
+    #[test]
     fn master_argv_no_identity_when_resolved_has_none() {
         // A password-only / default-auth resolved identity has no key path; the
         // master argv must then omit -i (ssh-agent / password path).

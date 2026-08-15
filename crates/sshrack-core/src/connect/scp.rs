@@ -140,6 +140,13 @@ pub fn build(
         argv.push("-i".into());
         argv.push(k.to_string_lossy().into_owned());
     }
+    // scp accepts ssh's `-o` options but not its flags (`-X`, `-L`, …), so
+    // only the `-o Key=Value` subset of the host's ssh_args is forwarded.
+    if let Some(h) = &host
+        && let Some(raw) = &h.ssh_args
+    {
+        argv.extend(crate::sshargs::o_option_tokens(raw));
+    }
     argv.extend(out_args);
 
     Ok(ScpPlan {
@@ -398,6 +405,23 @@ mod tests {
         .unwrap();
         assert_eq!(plan.argv, vec!["scp", "root@1.2.3.4:/x"]);
         assert!(plan.host.is_none());
+    }
+
+    #[test]
+    fn build_forwards_only_dash_o_subset_to_scp() {
+        let mut cfg = cfg_with_key_host("web1");
+        cfg.hosts[0].ssh_args = Some("-o ServerAliveInterval=30 -X -L 8080:x:80".into());
+        let plan = build(
+            &["web1:/tmp/x".into(), ".".into()],
+            &cfg,
+            &Overrides::default(),
+            None,
+            &FakeBackend::new(),
+        )
+        .unwrap_or_else(|e| panic!("invariant: valid build: {e}"));
+        assert!(plan.argv.contains(&"ServerAliveInterval=30".to_string()));
+        assert!(!plan.argv.iter().any(|a| a == "-X"));
+        assert!(!plan.argv.iter().any(|a| a.starts_with("-L")));
     }
 
     #[test]
