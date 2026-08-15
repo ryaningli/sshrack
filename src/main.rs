@@ -626,6 +626,56 @@ mod tests {
     }
 
     #[test]
+    fn host_edit_ssh_args_is_cli_patch() {
+        let cmd = Command::Host {
+            action: HostAction::Edit {
+                name: Some("somehost".into()),
+                host: None,
+                user: None,
+                port: None,
+                ssh_args: Some("-o ServerAliveInterval=30".into()),
+                identity: None,
+                identity_stdin: false,
+                identity_file: None,
+                certificate_stdin: false,
+                certificate_file: None,
+                rename: None,
+                credential: None,
+                clear_identity: false,
+                clear_password: false,
+                clear_ssh_args: false,
+                clear_credential: false,
+            },
+        };
+        assert!(!route_is_tui(&cli_with_cmd(Some(cmd))));
+    }
+
+    #[test]
+    fn host_edit_clear_ssh_args_is_cli() {
+        let cmd = Command::Host {
+            action: HostAction::Edit {
+                name: Some("h".into()),
+                host: None,
+                user: None,
+                port: None,
+                ssh_args: None,
+                identity: None,
+                identity_stdin: false,
+                identity_file: None,
+                certificate_stdin: false,
+                certificate_file: None,
+                rename: None,
+                credential: None,
+                clear_identity: false,
+                clear_password: false,
+                clear_ssh_args: true,
+                clear_credential: false,
+            },
+        };
+        assert!(!route_is_tui(&cli_with_cmd(Some(cmd))));
+    }
+
+    #[test]
     fn host_ls_is_cli() {
         let cmd = Command::Host {
             action: HostAction::Ls {
