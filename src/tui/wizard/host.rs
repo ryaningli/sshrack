@@ -487,8 +487,8 @@ impl HostForm {
     /// stable worst-case height without cloning the form.
     ///
     /// The matrix mirrors the wizard's top-down reading:
-    /// - **Reference** — only Name / Host / Port / SSH args / Auth /
-    ///   Credential are reachable (the user + secret come from the referenced
+    /// - **Reference** — only Name / Host / Port / Auth / Credential /
+    ///   SSH args are reachable (the user + secret come from the referenced
     ///   credential). The Source / Identity / Inline* / Password rows are all
     ///   unreachable. SSH args is reachable under every auth mode (it describes
     ///   the machine's network/compat, not identity).
@@ -1407,7 +1407,7 @@ mod tests {
         // Sync the cursor to the end of the pre-filled Host field, as if the
         // user had just typed it — cursor_target then reports that position.
         f.cursor = f.focused_text_len();
-        // Independent + None: reachable rows are Name(0)/Host(1)/Port(2)/SshArgs(3)/Auth(4)/User(5)/Secret(6).
+        // Independent + None: reachable rows are Name(0)/Host(1)/Port(2)/Auth(3)/User(4)/Secret(5)/SshArgs(6).
         assert_eq!(f.cursor_target(), Some((1, 8)));
     }
 
@@ -1432,8 +1432,8 @@ mod tests {
         f.focus = Field::Password;
         f.password = Zeroizing::new("hunter2".into());
         f.cursor = f.focused_text_len();
-        // Independent + Password: Name(0)/Host(1)/Port(2)/SshArgs(3)/Auth(4)/User(5)/Secret(6)/Password(7).
-        assert_eq!(f.cursor_target(), Some((7, 7)));
+        // Independent + Password: Name(0)/Host(1)/Port(2)/Auth(3)/User(4)/Secret(5)/Password(6)/SshArgs(7).
+        assert_eq!(f.cursor_target(), Some((6, 7)));
     }
 
     #[test]
@@ -1527,17 +1527,17 @@ mod tests {
 
     #[test]
     fn tab_moves_focus_forward_through_independent_none_rows() {
-        // Independent + None: Name→Host→Port→SSH args→Auth→User→Secret, then
+        // Independent + None: Name→Host→Port→Auth→User→Secret→SSH args, then
         // wraps.
         let mut f = blank_form();
         assert_eq!(f.focus, Field::Name);
         for next in [
             Field::Host,
             Field::Port,
-            Field::SshArgs,
             Field::Auth,
             Field::User,
             Field::Secret,
+            Field::SshArgs,
         ] {
             f.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
             assert_eq!(f.focus, next);
@@ -1552,9 +1552,9 @@ mod tests {
         let mut f = blank_form();
         f.focus = Field::Auth;
         f.on_key(press(KeyCode::BackTab, KeyModifiers::SHIFT));
-        // Independent + None order: Name(0)/Host(1)/Port(2)/SshArgs(3)/Auth(4)/User(5)/Secret(6);
-        // BackTab from Auth(4) lands on SshArgs(3).
-        assert_eq!(f.focus, Field::SshArgs);
+        // Independent + None order: Name(0)/Host(1)/Port(2)/Auth(3)/User(4)/Secret(5)/SshArgs(6);
+        // BackTab from Auth(3) lands on Port(2).
+        assert_eq!(f.focus, Field::Port);
     }
 
     #[test]
@@ -1573,18 +1573,27 @@ mod tests {
         let o = f.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(o, Outcome::Continue));
         assert_eq!(f.focus, Field::Host);
-        // Jump to the last reachable field under Independent+None = Secret.
+        // Secret is no longer last under Independent+None (SSH args is), so
+        // Enter on it advances instead of saving.
         f.focus = Field::Secret;
+        let o = f.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(o, Outcome::Continue));
+        assert_eq!(f.focus, Field::SshArgs);
+        // The last reachable field under Independent+None is SSH args; Enter saves.
         let o = f.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(o, Outcome::SaveHost));
     }
 
     #[test]
-    fn enter_on_password_row_attempts_save_when_last() {
-        // Under Password choice, the Password row is last reachable; Enter saves.
+    fn enter_on_password_row_advances_to_ssh_args_then_saves() {
+        // Under Password choice the Password row is followed by SSH args;
+        // Enter on Password advances, Enter on SSH args (last) saves.
         let mut f = complete_form();
         f.secret_kind = SecretChoice::Password;
         f.focus = Field::Password;
+        let o = f.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(o, Outcome::Continue));
+        assert_eq!(f.focus, Field::SshArgs);
         let o = f.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(o, Outcome::SaveHost));
     }
@@ -2322,8 +2331,7 @@ mod tests {
         // Focus Auth, then Left must cycle (to Reference) — cursor stays 0 (chooser).
         form.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // Name -> Host
         form.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // Host -> Port
-        form.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // Port -> SshArgs
-        form.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // SshArgs -> Auth
+        form.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // Port -> Auth
         // sanity: focus is Auth
         assert_eq!(form.focus, Field::Auth);
         form.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
@@ -2371,7 +2379,7 @@ mod tests {
     #[test]
     fn body_rows_is_stable_across_auth_secret_and_source_states() {
         // Independent + IdentityKey + Inline is the widest state (10 reachable
-        // fields: Name/Host/Port/SshArgs/Auth/User/Secret/Source/InlinePrivate/InlineCert);
+        // fields: Name/Host/Port/Auth/User/Secret/Source/InlinePrivate/InlineCert/SshArgs);
         // Reference is the narrowest (6). body_rows() must report the SAME value
         // for every (auth, secret, source) state — the max (10) + error + hint =
         // 12 — so the dialog box stays a fixed height while the form is open.
@@ -3101,7 +3109,7 @@ mod tests {
         });
     }
 
-    // ---- host ssh_args: SSH args text row after Port (RED -> GREEN) ----
+    // ---- host ssh_args: SSH args text row (last row of the form) ----
 
     #[test]
     fn ssh_args_field_kind_is_text() {

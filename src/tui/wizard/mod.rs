@@ -99,10 +99,6 @@ pub enum Field {
     Name,
     Host,
     Port,
-    /// Raw ssh option flags for this host (free text; validated at save).
-    /// Reachable under every auth mode — it describes the machine's
-    /// network/compat, not identity.
-    SshArgs,
     User,
     Auth,
     /// Pick which `[[credentials]]` entry this host reuses (Reference branch
@@ -127,6 +123,13 @@ pub enum Field {
     InlineCert,
     Identity,
     Password,
+    /// Raw ssh option flags for this host (free text; validated at save).
+    /// Reachable under every auth mode — it describes the machine's
+    /// network/compat, not identity. Ordered LAST: it is an advanced
+    /// escape-hatch field most hosts leave empty, so the common path
+    /// (Name → Host → Port → Auth …) stays contiguous and `Enter` on the
+    /// final row saves.
+    SshArgs,
 }
 
 impl Field {
@@ -134,12 +137,13 @@ impl Field {
     /// rows it gates so the Independent form reads top-down: pick the kind,
     /// then the source, then fill the slot it exposes. The slot rows are
     /// filtered at navigation time by [`HostForm::reachable_fields`] according
-    /// to the (auth, secret, source) matrix.
+    /// to the (auth, secret, source) matrix. `SshArgs` is deliberately last:
+    /// an advanced escape-hatch row most hosts leave empty, kept out of the
+    /// common path so `Enter` on the final reachable row saves.
     const ORDER: &'static [Field] = &[
         Field::Name,
         Field::Host,
         Field::Port,
-        Field::SshArgs,
         Field::Auth,
         Field::Credential,
         Field::User,
@@ -149,6 +153,7 @@ impl Field {
         Field::InlinePrivate,
         Field::InlineCert,
         Field::Password,
+        Field::SshArgs,
     ];
 
     /// Human label shown in the form. Capitalized so the add/edit forms read
