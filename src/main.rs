@@ -119,6 +119,13 @@ fn run_main() -> i32 {
                 // A missing host name (e.g. `sshrack sftp nope`) surfaces as
                 // NOT_FOUND, mirroring the CLI's connect path. Other TUI setup
                 // failures stay CONNECT.
+                if let sshrack_core::error::SshrackError::HostNotFound { name, .. } = &e {
+                    // Same two-line guidance the CLI's connect/scp paths print:
+                    // how to reach a host that is not registered.
+                    if let Some(hint_line) = cli::cmd::shared::unregistered_host_hint(name) {
+                        eprintln!("sshrack: {hint_line}");
+                    }
+                }
                 match &e {
                     sshrack_core::error::SshrackError::HostNotFound { .. } => exit_code::NOT_FOUND,
                     _ => exit_code::CONNECT,

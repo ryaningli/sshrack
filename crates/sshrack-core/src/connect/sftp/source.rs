@@ -31,7 +31,7 @@ use crate::dirsource::{DirEntry, DirSource, PathKind};
 /// already-established `ControlPath`; `batch` is the full sftp script body,
 /// which the caller is expected to terminate with a trailing `quit` line (every
 /// batch builder in [`super::proto`] — `pwd_batch`, `list_batch`, `get_batch`,
-/// `put_batch` — and the ad-hoc `ls -l`/`rm` batches in `worker.rs` already
+/// `put_batch` — and the one-off `ls -l`/`rm` batches in `worker.rs` already
 /// include it). Dropping the stdin handle after the write also signals
 /// end-of-batch. Returns the captured stdout on success, or
 /// `Err(first_useful_stderr_line)` on non-zero exit.

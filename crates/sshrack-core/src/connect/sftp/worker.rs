@@ -485,7 +485,7 @@ fn connect_phase(
 
     let sock = ControlSocket::new();
     let sock_path = sock.path().to_path_buf();
-    let target = sftp_target(resolved, host);
+    let target = sftp_target(resolved, host, overrides);
 
     // Materialize the password temp file (Inline only) and build the askpass
     // env. Keyring carries no file; None carries no env at all. The SFTP

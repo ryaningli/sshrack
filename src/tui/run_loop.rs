@@ -106,8 +106,8 @@ pub fn run_loop(
     loop {
         if first_tick {
             first_tick = false;
-            if let Some(host) = app.pending_transfer_host.take() {
-                match open_transfer(host, app, handle.clone(), data_dir) {
+            if let Some((host, user)) = app.pending_transfer_host.take() {
+                match open_transfer(host, user, app, handle.clone(), data_dir) {
                     Ok(()) => {}
                     Err(SshrackError::Interrupted) => {
                         // Defensive: open_transfer only interrupts on a popup
@@ -396,11 +396,11 @@ pub fn run_loop(
                     // Interrupted → return to the launcher (no status write);
                     // any other error surfaces as a red status-bar line via
                     // report_failure and returns to the launcher.
-                    let Some(host) = app.pending_transfer_host.take() else {
+                    let Some((host, user)) = app.pending_transfer_host.take() else {
                         // No host: defensive — Ctrl-T hit no host.
                         continue;
                     };
-                    match open_transfer(host, app, handle.clone(), data_dir) {
+                    match open_transfer(host, user, app, handle.clone(), data_dir) {
                         Ok(()) => {}
                         Err(SshrackError::Interrupted) => {
                             // User cancelled a popup (Esc/Ctrl-C). Return to the

@@ -43,15 +43,11 @@ pub struct ConnectOptions {
     pub identity: Option<PathBuf>,
 
     /// Reuse a `[[credentials]]` entry for this connection only (overlays the
-    /// resolved auth). For an ad-hoc target this is the identity source.
-    /// Resolved from name to id by the CLI layer, not by clap.
+    /// resolved auth). For an address target (unregistered `user@host`/IP)
+    /// this is the identity source. Resolved from name to id by the CLI
+    /// layer, not by clap.
     #[arg(short = 'c', long = "credential")]
     pub credential: Option<String>,
-
-    /// Treat the target as a literal address, not a config name. The only way
-    /// to reach an IP/host that is not a configured name.
-    #[arg(long = "ad-hoc")]
-    pub ad_hoc: bool,
 
     /// Accept a host key seen for the first time (like ssh's `accept-new`).
     /// Non-interactive escape hatch: without it, a new key is shown with its
@@ -72,8 +68,7 @@ impl ConnectOptions {
             port: self.port.or(base.port),
             identity: self.identity.or_else(|| base.identity.clone()),
             credential: self.credential.or_else(|| base.credential.clone()),
-            // Either level opting into ad-hoc / accept-new is enough (OR).
-            ad_hoc: self.ad_hoc || base.ad_hoc,
+            // Either level opting into accept-new is enough (OR).
             accept_new: self.accept_new || base.accept_new,
         }
     }
@@ -167,8 +162,8 @@ pub enum Command {
         opts: ConnectOptions,
         /// scp operands and flags. Remotes use `name:path`; sshrack rewrites
         /// known names and passes `user@host:path` through verbatim. An
-        /// unknown `name:path` is rejected — use `--ad-hoc` or
-        /// `user@host:path` for a host that is not a registered name.
+        /// unknown `name:path` is rejected — use `user@host:path` (or an IP
+        /// with `-c`/`-l`) for a host that is not a registered name.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -840,8 +835,8 @@ mod tests {
     // and the per-subcommand one) so `sshrack --port 9 ssh web1` and
     // `sshrack ssh --port 9 web1` behave the same. For user/port/identity/
     // credential the subcommand (self) value wins when set and falls back to
-    // the top-level (base) otherwise; ad_hoc and accept_new are OR (either
-    // level opting in is enough).
+    // the top-level (base) otherwise; accept_new is OR (either level opting
+    // in is enough).
 
     #[test]
     fn overlay_self_set_field_wins_over_base() {
@@ -851,7 +846,6 @@ mod tests {
             port: Some(22),
             identity: Some(PathBuf::from("/base/key")),
             credential: Some("base-cred".into()),
-            ad_hoc: false,
             accept_new: false,
         };
         let inner = ConnectOptions {
@@ -859,7 +853,6 @@ mod tests {
             port: Some(2222),
             identity: Some(PathBuf::from("/inner/key")),
             credential: Some("inner-cred".into()),
-            ad_hoc: false,
             accept_new: false,
         };
         let out = inner.overlay(&base);
@@ -880,7 +873,6 @@ mod tests {
             port: Some(22),
             identity: Some(PathBuf::from("/base/key")),
             credential: Some("base-cred".into()),
-            ad_hoc: false,
             accept_new: false,
         };
         let out = ConnectOptions::default().overlay(&base);
@@ -940,35 +932,6 @@ mod tests {
                 .overlay(&ConnectOptions::default())
                 .accept_new,
             "neither level opting in → false"
-        );
-    }
-
-    #[test]
-    fn overlay_ad_hoc_ors_across_levels() {
-        // ad_hoc is OR across both layers, mirroring accept_new.
-        let base_on = ConnectOptions {
-            ad_hoc: true,
-            ..ConnectOptions::default()
-        };
-        assert!(
-            ConnectOptions::default().overlay(&base_on).ad_hoc,
-            "base-only ad_hoc true → true"
-        );
-
-        let self_on = ConnectOptions {
-            ad_hoc: true,
-            ..ConnectOptions::default()
-        };
-        assert!(
-            self_on.overlay(&ConnectOptions::default()).ad_hoc,
-            "self-only ad_hoc true → true"
-        );
-
-        assert!(
-            !ConnectOptions::default()
-                .overlay(&ConnectOptions::default())
-                .ad_hoc,
-            "both false → false"
         );
     }
 }

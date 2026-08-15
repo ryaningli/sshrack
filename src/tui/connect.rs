@@ -19,7 +19,7 @@
 //!
 //! The launcher already selected a host from the loaded config, so the host
 //! `id` is known and trusted — there is no name to resolve and no
-//! `--credential`/`--ad-hoc`/`--port`/`--user`/`--identity` override to fold
+//! `--credential`/`--port`/`--user`/`--identity` override to fold
 //! in. The auth reference (by id) is still resolved through the same
 //! `credential::resolve` as the CLI, so a dangling reference fails here
 //! exactly as it would on the command line. An interactive shell has no
@@ -79,7 +79,7 @@ pub fn connect_host(
     let cfg: &SshrackConfig = app.config();
 
     // ── Step 1: Look up the host by id (launcher already chose it). ──────────
-    // No name resolution, no --credential/--ad-hoc/--port/--user/--identity
+    // No name resolution, no --credential/--port/--user/--identity
     // overrides: the TUI connect path is a direct launcher selection.
     let host = cfg
         .find_host_by_id(&host_id)

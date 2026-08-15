@@ -13,7 +13,9 @@
 //! 5. [`hostkey::run_host_key_flow`] — host-key pre-flight (new keys accepted
 //!    only with `--accept-new`; changed keys rejected by ssh upstream).
 //! 6. [`connect::ssh::build`] → argv.
-//! 7. [`frecency::record`] + [`frecency::store::save`] **before** launch.
+//! 7. [`frecency::record`] + [`frecency::store::save`] **before** launch
+//!    (ephemeral address targets never record — their fresh ULID per call
+//!    could never rank).
 //! 8. [`connect::launch`].
 //!
 //! ## Why credential before host (Steps 1 → 2)
@@ -42,7 +44,7 @@ use crate::shared::exit_code;
 /// Dispatch for the `Ssh`/`Connect` arms of the CLI.
 ///
 /// Merges the top-level `--port`/`--user`/`--identity`/`--credential`/
-/// `--ad-hoc`/`--accept-new` flags with any subcommand-level flags, then runs
+/// `--accept-new` flags with any subcommand-level flags, then runs
 /// the 8-step connect flow. Returns the ssh exit code, or an [`exit_code`]
 /// constant on a local error.
 pub fn run(cli: &Cli) -> i32 {
@@ -95,16 +97,18 @@ pub fn run(cli: &Cli) -> i32 {
 
     // ── Step 2: Resolve name → Host (fail-fast, no network I/O). ─────────────
     let resolve_overrides = host::ResolveOverrides {
-        ad_hoc: opts.ad_hoc,
         credential: cred_ulid,
         port: opts.port,
         user: opts.user.as_deref(),
         identity: opts.identity.as_deref(),
     };
-    let resolved_host = match host::resolve_target(&cfg, target, &resolve_overrides) {
-        Ok(h) => h,
+    let resolved = match host::resolve_target(&cfg, target, &resolve_overrides) {
+        Ok(r) => r,
         Err(SshrackError::HostNotFound { name, hint }) => {
             eprintln!("sshrack: host not found: {name}{hint}");
+            if let Some(hint_line) = crate::cli::cmd::shared::unregistered_host_hint(&name) {
+                eprintln!("sshrack: {hint_line}");
+            }
             return exit_code::NOT_FOUND;
         }
         Err(e) => {
@@ -112,6 +116,7 @@ pub fn run(cli: &Cli) -> i32 {
             return exit_code::VALIDATION;
         }
     };
+    let resolved_host = resolved.host;
     let port = opts.port.unwrap_or(resolved_host.port);
 
     // ── Step 3: Vault unlock (no-op when not in vault mode). ─────────────────
@@ -186,12 +191,15 @@ pub fn run(cli: &Cli) -> i32 {
     }
 
     // ── Step 6: Build argv. ───────────────────────────────────────────────────
+    // User precedence: `user@` (target_user) > `-l`. The resolved target
+    // already stripped the @user, so it must be re-applied here — otherwise a
+    // `user@registered-name` connect would silently log in as the credential
+    // user.
     let ssh_overrides = connect::ssh::Overrides {
-        user: opts.user.clone(),
+        user: resolved.target_user.clone().or_else(|| opts.user.clone()),
         port: opts.port,
         identity: opts.identity.clone(),
         credential: cred_ulid,
-        ad_hoc: opts.ad_hoc,
     };
     let argv = connect::ssh::build(
         &resolved_auth,
@@ -200,8 +208,11 @@ pub fn run(cli: &Cli) -> i32 {
         &remote_command,
     );
 
-    // ── Step 7: Record frecency BEFORE launch. ────────────────────────────────
-    if let Some(dir) = sshrack_core::config::path::default_data_dir() {
+    // ── Step 7: Record frecency BEFORE launch (ephemeral address targets
+    // never record — a fresh ULID per call could never rank, only bloat). ──
+    if !resolved.ephemeral
+        && let Some(dir) = sshrack_core::config::path::default_data_dir()
+    {
         let mut frec = frecency::store::load(&dir).unwrap_or_default();
         frec.record(&resolved_host.id);
         let _ = frecency::store::save(&dir, &frec);

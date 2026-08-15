@@ -1,6 +1,6 @@
 //! Design tokens for the TUI: a single accent color (Cyan) plus grayscale.
 //! Every view draws its colors from here so the palette stays consistent
-//! and minimal — no ad-hoc `Color::Foo` scattered across renderers.
+//! and minimal — no one-off `Color::Foo` scattered across renderers.
 
 use ratatui::{
     style::{Color, Modifier, Style},

@@ -128,10 +128,12 @@ pub struct App {
     /// outside a transfer session.
     pub(crate) transfer_key_artifact: Option<KeyArtifact>,
     /// [`super::transfer::open::open_transfer`]. Mirrors `pending_connect`.
-    /// Holds the resolved `Host` (a saved host from the launcher, or an ad-hoc
-    /// host built at the `sshrack sftp` entry) — `open_transfer` consumes it
-    /// directly, no id→host re-lookup.
-    pub(super) pending_transfer_host: Option<Host>,
+    /// Holds the resolved `Host` (a saved host from the launcher, or an
+    /// ephemeral host built at the `sshrack sftp` entry) — `open_transfer`
+    /// consumes it
+    /// directly, no id→host re-lookup. The host plus the effective login-user
+    /// override (`user@` > `-l`; `None` for the launcher Ctrl-T path).
+    pub(super) pending_transfer_host: Option<(Host, Option<String>)>,
     /// Set by [`App::route_transfer`] when the screen signals
     /// [`ScreenOutcome::CancelActive`]. The loop reads (and clears) this and
     /// sends `WorkerCmd::Cancel` to the worker. Pure-intent bridge: `on_key`
@@ -585,7 +587,7 @@ impl App {
     /// drive the open intent keep reading an id.
     #[cfg(test)]
     pub fn pending_transfer_id(&self) -> Option<Ulid> {
-        self.pending_transfer_host.as_ref().map(|h| h.id)
+        self.pending_transfer_host.as_ref().map(|(h, _)| h.id)
     }
 
     /// Take the pending-cancel flag. Returns `true` when the loop should send
@@ -737,7 +739,7 @@ impl App {
             && matches!(self.active_tab, Tab::Hosts)
         {
             if let Some(h) = self.launcher.selected_host(&self.config.hosts) {
-                self.pending_transfer_host = Some(h.clone());
+                self.pending_transfer_host = Some((h.clone(), None));
                 return Outcome::OpenTransfer;
             }
             // No host selected: silent no-op. The launcher already shows an
@@ -2765,8 +2767,8 @@ mod tests {
     #[test]
     fn ctrl_t_on_hosts_with_host_signals_open_transfer() {
         // Ctrl-T on the Hosts tab with a host under the cursor sets
-        // pending_transfer_host to that host and returns OpenTransfer. on_key
-        // performs NO I/O — the loop runs open_transfer.
+        // pending_transfer_host to that (host, None) pair and returns
+        // OpenTransfer. on_key performs NO I/O — the loop runs open_transfer.
         let mut app = app_with_host("web");
         let expected_id = app.config.hosts[0].id;
         let out = app.on_key(press(KeyCode::Char('t'), KeyModifiers::CONTROL));
