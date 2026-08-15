@@ -1,0 +1,490 @@
+## [0.1.1] - 2026-08-15
+
+### 🚀 Features
+
+- *(core)* Add sshargs module for raw host ssh flags
+- *(core)* Store ssh_args on hosts with save-time validation
+- *(core)* Append host ssh_args to ssh/sftp argv, -o subset to scp
+- *(cli)* --ssh-args on host add/edit, ssh-args in host show
+- *(tui)* SSH args text row in the host wizard
+- *(core)* User@host and bare-IP target resolution
+- *(connect)* Resolve user@host and bare-IP scp operands
+- *(cli)* Target-user precedence, frecency skip, unregistered-host hint
+
+### 🐛 Bug Fixes
+
+- *(cli)* Reject --ssh-args with --clear-ssh-args
+- *(core)* Reject long options and dangling value verbs in ssh_args
+- *(connect)* Bracket IPv6 addresses in rewritten scp operands
+- *(connect)* Split user@[v6]:path operands after the closing bracket
+- *(sftp)* Carry the effective user into the batch target and pane title
+- *(cli)* Print the unregistered-host hint on the sftp entry error
+- *(core)* Friendly TargetHasPort for user@ip:port targets
+
+### 🚜 Refactor
+
+- *(tui)* Move the SSH args row to the end of the host wizard
+- *(cli)* [**breaking**] Drop --ad-hoc in favor of user@host targets
+
+### 📚 Documentation
+
+- *(release)* Cargo install + tag-triggered publish runbook
+- *(readme)* Add TUI demo gif with reproducible assets
+- *(config)* Document host-level ssh_args
+- *(readme)* Document user@host targets, drop --ad-hoc
+- *(sftp)* Restore the sftp subcommand in the user@host example
+- *(readme)* Reword the unregistered-target example
+## [0.1.0] - 2026-08-11
+
+### 🚀 Features
+
+- *(core)* Port error type and fsutil private-write helper
+- *(core)* Add first-class identity helpers (id + keyring key)
+- *(config)* Port schema with first-class id and ref-by-id
+- *(config)* Port atomic config store and add data-dir path
+- *(secret)* Port vault crypto and passphrase cache
+- *(secret)* Extract SecretBackend/PassphraseProvider traits and keyring impl
+- *(core)* Port credential resolution with ref-by-id
+- *(connect)* Port ssh/scp argv assembly
+- *(core)* Port askpass protocol
+- *(connect)* Port zero-copy launcher with askpass wiring
+- *(core)* Port host-key pre-flight with injected confirm callback
+- *(core)* Port host CRUD pure logic
+- *(core)* Port credential CRUD pure logic and seal path
+- *(core)* Add frecency scoring and machine-local persistence
+- *(cli)* Clap structure with global --no-input/--format and askpass dispatch
+- *(cli)* Dialoguer prompt impl and --format json shapes
+- *(cli)* Connect path with fail-fast validation and frecency record
+- *(core)* Port vault write-direction (enable, seal_body, seal_auth)
+- *(cli)* Host/cred commands with json output and exit codes
+- *(cli)* Scp and store commands with mode migration
+- *(tui)* Add routing dispatch and tui module stub
+- *(tui)* App skeleton, terminal guard, delayed-exec contract
+- *(tui)* Passphrase provider and host-key confirm via popups
+- *(tui)* Pure host ranking with frecency and nucleo fuzzy
+- *(tui)* Launcher list with fuzzy filter, frecency tier, and key bindings
+- *(tui)* Wire connect orchestration to delayed exec
+- *(tui)* Host add/edit wizard with validation
+- *(tui)* Credential add/edit wizard with store-mode-aware sealing
+- *(tui)* Store mode switch view bound to F2
+- *(tui)* Delete confirm flow, F1 help overlay, consolidated status bar
+- *(tui)* Add pure StorePick key-decision helper
+- *(tui)* Offer in-wizard store-mode pick on undecided save
+- *(tui)* Use terminal cursor instead of drawn glyph in wizards
+- *(tui)* Add centralized design tokens in theme.rs
+- *(tui)* Add Tab enum and pure tab-switch key decision
+- *(tui)* Add three-band shell renderer (brand, tabs, footer)
+- *(tui)* Add centered Dialog overlay chrome
+- *(tui)* Add Credentials panel (search + ranked list, no secrets rendered)
+- *(tui)* Add Settings panel with storage-mode picker overlay
+- *(tui)* Route CLI entry to the matching tab + overlay
+- *(tui)* Dialog help overlay with new keymap; drop legacy bindings and docs
+- *(tui)* Add focus_marker selection helper to theme
+- *(tui)* Border the middle panel and drop the header F1 help
+- *(tui)* Consolidate status into the shell footer; drop panel status rows
+- *(tui)* Align host columns and show user@host:port with focus marker
+- *(tui)* Align credential columns with focus marker
+- *(tui)* Capitalize wizard field labels
+- *(tui)* Host wizard Reference/Independent auth with inline password sealing
+- *(tui)* Pure fuzzy credential picker state machine
+- *(tui)* Host wizard credential row with fuzzy picker, drop shift-cycling
+- *(tui)* Render credential picker as a centered fuzzy overlay
+- *(tui)* Auto-default store mode to keyring on startup when available
+- *(tui)* Boxed search input with matched/total count
+- *(tui)* Cycle host wizard credential inline and drop auth auto-jump
+- *(tui)* Pure focus_window and truncate_cells helpers
+- *(tui)* Size dialog height to its content rows
+- *(tui)* Scroll form fields to keep focus visible and truncate wide values
+- *(tui)* Scroll help overlay so all bindings are reachable
+- *(tui)* Size prompt popups to content and show passphrase cursor
+- *(tui)* Pure cursor-aware text edit helpers
+- *(tui)* Cursor movement within host-form text fields
+- *(tui)* Cursor movement within cred-form text fields
+- *(tui)* Bracket switchable chooser values and drop auth name echo
+- *(tui)* Field-only hints with footer separator and aligned credential label
+- *(tui)* Stable dialog height with bottom-pinned error/hint
+- *(tui)* Fuzzy-match host/cred user and host fields with per-field highlight
+- *(core)* KeySource model for path or inline identity keys
+- *(core)* Seal and count inline key secrets per store mode
+- *(core)* Resolve inline key to a temp-file KeyArtifact for ssh -i
+- *(cli)* Import identity key contents via stdin/file; mask inline in ls/show
+- *(tui)* SourceChoice + Source/Inline fields for inline key wizard
+- *(tui)* Cred wizard Source cycling + inline textarea input
+- *(tui)* Build_body routes inline source to with_inline_key
+- *(tui)* Render inline-key multiline editor block in cred wizard
+- *(tui)* Inline-key multiline editor in host wizard (Independent)
+- *(tui)* Modal KeyPaste popup for inline key editing
+- *(core)* Pure path-parse helpers for the file picker
+- *(core)* Pure private-key header/filename detection
+- *(core)* DirSource trait + LocalDirSource for the file picker
+- *(tui)* FilePicker state machine with path-aware on_key
+- *(tui)* Render FilePicker overlay with cwd/list/query/status
+- *(tui)* Open file picker from the host wizard Identity row
+- *(tui)* Open file picker from the credential wizard Identity row
+- *(tui)* Remember per-directory cursor in the file picker
+- *(tui)* Unified field-type affordance suffixes in host wizard
+- *(tui)* Apply unified field-type affordance suffixes to cred wizard
+- *(core)* Extend DirEntry with size and modified for sftp listing
+- *(sftp)* Connection-option reuse + ControlMaster/sftp argv builders
+- *(sftp)* Robust ls -l parser with control-char stripping
+- *(sftp)* Worker protocol, batch builders, progress math
+- *(sftp)* SftpDirSource over an injectable SftpRunner seam
+- *(sftp)* ControlSocket RAII + SftpWorker thread with multiplexed master
+- *(sftp)* Pure Pane navigation/filter/mark for dual-pane transfer
+- *(sftp)* TransferScreen dual-pane render with progress and queue
+- *(sftp)* Transfer on_key, overwrite decision, queue advance
+- *(sftp)* Wire TransferScreen into App with worker event drain
+- *(sftp)* Sshrack sftp <name> CLI + Ctrl-T launcher entry
+- *(tui)* Remember per-directory cursor in the transfer pane
+- *(tui)* Carry a remote pane title on the transfer screen
+- *(tui)* Title and border each sftp transfer pane
+- *(tui)* Resolve --ad-hoc and override targets at the sftp entry
+- *(tui)* Highlight the whole cursor row in the sftp pane
+- *(transfer)* Add pure TransferLedger model for queue management
+- *(transfer)* Collapse status panel to a 2-row active+summary band
+- *(transfer)* Add ^Q queue-manager overlay (view + navigation)
+- *(transfer)* Wire queue-overlay retry/remove/cancel/pause operations
+- *(tui)* Split queue overlay into active/failed/completed views
+- *(tui)* Add view tabs and empty-state to queue overlay
+- *(connect)* Add config-channel askpass path for plaintext mode
+- *(core)* Startup stale-sweep for crashed-run temp-file residue
+- *(tui)* Add Overlay::Alert modal error dialog
+- *(core)* Add SSHRACK_ASKPASS_DENY so SFTP master never reads /dev/tty
+- *(tui)* Route sftp open failures through the Alert overlay
+- *(secret)* Add raw set_at/delete_at and inline-keyring-key helpers
+- *(core)* Allow keyring-stored inline keys; drop dead InlineKeyNeedsVaultOrPlaintext
+- *(secret)* Seal inline keys into the OS keyring under keyring mode
+- *(core)* Resolve keyring-stored inline keys via the backend
+- *(secret)* Clean and copy inline-key keyring slots on rm/cp/overwrite
+- *(tui)* Advertise F1 help in the SFTP footer and document the model
+- *(tui)* Add plan_active_row width-budget planner for active-transfer row
+- *(tui)* Add plan_gauge pure bar-layout helper for visible track
+- *(tui)* Render visible-track progress bar instead of Gauge widget
+- *(cli)* Add prompt module for default-interactive mode
+- *(cli)* Prompt host-key fingerprint when tty present
+- *(cli)* Use tty-aware passphrase provider on connect paths
+- *(cli)* Confirm destructive ops on tty, zeroize passphrase scratch
+- *(core)* Add pathfind::parse_query for path-aware find
+- *(core)* Add SegmentMatcher trait and PathMatch types
+- *(core)* Add pathfind::filter_level with per-segment pruning
+- *(core)* Add PathSearch streaming traversal and LocalPathSearch
+- *(core)* Add RemotePathSearch over the sftp ControlMaster
+- *(tui)* Add NucleoSegmentMatcher for path-aware find
+- *(tui)* Add PaneSearch state and search-aware Pane::on_key
+- *(tui)* Wire TransferScreen search dispatch and result actions
+- *(tui)* Dispatch and drain path-aware search with debounce
+- *(tui)* Render path-aware find results and wire remote search
+- *(core)* Parse trailing slash in path-aware find query
+- *(tui)* Tab completes focused pane candidate in transfer screen
+- *(tui)* Compact sftp find-mode filter label with animated spinner
+- *(tui)* Make find-mode Enter enqueue files, jump into dirs
+- *(core)* Add TTL+LRU DirListCache for pathfind listings
+- *(core)* Route LocalPathSearch listings through DirListCache
+- *(sftp)* Route RemotePathSearch listings through DirListCache
+- *(core)* Emit Drilled event for trailing-slash find
+- *(tui)* Model synthetic "." current-dir row in PaneSearch
+- *(tui)* Wire Drilled into search state and suppress Tab on "."
+- *(tui)* Render "." current-dir row in find results
+- *(tui)* Tail-truncate long find-result paths at segment boundaries
+- *(tui)* Tail-truncate long filter/query input with ellipsis
+- *(tui)* Truncate long pane border titles with ellipsis
+- *(transfer)* Add CloseConfirm quit-confirmation overlay component
+- *(transfer)* Confirm before quitting SFTP while a transfer is in flight
+- *(transfer)* Async SFTP master handshake so Ctrl-T no longer freezes
+- *(transfer)* Async host-key pre-flight for SFTP
+
+### 🐛 Bug Fixes
+
+- *(core)* Remove unsafe from vault tests via env-passphrase injection
+- *(cli)* Escape reveal-json password, clean force-orphaned keyring, distinct sort recent
+- *(core)* Redact Secret::Plain in Debug; plus host expect convention, frecency warn, store DRY
+- *(tui)* Accurate terminal-handle lifetime + silent EINTR cancel in popups
+- *(tui)* Prefill correct credential when editing Auth::Ref host
+- *(tui)* Remove dead draw fns; ? help launcher-only
+- *(tui)* Stop reentrant RefCell panic by narrowing the draw borrow
+- *(tui)* Zeroize popup buffers on cancel; rethrow host-key Interrupted
+- *(cli)* Handle edit-no-name and --format json routing; cleanups
+- *(tui)* Place field cursor before placeholder as background hint
+- *(tui)* Redact CredForm password in Debug impl
+- *(tui)* Move enter_press to app to drop run_loop back-edge
+- *(tui)* Drop stale empty-state copy, center placeholder on both axes
+- *(tui)* Reject empty vault passphrase before enabling
+- *(secret)* Treat empty SSHRACK_PASSPHRASE as unset
+- *(tui)* Let help scroll reach the tail on short terminals
+- *(tui)* Make credential form secret choice three-way mutually exclusive
+- *(tui)* Keep the search-box cursor from bleeding through overlays
+- *(tui)* Advance text cursor on Right arrow in forms
+- *(tui)* Render cred Secret chooser above its gated slot rows
+- *(core)* Let ssh prompt for an encrypted key's passphrase on key-only connections
+- *(cli)* Reject --identity-stdin with --certificate-stdin (shared stdin corrupts the key)
+- *(cli)* Seal inline identity key per store mode on add/edit; doc + tests
+- *(core)* Migrate re-seals inline identity keys on store-mode switch/rekey
+- *(core,cli)* Preserve inline key on CLI patch; reject conflicting cert/credential flags
+- *(tui)* Lock cred textarea viewport with short-terminal test; unreachable guard
+- *(tui)* Redact KeyPaste Debug to avoid leaking pasted key text
+- *(tui)* Preserve newlines when pasting multi-line keys
+- *(tui)* Make Ctrl-C cancel the active overlay instead of quitting
+- *(tui)* Address final review — cwd left-truncate, doc accuracy, test naming
+- *(picker)* Resolve deferred nits — ensure_started retry, ~-prefix PathLike, drop ../ dead data
+- *(tui)* Make file-picker Right a no-op on files (navigation only)
+- *(tui)* Reattach render_row doc and drop broken truncate_cells link
+- *(tui)* Refresh cred render_row doc to describe delegation
+- *(sftp)* Parameterize ls parse clock for purity and year-boundary
+- *(sftp)* Reuse dirsource::DirEntry and correct sftp recursive flag placement
+- *(sftp)* Break Drop deadlock, clean upload partials, drop dead code
+- *(sftp)* Drop stale reachability doc and tighten render helper visibility
+- *(sftp)* Delete speculative dead-code setters (set_focus/push_queue)
+- *(sftp)* Remote on_step parity, split oversized files, doc nit
+- *(sftp)* Make transfer reachable via Ctrl-S and Enter
+- *(tui)* Populate both transfer panes on screen open
+- *(sftp)* Show remote entries by basename, not absolute path
+- *(tui)* Cut transfer-pane remote-listing lag to 50ms poll
+- *(tui)* Show transfer sizes ls -lh style (K/M/G)
+- *(tui)* Refresh destination pane after a transfer completes
+- *(tui)* Drop duplicate hotkey hints from sftp status row
+- *(tui)* Clear sftp pane query when re-entering current dir
+- *(tui)* Prefer host name over user@ip for sftp pane title
+- *(tui)* Drop the prompt prefix from the sftp pane cwd row
+- *(tui)* Show user@host for an ad-hoc sftp pane title
+- *(transfer)* Summary 'done' counts Ok only, not all terminal tasks
+- *(core)* Include hidden files in sftp remote listings
+- *(tui)* Make sftp pane Backspace a pure edit key
+- *(core)* Drop sftp ls -la self-ref ./.. rows in remote listings
+- *(tui)* Land cursor on the entered child when going back up
+- *(tui)* Truncate long filenames in queue rows
+- *(tui)* Land wizard overlays on the current state
+- *(tui)* Echo saved inline-key line count on the field row in edit mode
+- *(test)* Retry transient ETXTBSY in connect_flow launch tests
+- *(sftp)* Capture master stderr and fail fast when it exits
+- *(sftp)* Drain master stderr in chunks to avoid handshake deadlock
+- *(secret)* Migrate inline keys across store-mode switches; drop dead re_seal_inline_secret
+- *(secret)* Count keyring inline keys and re-encrypt them on rekey
+- *(tui)* Seal inline-key plaintext under any store mode; verify keyring connect path
+- *(connect)* Fail fast on bad key for key-only hosts, no password fallback
+- *(sweep)* Shrink temp-file leak window from 1h to 5min
+- *(connect)* Wipe temp files on SIGINT/SIGTERM so a Ctrl-C does not leak keys
+- *(connect)* Serialize registry tests, unregister sftp worker pw temp file, doc/visibility polish
+- *(sftp)* Admit default-ssh hosts without a configured key
+- *(connect)* Re-attach trailing newline stripped from inline keys
+- *(sftp)* Revert pane cwd when a listing fails
+- *(tui)* Auto-clear transfer status on each keypress
+- *(tui)* Make F1 a true global Help layer over every surface
+- *(sftp)* Skip sftp prompt echo when polling upload progress
+- *(tui)* Drop duplicate /s suffix in active-transfer rate
+- *(sftp)* Relax e2e download-progress assertion to avoid fast-loopback flake
+- *(tui)* Truncate active-transfer name and hug gauge to the right edge
+- *(tui)* Truncate pane names by display width and plan meta column
+- *(tui)* Use display width for pane-row meta fill and tighten cjk align test
+- *(tui)* Drop trailing footer hints on narrow terminals instead of clipping
+- *(core)* Reject non-keyring inline key with no private-key material
+- *(cli)* Show (yes/no) affordance on host-key confirm prompt
+- *(tui)* Clear pending_search on cancel and clamp cursor in-place
+- *(tui)* Treat trailing slash as find mode in path-aware filter
+- *(tui)* Preserve base prefix in Tab completion
+- *(tui)* Keep stale find results until next search event
+- *(tui)* Swallow Tab mid-search with no candidate
+- *(tui)* Do not complete off stale results mid-search
+- *(tui)* Tab never flips focus in find mode
+- *(tui)* Show base prefix in find candidate paths
+- *(tui)* Gen-gate find result clear to prevent fast-backspace duplicate
+- *(tui)* Route sftp find events by in-flight pane side, not heuristic
+- *(tui)* Disable Space-marking in SFTP find mode
+- *(tui)* Make Esc clear a non-empty query in both filter and find modes
+- *(tui)* Accept Drilled event in search dispatch match
+- *(tui)* Clear current_dir on search Error event
+- *(transfer)* Wire pane loading indicator around every list
+- *(transfer)* Reserve a separator between query and count in filter row
+- *(transfer)* Stop Esc from silently cancelling an in-flight transfer
+- *(transfer)* Detach ssh -O exit so closing SFTP no longer freezes the UI
+- *(transfer)* Clean up SFTP connect-state rendering
+- *(transfer)* Drop ConnectFailed modal, surface failure via status line
+- *(tui)* Correct SFTP help — Esc no longer cancels transfers
+- *(cli)* Unblock prompt tests under CI's script pty
+
+### 💼 Other
+
+- *(workspace)* Scaffold core/cli/tui crates
+- *(workspace)* Bump MSRV to 1.88
+- *(deps)* Bump chacha20poly1305/crossterm/keyring to latest majors
+- *(deps)* Add insta dev-dependency for snapshot testing
+
+### 🚜 Refactor
+
+- *(core)* Lift atomic_write_private into fsutil
+- *(core)* Rename alias to name across host/credential schema
+- *(cli)* Rename alias to name in flags, handlers, and JSON contract
+- Merge sshrack-cli into root binary, add shared layer
+- *(cli)* Strip all interactivity; CLI is now fail-closed non-interactive
+- *(tui)* Extract rank_by_name; launcher delegates to it
+- *(tui)* Rewrite App to active_tab+Overlay with 3-layer on_key; delete Mode
+- *(tui)* Polish host/cred wizard dialog styling via theme tokens
+- *(tui)* Split wizard.rs into wizard/{mod,host,cred}.rs modules
+- *(tui)* Drop cancel-noise status writes and dead selected_gutter
+- *(tui)* Extract shared test helpers into test_support module
+- *(tui)* Extract TerminalGuard and terminal types into term module
+- *(tui)* Extract Outcome/Overlay/Status into intent module
+- *(tui)* Extract persist_* side-effects into persist module
+- *(tui)* Extract event loop into run_loop module
+- *(tui)* Dedup press helper into test_support
+- *(tui)* Drop Ctrl-1/2/3 tab-jump bindings
+- *(tui)* Move status to panel bottom, keep footer hints, auto-clear on next key
+- *(tui)* Reuse focus_window in cred picker and refresh overlay docs
+- *(tui)* Cred wizard inline key via popup, buffer to String
+- *(tui)* Host wizard inline key via popup, buffer to String
+- *(tui)* Move textarea bridge into key_paste, guard cred Enter trigger
+- *(tui)* Drop stale TEXTAREA_H test comment, align cred test name
+- *(tui)* Reuse shared cursor-history helper in file picker
+- *(tui)* Final-review polish — comments, doc, visibility
+- *(tui)* Carry a resolved Host through the sftp transfer-open path
+- *(tui)* Drop the dead name field from EntryMode::Transfer
+- *(transfer)* Back TransferScreen with TransferLedger
+- *(tui)* Extract BrowserCore base with shared listing ops
+- *(tui)* Unify dir-switch + nav decisions in BrowserCore
+- *(tui)* Reduce Pane to a BrowserCore shell
+- *(tui)* Reduce FilePicker to BrowserCore shell, align Backspace
+- *(tui)* Finalize browser-core extraction cleanup
+- *(tui)* Drop plan-internal task-step refs from BrowserCore docs
+- *(tui)* Drop plan-internal task-step refs and stale dead-code allow
+- *(core)* Resolve plaintext passwords via config channel, drop temp file
+- *(sftp)* Collapse multi-line master stderr to one status line
+- *(tui)* Route action failures through a single status helper
+- *(tui)* Drop the modal Alert; unify all failures to the status bar
+- *(tui)* Make help content context-sensitive
+- *(tui)* Right-align gauge percent instead of centered overlay
+- *(cli)* Extract col_widths for directly-testable width calculation
+- *(sftp)* Make master/control/sftp spawn argv[0] injectable for hermetic tests
+- *(core)* Make host-key classify 3-dim with Accept action
+- *(core)* Parameterize run_host_key_flow has_tty, fix accept-new no-tty
+- *(cli)* Route store vault/rekey passphrase through provider
+- *(tui)* Extract search dispatch into search_dispatch.rs
+- *(core)* Exact-drill descent with leaf-only fuzzy in path find
+- *(tui)* Preserve leaf tail in fit_units_tail degenerate path
+- *(tui)* Drop redundant prefix on store-switch errors
+- *(tui)* Dedupe store-switch status writes + align CLAUDE.md Io rule
+- *(transfer)* Quiet the status panel when idle
+- *(launcher)* Drop the frecency tier badge from the host list
+- *(tui)* Adaptive column widths for host and credential lists
+
+### 📚 Documentation
+
+- *(spec)* Add sshrack rewrite design spec
+- *(plan)* Add sshrack rewrite implementation plan
+- Rewrite CLAUDE.md for workspace core/cli/tui architecture
+- *(plan)* Endgame plan — TUI + non-interactive CLI + alias->name + single-binary routing
+- Rename alias to name in CLAUDE.md, spec, and rewrite plan
+- Rewrite architecture for single-binary cli+tui routing
+- *(spec)* Replace non-English first期 tokens with first phase
+- *(plans)* Add store-pick and cursor UX fix plan
+- *(plans)* Add TUI shell + tabs + popovers refactor plan
+- *(tui)* Add visual polish implementation plan
+- *(plan)* Host Reference/Independent auth with inline password
+- *(core,cli)* Host Reference/Independent auth model across wizard and CLAUDE.md
+- Correct Auth::Inline variant syntax in CLAUDE.md
+- *(plan)* Split app.rs into term/intent/persist/run_loop modules
+- *(tui)* Document app.rs split into term/intent/persist/run_loop modules
+- *(plan)* Host wizard credential picker
+- *(plan)* Correct cycle_auth convergence and popup test in credential-picker plan
+- *(tui)* Document host wizard credential picker row
+- *(tui)* Update stale launcher doc comments after status relocation
+- *(tui)* Update keymap and shell/panel layout for ux refinements
+- *(plan)* Record tui-ux-refinements plan
+- *(plan)* Dialog content-fit and focus-scroll
+- *(tui)* Drop stale DeleteHost overlay references in intent and run_loop
+- *(plan)* Form UX fixes (cursor, hints, mutex, bleed, brackets, alignment)
+- *(tui)* Document draw_search_box show_cursor param
+- *(tui)* Inline-key Source chooser + multiline paste in wizards
+- *(plan)* Record inline-key TUI popup and paste-refactor plans
+- *(plan)* File picker (identity key path browser) implementation plan
+- *(tui)* Document the file picker overlay and drop its staging allow
+- *(plan)* Field-type affordance suffixes
+- *(plan)* Sftp dual-pane transfer implementation plan
+- *(plan)* Correct sftp recursive flag to uppercase -R, after command
+- *(sftp)* Document the dual-pane SFTP transfer screen
+- *(docs)* Extract reference material into docs/
+- *(docs)* Slim CLAUDE.md to high-frequency essentials
+- *(tui)* Correct transfer render module doc after pane-border change
+- *(sftp)* Note per-pane titled borders on the transfer screen
+- *(plans)* Record recent sftp and picker plan documents
+- *(plans)* Add sftp ad-hoc target support plan
+- *(tui)* Refresh stale pending_transfer/host_id references after the Host refactor
+- *(plans)* Add SFTP queue manager MVP implementation plan
+- *(transfer)* Document the ^Q queue manager + add footer hint
+- *(transfer)* Fix two stale comments after the ledger refactor
+- *(plans)* Browser-core extraction plan
+- *(plans)* Queue overlay view-tabs plan
+- *(sftp)* Document queue-overlay view tabs and keys
+- *(plans)* Record insta snapshot pilot + hermetic CI snapshot plans
+- Add testing layer guidance to CLAUDE.md
+- Dedupe testing guidance between Hard Rules and Testing section
+- *(plans)* Add eliminate-plaintext-tempfiles plan
+- *(core)* Clarify resolve Inline branch covers non-plaintext modes
+- *(plans)* Add tty-safe sftp open spec and plan
+- *(plans)* Add unified error feedback plan
+- Keyring mode stores inline keys in the OS keyring
+- *(plans)* Record keyring-inline-key and key-tempfile-leak plans
+- *(readme)* Add English and Chinese README
+- *(plans)* Add transfer status auto-clear plan
+- *(plans)* Add context-sensitive help plan
+- *(tui)* Correct stale transfer-screen F1 doc after the global Help layer
+- *(tui)* Correct queue/file-picker/wizard help bindings to match on_key
+- *(tui)* Update stale Gauge widget references after bar rewire
+- *(core)* Correct copy_keyring_entry missing-entry contract to Ok
+- *(cli)* Rewrite CLI contract to default-interactive + escape hatches
+- *(sftp)* Describe exact-drill path-aware find semantics
+- *(core)* Align pathfind and find doc comments with exact-drill semantics
+- *(tui)* Document Tab completion in footer, help, and sftp doc
+- *(tui)* Pin error-feedback surface rules in CLAUDE.md
+- *(cli)* Correct bare-sshrack behavior in args module doc
+- *(readme)* Add CI badge, ControlMaster note, and AI authorship
+
+### 🎨 Styling
+
+- *(tui)* Unify panels to gutter selection, real cursor, accent-only colors
+- *(tui)* Drop orphaned wizard banner and tighten render_field_row doc
+- *(tui)* Use imported short names for fit helpers in draw_filter_row
+
+### 🧪 Testing
+
+- *(integration)* End-to-end tests for ref-by-id, frecency, connect, json
+- *(cli)* Align alias->name rename in test assertions and JSON contract
+- *(cli)* Pin host independent/reference auth modes and align wording
+- *(tui)* Cover picker no-match enter; name visible-rows const
+- *(cli)* Auto-reap inline-key test tempdirs via TempDir
+- *(tui)* Snapshot the help overlay with insta
+- *(tui)* Snapshot the shell chrome and host launcher list
+- *(tui)* Snapshot sftp pane long-filename truncation
+- *(sftp)* Add progress-refresh regression tests for active row and queue
+- *(cli)* Cover ConnectOptions overlay, selected_fields, sort_hosts
+- *(cli)* Cover text table column-width and alignment
+- *(cli)* Cover host ls/show/rm helpers and dangling-reference fallbacks
+- *(cli)* Cover cred ls/show helpers
+- *(cli)* Cover scp credential_msg and plan_host_name operand parsing
+- *(core)* Cover vault migrate atomicity, idempotency, inline-key, no-leak
+- *(core)* Cover credential resolve inline-key, dangling refs, patch/validate edges
+- *(core)* Cover host apply_patch clear_credential, patch_body validate, rename/build_auth edges
+- *(core)* Cover vault unlock cache-hit, enable store invariant, seal edges
+- *(core)* Cover crypto error branches, schema predicates, malformed toml, atomic_temp_path
+- *(tui)* Drive QueueOverlay::on_key directly across views and actions
+- *(tui)* Pin Status error flag and snapshot queue_overlay/store/settings draw
+- *(connect)* Cover sshrack askpass helper fork across file/config/deny channels
+- *(cli)* Assert non-zero exit codes across error paths
+- *(cli)* Cover identity-import sealed-secret storage and accept-new
+- *(connect)* Exercise scp build→launch argv and never-in-argv via shim
+- *(core)* Cover hostkey is_known/append against temp known_hosts
+- *(sftp)* Cover master env shape, transfer progress/cancel, drop teardown via shim
+- *(sftp)* Assert askpass pw-file removal in drop teardown (snapshot delta)
+- *(cli)* Pin no-tty --yes hint, document tty-confirm coverage split
+- *(tui)* Pin Tab-flips-when-no-candidate fallback
+- *(tui)* Pin Tab-to-dot Enter navigates drilled dir, not first child
+- *(transfer)* Pin quit-confirm when transfer completes mid-dialog
+
+### ⚙️ Miscellaneous Tasks
+
+- *(workspace)* Commit Cargo.lock for reproducible binary builds
+- *(transfer)* Drop stale #[allow(dead_code)] from TransferLedger
+- Add format, clippy, and test workflow
+- Run tests under a pty so crossterm tty probes succeed
+- Bump actions/checkout to v5 (node 24)
+- *(repo)* Untrack docs/superpowers and ignore the directory
+- *(release)* Add crates.io publish metadata
+- Publish to crates.io on version tags
