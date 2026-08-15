@@ -10,10 +10,17 @@ pub fn normalize(raw: Option<&str>) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+/// ssh single-dash flags that consume the next token as their value. A
+/// combined form (`-oK=V`) carries its own value and is not in this set.
+const VALUE_TAKING_FLAGS: [&str; 10] = ["-o", "-l", "-W", "-J", "-b", "-D", "-L", "-R", "-e", "-I"];
+
 /// Validate a raw `ssh_args` value at save time. Rejects control characters
-/// (they could smuggle argv/config structure), unterminated quotes, and empty
-/// tokens. Accepts any token shape — `-o "SetEnv FOO=1"` legitimately splits
-/// into a non-dash token.
+/// (they could smuggle argv/config structure), unterminated quotes, empty
+/// tokens, long options (`--…` — ssh has none; this also blocks a stray
+/// `--clear-ssh-args` swallowed as a value by `allow_hyphen_values`), and a
+/// trailing value-taking flag whose missing value would make ssh eat the
+/// destination. Accepts any other token shape — `-o "SetEnv FOO=1"`
+/// legitimately splits into a non-dash token.
 pub fn validate(raw: &str) -> Result<(), SshrackError> {
     if raw.chars().any(char::is_control) {
         return Err(SshrackError::InvalidSshArgs {
@@ -28,6 +35,19 @@ pub fn validate(raw: &str) -> Result<(), SshrackError> {
     if tokens.iter().any(String::is_empty) {
         return Err(SshrackError::InvalidSshArgs {
             reason: "empty argument".into(),
+        });
+    }
+    if tokens.iter().any(|t| t.starts_with("--")) {
+        return Err(SshrackError::InvalidSshArgs {
+            reason: "long options (--…) are not valid ssh flags".into(),
+        });
+    }
+    if let Some(token) = tokens
+        .last()
+        .filter(|t| VALUE_TAKING_FLAGS.contains(&t.as_str()))
+    {
+        return Err(SshrackError::InvalidSshArgs {
+            reason: format!("option requires a value: {token}"),
         });
     }
     Ok(())
@@ -89,6 +109,32 @@ mod tests {
     #[test]
     fn validate_rejects_empty_token() {
         assert!(validate("-o ''").is_err());
+    }
+
+    #[test]
+    fn validate_rejects_long_options() {
+        // `--ssh-args --clear-ssh-args` (allow_hyphen_values) would otherwise
+        // store the flag as a literal value; ssh itself has no long options.
+        assert!(validate("--clear-ssh-args").is_err());
+        assert!(validate("-o X=1 --verbose").is_err());
+        assert!(validate("--").is_err());
+    }
+
+    #[test]
+    fn validate_accepts_short_flags_alongside_long_option_rejection() {
+        assert!(validate("-o X=1 -X").is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_trailing_value_taking_flag() {
+        // A dangling `-o`/`-L`/… at the end makes ssh eat the destination.
+        assert!(validate("-o X=1 -o").is_err());
+        assert!(validate("-X -L").is_err());
+    }
+
+    #[test]
+    fn validate_accepts_combined_forms_with_embedded_value() {
+        assert!(validate("-o X=1 -oK=V").is_ok());
     }
 
     #[test]

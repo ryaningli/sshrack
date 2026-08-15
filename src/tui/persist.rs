@@ -184,8 +184,7 @@ pub(crate) fn persist_host_save(
         if orig.name != name {
             host::validate_rename(&app.config, &orig.name, &name)?;
         }
-        let edited =
-            host::finalize_body(target_id, &name, &host_addr, port, ssh_args.clone(), auth);
+        let edited = host::finalize_body(target_id, &name, &host_addr, port, ssh_args, auth);
         let mut next = app.config.clone();
         if let Some(slot) = next.hosts.iter_mut().find(|h| h.id == target_id) {
             *slot = edited;

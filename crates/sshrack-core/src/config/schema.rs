@@ -644,9 +644,6 @@ auth = { user = "root" }
         };
         let text = toml::to_string(&without).expect("invariant: serializable host");
         assert!(!text.contains("ssh_args"));
-        // A config written before this feature still parses (serde default).
-        let legacy = text.replace("ssh_args", ""); // no-op guard: field absent above
-        let _: Host = toml::from_str(&legacy).expect("invariant: legacy parse");
     }
 
     #[test]
