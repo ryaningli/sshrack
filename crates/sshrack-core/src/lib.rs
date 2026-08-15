@@ -21,6 +21,7 @@ pub mod keydetect;
 pub mod pathfind;
 pub mod pathutil;
 pub mod secret;
+pub mod sshargs;
 pub mod suggest;
 pub mod sweep;
 pub mod tempfile_registry;
