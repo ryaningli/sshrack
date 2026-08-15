@@ -53,7 +53,7 @@ cargo build --release
 
 ```bash
 sshrack web1 df -h                       # connect, run a one-off command
-sshrack root@10.0.0.50 uptime            # ad-hoc target without saved host
+sshrack root@10.0.0.50 uptime            # unregistered target without a saved host
 sshrack ssh web1                         # interactive remote shell
 sshrack scp ./app.tar web1:/tmp/         # scripted file transfer
 sshrack sftp web1                        # dual-pane transfer screen
