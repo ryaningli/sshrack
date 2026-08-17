@@ -113,7 +113,7 @@ cargo test --workspace                   # run all tests
 
 Quality gates before every commit: `cargo fmt` green, clippy green, tests green.
 
-CI runs the suite under a pty (`script -qec "cargo test --workspace" /dev/null`) because some TUI tests build a real terminal backend. See [`CLAUDE.md`](CLAUDE.md) for the full architecture, routing rules, and constraints.
+CI runs the suite under a pty (`script -qec "cargo test --workspace" /dev/null`) because some TUI tests build a real terminal backend. See [`AGENTS.md`](AGENTS.md) for the full architecture, routing rules, and constraints.
 
 ## 🧱 Architecture
 
@@ -162,7 +162,7 @@ sshrack is being built out incrementally.
 
 ## 🤝 Contributing
 
-Contributions are welcome. Please read [`CLAUDE.md`](CLAUDE.md) first — it covers the architecture, routing rules, code style, and the quality gates every change must pass. For larger work, open an issue to discuss the direction first.
+Contributions are welcome. Please read [`AGENTS.md`](AGENTS.md) first — it covers the architecture, routing rules, code style, and the quality gates every change must pass. For larger work, open an issue to discuss the direction first.
 
 ## 🤖 Authorship
 

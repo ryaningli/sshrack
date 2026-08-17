@@ -1,6 +1,6 @@
 # Version Release Runbook
 
-Used only when cutting a release; split out of `CLAUDE.md` for length. When
+Used only when cutting a release; split out of `AGENTS.md` for length. When
 asked to release without a specific version, auto-increment PATCH
 (e.g. `0.1.0` → `0.1.1`).
 

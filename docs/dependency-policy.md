@@ -1,8 +1,8 @@
 # Dependency Policy & Rust Skills
 
 Reference for adding/evaluating crates and the Rust-skill routing convention.
-Split out of `CLAUDE.md` for length; the **Banned** list is duplicated in
-`CLAUDE.md` because it is a hard, frequently-relevant constraint.
+Split out of `AGENTS.md` for length; the **Banned** list is duplicated in
+`AGENTS.md` because it is a hard, frequently-relevant constraint.
 
 ## Principles
 

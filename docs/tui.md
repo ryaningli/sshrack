@@ -1,7 +1,7 @@
 # TUI Design
 
 The interactive shell (`src/tui/`) is a **three-band shell + tabs + overlays**.
-The high-frequency keymap lives in `CLAUDE.md` (`## TUI Keys`); this file holds
+The high-frequency keymap lives in `AGENTS.md` (`## TUI Keys`); this file holds
 the structural design: shell, tabs, panels, overlays, wizards, file picker, and
 event routing.
 

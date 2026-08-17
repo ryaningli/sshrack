@@ -113,7 +113,7 @@ cargo test --workspace                   # 跑全部测试
 
 每次提交前的质量门禁：`cargo fmt` 通过、clippy 通过、测试通过。
 
-CI 在 pty 下跑测试套件（`script -qec "cargo test --workspace" /dev/null`），因为部分 TUI 测试会构建真实的终端 backend。完整架构、路由规则与约束见 [`CLAUDE.md`](CLAUDE.md)。
+CI 在 pty 下跑测试套件（`script -qec "cargo test --workspace" /dev/null`），因为部分 TUI 测试会构建真实的终端 backend。完整架构、路由规则与约束见 [`AGENTS.md`](AGENTS.md)。
 
 ## 🧱 架构
 
@@ -162,7 +162,7 @@ sshrack 正在分步构建。
 
 ## 🤝 贡献
 
-欢迎贡献。改动前请先阅读 [`CLAUDE.md`](CLAUDE.md) —— 它涵盖了架构、路由规则、代码风格，以及每次改动必须通过的质量门禁。较大改动建议先开 issue 讨论方向。
+欢迎贡献。改动前请先阅读 [`AGENTS.md`](AGENTS.md) —— 它涵盖了架构、路由规则、代码风格，以及每次改动必须通过的质量门禁。较大改动建议先开 issue 讨论方向。
 
 ## 🤖 关于作者
 

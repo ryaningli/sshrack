@@ -2,7 +2,7 @@
 
 Recorded for migration off the predecessor `sshrack-old`; this project is
 pre-1.0 and carries no compat shim (per the dev-stage rule). Split out of
-`CLAUDE.md` for length — consult this when porting an old setup.
+`AGENTS.md` for length — consult this when porting an old setup.
 
 - **Identifier rename `alias` → `name`.** JSON output keys `alias`→`name` and `credential_alias`→`credential_name`; TOML key `alias`→`name` in hosts and credentials. `--credential` accepts a name.
 - **`--no-input` removed (still absent).** The CLI now defaults to interactive on a tty (host-key / passphrase / destructive confirms), with per-scenario escape hatches (`--accept-new`, `--yes`, `SSHRACK_PASSPHRASE`). There is no global non-interactive toggle. Missing required *config* flags still error directly.

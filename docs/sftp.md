@@ -2,7 +2,7 @@
 
 Dual-pane interactive SFTP over the system `ssh`/`sftp` binaries (zero protocol
 libraries; the "Never Reimplement SSH" invariant holds). The high-frequency
-transfer keymap lives in `CLAUDE.md`; this file holds the architecture and
+transfer keymap lives in `AGENTS.md`; this file holds the architecture and
 failure-hygiene design.
 
 ## Connection Model

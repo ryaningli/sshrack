@@ -1,9 +1,9 @@
 # Architecture
 
 Reference: workspace layout, core invariants, the identity/config model, on-disk
-layout, and external-process boundaries. Split out of `CLAUDE.md` for length;
-the high-frequency bits (build commands, hard rules, routing, TUI keys) live
-there. Each module also carries a `//!` doc comment — this file is the
+layout, and external-process boundaries. Split out of `AGENTS.md` for length;
+the high-frequency bits (build commands, hard constraints, routing, TUI keys)
+live there. Each module also carries a `//!` doc comment — this file is the
 bird's-eye view across them.
 
 ## Workspace Layout
@@ -77,7 +77,7 @@ Both `Host` and `Credential` carry a **first-class, immutable `id: Ulid`** (gene
 - **Reference by id.** A host authenticates one of two ways:
   - **Reference** — `Auth::Ref { credential: Ulid }` points at a `[[credentials]]` entry by its ULID, not by name. **Renaming a credential never dangles a host reference.** For human readability, `host ls`/`show` reverse-resolve id→name; on `add`/`edit` the user specifies a credential by name and the CLI/wizard resolves it to an id before persisting.
   - **Independent** — `Auth::Inline(CredentialBody)` carries a host-own user plus an optional secret of kind None / Password / IdentityKey. The host owns its secret directly, so it works without a detour to the credential tab; the password variant is keyring-keyed by the host's ULID (`OwnerKind::Host`), so the same rename-safe and delete/`cp`/`--force` cleanup rules apply as for credentials. An IdentityKey secret is modeled by `KeySource`, which is either a file **`Path`** (a reference, delivered to `ssh -i <path>`) or pasted **`Inline`** contents; inline contents are sealed as `Secret` (Argon2id + XChaCha20-Poly1305 under vault, clear text under plaintext, **OS-keyring-stored under keyring mode** — the private key and optional certificate text live in the keyring under `<kind>:<id>#ikpriv` / `#ikcert` slots, and the body carries only an `ik.keyring = true` marker) and, at connect time, materialized to a `0600` temp file for `ssh -i` and deleted after the connection. Encrypted (passphrase-protected) private keys are not decrypted by sshrack: on a key-only connection sshrack leaves `SSH_ASKPASS` unset so OpenSSH prompts for the passphrase at the tty itself.
-- Both surfaces expose the full chooser: the **TUI** host wizard cycles Auth between Reference and Independent (and, under Independent, Secret between None/Password/IdentityKey); the **CLI** exposes both via `--credential` (Reference) and `--user` / `--identity` (Independent). Inline **None** and **IdentityKey** hosts can be created either way; an inline **password** is TUI-only (passwords never enter argv — see the CLI Contract in `CLAUDE.md`). Inline key *contents* reach the CLI via `--identity-stdin` / `--identity-file` (plus `--certificate-stdin` / `--certificate-file`); the path-reference source remains `--identity <path>`.
+- Both surfaces expose the full chooser: the **TUI** host wizard cycles Auth between Reference and Independent (and, under Independent, Secret between None/Password/IdentityKey); the **CLI** exposes both via `--credential` (Reference) and `--user` / `--identity` (Independent). Inline **None** and **IdentityKey** hosts can be created either way; an inline **password** is TUI-only (passwords never enter argv — see the CLI Contract in `AGENTS.md`). Inline key *contents* reach the CLI via `--identity-stdin` / `--identity-file` (plus `--certificate-stdin` / `--certificate-file`); the path-reference source remains `--identity <path>`.
 - **Host `ssh_args`** — optional raw ssh option flags (e.g. `-o ServerAliveInterval=30`), stored verbatim on the host, shell-split at connect time, appended after sshrack's own options (ssh's last-`-o`-wins makes user overrides possible). Validated at save time (no control chars, no unterminated quotes, no empty tokens). ssh and the SFTP master receive all tokens; scp receives only the `-o Key=Value` subset.
 - A `format_version` field (currently `1`) is included for future migrations.
 - `CredentialBody` (user + optional secret) carries no id — the id lives on the owner (the credential, or the host when inline).
