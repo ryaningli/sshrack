@@ -207,9 +207,9 @@ pub fn run_loop(
                     // overlay. on_key's route_overlay stashed the form back on
                     // SaveHost (non-terminal), so the overlay is still open here.
                     match persist_host_save(app, &handle, &OsKeyring) {
-                        Ok(()) => {
+                        Ok(saved_id) => {
                             app.set_status("host saved".to_string());
-                            app.close_host_wizard();
+                            app.close_host_wizard(saved_id);
                         }
                         Err(e) => {
                             // Persist failed (duplicate name, write error,

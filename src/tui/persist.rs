@@ -71,17 +71,21 @@ fn body_has_plaintext_secret(body: &sshrack_core::config::schema::CredentialBody
 /// Keyring lifecycle: an inline password is keyed by the host's ULID
 /// (`OwnerKind::Host`); on edit the old entry is cleaned up, and on delete /
 /// `host cp` / `host add --force` the same id-keyed cleanup runs.
+///
+/// Returns the saved host's id (fresh for add, original for edit) so the
+/// caller can move the launcher pointer onto it; `None` only in the
+/// defensive no-form case (the overlay held no host wizard).
 pub(crate) fn persist_host_save(
     app: &mut App,
     handle: &TerminalHandle,
     backend: &dyn SecretBackend,
-) -> Result<(), SshrackError> {
+) -> Result<Option<Ulid>, SshrackError> {
     // Take the form out of the overlay so we can borrow `app.config` for the
     // credential-name → id resolution without a borrow conflict. The form lives
     // inside `Overlay::HostWizard`; clone it out (the overlay keeps its copy so
     // an error-path set_core_error still reaches the user).
     let Some(Overlay::HostWizard(form)) = app.overlay.clone() else {
-        return Ok(());
+        return Ok(None);
     };
 
     // Resolve credential name → id (only when the user picked Reference).
@@ -218,7 +222,7 @@ pub(crate) fn persist_host_save(
         // memory only. The launcher will still show the host this session.
         app.set_config(new_cfg);
     }
-    Ok(())
+    Ok(Some(target_id))
 }
 
 /// Fulfill a [`Outcome::DeleteHost`] intent (after the user confirmed the
@@ -693,7 +697,8 @@ mod tests {
         w.user = "deploy".into();
         app.overlay = Some(Overlay::HostWizard(w));
 
-        persist_host_save(&mut app, &dead_handle(), &OsKeyring).expect("add save should succeed");
+        let saved_id = persist_host_save(&mut app, &dead_handle(), &OsKeyring)
+            .expect("add save should succeed");
 
         // Wizard is NOT auto-closed by persist (the loop does that); but the
         // config has been reloaded with the new host.
@@ -703,6 +708,11 @@ mod tests {
         assert_eq!(reloaded.hosts[0].host, "10.0.0.5");
         assert_eq!(reloaded.hosts[0].port, 2222);
         assert_eq!(reloaded.hosts[0].auth.inline_body().unwrap().user, "deploy");
+        assert_eq!(
+            saved_id,
+            Some(reloaded.hosts[0].id),
+            "save returns the fresh host id for the pointer redirect"
+        );
     }
 
     #[test]

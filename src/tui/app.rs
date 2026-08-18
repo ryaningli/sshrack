@@ -340,12 +340,28 @@ impl App {
     }
 
     /// Leave the host wizard overlay and return to the launcher, reloading the
-    /// host ranking so a freshly added/edited host shows up. Used by the loop
-    /// after a save or a cancel.
-    pub fn close_host_wizard(&mut self) {
+    /// host ranking so a freshly added/edited host shows up — and move the
+    /// launcher pointer onto the saved host (`saved_id`) so the user lands on
+    /// what they just saved (a new host has no frecency, so it ranks last and
+    /// would otherwise be easy to miss). When the active query filters the
+    /// saved host out, the filter is cleared first so the host is visible
+    /// under the pointer. `None` is the defensive no-form case (plain close +
+    /// re-rank). Used by the loop after a save.
+    pub fn close_host_wizard(&mut self, saved_id: Option<Ulid>) {
         self.overlay = None;
         // Re-rank so the launcher reflects the (possibly) updated host list.
         self.recompute_panels();
+        let Some(id) = saved_id else {
+            return;
+        };
+        if !self.launcher.select_by_id(&self.config.hosts, id) {
+            // Filtered out by the active query: drop the filter and re-rank so
+            // the saved host is visible with the pointer on it.
+            self.launcher.query.clear();
+            self.launcher
+                .recompute(&self.config.hosts, &self.config.credentials, &self.frecency);
+            self.launcher.select_by_id(&self.config.hosts, id);
+        }
     }
 
     /// Re-rank both panels (Hosts by frecency, Credentials alphabetically) from
@@ -1581,13 +1597,158 @@ mod tests {
         assert!(matches!(outcome, Outcome::SaveHost));
 
         // Loop actions.
-        persist_host_save(&mut app, &dead_handle(), &OsKeyring).expect("save");
-        app.close_host_wizard();
+        let saved_id = persist_host_save(&mut app, &dead_handle(), &OsKeyring).expect("save");
+        assert_eq!(
+            saved_id,
+            Some(app.config().hosts[0].id),
+            "save returns the new id"
+        );
+        app.close_host_wizard(saved_id);
         assert!(app.overlay().is_none(), "overlay closed back to launcher");
-        // The launcher now sees the new host (re-ranked on close).
+        // The launcher now sees the new host (re-ranked on close), with the
+        // pointer on it.
         assert_eq!(app.config().hosts.len(), 1);
         assert_eq!(app.launcher.ranked.len(), 1);
         assert_eq!(app.config().hosts[0].name, "web");
+        assert_eq!(
+            app.launcher
+                .selected_host(&app.config().hosts)
+                .map(|h| h.name.as_str()),
+            Some("web"),
+            "pointer must land on the freshly added host"
+        );
+    }
+
+    #[test]
+    fn add_save_moves_pointer_onto_new_host() {
+        // Two pre-existing hosts carry frecency scores; the freshly added host
+        // has none, so it ranks last. The pointer must still land on it after
+        // the save closes the wizard — not stay clamped at its old index.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let alpha_id = Ulid::new();
+        let beta_id = Ulid::new();
+        let cfg = SshrackConfig {
+            hosts: vec![
+                Host {
+                    id: alpha_id,
+                    name: "alpha".into(),
+                    host: "10.0.0.1".into(),
+                    port: 22,
+                    ssh_args: None,
+                    auth: Auth::inline(CredentialBody::new("ops")),
+                },
+                Host {
+                    id: beta_id,
+                    name: "beta".into(),
+                    host: "10.0.0.2".into(),
+                    port: 22,
+                    ssh_args: None,
+                    auth: Auth::inline(CredentialBody::new("ops")),
+                },
+            ],
+            ..SshrackConfig::default()
+        };
+        sshrack_core::config::store::save(&path, &cfg).unwrap();
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let mut fr = Frecency::default();
+        fr.record_at(&alpha_id, now);
+        fr.record_at(&beta_id, now);
+        let mut app = App::new(cfg, Some(path), fr, HashMap::new());
+
+        // ^a → add wizard; type name + host; ^s.
+        app.on_key(press(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        for ch in "web".chars() {
+            app.on_key(press(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+        for ch in "10.0.0.9".chars() {
+            app.on_key(press(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        let outcome = app.on_key(press(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(matches!(outcome, Outcome::SaveHost));
+
+        let saved_id = persist_host_save(&mut app, &dead_handle(), &OsKeyring).expect("save");
+        app.close_host_wizard(saved_id);
+        assert_eq!(app.launcher.ranked.len(), 3);
+        assert_eq!(
+            app.launcher
+                .selected_host(&app.config().hosts)
+                .map(|h| h.name.as_str()),
+            Some("web"),
+            "pointer must land on the freshly added host, not the old index"
+        );
+        // The new host ranks last (no frecency) — the pointer moved there.
+        assert_eq!(app.launcher.selected, 2);
+    }
+
+    #[test]
+    fn add_save_clears_filter_when_new_host_hidden() {
+        // The launcher has an active query ("b" — matches only "beta"; the new
+        // host's name must contain no 'b' anywhere, since nucleo matches
+        // subsequences and "web" would match "b" via its final letter) that
+        // cannot match the freshly added host: the save must drop the filter so
+        // the saved host is visible under the pointer.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let alpha_id = Ulid::new();
+        let beta_id = Ulid::new();
+        let cfg = SshrackConfig {
+            hosts: vec![
+                Host {
+                    id: alpha_id,
+                    name: "alpha".into(),
+                    host: "10.0.0.1".into(),
+                    port: 22,
+                    ssh_args: None,
+                    auth: Auth::inline(CredentialBody::new("ops")),
+                },
+                Host {
+                    id: beta_id,
+                    name: "beta".into(),
+                    host: "10.0.0.2".into(),
+                    port: 22,
+                    ssh_args: None,
+                    auth: Auth::inline(CredentialBody::new("ops")),
+                },
+            ],
+            ..SshrackConfig::default()
+        };
+        sshrack_core::config::store::save(&path, &cfg).unwrap();
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let mut fr = Frecency::default();
+        fr.record_at(&alpha_id, now);
+        fr.record_at(&beta_id, now);
+        let mut app = App::new(cfg, Some(path), fr, HashMap::new());
+
+        // Type a launcher query, then ^a → add wizard.
+        app.on_key(press(KeyCode::Char('b'), KeyModifiers::NONE));
+        assert_eq!(app.launcher.query, "b");
+        app.on_key(press(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        for ch in "zz9".chars() {
+            app.on_key(press(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+        for ch in "10.0.0.9".chars() {
+            app.on_key(press(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        let outcome = app.on_key(press(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(matches!(outcome, Outcome::SaveHost));
+
+        let saved_id = persist_host_save(&mut app, &dead_handle(), &OsKeyring).expect("save");
+        app.close_host_wizard(saved_id);
+        assert!(
+            app.launcher.query.is_empty(),
+            "filter must be cleared so the saved host is visible"
+        );
+        assert_eq!(app.launcher.ranked.len(), 3);
+        assert_eq!(
+            app.launcher
+                .selected_host(&app.config().hosts)
+                .map(|h| h.name.as_str()),
+            Some("zz9"),
+            "pointer must land on the freshly added host"
+        );
     }
 
     #[test]
@@ -1633,11 +1794,20 @@ mod tests {
         let outcome = app.on_key(press(KeyCode::Char('s'), KeyModifiers::CONTROL));
         assert!(matches!(outcome, Outcome::SaveHost));
 
-        persist_host_save(&mut app, &dead_handle(), &OsKeyring).expect("save");
-        app.close_host_wizard();
+        let saved_id = persist_host_save(&mut app, &dead_handle(), &OsKeyring).expect("save");
+        assert_eq!(saved_id, Some(orig_id), "edit save returns the original id");
+        app.close_host_wizard(saved_id);
         assert_eq!(app.config().hosts.len(), 1);
         assert_eq!(app.config().hosts[0].port, 2200);
         assert_eq!(app.config().hosts[0].id, orig_id);
+        // The pointer stays on the edited host after re-ranking.
+        assert_eq!(
+            app.launcher
+                .selected_host(&app.config().hosts)
+                .map(|h| h.name.as_str()),
+            Some("web"),
+            "pointer must land on the edited host"
+        );
     }
 
     #[test]
