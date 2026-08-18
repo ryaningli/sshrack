@@ -210,6 +210,17 @@ impl Launcher {
         self.ranked.get(self.selected).map(|r| &hosts[r.host_idx])
     }
 
+    /// Move the cursor onto the host with the given id. Returns `false` and
+    /// leaves the selection unchanged when that host is not in the ranked
+    /// list (absent, or filtered out by the active query). Pure.
+    pub fn select_by_id(&mut self, hosts: &[Host], id: Ulid) -> bool {
+        let Some(idx) = self.ranked.iter().position(|r| hosts[r.host_idx].id == id) else {
+            return false;
+        };
+        self.selected = idx;
+        true
+    }
+
     /// Pure key decision: inspect `key`, mutate query/selection, and return
     /// what the loop should do next. Performs **no I/O**.
     ///
@@ -997,6 +1008,36 @@ mod tests {
         assert!(launcher.query.is_empty());
         assert_eq!(launcher.selected, 0);
         assert_eq!(launcher.ranked.len(), 2);
+    }
+
+    #[test]
+    fn select_by_id_moves_cursor_to_ranked_position() {
+        // Slice order differs from the ranked order so the idx mapping is
+        // exercised: ranked is alpha, beta, gamma (name-ascending tiebreak on
+        // equal frecency scores).
+        let hosts = vec![host(3, "gamma"), host(1, "alpha"), host(2, "beta")];
+        let fr = Frecency::default();
+        let mut launcher = Launcher::new(&hosts, &[], &fr);
+        assert_eq!(launcher.selected, 0);
+        assert!(
+            launcher.select_by_id(&hosts, hosts[0].id),
+            "gamma is ranked"
+        );
+        assert_eq!(launcher.selected, 2);
+        assert_eq!(hosts[launcher.ranked[2].host_idx].name, "gamma");
+    }
+
+    #[test]
+    fn select_by_id_reports_absence_and_keeps_cursor() {
+        let hosts = vec![host(1, "alpha"), host(2, "beta")];
+        let fr = Frecency::default();
+        let mut launcher = Launcher::new(&hosts, &[], &fr);
+        launcher.selected = 1;
+        assert!(
+            !launcher.select_by_id(&hosts, Ulid::new()),
+            "an unknown id must not move the cursor"
+        );
+        assert_eq!(launcher.selected, 1);
     }
 
     #[test]
